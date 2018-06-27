@@ -237,6 +237,14 @@ class Statestore : public CacheLineAligned {
     /// Acquires an exclusive write lock for the topic.
     std::vector<TopicEntry::Version> Put(const std::vector<TTopicItem>& entries);
 
+    /// Deletes all the topic entries and updates the topic metrics. It doesn't
+    /// reset the last_version_ to ensure that versions are monotonically
+    /// increasing.
+    ///
+    /// Safe to call concurrently from multiple threads (for different
+    /// subscribers). Acquires an exclusive lock for the topic.
+    void ClearAllEntries();
+
     /// Utility method to support removing transient entries. We track the version numbers
     /// of entries added by subscribers, and remove entries with the same version number
     /// when that subscriber fails (the same entry may exist, but may have been updated by
@@ -323,10 +331,16 @@ class Statestore : public CacheLineAligned {
 
     /// Information about a subscriber's subscription to a specific topic.
     struct TopicSubscription {
-      TopicSubscription(bool is_transient) : is_transient(is_transient) {}
+      TopicSubscription(bool is_transient, bool populate_min_subscriber_topic_version)
+        : is_transient(is_transient),
+          populate_min_subscriber_topic_version(populate_min_subscriber_topic_version) {}
 
       /// Whether entries written by this subscriber should be considered transient.
       const bool is_transient;
+
+      /// Whether min_subscriber_topic_version needs to be filled in for this
+      /// subscription.
+      const bool populate_min_subscriber_topic_version;
 
       /// The last topic entry version successfully processed by this subscriber. Only
       /// written by a single thread at a time but can be read concurrently.
@@ -388,7 +402,7 @@ class Statestore : public CacheLineAligned {
     /// processed. Will never decrease.
     TopicEntry::Version LastTopicVersionProcessed(const TopicId& topic_id) const;
 
-    /// Sets the subscriber's last processed version of the topic to the given value.  This
+    /// Sets the subscriber's last processed version of the topic to the given value. This
     /// should only be set when once a subscriber has succesfully processed the given
     /// update corresponding to this version. Should not be called concurrently from
     /// multiple threads for a given 'topic_id'.
@@ -517,7 +531,11 @@ class Statestore : public CacheLineAligned {
 
   /// Failure detector for subscribers. If a subscriber misses a configurable number of
   /// consecutive heartbeat messages, it is considered failed and a) its transient topic
-  /// entries are removed and b) its entry in the subscriber map is erased.
+  /// entries are removed and b) its entry in the subscriber map is erased. The
+  /// subscriber ID is used to identify peers for failure detection purposes. Subscriber
+  /// state is evicted from the failure detector when the subscriber is unregistered,
+  /// so old subscribers do not occupy memory and the failure detection state does not
+  /// carry over to any new registrations of the previous subscriber.
   boost::scoped_ptr<MissedHeartbeatFailureDetector> failure_detector_;
 
   /// Metric that track the registered, non-failed subscribers.

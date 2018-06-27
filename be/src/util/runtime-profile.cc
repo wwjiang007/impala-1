@@ -17,8 +17,10 @@
 
 #include "util/runtime-profile-counters.h"
 
+#include <algorithm>
 #include <iomanip>
 #include <iostream>
+#include <utility>
 
 #include <boost/bind.hpp>
 #include <boost/thread/locks.hpp>
@@ -202,19 +204,33 @@ void RuntimeProfile::UpdateAverage(RuntimeProfile* other) {
   {
     lock_guard<SpinLock> l(children_lock_);
     lock_guard<SpinLock> m(other->children_lock_);
-    // Recursively merge children with matching names
+    // Recursively merge children with matching names.
+    // Track the current position in the vector so we preserve the order of children
+    // if children are added after the first Update()/UpdateAverage() call (IMPALA-6694).
+    // E.g. if the first update sends [B, D] and the second update sends [A, B, C, D],
+    // then this code makes sure that children_ is [A, B, C, D] afterwards.
+    ChildVector::iterator insert_pos = children_.begin();
     for (int i = 0; i < other->children_.size(); ++i) {
       RuntimeProfile* other_child = other->children_[i].first;
       ChildMap::iterator j = child_map_.find(other_child->name_);
       RuntimeProfile* child = NULL;
       if (j != child_map_.end()) {
         child = j->second;
+        // Search forward until the insert position is either at the end of the vector
+        // or after this child. This preserves the order if the relative order of
+        // children in all updates is consistent.
+        bool found_child = false;
+        while (insert_pos != children_.end() && !found_child) {
+          found_child = insert_pos->first == child;
+          ++insert_pos;
+        }
       } else {
         child = Create(pool_, other_child->name_, true);
         child->metadata_ = other_child->metadata_;
         bool indent_other_child = other->children_[i].second;
         child_map_[child->name_] = child;
-        children_.push_back(make_pair(child, indent_other_child));
+        insert_pos = children_.insert(insert_pos, make_pair(child, indent_other_child));
+        ++insert_pos;
       }
       child->UpdateAverage(other_child);
     }
@@ -329,6 +345,11 @@ void RuntimeProfile::Update(const vector<TRuntimeProfileNode>& nodes, int* idx) 
   ++*idx;
   {
     lock_guard<SpinLock> l(children_lock_);
+    // Track the current position in the vector so we preserve the order of children
+    // if children are added after the first Update()/UpdateAverage() call (IMPALA-6694).
+    // E.g. if the first update sends [B, D] and the second update sends [A, B, C, D],
+    // then this code makes sure that children_ is [A, B, C, D] afterwards.
+    ChildVector::iterator insert_pos = children_.begin();
     // Update children with matching names; create new ones if they don't match.
     for (int i = 0; i < node.num_children; ++i) {
       const TRuntimeProfileNode& tchild = nodes[*idx];
@@ -336,11 +357,20 @@ void RuntimeProfile::Update(const vector<TRuntimeProfileNode>& nodes, int* idx) 
       RuntimeProfile* child = NULL;
       if (j != child_map_.end()) {
         child = j->second;
+        // Search forward until the insert position is either at the end of the vector
+        // or after this child. This preserves the order if the relative order of
+        // children in all updates is consistent.
+        bool found_child = false;
+        while (insert_pos != children_.end() && !found_child) {
+          found_child = insert_pos->first == child;
+          ++insert_pos;
+        }
       } else {
         child = Create(pool_, tchild.name);
         child->metadata_ = tchild.metadata;
         child_map_[tchild.name] = child;
-        children_.push_back(make_pair(child, tchild.indent));
+        insert_pos = children_.insert(insert_pos, make_pair(child, tchild.indent));
+        ++insert_pos;
       }
       child->Update(nodes, idx);
     }
@@ -462,9 +492,7 @@ RuntimeProfile* RuntimeProfile::CreateChild(const string& name, bool indent,
 void RuntimeProfile::GetChildren(vector<RuntimeProfile*>* children) {
   children->clear();
   lock_guard<SpinLock> l(children_lock_);
-  for (ChildMap::iterator i = child_map_.begin(); i != child_map_.end(); ++i) {
-    children->push_back(i->second);
-  }
+  for (const auto& entry : children_) children->push_back(entry.first);
 }
 
 void RuntimeProfile::GetAllChildren(vector<RuntimeProfile*>* children) {
@@ -473,6 +501,24 @@ void RuntimeProfile::GetAllChildren(vector<RuntimeProfile*>* children) {
     children->push_back(i->second);
     i->second->GetAllChildren(children);
   }
+}
+
+void RuntimeProfile::SortChildrenByTotalTime() {
+  lock_guard<SpinLock> l(children_lock_);
+  // Create a snapshot of total time values so that they don't change while we're
+  // sorting. Sort the <total_time, index> pairs, then reshuffle children_.
+  vector<pair<int64_t, int64_t>> total_times;
+  for (int i = 0; i < children_.size(); ++i) {
+    total_times.emplace_back(children_[i].first->total_time_counter()->value(), i);
+  }
+  // Order by descending total time.
+  sort(total_times.begin(), total_times.end(),
+      [](const pair<int64_t, int64_t>& p1, const pair<int64_t, int64_t>& p2) {
+        return p1.first > p2.first;
+      });
+  ChildVector new_children;
+  for (const auto& p : total_times) new_children.emplace_back(children_[p.second]);
+  children_ = move(new_children);
 }
 
 void RuntimeProfile::AddInfoString(const string& key, const string& value) {
@@ -593,6 +639,15 @@ RuntimeProfile::Counter* RuntimeProfile::GetCounter(const string& name) {
     return counter_map_[name];
   }
   return NULL;
+}
+
+RuntimeProfile::SummaryStatsCounter* RuntimeProfile::GetSummaryStatsCounter(
+    const string& name) {
+  lock_guard<SpinLock> l(summary_stats_map_lock_);
+  if (summary_stats_map_.find(name) != summary_stats_map_.end()) {
+    return summary_stats_map_[name];
+  }
+  return nullptr;
 }
 
 void RuntimeProfile::GetCounters(const string& name, vector<Counter*>* counters) {

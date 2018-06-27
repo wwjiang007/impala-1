@@ -31,6 +31,7 @@
 #include "common/status.h"
 #include "exprs/scalar-expr.h"
 #include "exprs/scalar-fn-call.h"
+#include "exprs/timezone_db.h"
 #include "runtime/bufferpool/buffer-pool.h"
 #include "runtime/bufferpool/reservation-tracker.h"
 #include "runtime/data-stream-mgr-base.h"
@@ -40,6 +41,7 @@
 #include "runtime/mem-tracker.h"
 #include "runtime/query-state.h"
 #include "runtime/runtime-filter-bank.h"
+#include "runtime/thread-resource-mgr.h"
 #include "runtime/timestamp-value.h"
 #include "util/auth-util.h" // for GetEffectiveUser()
 #include "util/bitmap.h"
@@ -50,6 +52,7 @@
 #include "util/jni-util.h"
 #include "util/mem-info.h"
 #include "util/pretty-printer.h"
+#include "util/test-info.h"
 
 #include "common/names.h"
 
@@ -69,6 +72,7 @@ RuntimeState::RuntimeState(QueryState* query_state, const TPlanFragmentCtx& frag
     now_(new TimestampValue(TimestampValue::Parse(query_state->query_ctx().now_string))),
     utc_timestamp_(new TimestampValue(TimestampValue::Parse(
         query_state->query_ctx().utc_timestamp_string))),
+    local_time_zone_(&TimezoneDatabase::GetUtcTimezone()),
     exec_env_(exec_env),
     profile_(RuntimeProfile::Create(
           obj_pool(), "Fragment " + PrintId(instance_ctx.fragment_instance_id))),
@@ -86,6 +90,7 @@ RuntimeState::RuntimeState(
     local_query_state_(query_state_),
     now_(new TimestampValue(TimestampValue::Parse(qctx.now_string))),
     utc_timestamp_(new TimestampValue(TimestampValue::Parse(qctx.utc_timestamp_string))),
+    local_time_zone_(&TimezoneDatabase::GetUtcTimezone()),
     exec_env_(exec_env),
     profile_(RuntimeProfile::Create(obj_pool(), "<unnamed>")) {
   // We may use execution resources while evaluating exprs, etc. Decremented in
@@ -106,8 +111,12 @@ void RuntimeState::Init() {
   SCOPED_TIMER(profile_->total_time_counter());
 
   // Register with the thread mgr
-  resource_pool_ = exec_env_->thread_mgr()->RegisterPool();
-  DCHECK(resource_pool_ != NULL);
+  resource_pool_ = exec_env_->thread_mgr()->CreatePool();
+  DCHECK(resource_pool_ != nullptr);
+  if (fragment_ctx_ != nullptr) {
+    // Ensure that the planner correctly determined the required threads.
+    resource_pool_->set_max_required_threads(fragment_ctx_->fragment.thread_reservation);
+  }
 
   total_thread_statistics_ = ADD_THREAD_COUNTERS(runtime_profile(), "TotalThreads");
   total_storage_wait_timer_ = ADD_TIMER(runtime_profile(), "TotalStorageWaitTime");
@@ -121,6 +130,23 @@ void RuntimeState::Init() {
     instance_buffer_reservation_->InitChildTracker(profile_,
         query_state_->buffer_reservation(), instance_mem_tracker_.get(),
         numeric_limits<int64_t>::max());
+  }
+
+  // Find local timezone.
+  // (For FE tests leave 'local_time_zone_' as default. FE tests don't load the timezone
+  // db since they don't need any timezone information.)
+  if (!TestInfo::is_fe_test()) {
+    const Timezone* tz = TimezoneDatabase::FindTimezone(query_ctx().local_time_zone);
+    if (tz != nullptr) {
+      local_time_zone_ = tz;
+    } else {
+      const string msg = Substitute(
+          "Failed to find local timezone '$0'.Falling back to UTC.",
+          query_ctx().local_time_zone);
+      LOG(WARNING) << msg;
+      LogError(ErrorMsg(TErrorCode::GENERAL, msg));
+      local_time_zone_ = &TimezoneDatabase::GetUtcTimezone();
+    }
   }
 }
 
@@ -167,7 +193,7 @@ bool RuntimeState::LogError(const ErrorMsg& message, int vlog_level) {
   // All errors go to the log, unreported_error_count_ is counted independently of the
   // size of the error_log to account for errors that were already reported to the
   // coordinator
-  VLOG(vlog_level) << "Error from query " << query_id() << ": " << message.msg();
+  VLOG(vlog_level) << "Error from query " << PrintId(query_id()) << ": " << message.msg();
   if (ErrorCount(error_log_) < query_options().max_errors) {
     AppendError(&error_log_, message);
     return true;
@@ -201,6 +227,16 @@ Status RuntimeState::LogOrReturnError(const ErrorMsg& message) {
 
 void RuntimeState::SetMemLimitExceeded(MemTracker* tracker,
     int64_t failed_allocation_size, const ErrorMsg* msg) {
+  // Constructing the MemLimitExceeded and logging it is not cheap, so
+  // avoid the cost if the query has already hit an error.
+  // This is particularly important on the UDF codepath, because the UDF codepath
+  // cannot abort the fragment immediately. It relies on callers checking status
+  // periodically. This means that this function could be called a large number of times
+  // (e.g. once per row) before the fragment aborts. See IMPALA-6997.
+  {
+    lock_guard<SpinLock> l(query_status_lock_);
+    if (!query_status_.ok()) return;
+  }
   Status status = tracker->MemLimitExceeded(this, msg == nullptr ? "" : msg->msg(),
       failed_allocation_size);
   {
@@ -229,7 +265,7 @@ void RuntimeState::ReleaseResources() {
   DCHECK(!released_resources_);
   if (filter_bank_ != nullptr) filter_bank_->Close();
   if (resource_pool_ != nullptr) {
-    exec_env_->thread_mgr()->UnregisterPool(resource_pool_);
+    exec_env_->thread_mgr()->DestroyPool(move(resource_pool_));
   }
   // Release any memory associated with codegen.
   if (codegen_ != nullptr) codegen_->Close();
@@ -239,7 +275,7 @@ void RuntimeState::ReleaseResources() {
 
   // No more memory should be tracked for this instance at this point.
   if (instance_mem_tracker_->consumption() != 0) {
-    LOG(WARNING) << "Query " << query_id() << " may have leaked memory." << endl
+    LOG(WARNING) << "Query " << PrintId(query_id()) << " may have leaked memory." << endl
                  << instance_mem_tracker_->LogUsage(MemTracker::UNLIMITED_DEPTH);
   }
   instance_mem_tracker_->Close();

@@ -17,6 +17,7 @@ shell/__init__.py
 ssh_keys/id_rsa_impala
 testdata/__init__.py
 tests/__init__.py
+bin/diagnostics/__init__.py
 www/index.html
 
 # See $IMPALA_HOME/LICENSE.txt
@@ -33,7 +34,7 @@ tests/comparison/leopard/static/css/bootstrap*
 tests/comparison/leopard/static/fonts/glyphicons-halflings*
 tests/comparison/leopard/static/js/bootstrap*
 shell/ext-py/prettytable-0.7.1/*
-shell/ext-py/sqlparse-0.1.14/*
+shell/ext-py/sqlparse-0.1.19/*
 shell/ext-py/sasl-0.1.1/*
 www/d3.v3.min.js
 www/jquery/jquery-1.12.4.min.js
@@ -79,6 +80,7 @@ tests/comparison/ORACLE.txt
 bin/distcc/README.md
 tests/comparison/POSTGRES.txt
 docs/README.md
+docker/README.md
 be/src/thirdparty/pcg-cpp-0.98/README.md
 
 # http://www.apache.org/legal/src-headers.html: "Test data for which the addition of a
@@ -96,7 +98,7 @@ testdata/AllTypesErrorNoNulls/*.txt
 *.parq
 *.parquet
 testdata/cluster/node_templates/cdh5/etc/hadoop/conf/*.xml.tmpl
-testdata/cluster/node_templates/cdh5/etc/kudu/*.conf.tmpl
+testdata/cluster/node_templates/common/etc/kudu/*.conf.tmpl
 testdata/cluster/node_templates/common/etc/hadoop/conf/*.xml.tmpl
 testdata/data/chars-formats.txt
 testdata/data/chars-tiny.txt
@@ -109,6 +111,9 @@ testdata/data/widerow.txt
 testdata/data/local_tbl/00000.txt
 testdata/datasets/functional/functional_schema_template.sql
 testdata/hive_benchmark/grepTiny/part-00000
+testdata/tzdb/2017c.zip
+testdata/tzdb/2017c-corrupt.zip
+testdata/tzdb_tiny/*
 tests/pytest.ini
 tests/shell/bad_impalarc
 tests/shell/good_impalarc

@@ -42,6 +42,7 @@
 #include "runtime/query-state.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/row-batch.h"
+#include "runtime/thread-resource-mgr.h"
 #include "scheduling/query-schedule.h"
 #include "util/debug-util.h"
 #include "util/container-util.h"
@@ -72,13 +73,13 @@ FragmentInstanceState::FragmentInstanceState(
 Status FragmentInstanceState::Exec() {
   Status status = Prepare();
   DCHECK(runtime_state_ != nullptr);  // we need to guarantee at least that
-  prepared_promise_.Set(status);
+  discard_result(prepared_promise_.Set(status));
   if (!status.ok()) {
-    opened_promise_.Set(status);
+    discard_result(opened_promise_.Set(status));
     goto done;
   }
   status = Open();
-  opened_promise_.Set(status);
+  discard_result(opened_promise_.Set(status));
   if (!status.ok()) goto done;
 
   {
@@ -102,13 +103,9 @@ void FragmentInstanceState::Cancel() {
   // being cancelled.
   discard_result(WaitForPrepare());
 
-  // Ensure that the sink is closed from both sides. Although in ordinary executions we
-  // rely on the consumer to do this, in error cases the consumer may not be able to send
-  // CloseConsumer() (see IMPALA-4348 for an example).
-  if (root_sink_ != nullptr) root_sink_->CloseConsumer();
-
   DCHECK(runtime_state_ != nullptr);
   runtime_state_->set_is_cancelled();
+  if (root_sink_ != nullptr) root_sink_->Cancel(runtime_state_);
   runtime_state_->stream_mgr()->Cancel(runtime_state_->fragment_instance_id());
 }
 
@@ -141,7 +138,7 @@ Status FragmentInstanceState::Prepare() {
   // Reserve one main thread from the pool
   runtime_state_->resource_pool()->AcquireThreadToken();
   avg_thread_tokens_ = profile()->AddSamplingCounter("AverageThreadTokens",
-      bind<int64_t>(mem_fn(&ThreadResourceMgr::ResourcePool::num_threads),
+      bind<int64_t>(mem_fn(&ThreadResourcePool::num_threads),
           runtime_state_->resource_pool()));
   mem_usage_sampled_counter_ = profile()->AddTimeSeriesCounter("MemoryUsage",
       TUnit::BYTES,
@@ -149,7 +146,7 @@ Status FragmentInstanceState::Prepare() {
           runtime_state_->instance_mem_tracker()));
   thread_usage_sampled_counter_ = profile()->AddTimeSeriesCounter("ThreadUsage",
       TUnit::UNIT,
-      bind<int64_t>(mem_fn(&ThreadResourceMgr::ResourcePool::num_threads),
+      bind<int64_t>(mem_fn(&ThreadResourcePool::num_threads),
           runtime_state_->resource_pool()));
 
   // set up plan
@@ -244,11 +241,19 @@ Status FragmentInstanceState::Open() {
   if (runtime_state_->ShouldCodegen()) {
     UpdateState(StateEvent::CODEGEN_START);
     RETURN_IF_ERROR(runtime_state_->CreateCodegen());
-    exec_tree_->Codegen(runtime_state_);
-    // It shouldn't be fatal to fail codegen. However, until IMPALA-4233 is fixed,
-    // ScalarFnCall has no fall back to interpretation when codegen fails so propagates
-    // the error status for now.
-    RETURN_IF_ERROR(runtime_state_->CodegenScalarFns());
+    {
+      SCOPED_TIMER(runtime_state_->codegen()->ir_generation_timer());
+      SCOPED_TIMER(runtime_state_->codegen()->runtime_profile()->total_time_counter());
+      SCOPED_THREAD_COUNTER_MEASUREMENT(
+          runtime_state_->codegen()->llvm_thread_counters());
+      exec_tree_->Codegen(runtime_state_);
+      sink_->Codegen(runtime_state_->codegen());
+
+      // It shouldn't be fatal to fail codegen. However, until IMPALA-4233 is fixed,
+      // ScalarFnCall has no fall back to interpretation when codegen fails so propagates
+      // the error status for now.
+      RETURN_IF_ERROR(runtime_state_->CodegenScalarFns());
+    }
 
     LlvmCodeGen* codegen = runtime_state_->codegen();
     DCHECK(codegen != nullptr);
@@ -320,9 +325,10 @@ void FragmentInstanceState::Close() {
       RuntimeProfile::Counter* counter = timings_profile_->GetCounter(name);
       if (counter != nullptr) other_time += counter->value();
     }
-    // TODO: IMPALA-4631: Occasionally we see other_time = total_time + 1 for some reason
-    // we don't yet understand, so add 1 to total_time to avoid DCHECKing in that case.
-    DCHECK_LE(other_time, total_time + 1);
+    // TODO: IMPALA-4631: Occasionally we see other_time = total_time + ε where ε is 1,
+    // 2, or 3. It appears to be a bug with clocks on some virtualized systems. Add 3
+    // to total_time to avoid DCHECKing in that case.
+    DCHECK_LE(other_time, total_time + 3);
   }
 #endif
 }
@@ -354,20 +360,15 @@ void FragmentInstanceState::ReportProfileThread() {
     SendReport(false, Status::OK());
   }
 
-  VLOG_FILE << "exiting reporting thread: instance_id=" << instance_id();
+  VLOG_FILE << "exiting reporting thread: instance_id=" << PrintId(instance_id());
 }
 
 void FragmentInstanceState::SendReport(bool done, const Status& status) {
   DCHECK(status.ok() || done);
   DCHECK(runtime_state_ != nullptr);
 
-  if (VLOG_FILE_IS_ON) {
-    VLOG_FILE << "Reporting " << (done ? "final " : "") << "profile for instance "
-        << runtime_state_->fragment_instance_id();
-    stringstream ss;
-    profile()->PrettyPrint(&ss);
-    VLOG_FILE << ss.str();
-  }
+  VLOG_FILE << "Reporting " << (done ? "final " : "") << "profile for instance "
+      << PrintId(runtime_state_->fragment_instance_id());
 
   // Update the counter for the peak per host mem usage.
   if (per_host_mem_usage_ != nullptr) {
@@ -547,5 +548,5 @@ void FragmentInstanceState::PrintVolumeIds() {
   profile()->AddInfoString(HdfsScanNodeBase::HDFS_SPLIT_STATS_DESC, str.str());
   VLOG_FILE
       << "Hdfs split stats (<volume id>:<# splits>/<split lengths>) for query="
-      << query_id() << ":\n" << str.str();
+      << PrintId(query_id()) << ":\n" << str.str();
 }

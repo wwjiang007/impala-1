@@ -65,8 +65,20 @@ SET(CXX_COVERAGE_FLAGS "-fprofile-arcs -ftest-coverage")
 #        when using ccache as clang thinks it is not called from a terminal.
 #   -Wno-mismatched-tags: ignore harmless class/struct mismatch for forward declarations.
 #        Disabling to be consistent with gcc, which doesn't have this warning.
+#   -Wno-zero-as-null-pointer-constant: We are slowly moving towards the use of nullptr,
+#        but till we switch to it completely, we will ignore the warnings due to use of
+#        NULL as a null pointer constant.
+#   -Wno-c++17-extensions: ignore warnings caused due to the use of [[nodiscard]]
+#        attribute which our current compiler does not support but is used in conjunction
+#        with WARN_UNUSED_RESULT with our current toolchain to be effective.
+#   -Wno-inconsistent-missing-destructor-override: ignore warnings to mark virtual
+#        destructors with 'override' which is enforced by clang by not recommended by c++
+#        core guidelines (read C.128).
 SET(CXX_CLANG_FLAGS "-Qunused-arguments -fcolor-diagnostics -Wno-unused-local-typedef")
 SET(CXX_CLANG_FLAGS "${CXX_CLANG_FLAGS} -Wno-mismatched-tags")
+SET(CXX_CLANG_FLAGS "${CXX_CLANG_FLAGS} -Wno-zero-as-null-pointer-constant")
+SET(CXX_CLANG_FLAGS "${CXX_CLANG_FLAGS} -Wno-c++17-extensions")
+SET(CXX_CLANG_FLAGS "${CXX_CLANG_FLAGS} -Wno-inconsistent-missing-destructor-override")
 # For any gcc builds:
 #   -g: Enable symbols for profiler tools
 #   -Wno-unused-local-typedefs: Do not warn for local typedefs that are unused.
@@ -100,7 +112,7 @@ SET(CXX_FLAGS_ADDRESS_SANITIZER
 
 # Set the flags to the undefined behavior sanitizer, also known as "ubsan"
 # Turn on sanitizer and debug symbols to get stack traces:
-SET(CXX_FLAGS_UBSAN "${CXX_CLANG_FLAGS} -ggdb3 -fno-omit-frame-pointer -fsanitize=undefined")
+SET(CXX_FLAGS_UBSAN "${CXX_CLANG_FLAGS} -ggdb3 -fno-omit-frame-pointer -fsanitize=undefined -DUNDEFINED_SANITIZER")
 # Add flags to enable symbol resolution in the stack traces:
 SET(CXX_FLAGS_UBSAN "${CXX_FLAGS_UBSAN} -rtlib=compiler-rt -lgcc_s")
 # Ignore a number of noisy errors with too many false positives:
@@ -283,6 +295,7 @@ set(CLANG_INCLUDE_FLAGS
   "-I${GFLAGS_INCLUDE_DIR}"
   "-I${RAPIDJSON_INCLUDE_DIR}"
   "-I${AVRO_INCLUDE_DIR}"
+  "-I${ORC_INCLUDE_DIR}"
   # Include Boost as a system directory to suppress warnings from headers.
   "-isystem${BOOST_INCLUDEDIR}"
   # Required so that jni.h can be found during Clang compilation
@@ -295,10 +308,11 @@ set(CLANG_INCLUDE_FLAGS
   "-I${OPENSSL_INCLUDE_DIR}"
   "-I${LDAP_INCLUDE_DIR}"
   "-I${PROTOBUF_INCLUDE_DIR}"
+  "-I${CCTZ_INCLUDE_DIR}"
 )
 
 # allow linking of static libs into dynamic lib
-add_definitions(-fPIC)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # set compile output directory
 if ("${CMAKE_BUILD_TYPE}" STREQUAL "DEBUG" OR
@@ -336,6 +350,10 @@ CHECK_LIBRARY_EXISTS("krb5" krb5_is_config_principal
   ${KERBEROS_LIBRARY} HAVE_KRB5_IS_CONFIG_PRINCIPAL)
 CHECK_LIBRARY_EXISTS("krb5" krb5_get_init_creds_opt_set_out_ccache
   ${KERBEROS_LIBRARY} HAVE_KRB5_GET_INIT_CREDS_OPT_SET_OUT_CCACHE)
+
+# Used to check if we're using krb-1.6 or lower.
+CHECK_LIBRARY_EXISTS("krb5" krb5_get_init_creds_opt_set_fast_ccache_name
+  ${KERBEROS_LIBRARY} HAVE_KRB5_GET_INIT_CREDS_OPT_SET_FAST_CCACHE_NAME)
 
 # This is a list of impala library dependencies. Individual libraries
 # must not specify library dependencies in their own CMakeLists.txt file.
@@ -431,8 +449,10 @@ set (IMPALA_DEPENDENCIES
   zlib
   bzip2
   avro
+  orc
   java_jvm
-  kudu_client)
+  kudu_client
+  cctz)
 
 # Add all external dependencies. They should come after the impala libs.
 set (IMPALA_LINK_LIBS ${IMPALA_LINK_LIBS}
@@ -492,6 +512,20 @@ FUNCTION(ADD_BE_TEST TEST_NAME)
   ADD_DEPENDENCIES(be-test ${TEST_NAME})
 ENDFUNCTION()
 
+FUNCTION(ENABLE_LSAN_FOR_TEST TEST_NAME)
+  SET_TESTS_PROPERTIES(${TEST_NAME} PROPERTIES ENVIRONMENT
+      "ASAN_OPTIONS=handle_segv=0 detect_leaks=1 allocator_may_return_null=1")
+  SET_TESTS_PROPERTIES(${TEST_NAME} PROPERTIES ENVIRONMENT
+      "LSAN_OPTIONS=suppressions=${CMAKE_SOURCE_DIR}/bin/lsan-suppressions.txt")
+ENDFUNCTION()
+
+# Same as ADD_BE_TEST, but also enable LeakSanitizer.
+# TODO: IMPALA-2746: we should make this the default.
+FUNCTION(ADD_BE_LSAN_TEST TEST_NAME)
+  ADD_BE_TEST(${TEST_NAME})
+  ENABLE_LSAN_FOR_TEST(${TEST_NAME})
+ENDFUNCTION()
+
 # Similar utility function for tests that use the UDF SDK
 FUNCTION(ADD_UDF_TEST TEST_NAME)
   # This gets the directory where the test is from (e.g. 'exprs' or 'runtime')
@@ -506,6 +540,7 @@ FUNCTION(ADD_UDF_TEST TEST_NAME)
   ADD_TEST(${TEST_NAME} "${BUILD_OUTPUT_ROOT_DIRECTORY}/${DIR_NAME}/${TEST_NAME}"
     -log_dir=$ENV{IMPALA_BE_TEST_LOGS_DIR})
   ADD_DEPENDENCIES(be-test ${TEST_NAME})
+  ENABLE_LSAN_FOR_TEST(${TEST_NAME})
 ENDFUNCTION()
 
 # Function to generate rule to cross compile a source file to an IR module.

@@ -18,13 +18,13 @@
 package org.apache.impala.catalog;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 
-import org.apache.hadoop.hive.common.StatsSetupConst;
 import org.apache.hadoop.hive.metastore.IMetaStoreClient;
 import org.apache.hadoop.hive.metastore.TableType;
 import org.apache.hadoop.hive.metastore.api.ColumnStatisticsObj;
@@ -58,7 +58,7 @@ import com.google.common.collect.Maps;
  * is more general than Hive's CLUSTER BY ... INTO BUCKETS clause (which partitions
  * a key range into a fixed number of buckets).
  */
-public abstract class Table extends CatalogObjectImpl {
+public abstract class Table extends CatalogObjectImpl implements FeTable {
   private static final Logger LOG = Logger.getLogger(Table.class);
   protected org.apache.hadoop.hive.metastore.api.Table msTable_;
   protected final Db db_;
@@ -97,9 +97,6 @@ public abstract class Table extends CatalogObjectImpl {
   // Type of this table (array of struct) that mirrors the columns. Useful for analysis.
   protected final ArrayType type_ = new ArrayType(new StructType());
 
-  // The lastDdlTime for this table; -1 if not set
-  protected long lastDdlTime_;
-
   // True if this object is stored in an Impalad catalog cache.
   protected boolean storedInImpaladCatalogCache_ = false;
 
@@ -109,14 +106,19 @@ public abstract class Table extends CatalogObjectImpl {
   public static final String ALTER_DURATION_METRIC = "alter-duration";
   public static final String LOAD_DURATION_METRIC = "load-duration";
 
+  // Table property key for storing the time of the last DDL operation.
+  public static final String TBL_PROP_LAST_DDL_TIME = "transient_lastDdlTime";
+
+  // Table property key for storing the last time when Impala executed COMPUTE STATS.
+  public static final String TBL_PROP_LAST_COMPUTE_STATS_TIME =
+      "impala.lastComputeStatsTime";
+
   protected Table(org.apache.hadoop.hive.metastore.api.Table msTable, Db db,
       String name, String owner) {
     msTable_ = msTable;
     db_ = db;
     name_ = name.toLowerCase();
     owner_ = owner;
-    lastDdlTime_ = (msTable_ != null) ?
-        CatalogServiceCatalog.getLastDdlTime(msTable_) : -1;
     tableStats_ = new TTableStats(-1);
     tableStats_.setTotal_file_bytes(-1);
     initMetrics();
@@ -125,7 +127,10 @@ public abstract class Table extends CatalogObjectImpl {
   public ReentrantLock getLock() { return tableLock_; }
   public abstract TTableDescriptor toThriftDescriptor(
       int tableId, Set<Long> referencedPartitions);
+
+  @Override // FeTable
   public abstract TCatalogObjectType getCatalogObjectType();
+
   public long getMetadataOpsCount() { return metadataOpsCount_.get(); }
   public long getEstimatedMetadataSize() { return estimatedMetadataSize_.get(); }
   public void setEstimatedMetadataSize(long estimatedMetadataSize) {
@@ -168,8 +173,8 @@ public abstract class Table extends CatalogObjectImpl {
    * Sets 'tableStats_' by extracting the table statistics from the given HMS table.
    */
   public void setTableStats(org.apache.hadoop.hive.metastore.api.Table msTbl) {
-    tableStats_ = new TTableStats(getRowCount(msTbl.getParameters()));
-    tableStats_.setTotal_file_bytes(getTotalSize(msTbl.getParameters()));
+    tableStats_ = new TTableStats(FeCatalogUtils.getRowCount(msTbl.getParameters()));
+    tableStats_.setTotal_file_bytes(FeCatalogUtils.getTotalSize(msTbl.getParameters()));
   }
 
   public void addColumn(Column col) {
@@ -183,16 +188,6 @@ public abstract class Table extends CatalogObjectImpl {
     colsByPos_.clear();
     colsByName_.clear();
     ((StructType) type_.getItemType()).clearFields();
-  }
-
-  /**
-   * Updates the lastDdlTime for this Table, if the new value is greater
-   * than the existing value. Does nothing if the new value is less than
-   * or equal to the existing value.
-   */
-  public void updateLastDdlTime(long ddlTime) {
-    // Ensure the lastDdlTime never goes backwards.
-    if (ddlTime > lastDdlTime_) lastDdlTime_ = ddlTime;
   }
 
   // Returns a list of all column names for this table which we expect to have column
@@ -247,29 +242,6 @@ public abstract class Table extends CatalogObjectImpl {
   }
 
   /**
-   * Returns the value of the ROW_COUNT constant, or -1 if not found.
-   */
-  protected static long getRowCount(Map<String, String> parameters) {
-    return getLongParam(StatsSetupConst.ROW_COUNT, parameters);
-  }
-
-  protected static long getTotalSize(Map<String, String> parameters) {
-    return getLongParam(StatsSetupConst.TOTAL_SIZE, parameters);
-  }
-
-  private static long getLongParam(String key, Map<String, String> parameters) {
-    if (parameters == null) return -1;
-    String value = parameters.get(key);
-    if (value == null) return -1;
-    try {
-      return Long.valueOf(value);
-    } catch (NumberFormatException exc) {
-      // ignore
-    }
-    return -1;
-  }
-
-  /**
    * Creates a table of the appropriate type based on the given hive.metastore.api.Table
    * object.
    */
@@ -313,6 +285,7 @@ public abstract class Table extends CatalogObjectImpl {
     return newTable;
   }
 
+  @Override // FeTable
   public boolean isClusteringColumn(Column c) {
     return c.getPosition() < numClusteringCols_;
   }
@@ -414,108 +387,71 @@ public abstract class Table extends CatalogObjectImpl {
   }
 
   /**
-   * Gets the ColumnType from the given FieldSchema by using Impala's SqlParser.
-   * Throws a TableLoadingException if the FieldSchema could not be parsed.
-   * The type can either be:
-   *   - Supported by Impala, in which case the type is returned.
-   *   - A type Impala understands but is not yet implemented (e.g. date), the type is
-   *     returned but type.IsSupported() returns false.
-   *   - A supported type that exceeds an Impala limit, e.g., on the nesting depth.
-   *   - A type Impala can't understand at all, and a TableLoadingException is thrown.
+   * @see FeCatalogUtils#parseColumnType(FieldSchema, String)
    */
-   protected Type parseColumnType(FieldSchema fs) throws TableLoadingException {
-     Type type = Type.parseColumnType(fs.getType());
-     if (type == null) {
-       throw new TableLoadingException(String.format(
-           "Unsupported type '%s' in column '%s' of table '%s'",
-           fs.getType(), fs.getName(), getName()));
-     }
-     if (type.exceedsMaxNestingDepth()) {
-       throw new TableLoadingException(String.format(
-           "Type exceeds the maximum nesting depth of %s:\n%s",
-           Type.MAX_NESTING_DEPTH, type.toSql()));
-     }
-     return type;
-   }
+  protected Type parseColumnType(FieldSchema fs) throws TableLoadingException {
+    return FeCatalogUtils.parseColumnType(fs, getName());
+  }
 
+  @Override // FeTable
   public Db getDb() { return db_; }
+
+  @Override // FeTable
   public String getName() { return name_; }
+
+  @Override // FeTable
   public String getFullName() { return (db_ != null ? db_.getName() + "." : "") + name_; }
+
+  @Override // FeTable
   public TableName getTableName() {
     return new TableName(db_ != null ? db_.getName() : null, name_);
   }
-  @Override
+
+  @Override // CatalogObject
   public String getUniqueName() { return "TABLE:" + getFullName(); }
 
+  @Override // FeTable
   public ArrayList<Column> getColumns() { return colsByPos_; }
 
-  /**
-   * Returns a list of the column names ordered by position.
-   */
+  @Override // FeTable
   public List<String> getColumnNames() { return Column.toColumnNames(colsByPos_); }
 
   /**
    * Returns a list of thrift column descriptors ordered by position.
    */
   public List<TColumnDescriptor> getTColumnDescriptors() {
-    List<TColumnDescriptor> colDescs = Lists.<TColumnDescriptor>newArrayList();
-    for (Column col: colsByPos_) {
-      colDescs.add(new TColumnDescriptor(col.getName(), col.getType().toThrift()));
-    }
-    return colDescs;
+    return FeCatalogUtils.getTColumnDescriptors(this);
   }
 
   /**
    * Subclasses should override this if they provide a storage handler class. Currently
    * only HBase tables need to provide a storage handler.
    */
+  @Override // FeTable
   public String getStorageHandlerClassName() { return null; }
 
-  /**
-   * Returns the list of all columns, but with partition columns at the end of
-   * the list rather than the beginning. This is equivalent to the order in
-   * which Hive enumerates columns.
-   */
-  public ArrayList<Column> getColumnsInHiveOrder() {
+  @Override // FeTable
+  public List<Column> getColumnsInHiveOrder() {
     ArrayList<Column> columns = Lists.newArrayList(getNonClusteringColumns());
     columns.addAll(getClusteringColumns());
-    return columns;
+    return Collections.unmodifiableList(columns);
   }
 
-  /**
-   * Returns a struct type with the columns in the same order as getColumnsInHiveOrder().
-   */
-  public StructType getHiveColumnsAsStruct() {
-    ArrayList<StructField> fields = Lists.newArrayListWithCapacity(colsByPos_.size());
-    for (Column col: getColumnsInHiveOrder()) {
-      fields.add(new StructField(col.getName(), col.getType(), col.getComment()));
-    }
-    return new StructType(fields);
-  }
-
-  /**
-   * Returns the list of all partition columns.
-   */
+  @Override // FeTable
   public List<Column> getClusteringColumns() {
-    return colsByPos_.subList(0, numClusteringCols_);
+    return Collections.unmodifiableList(colsByPos_.subList(0, numClusteringCols_));
   }
 
-  /**
-   * Returns the list of all columns excluding any partition columns.
-   */
+  @Override // FeTable
   public List<Column> getNonClusteringColumns() {
-    return colsByPos_.subList(numClusteringCols_, colsByPos_.size());
+    return Collections.unmodifiableList(colsByPos_.subList(numClusteringCols_,
+        colsByPos_.size()));
   }
 
-  /**
-   * Case-insensitive lookup. Returns null if the column with 'name' is not found.
-   */
+  @Override // FeTable
   public Column getColumn(String name) { return colsByName_.get(name.toLowerCase()); }
 
-  /**
-   * Returns the metastore.api.Table object this Table was created from. Returns null
-   * if the derived Table object was not created from a metastore Table (ex. InlineViews).
-   */
+  @Override // FeTable
   public org.apache.hadoop.hive.metastore.api.Table getMetaStoreTable() {
     return msTable_;
   }
@@ -524,6 +460,7 @@ public abstract class Table extends CatalogObjectImpl {
     msTable_ = msTbl;
   }
 
+  @Override // FeTable
   public int getNumClusteringCols() { return numClusteringCols_; }
 
   /**
@@ -536,8 +473,13 @@ public abstract class Table extends CatalogObjectImpl {
     numClusteringCols_ = n;
   }
 
+  @Override // FeTable
   public long getNumRows() { return tableStats_.num_rows; }
+
+  @Override // FeTable
   public TTableStats getTTableStats() { return tableStats_; }
+
+  @Override // FeTable
   public ArrayType getType() { return type_; }
 
   public static boolean isExternalTable(
@@ -585,5 +527,13 @@ public abstract class Table extends CatalogObjectImpl {
     if (obj == null) return false;
     if (!(obj instanceof Table)) return false;
     return getFullName().equals(((Table) obj).getFullName());
+  }
+
+  /**
+   *  Updates a table property with the current system time in seconds precision.
+   */
+  public static void updateTimestampProperty(
+      org.apache.hadoop.hive.metastore.api.Table msTbl, String propertyKey) {
+    msTbl.putToParameters(propertyKey, Long.toString(System.currentTimeMillis() / 1000));
   }
 }

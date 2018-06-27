@@ -38,6 +38,10 @@
 
 #include "common/names.h"
 
+DEFINE_int32(report_status_retry_interval_ms, 100,
+    "The interval in milliseconds to wait before retrying a failed status report RPC to "
+    "the coordinator.");
+
 using namespace impala;
 
 QueryState::ScopedRef::ScopedRef(const TUniqueId& query_id) {
@@ -138,9 +142,9 @@ Status QueryState::Init(const TExecQueryFInstancesParams& rpc_params) {
   // to handle releasing it if a later step fails.
   initial_reservations_ = obj_pool_.Add(new InitialReservations(&obj_pool_,
       buffer_reservation_, query_mem_tracker_,
-      rpc_params.initial_reservation_total_claims));
+      rpc_params.initial_mem_reservation_total_claims));
   RETURN_IF_ERROR(
-      initial_reservations_->Init(query_id(), rpc_params.min_reservation_bytes));
+      initial_reservations_->Init(query_id(), rpc_params.min_mem_reservation_bytes));
   return Status::OK();
 }
 
@@ -236,18 +240,9 @@ void QueryState::ReportExecStatusAux(bool done, const Status& status,
     // Only send updates to insert status if fragment is finished, the coordinator waits
     // until query execution is done to use them anyhow.
     RuntimeState* state = fis->runtime_state();
-    if (done && (state->hdfs_files_to_move()->size() > 0
-        || state->per_partition_status()->size() > 0)) {
-      TInsertExecStatus insert_status;
-      if (state->hdfs_files_to_move()->size() > 0) {
-        insert_status.__set_files_to_move(*state->hdfs_files_to_move());
-      }
-      if (state->per_partition_status()->size() > 0) {
-        insert_status.__set_per_partition_status(*state->per_partition_status());
-      }
-      params.__set_insert_exec_status(insert_status);
+    if (done && state->dml_exec_state()->ToThrift(&params.insert_exec_status)) {
+      params.__isset.insert_exec_status = true;
     }
-
     // Send new errors to coordinator
     state->GetUnreportedErrors(&params.error_log);
     params.__isset.error_log = (params.error_log.size() > 0);
@@ -258,28 +253,40 @@ void QueryState::ReportExecStatusAux(bool done, const Status& status,
   DCHECK_EQ(res.status.status_code, TErrorCode::OK);
   // Try to send the RPC 3 times before failing. Sleep for 100ms between retries.
   // It's safe to retry the RPC as the coordinator handles duplicate RPC messages.
+  Status client_status;
   for (int i = 0; i < 3; ++i) {
-    Status client_status;
     ImpalaBackendConnection client(ExecEnv::GetInstance()->impalad_client_cache(),
         query_ctx().coord_address, &client_status);
     if (client_status.ok()) {
       rpc_status = client.DoRpc(&ImpalaBackendClient::ReportExecStatus, params, &res);
       if (rpc_status.ok()) break;
     }
-    if (i < 2) SleepForMs(100);
+    if (i < 2) SleepForMs(FLAGS_report_status_retry_interval_ms);
   }
   Status result_status(res.status);
-  if ((!rpc_status.ok() || !result_status.ok()) && instances_started) {
+  if ((!client_status.ok() || !rpc_status.ok() || !result_status.ok()) &&
+      instances_started) {
     // TODO: should we try to keep rpc_status for the final report? (but the final
     // report, following this Cancel(), may not succeed anyway.)
     // TODO: not keeping an error status here means that all instances might
     // abort with CANCELLED status, despite there being an error
-    if (!rpc_status.ok()) {
-      // TODO: Fix IMPALA-2990. Cancelling fragment instances here may cause query to
-      // hang as the coordinator may not be aware of the cancellation. Remove the log
-      // statement once IMPALA-2990 is fixed.
-      LOG(ERROR) << "Cancelling fragment instances due to failure to report status. "
-                 << "Query " << PrintId(query_id()) << " may hang. See IMPALA-2990.";
+    // TODO: Fix IMPALA-2990. Cancelling fragment instances without sending the
+    // ReporExecStatus RPC may cause query to hang as the coordinator may not be aware
+    // of the cancellation. Remove the log statements once IMPALA-2990 is fixed.
+    if (!client_status.ok()) {
+      LOG(ERROR) << "Cancelling fragment instances due to failure to obtain a connection "
+                 << "to the coordinator. (" << client_status.GetDetail()
+                 << "). Query " << PrintId(query_id()) << " may hang. See IMPALA-2990.";
+    } else if (!rpc_status.ok()) {
+      LOG(ERROR) << "Cancelling fragment instances due to failure to reach the "
+                 << "coordinator. (" << rpc_status.GetDetail()
+                 << "). Query " << PrintId(query_id()) << " may hang. See IMPALA-2990.";
+    } else if (!result_status.ok()) {
+      // If the ReportExecStatus RPC succeeded in reaching the coordinator and we get
+      // back a non-OK status, it means that the coordinator expects us to cancel the
+      // fragment instances for this query.
+      LOG(INFO) << "Cancelling fragment instances as directed by the coordinator. "
+                << "Returned status: " << result_status.GetDetail();
     }
     Cancel();
   }
@@ -299,7 +306,7 @@ void QueryState::StartFInstances() {
   DCHECK(query_ctx().__isset.desc_tbl);
   Status status = DescriptorTbl::Create(&obj_pool_, query_ctx().desc_tbl, &desc_tbl_);
   if (!status.ok()) {
-    instances_prepared_promise_.Set(status);
+    discard_result(instances_prepared_promise_.Set(status));
     ReportExecStatusAux(true, status, nullptr, false);
     return;
   }
@@ -360,7 +367,7 @@ void QueryState::StartFInstances() {
       prepare_status = instance_status;
     }
   }
-  instances_prepared_promise_.Set(prepare_status);
+  discard_result(instances_prepared_promise_.Set(prepare_status));
   // If this is aborting due to failure in thread creation, report status to the
   // coordinator to start query cancellation. (Other errors are reported by the
   // fragment instance itself.)
@@ -406,7 +413,7 @@ void QueryState::ExecFInstance(FragmentInstanceState* fis) {
 }
 
 void QueryState::Cancel() {
-  VLOG_QUERY << "Cancel: query_id=" << query_id();
+  VLOG_QUERY << "Cancel: query_id=" << PrintId(query_id());
   (void) instances_prepared_promise_.Get();
   if (!is_cancelled_.CompareAndSwap(0, 1)) return;
   for (auto entry: fis_map_) entry.second->Cancel();

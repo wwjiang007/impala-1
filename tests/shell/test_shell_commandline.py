@@ -21,8 +21,10 @@ import os
 import pytest
 import re
 import signal
+import shlex
+import socket
 
-from subprocess import call
+from subprocess import call, Popen
 from tests.common.impala_service import ImpaladService
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.skip import SkipIf
@@ -33,6 +35,8 @@ from util import assert_var_substitution, run_impala_shell_cmd, ImpalaShell
 DEFAULT_QUERY = 'select 1'
 QUERY_FILE_PATH = os.path.join(os.environ['IMPALA_HOME'], 'tests', 'shell')
 
+RUSSIAN_CHARS = (u"А, Б, В, Г, Д, Е, Ё, Ж, З, И, Й, К, Л, М, Н, О, П, Р,"
+                 u"С, Т, У, Ф, Х, Ц,Ч, Ш, Щ, Ъ, Ы, Ь, Э, Ю, Я")
 
 @pytest.fixture
 def empty_table(unique_database, request):
@@ -245,8 +249,8 @@ class TestImpalaShell(ImpalaTestSuite):
     args = '-q "set"'
     result_set = run_impala_shell_cmd(args)
     assert 'MEM_LIMIT: [0]' in result_set.stdout
-    # test to check that explain_level is 1
-    assert 'EXPLAIN_LEVEL: [1]' in result_set.stdout
+    # test to check that explain_level is STANDARD
+    assert 'EXPLAIN_LEVEL: [STANDARD]' in result_set.stdout
     # test to check that configs without defaults show up as []
     assert 'COMPRESSION_CODEC: []' in result_set.stdout
     # test values displayed after setting value
@@ -315,10 +319,13 @@ class TestImpalaShell(ImpalaTestSuite):
     assert 0 == impalad_service.get_num_in_flight_queries()
 
   def test_cancellation(self):
-    """Test cancellation (Ctrl+C event)."""
-    args = '-q "select sleep(10000)"'
-    p = ImpalaShell(args)
-    sleep(3)
+    """Test cancellation (Ctrl+C event). Run a query that sleeps 10ms per row so will run
+    for 110s if not cancelled, but will detect cancellation quickly because of the small
+    batch size."""
+    query = "set num_nodes=1; set mt_dop=1; set batch_size=1; \
+             select sleep(10) from functional_parquet.alltypesagg"
+    p = ImpalaShell('-q "{0}"'.format(query))
+    sleep(6)
     os.kill(p.pid(), signal.SIGINT)
     result = p.get_result()
 
@@ -405,12 +412,27 @@ class TestImpalaShell(ImpalaTestSuite):
 
   def test_international_characters(self):
     """Sanity test to ensure that the shell can read international characters."""
-    russian_chars = (u"А, Б, В, Г, Д, Е, Ё, Ж, З, И, Й, К, Л, М, Н, О, П, Р,"
-                     u"С, Т, У, Ф, Х, Ц,Ч, Ш, Щ, Ъ, Ы, Ь, Э, Ю, Я")
-    args = """-B -q "select '%s'" """ % russian_chars
+    args = """-B -q "select '%s'" """ % RUSSIAN_CHARS
     result = run_impala_shell_cmd(args.encode('utf-8'))
     assert 'UnicodeDecodeError' not in result.stderr
-    assert russian_chars.encode('utf-8') in result.stdout
+    assert RUSSIAN_CHARS.encode('utf-8') in result.stdout
+
+  def test_international_characters_prettyprint(self):
+    """IMPALA-2717: ensure we can handle international characters in pretty-printed
+    output"""
+    args = """-q "select '%s'" """ % RUSSIAN_CHARS
+    result = run_impala_shell_cmd(args.encode('utf-8'))
+    assert 'UnicodeDecodeError' not in result.stderr
+    assert RUSSIAN_CHARS.encode('utf-8') in result.stdout
+
+  def test_international_characters_prettyprint_tabs(self):
+    """IMPALA-2717: ensure we can handle international characters in pretty-printed
+    output when pretty-printing falls back to delimited output."""
+    args = """-q "select '%s\\t'" """ % RUSSIAN_CHARS
+    result = run_impala_shell_cmd(args.encode('utf-8'))
+    assert 'Reverting to tab delimited text' in result.stderr
+    assert 'UnicodeDecodeError' not in result.stderr
+    assert RUSSIAN_CHARS.encode('utf-8') in result.stdout
 
   @pytest.mark.execute_serially  # This tests invalidates metadata, and must run serially
   def test_config_file(self):
@@ -557,7 +579,7 @@ class TestImpalaShell(ImpalaTestSuite):
     results = run_impala_shell_cmd('--query="%s"' % (stmt))
     expected_output = "Modified %d row(s), %d row error(s)" %\
         (expected_rows_modified, expected_row_errors)
-    assert expected_output in results.stderr
+    assert expected_output in results.stderr, results.stderr
 
   @SkipIf.kudu_not_supported
   def test_kudu_dml_reporting(self, unique_database):
@@ -587,3 +609,44 @@ class TestImpalaShell(ImpalaTestSuite):
   def test_missing_query_file(self):
     result = run_impala_shell_cmd('-f nonexistent.sql', expect_success=False)
     assert "Could not open file 'nonexistent.sql'" in result.stderr
+
+  def _validate_expected_socket_connected(self, args, sock):
+    # Building an one-off shell command instead of using Util::ImpalaShell since we need
+    # to customize the impala daemon socket.
+    shell_cmd = "%s/bin/impala-shell.sh" % (os.environ['IMPALA_HOME'])
+    expected_output = "PingImpalaService"
+    with open(os.devnull, 'w') as devnull:
+      try:
+        impala_shell = Popen(shlex.split("%s %s" % (shell_cmd, args, )), stdout=devnull,
+                               stderr=devnull)
+        connection, client_address = sock.accept()
+        data = connection.recv(1024)
+        assert expected_output in data
+      finally:
+        if impala_shell.poll() is None:
+          impala_shell.kill()
+        if connection is not None:
+          connection.close()
+
+  def test_socket_opening(self):
+    ''' Tests that impala-shell will always open a socket against
+    the host[:port] specified by the -i option with or without the
+    -b option '''
+    try:
+      socket.setdefaulttimeout(10)
+      s = socket.socket()
+      s.bind(("",0))
+      s.listen(1)
+      test_impalad_port = s.getsockname()[1]
+      load_balancer_fqdn = "my-load-balancer.local"
+      args1 = "-i localhost:%d" % (test_impalad_port,)
+      args2 = "%s -b %s" % (args1, load_balancer_fqdn,)
+
+      # Verify that impala-shell tries to create a socket against the host:port
+      # combination specified by -i when -b is not used
+      self._validate_expected_socket_connected(args1, s)
+      # Verify that impala-shell tries to create a socket against the host:port
+      # combination specified by -i when -b is used
+      self._validate_expected_socket_connected(args2, s)
+    finally:
+      s.close()

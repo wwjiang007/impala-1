@@ -360,6 +360,8 @@ public class ParserTest extends FrontendTestBase {
     for (String[] hintStyle: hintStyles_) {
       String prefix = hintStyle[0];
       String suffix = hintStyle[1];
+      // Test unexpected token
+      ParserError(prefix + suffix,"Syntax error in line 1:\n" + prefix + suffix);
       // Test join hints.
       TestJoinHints(String.format(
           "select * from functional.alltypes a join %sbroadcast%s " +
@@ -2004,7 +2006,7 @@ public class ParserTest extends FrontendTestBase {
       ParserError(String.format("CREATE %s Foo LOCATION", kw));
       ParserError(String.format("CREATE %s Foo LOCATION 'dfsd' 'dafdsf'", kw));
 
-      ParserError(String.format("CREATE Foo", kw));
+      ParserError(String.format("CREATE Foo"));
       ParserError(String.format("CREATE %s 'Foo'", kw));
       ParserError(String.format("CREATE %s", kw));
       ParserError(String.format("CREATE %s IF EXISTS Foo", kw));
@@ -3233,9 +3235,9 @@ public class ParserTest extends FrontendTestBase {
         "c, b, c from t\n" +
         "^\n" +
         "Encountered: IDENTIFIER\n" +
-        "Expected: ALTER, COMPUTE, CREATE, DELETE, DESCRIBE, DROP, EXPLAIN, GRANT, " +
-        "INSERT, INVALIDATE, LOAD, REFRESH, REVOKE, SELECT, SET, SHOW, TRUNCATE, " +
-        "UPDATE, UPSERT, USE, VALUES, WITH\n");
+        "Expected: ALTER, COMMENT, COMPUTE, CREATE, DELETE, DESCRIBE, DROP, EXPLAIN, " +
+        "GRANT, INSERT, INVALIDATE, LOAD, REFRESH, REVOKE, SELECT, SET, SHOW, " +
+        "TRUNCATE, UPDATE, UPSERT, USE, VALUES, WITH\n");
 
     // missing select list
     ParserError("select from t",
@@ -3575,6 +3577,29 @@ public class ParserTest extends FrontendTestBase {
           formatStr));
       ParserError(String.format("%s SELECT (a, b) ON URI 'foo' %s myRole", formatStr));
 
+      // REFRESH privilege.
+      ParsesOk(String.format("%s REFRESH ON SERVER %s myRole", formatStr));
+      ParsesOk(String.format("%s REFRESH ON SERVER foo %s myRole", formatStr));
+      ParsesOk(String.format("%s REFRESH ON DATABASE foo %s myRole", formatStr));
+      ParsesOk(String.format("%s REFRESH ON TABLE foo %s myRole", formatStr));
+
+      // CREATE privilege.
+      ParsesOk(String.format("%s CREATE ON SERVER %s myRole", formatStr));
+      ParsesOk(String.format("%s CREATE ON SERVER foo %s myRole", formatStr));
+      ParsesOk(String.format("%s CREATE ON DATABASE foo %s myRole", formatStr));
+
+      // ALTER privilege.
+      ParsesOk(String.format("%s ALTER ON SERVER %s myRole", formatStr));
+      ParsesOk(String.format("%s ALTER ON SERVER foo %s myRole", formatStr));
+      ParsesOk(String.format("%s ALTER ON DATABASE foo %s myRole", formatStr));
+      ParsesOk(String.format("%s ALTER ON TABLE foo %s myRole", formatStr));
+
+      // DROP privilege.
+      ParsesOk(String.format("%s DROP ON SERVER %s myRole", formatStr));
+      ParsesOk(String.format("%s DROP ON SERVER foo %s myRole", formatStr));
+      ParsesOk(String.format("%s DROP ON DATABASE foo %s myRole", formatStr));
+      ParsesOk(String.format("%s DROP ON TABLE foo %s myRole", formatStr));
+
       // Server scope does not accept a name.
       ParsesOk(String.format("%s ALL ON SERVER %s myRole", formatStr));
       ParsesOk(String.format("%s INSERT ON SERVER %s myRole", formatStr));
@@ -3712,5 +3737,52 @@ public class ParserTest extends FrontendTestBase {
     ParsesOk("CREATE TABLE functional.test_table (col INT);");
     ParsesOk("DESCRIBE functional.alltypes;");
     ParsesOk("SET num_nodes=1;");
+  }
+
+  @Test
+  public void TestCommentOn() {
+    ParsesOk("COMMENT ON DATABASE db IS 'comment'");
+    ParsesOk("COMMENT ON DATABASE db IS ''");
+    ParsesOk("COMMENT ON DATABASE db IS NULL");
+    ParserError("COMMENT ON DATABASE IS 'comment'");
+    ParserError("COMMENT ON DATABASE db IS");
+
+    for (String tbl : new String[]{"db.t", "t"}) {
+      ParsesOk(String.format("COMMENT ON TABLE %s IS 'comment'", tbl));
+      ParsesOk(String.format("COMMENT ON TABLE %s IS ''", tbl));
+      ParsesOk(String.format("COMMENT ON TABLE %s IS NULL", tbl));
+
+      ParsesOk(String.format("COMMENT ON VIEW %s IS 'comment'", tbl));
+      ParsesOk(String.format("COMMENT ON VIEW %s IS ''", tbl));
+      ParsesOk(String.format("COMMENT ON VIEW %s IS NULL", tbl));
+    }
+    ParserError("COMMENT ON TABLE IS 'comment'");
+    ParserError("COMMENT ON TABLE tbl IS");
+
+    ParserError("COMMENT ON VIEW IS 'comment'");
+    ParserError("COMMENT ON VIEW tbl IS");
+  }
+
+  @Test
+  public void TestAlterDatabaseSetOwner() {
+    for (String valid : new String[]{"foo", "user", "owner"}) {
+      ParsesOk(String.format("ALTER DATABASE %s SET OWNER USER %s", valid, valid));
+      ParsesOk(String.format("ALTER DATABASE %s SET OWNER ROLE %s", valid, valid));
+    }
+
+    for (String invalid : new String[]{"'foo'", "''", "NULL"}) {
+      ParserError(String.format("ALTER DATABASE %s SET OWNER ROLE %s", invalid, invalid));
+      ParserError(String.format("ALTER DATABASE %s SET OWNER USER %s", invalid, invalid));
+    }
+
+    ParserError("ALTER DATABASE db SET ABC USER foo");
+    ParserError("ALTER DATABASE db SET ABC ROLE foo");
+    ParserError("ALTER DATABASE db SET OWNER ABC foo");
+    ParserError("ALTER DATABASE db SET OWNER USER");
+    ParserError("ALTER DATABASE SET OWNER foo");
+    ParserError("ALTER DATABASE SET OWNER USER foo");
+    ParserError("ALTER DATABASE db SET OWNER ROLE");
+    ParserError("ALTER DATABASE SET OWNER ROLE foo");
+    ParserError("ALTER DATABASE SET OWNER");
   }
 }

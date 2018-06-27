@@ -28,11 +28,13 @@
 #include <gutil/strings/substitute.h>
 
 #include "common/logging.h"
+#include "flatbuffers/flatbuffers.h"
 #include "gen-cpp/ImpalaInternalService_constants.h"
 #include "gen-cpp/Types_types.h"
 #include "runtime/exec-env.h"
 #include "statestore/statestore-subscriber.h"
 #include "util/container-util.h"
+#include "util/flat_buffer.h"
 #include "util/metrics.h"
 #include "util/network-util.h"
 #include "util/runtime-profile-counters.h"
@@ -41,6 +43,7 @@
 
 using boost::algorithm::join;
 using namespace apache::thrift;
+using namespace org::apache::impala::fb;
 using namespace strings;
 
 DECLARE_bool(use_krpc);
@@ -85,7 +88,7 @@ Status Scheduler::Init(const TNetworkAddress& backend_address,
     StatestoreSubscriber::UpdateCallback cb =
         bind<void>(mem_fn(&Scheduler::UpdateMembership), this, _1, _2);
     Status status = statestore_subscriber_->AddTopic(
-        Statestore::IMPALA_MEMBERSHIP_TOPIC, true, cb);
+        Statestore::IMPALA_MEMBERSHIP_TOPIC, true, false, cb);
     if (!status.ok()) {
       status.AddDetail("Scheduler failed to register membership topic");
       return status;
@@ -115,6 +118,10 @@ Status Scheduler::Init(const TNetworkAddress& backend_address,
     }
   }
   return Status::OK();
+}
+
+void Scheduler::UpdateLocalBackendAddrForBeTest() {
+  local_backend_descriptor_.address = ExecEnv::GetInstance()->GetThriftBackendAddress();
 }
 
 void Scheduler::UpdateMembership(
@@ -172,7 +179,7 @@ void Scheduler::UpdateMembership(
       // adds the IP address to local_backend_descriptor_. If it is empty, then either
       // that code has been changed, or someone else is sending malformed packets.
       VLOG(1) << "Ignoring subscription request with empty IP address from subscriber: "
-              << be_desc.address;
+              << TNetworkAddressToString(be_desc.address);
       continue;
     }
     if (item.key == local_backend_id_
@@ -181,9 +188,8 @@ void Scheduler::UpdateMembership(
       // will try to re-register (i.e. overwrite their subscription), but there is
       // likely a configuration problem.
       LOG_EVERY_N(WARNING, 30) << "Duplicate subscriber registration from address: "
-                               << be_desc.address
-                               << " (we are: " << local_backend_descriptor_.address
-                               << ")";
+           << TNetworkAddressToString(be_desc.address) << " (we are: "
+           << TNetworkAddressToString(local_backend_descriptor_.address) << ")";
       continue;
     }
     if (be_desc.is_executor) {
@@ -216,11 +222,50 @@ const TBackendDescriptor& Scheduler::LookUpBackendDesc(
   const TBackendDescriptor* desc = executor_config.LookUpBackendDesc(host);
   if (desc == nullptr) {
     // Local host may not be in executor_config if it's a dedicated coordinator.
-    DCHECK_EQ(host, local_backend_descriptor_.address);
+    DCHECK(host == local_backend_descriptor_.address);
     DCHECK(!local_backend_descriptor_.is_executor);
     desc = &local_backend_descriptor_;
   }
   return *desc;
+}
+
+Status Scheduler::GenerateScanRanges(const vector<TFileSplitGeneratorSpec>& specs,
+    vector<TScanRangeLocationList>* generated_scan_ranges) {
+  for (const auto& spec : specs) {
+    // Converts the spec to one or more scan ranges.
+    const FbFileDesc* fb_desc =
+        flatbuffers::GetRoot<FbFileDesc>(spec.file_desc.file_desc_data.c_str());
+    DCHECK(fb_desc->file_blocks() == nullptr || fb_desc->file_blocks()->size() == 0);
+
+    long scan_range_offset = 0;
+    long remaining = fb_desc->length();
+    long scan_range_length = std::min(spec.max_block_size, fb_desc->length());
+    if (!spec.is_splittable) scan_range_length = fb_desc->length();
+
+    while (remaining > 0) {
+      THdfsFileSplit hdfs_scan_range;
+      THdfsCompression::type compression;
+      RETURN_IF_ERROR(FromFbCompression(fb_desc->compression(), &compression));
+      hdfs_scan_range.__set_file_compression(compression);
+      hdfs_scan_range.__set_file_length(fb_desc->length());
+      hdfs_scan_range.__set_file_name(fb_desc->file_name()->str());
+      hdfs_scan_range.__set_length(scan_range_length);
+      hdfs_scan_range.__set_mtime(fb_desc->last_modification_time());
+      hdfs_scan_range.__set_offset(scan_range_offset);
+      hdfs_scan_range.__set_partition_id(spec.partition_id);
+      TScanRange scan_range;
+      scan_range.__set_hdfs_file_split(hdfs_scan_range);
+      TScanRangeLocationList scan_range_list;
+      scan_range_list.__set_scan_range(scan_range);
+
+      generated_scan_ranges->push_back(scan_range_list);
+      scan_range_offset += scan_range_length;
+      remaining -= scan_range_length;
+      scan_range_length = (scan_range_length > remaining ? remaining : scan_range_length);
+    }
+  }
+
+  return Status::OK();
 }
 
 Status Scheduler::ComputeScanRangeAssignment(
@@ -248,11 +293,26 @@ Status Scheduler::ComputeScanRangeAssignment(
 
       FragmentScanRangeAssignment* assignment =
           &schedule->GetFragmentExecParams(fragment.idx)->scan_range_assignment;
+
+      const vector<TScanRangeLocationList>* locations = nullptr;
+      vector<TScanRangeLocationList> expanded_locations;
+      if (entry.second.split_specs.empty()) {
+        // directly use the concrete ranges.
+        locations = &entry.second.concrete_ranges;
+      } else {
+        // union concrete ranges and expanded specs.
+        expanded_locations.insert(expanded_locations.end(),
+            entry.second.concrete_ranges.begin(), entry.second.concrete_ranges.end());
+        RETURN_IF_ERROR(
+            GenerateScanRanges(entry.second.split_specs, &expanded_locations));
+        locations = &expanded_locations;
+      }
+      DCHECK(locations != nullptr);
       RETURN_IF_ERROR(
           ComputeScanRangeAssignment(executor_config, node_id, node_replica_preference,
-              node_random_replica, entry.second, exec_request.host_list, exec_at_coord,
+              node_random_replica, *locations, exec_request.host_list, exec_at_coord,
               schedule->query_options(), total_assignment_timer, assignment));
-      schedule->IncNumScanRanges(entry.second.size());
+      schedule->IncNumScanRanges(locations->size());
     }
   }
   return Status::OK();
@@ -520,6 +580,7 @@ Status Scheduler::ComputeScanRangeAssignment(const BackendConfig& executor_confi
       exec_at_coord ? coord_only_backend_config_ : executor_config, total_assignments_,
       total_local_assignments_);
 
+  // Holds scan ranges that must be assigned for remote reads.
   vector<const TScanRangeLocationList*> remote_scan_range_locations;
 
   // Loop over all scan ranges, select an executor for those with local impalads and
@@ -686,21 +747,25 @@ Status Scheduler::Schedule(QuerySchedule* schedule) {
   ExecutorsConfigPtr config_ptr = GetExecutorsConfig();
   RETURN_IF_ERROR(ComputeScanRangeAssignment(*config_ptr, schedule));
   ComputeFragmentExecParams(*config_ptr, schedule);
-  ComputeBackendExecParams(schedule);
+  ComputeBackendExecParams(*config_ptr, schedule);
 #ifndef NDEBUG
   schedule->Validate();
 #endif
 
   // TODO: Move to admission control, it doesn't need to be in the Scheduler.
   string resolved_pool;
+  // Re-resolve the pool name to propagate any resolution errors now that this request
+  // is known to require a valid pool.
   RETURN_IF_ERROR(request_pool_service_->ResolveRequestPool(
-      schedule->request().query_ctx, &resolved_pool));
-  schedule->set_request_pool(resolved_pool);
-  schedule->summary_profile()->AddInfoString("Request Pool", resolved_pool);
+          schedule->request().query_ctx, &resolved_pool));
+  // Resolved pool name should have been set in the TQueryCtx and shouldn't have changed.
+  DCHECK_EQ(resolved_pool, schedule->request_pool());
+  schedule->summary_profile()->AddInfoString("Request Pool", schedule->request_pool());
   return Status::OK();
 }
 
-void Scheduler::ComputeBackendExecParams(QuerySchedule* schedule) {
+void Scheduler::ComputeBackendExecParams(
+    const BackendConfig& executor_config, QuerySchedule* schedule) {
   PerBackendExecParams per_backend_params;
   for (const FragmentExecParams& f : schedule->fragment_exec_params()) {
     for (const FInstanceExecParams& i : f.instance_exec_params) {
@@ -712,21 +777,28 @@ void Scheduler::ComputeBackendExecParams(QuerySchedule* schedule) {
       // instances on this backend can consume their peak resources at the same time,
       // i.e. that this backend's peak resources is the sum of the per-fragment-instance
       // peak resources for the instances executing on this backend.
-      be_params.min_reservation_bytes += f.fragment.min_reservation_bytes;
-      be_params.initial_reservation_total_claims +=
-          f.fragment.initial_reservation_total_claims;
+      be_params.min_mem_reservation_bytes += f.fragment.min_mem_reservation_bytes;
+      be_params.initial_mem_reservation_total_claims +=
+          f.fragment.initial_mem_reservation_total_claims;
+      be_params.thread_reservation += f.fragment.thread_reservation;
     }
+  }
+
+  for (auto& backend: per_backend_params) {
+    const TNetworkAddress& host = backend.first;
+    backend.second.proc_mem_limit =
+        LookUpBackendDesc(executor_config, host).proc_mem_limit;
   }
   schedule->set_per_backend_exec_params(per_backend_params);
 
-  stringstream min_reservation_ss;
+  stringstream min_mem_reservation_ss;
   for (const auto& e: per_backend_params) {
-    min_reservation_ss << e.first << "("
-         << PrettyPrinter::Print(e.second.min_reservation_bytes, TUnit::BYTES)
+    min_mem_reservation_ss << TNetworkAddressToString(e.first) << "("
+         << PrettyPrinter::Print(e.second.min_mem_reservation_bytes, TUnit::BYTES)
          << ") ";
   }
-  schedule->summary_profile()->AddInfoString("Per Host Min Reservation",
-      min_reservation_ss.str());
+  schedule->summary_profile()->AddInfoString("Per Host Min Memory Reservation",
+      min_mem_reservation_ss.str());
 }
 
 Scheduler::AssignmentCtx::AssignmentCtx(const BackendConfig& executor_config,
@@ -897,7 +969,8 @@ void Scheduler::AssignmentCtx::RecordScanRangeAssignment(
   scan_range_params_list->push_back(scan_range_params);
 
   if (VLOG_FILE_IS_ON) {
-    VLOG_FILE << "Scheduler assignment to executor: " << executor.address << "("
+    VLOG_FILE << "Scheduler assignment to executor: "
+              << TNetworkAddressToString(executor.address) << "("
               << (remote_read ? "remote" : "local") << " selection)";
   }
 }

@@ -93,9 +93,6 @@ class ParquetLevelDecoder {
   /// CacheHasNext() is false.
   bool FillCache(int batch_size, int* num_cached_levels);
 
-  /// Implementation of FillCache() for RLE encoding.
-  bool FillCacheRle(int batch_size, int* num_cached_levels);
-
   /// RLE decoder, used if 'encoding_' is RLE.
   RleBatchDecoder<uint8_t> rle_decoder_;
 
@@ -201,18 +198,14 @@ class ParquetColumnReader {
   /// not in collections.
   virtual bool ReadNonRepeatedValue(MemPool* pool, Tuple* tuple) = 0;
 
-  /// Returns true if this reader needs to be seeded with NextLevels() before
-  /// calling ReadValueBatch() or ReadNonRepeatedValueBatch().
-  /// Note that all readers need to be seeded before calling the non-batched ReadValue().
-  virtual bool NeedsSeedingForBatchedReading() const { return true; }
-
   /// Batched version of ReadValue() that reads up to max_values at once and materializes
   /// them into tuples in tuple_mem. Returns the number of values actually materialized
   /// in *num_values. The return value, error behavior and state changes are generally
   /// the same as in ReadValue(). For example, if an error occurs in the middle of
   /// materializing a batch then false is returned, and num_values, tuple_mem, as well as
   /// this column reader are left in an undefined state, assuming that the caller will
-  /// immediately abort execution.
+  /// immediately abort execution. NextLevels() does *not* need to be called before
+  /// ReadValueBatch(), unlike ReadValue().
   virtual bool ReadValueBatch(MemPool* pool, int max_values, int tuple_size,
       uint8_t* tuple_mem, int* num_values);
 
@@ -235,13 +228,19 @@ class ParquetColumnReader {
   /// true.
   virtual bool NextLevels() = 0;
 
-  /// Should only be called if pos_slot_desc_ is non-NULL. Writes pos_current_value_ to
-  /// 'tuple' (i.e. "reads" the synthetic position field of the parent collection into
-  /// 'tuple') and increments pos_current_value_.
-  void ReadPosition(Tuple* tuple);
+  /// Writes pos_current_value_ (i.e. "reads" the synthetic position field of the
+  /// parent collection) to 'pos' and increments pos_current_value_. Only valid to
+  /// call when doing non-batched reading, i.e. NextLevels() must have been called
+  /// before each call to this function to advance to the next element in the
+  /// collection.
+  void ReadPositionNonBatched(int64_t* pos);
 
   /// Returns true if this column reader has reached the end of the row group.
-  inline bool RowGroupAtEnd() { return rep_level_ == HdfsParquetScanner::ROW_GROUP_END; }
+  inline bool RowGroupAtEnd() {
+    DCHECK_EQ(rep_level_ == HdfsParquetScanner::ROW_GROUP_END,
+              def_level_ == HdfsParquetScanner::ROW_GROUP_END);
+    return rep_level_ == HdfsParquetScanner::ROW_GROUP_END;
+  }
 
   /// If 'row_batch' is non-NULL, transfers the remaining resources backing tuples to it,
   /// and frees up other resources. If 'row_batch' is NULL frees all resources instead.
@@ -250,37 +249,38 @@ class ParquetColumnReader {
  protected:
   HdfsParquetScanner* parent_;
   const SchemaNode& node_;
-  const SlotDescriptor* slot_desc_;
+  const SlotDescriptor* const slot_desc_;
 
   /// The slot descriptor for the position field of the tuple, if there is one. NULL if
   /// there's not. Only one column reader for a given tuple desc will have this set.
   const SlotDescriptor* pos_slot_desc_;
 
   /// The next value to write into the position slot, if there is one. 64-bit int because
-  /// the pos slot is always a BIGINT Set to -1 when this column reader does not have a
-  /// current rep and def level (i.e. before the first NextLevels() call or after the last
-  /// value in the column has been read).
+  /// the pos slot is always a BIGINT Set to INVALID_POS when this column reader does not
+  /// have a current rep and def level (i.e. before the first NextLevels() call or after
+  /// the last value in the column has been read).
   int64_t pos_current_value_;
 
   /// The current repetition and definition levels of this reader. Advanced via
-  /// ReadValue() and NextLevels(). Set to -1 when this column reader does not have a
-  /// current rep and def level (i.e. before the first NextLevels() call or after the last
-  /// value in the column has been read). If this is not inside a collection, rep_level_ is
-  /// always 0.
-  /// int16_t is large enough to hold the valid levels 0-255 and sentinel value -1.
-  /// The maximum values are cached here because they are accessed in inner loops.
+  /// ReadValue() and NextLevels(). Set to INVALID_LEVEL before the first NextLevels()
+  /// call for a row group or if an error is encountered decoding a level. Set to
+  /// ROW_GROUP_END after the last value in the column has been read). If this is not
+  /// inside a collection, rep_level_ is always 0, INVALID_LEVEL or ROW_GROUP_END.
+  /// int16_t is large enough to hold the valid levels 0-255 and negative sentinel values
+  /// INVALID_LEVEL and ROW_GROUP_END. The maximum values are cached here because they
+  /// are accessed in inner loops.
   int16_t rep_level_;
-  int16_t max_rep_level_;
+  const int16_t max_rep_level_;
   int16_t def_level_;
-  int16_t max_def_level_;
+  const int16_t max_def_level_;
 
   // Cache frequently accessed members of slot_desc_ for perf.
 
   /// slot_desc_->tuple_offset(). -1 if slot_desc_ is NULL.
-  int tuple_offset_;
+  const int tuple_offset_;
 
   /// slot_desc_->null_indicator_offset(). Invalid if slot_desc_ is NULL.
-  NullIndicatorOffset null_indicator_offset_;
+  const NullIndicatorOffset null_indicator_offset_;
 
   ParquetColumnReader(HdfsParquetScanner* parent, const SchemaNode& node,
       const SlotDescriptor* slot_desc)
@@ -322,42 +322,29 @@ class BaseScalarColumnReader : public ParquetColumnReader {
   BaseScalarColumnReader(HdfsParquetScanner* parent, const SchemaNode& node,
       const SlotDescriptor* slot_desc)
     : ParquetColumnReader(parent, node, slot_desc),
-      data_(NULL),
-      data_end_(NULL),
-      def_levels_(true),
-      rep_levels_(false),
-      page_encoding_(parquet::Encoding::PLAIN_DICTIONARY),
-      num_buffered_values_(0),
-      num_values_read_(0),
-      metadata_(NULL),
-      stream_(NULL),
       data_page_pool_(new MemPool(parent->scan_node_->mem_tracker())) {
     DCHECK_GE(node_.col_idx, 0) << node_.DebugString();
   }
 
   virtual ~BaseScalarColumnReader() { }
 
-  /// This is called once for each row group in the file.
-  Status Reset(const parquet::ColumnMetaData* metadata, ScannerContext::Stream* stream) {
-    DCHECK(stream != NULL);
-    DCHECK(metadata != NULL);
+  /// Resets the reader for each row group in the file and creates the scan
+  /// range for the column, but does not start it. To start scanning,
+  /// set_io_reservation() must be called to assign reservation to this
+  /// column, followed by StartScan().
+  Status Reset(const HdfsFileDesc& file_desc, const parquet::ColumnChunk& col_chunk,
+    int row_group_idx);
 
-    num_buffered_values_ = 0;
-    data_ = NULL;
-    data_end_ = NULL;
-    stream_ = stream;
-    metadata_ = metadata;
-    num_values_read_ = 0;
-    def_level_ = -1;
-    // See ColumnReader constructor.
-    rep_level_ = max_rep_level() == 0 ? 0 : -1;
-    pos_current_value_ = -1;
+  /// Starts the column scan range. The reader must be Reset() and have a
+  /// reservation assigned via set_io_reservation(). This must be called
+  /// before any of the column data can be read (including dictionary and
+  /// data pages). Returns an error status if there was an error starting the
+  /// scan or allocating buffers for it.
+  Status StartScan();
 
-    if (metadata_->codec != parquet::CompressionCodec::UNCOMPRESSED) {
-      RETURN_IF_ERROR(Codec::CreateDecompressor(
-          NULL, false, ConvertParquetToImpalaCodec(metadata_->codec), &decompressor_));
-    }
-    ClearDictionaryDecoder();
+  /// Helper to start scans for multiple columns at once.
+  static Status StartScans(const std::vector<BaseScalarColumnReader*> readers) {
+    for (BaseScalarColumnReader* reader : readers) RETURN_IF_ERROR(reader->StartScan());
     return Status::OK();
   }
 
@@ -372,21 +359,26 @@ class BaseScalarColumnReader : public ParquetColumnReader {
     if (dict_decoder != nullptr) dict_decoder->Close();
   }
 
+  io::ScanRange* scan_range() const { return scan_range_; }
   int64_t total_len() const { return metadata_->total_compressed_size; }
   int col_idx() const { return node_.col_idx; }
   THdfsCompression::type codec() const {
     if (metadata_ == NULL) return THdfsCompression::NONE;
     return ConvertParquetToImpalaCodec(metadata_->codec);
   }
+  void set_io_reservation(int bytes) { io_reservation_ = bytes; }
 
   /// Reads the next definition and repetition levels for this column. Initializes the
   /// next data page if necessary.
   virtual bool NextLevels() { return NextLevels<true>(); }
 
-  // Check the data stream to see if there is a dictionary page. If there is,
-  // use that page to initialize dict_decoder_ and advance the data stream
-  // past the dictionary page.
+  /// Check the data stream to see if there is a dictionary page. If there is,
+  /// use that page to initialize dict_decoder_ and advance the data stream
+  /// past the dictionary page.
   Status InitDictionary();
+
+  /// Convenience function to initialize multiple dictionaries.
+  static Status InitDictionaries(const std::vector<BaseScalarColumnReader*> readers);
 
   // Returns the dictionary or NULL if the dictionary doesn't exist
   virtual DictDecoderBase* GetDictionaryDecoder() { return nullptr; }
@@ -413,33 +405,45 @@ class BaseScalarColumnReader : public ParquetColumnReader {
   // fit in as few cache lines as possible.
 
   /// Pointer to start of next value in data page
-  uint8_t* data_;
+  uint8_t* data_ = nullptr;
 
   /// End of the data page.
-  const uint8_t* data_end_;
+  const uint8_t* data_end_ = nullptr;
 
   /// Decoder for definition levels.
-  ParquetLevelDecoder def_levels_;
+  ParquetLevelDecoder def_levels_{true};
 
   /// Decoder for repetition levels.
-  ParquetLevelDecoder rep_levels_;
+  ParquetLevelDecoder rep_levels_{false};
 
   /// Page encoding for values of the current data page. Cached here for perf. Set in
   /// InitDataPage().
-  parquet::Encoding::type page_encoding_;
+  parquet::Encoding::type page_encoding_ = parquet::Encoding::PLAIN_DICTIONARY;
 
   /// Num values remaining in the current data page
-  int num_buffered_values_;
+  int num_buffered_values_ = 0;
 
   // Less frequently used members that are not accessed in inner loop should go below
   // here so they do not occupy precious cache line space.
 
   /// The number of values seen so far. Updated per data page.
-  int64_t num_values_read_;
+  int64_t num_values_read_ = 0;
 
-  const parquet::ColumnMetaData* metadata_;
+  /// Metadata for the column for the current row group.
+  const parquet::ColumnMetaData* metadata_ = nullptr;
+
   boost::scoped_ptr<Codec> decompressor_;
-  ScannerContext::Stream* stream_;
+
+  /// The scan range for the column's data. Initialized for each row group by Reset().
+  io::ScanRange* scan_range_ = nullptr;
+
+  // Stream used to read data from 'scan_range_'. Initialized by StartScan().
+  ScannerContext::Stream* stream_ = nullptr;
+
+  /// Reservation in bytes to use for I/O buffers in 'scan_range_'/'stream_'. Must be set
+  /// with set_io_reservation() before 'stream_' is initialized. Reset for each row group
+  /// by Reset().
+  int64_t io_reservation_ = 0;
 
   /// Pool to allocate storage for data pages from - either decompression buffers for
   /// compressed data pages or copies of the data page with var-len data to attach to
@@ -502,6 +506,15 @@ class BaseScalarColumnReader : public ParquetColumnReader {
     return page_encoding != parquet::Encoding::PLAIN_DICTIONARY
         && slot_desc_ != nullptr && slot_desc_->type().IsVarLenStringType();
   }
+
+  /// Slow-path status construction code for def/rep decoding errors. 'level_name' is
+  /// either "rep" or "def", 'decoded_level' is the value returned from
+  /// ParquetLevelDecoder::ReadLevel() and 'max_level' is the maximum allowed value.
+  void __attribute__((noinline)) SetLevelDecodeError(const char* level_name,
+      int decoded_level, int max_level);
+
+  // Returns a detailed error message about unsupported encoding.
+  Status GetUnsupportedDecodingError();
 };
 
 /// Collections are not materialized directly in parquet files; only scalar values appear
@@ -541,9 +554,9 @@ class CollectionColumnReader : public ParquetColumnReader {
 
   /// This is called once for each row group in the file.
   void Reset() {
-    def_level_ = -1;
-    rep_level_ = -1;
-    pos_current_value_ = -1;
+    def_level_ = HdfsParquetScanner::INVALID_LEVEL;
+    rep_level_ = HdfsParquetScanner::INVALID_LEVEL;
+    pos_current_value_ = HdfsParquetScanner::INVALID_POS;
   }
 
   virtual void Close(RowBatch* row_batch) {
@@ -564,13 +577,12 @@ class CollectionColumnReader : public ParquetColumnReader {
   void UpdateDerivedState();
 
   /// Recursively reads from children_ to assemble a single CollectionValue into
-  /// the appropriate destination slot in 'tuple'. Also advances rep_level_ and
-  /// def_level_ via NextLevels().
+  /// 'slot'. Also advances rep_level_ and def_level_ via NextLevels().
   ///
   /// Returns false if execution should be aborted for some reason, e.g. parse_error_ is
   /// set, the query is cancelled, or the scan node limit was reached. Otherwise returns
   /// true.
-  inline bool ReadSlot(Tuple* tuple, MemPool* pool);
+  inline bool ReadSlot(CollectionValue* slot, MemPool* pool);
 };
 
 }

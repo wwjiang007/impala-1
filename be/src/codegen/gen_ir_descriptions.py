@@ -177,8 +177,8 @@ ir_functions = [
    "_ZN6impala11HdfsScanner18WriteAlignedTuplesEPNS_7MemPoolEPNS_8TupleRowEPNS_13FieldLocationEiiiib"],
   ["PROCESS_SCRATCH_BATCH",
    "_ZN6impala18HdfsParquetScanner19ProcessScratchBatchEPNS_8RowBatchE"],
-  ["PARQUET_SCANNER_EVAL_RUNTIME_FILTER",
-   "_ZN6impala18HdfsParquetScanner17EvalRuntimeFilterEiPNS_8TupleRowE"],
+  ["HDFS_SCANNER_EVAL_RUNTIME_FILTER",
+   "_ZN6impala11HdfsScanner17EvalRuntimeFilterEiPNS_8TupleRowE"],
   ["STRING_TO_BOOL", "IrStringToBool"],
   ["STRING_TO_INT8", "IrStringToInt8"],
   ["STRING_TO_INT16", "IrStringToInt16"],
@@ -196,6 +196,8 @@ ir_functions = [
    "_ZN6impala8RawValue7CompareEPKvS2_RKNS_10ColumnTypeE"],
   ["RAW_VALUE_GET_HASH_VALUE",
    "_ZN6impala8RawValue12GetHashValueEPKvRKNS_10ColumnTypeEj"],
+  ["RAW_VALUE_GET_HASH_VALUE_FAST_HASH",
+   "_ZN6impala8RawValue20GetHashValueFastHashEPKvRKNS_10ColumnTypeEm"],
   ["TOPN_NODE_INSERT_BATCH",
    "_ZN6impala8TopNNode11InsertBatchEPNS_8RowBatchE"],
   ["MEMPOOL_ALLOCATE",
@@ -219,7 +221,11 @@ ir_functions = [
   ["FLOAT_MIN_MAX_FILTER_INSERT", "_ZN6impala17FloatMinMaxFilter6InsertEPv"],
   ["DOUBLE_MIN_MAX_FILTER_INSERT", "_ZN6impala18DoubleMinMaxFilter6InsertEPv"],
   ["STRING_MIN_MAX_FILTER_INSERT", "_ZN6impala18StringMinMaxFilter6InsertEPv"],
-  ["TIMESTAMP_MIN_MAX_FILTER_INSERT", "_ZN6impala21TimestampMinMaxFilter6InsertEPv"]
+  ["TIMESTAMP_MIN_MAX_FILTER_INSERT", "_ZN6impala21TimestampMinMaxFilter6InsertEPv"],
+  ["KRPC_DSS_GET_PART_EXPR_EVAL",
+  "_ZN6impala20KrpcDataStreamSender25GetPartitionExprEvaluatorEi"],
+  ["KRPC_DSS_HASH_AND_ADD_ROWS",
+  "_ZN6impala20KrpcDataStreamSender14HashAndAddRowsEPNS_8RowBatchE"]
 ]
 
 enums_preamble = '\

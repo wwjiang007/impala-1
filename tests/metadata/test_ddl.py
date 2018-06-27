@@ -26,6 +26,7 @@ from tests.common.parametrize import UniqueDatabase
 from tests.common.skip import SkipIf, SkipIfADLS, SkipIfLocal
 from tests.common.test_dimensions import create_single_exec_option_dimension
 from tests.util.filesystem_utils import WAREHOUSE, IS_HDFS, IS_S3, IS_ADLS
+from tests.common.impala_cluster import ImpalaCluster
 
 # Validates DDL statements (create, drop)
 class TestDdlStatements(TestDdlBase):
@@ -193,6 +194,39 @@ class TestDdlStatements(TestDdlBase):
     self.run_test_case('QueryTest/create-database', vector, use_db=unique_database,
         multiple_impalad=self._use_multiple_impalad(vector))
 
+  def test_comment_on_database(self, vector, unique_database):
+    comment = self._get_db_comment(unique_database)
+    assert '' == comment
+
+    self.client.execute("comment on database {0} is 'comment'".format(unique_database))
+    comment = self._get_db_comment(unique_database)
+    assert 'comment' == comment
+
+    self.client.execute("comment on database {0} is '\\'comment\\''".format(unique_database))
+    comment = self._get_db_comment(unique_database)
+    assert "\\'comment\\'" == comment
+
+    self.client.execute("comment on database {0} is ''".format(unique_database))
+    comment = self._get_db_comment(unique_database)
+    assert '' == comment
+
+    self.client.execute("comment on database {0} is null".format(unique_database))
+    comment = self._get_db_comment(unique_database)
+    assert '' == comment
+
+  def test_alter_database_set_owner(self, vector, unique_database):
+    self.client.execute("alter database {0} set owner user foo_user".format(
+      unique_database))
+    properties = self._get_db_owner_properties(unique_database)
+    assert len(properties) == 1
+    assert {'foo_user': 'USER'} == properties
+
+    self.client.execute("alter database {0} set owner role foo_role".format(
+      unique_database))
+    properties = self._get_db_owner_properties(unique_database)
+    assert len(properties) == 1
+    assert {'foo_role': 'ROLE'} == properties
+
   # There is a query in QueryTest/create-table that references nested types, which is not
   # supported if old joins and aggs are enabled. Since we do not get any meaningful
   # additional coverage by running a DDL test under the old aggs and joins, it can be
@@ -225,8 +259,55 @@ class TestDdlStatements(TestDdlBase):
   @UniqueDatabase.parametrize(sync_ddl=True)
   def test_create_kudu(self, vector, unique_database):
     vector.get_value('exec_option')['abort_on_error'] = False
+    vector.get_value('exec_option')['kudu_read_mode'] = "READ_AT_SNAPSHOT"
     self.run_test_case('QueryTest/kudu_create', vector, use_db=unique_database,
         multiple_impalad=self._use_multiple_impalad(vector))
+
+  def test_comment_on_table(self, vector, unique_database):
+    table = '{0}.comment_table'.format(unique_database)
+    self.client.execute("create table {0} (i int)".format(table))
+
+    comment = self._get_table_or_view_comment(table)
+    assert comment is None
+
+    self.client.execute("comment on table {0} is 'comment'".format(table))
+    comment = self._get_table_or_view_comment(table)
+    assert "comment" == comment
+
+    self.client.execute("comment on table {0} is '\\'comment\\''".format(table))
+    comment = self._get_table_or_view_comment(table)
+    assert "\\\\'comment\\\\'" == comment
+
+    self.client.execute("comment on table {0} is ''".format(table))
+    comment = self._get_table_or_view_comment(table)
+    assert "" == comment
+
+    self.client.execute("comment on table {0} is null".format(table))
+    comment = self._get_table_or_view_comment(table)
+    assert comment is None
+
+  def test_comment_on_view(self, vector, unique_database):
+    view = '{0}.comment_view'.format(unique_database)
+    self.client.execute("create view {0} as select 1".format(view))
+
+    comment = self._get_table_or_view_comment(view)
+    assert comment is None
+
+    self.client.execute("comment on view {0} is 'comment'".format(view))
+    comment = self._get_table_or_view_comment(view)
+    assert "comment" == comment
+
+    self.client.execute("comment on view {0} is '\\'comment\\''".format(view))
+    comment = self._get_table_or_view_comment(view)
+    assert "\\\\'comment\\\\'" == comment
+
+    self.client.execute("comment on view {0} is ''".format(view))
+    comment = self._get_table_or_view_comment(view)
+    assert "" == comment
+
+    self.client.execute("comment on view {0} is null".format(view))
+    comment = self._get_table_or_view_comment(view)
+    assert comment is None
 
   @UniqueDatabase.parametrize(sync_ddl=True)
   def test_sync_ddl_drop(self, vector, unique_database):
@@ -360,6 +441,37 @@ class TestDdlStatements(TestDdlBase):
 |--05:EXCHANGE [BROADCAST]
 |  01:SCAN HDFS [functional.alltypes b]
 00:SCAN HDFS [functional.alltypestiny a]""" in '\n'.join(plan.data)
+
+  def test_views_describe(self, vector, unique_database):
+    # IMPALA-6896: Tests that altered views can be described by all impalads.
+    impala_cluster = ImpalaCluster()
+    impalads = impala_cluster.impalads
+    first_client = impalads[0].service.create_beeswax_client()
+    try:
+      self.execute_query_expect_success(first_client,
+                                        "create view {0}.test_describe_view as "
+                                        "select * from functional.alltypes"
+                                        .format(unique_database), {'sync_ddl': 1})
+      self.execute_query_expect_success(first_client,
+                                        "alter view {0}.test_describe_view as "
+                                        "select * from functional.alltypesagg"
+                                        .format(unique_database))
+    finally:
+      first_client.close()
+
+    for impalad in impalads:
+      client = impalad.service.create_beeswax_client()
+      try:
+        while True:
+          result = self.execute_query_expect_success(
+              client, "describe formatted {0}.test_describe_view"
+              .format(unique_database))
+          if any("select * from functional.alltypesagg" in s.lower()
+                 for s in result.data):
+            break
+          time.sleep(1)
+      finally:
+        client.close()
 
   @UniqueDatabase.parametrize(sync_ddl=True)
   def test_functions_ddl(self, vector, unique_database):

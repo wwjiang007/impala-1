@@ -35,7 +35,6 @@ import org.apache.impala.util.PatternMatcher;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
-import org.apache.impala.util.TUniqueIdUtil;
 
 /**
  * Thread safe interface for reading and updating metadata stored in the Hive MetaStore.
@@ -59,7 +58,6 @@ public abstract class Catalog {
   // Initial catalog version.
   public final static long INITIAL_CATALOG_VERSION = 0L;
   public static final String DEFAULT_DB = "default";
-  public static final String BUILTINS_DB = "_impala_builtins";
 
   protected final MetaStoreClientPool metaStoreClientPool_ =
       new MetaStoreClientPool(0, 0);
@@ -75,9 +73,6 @@ public abstract class Catalog {
       new AtomicReference<ConcurrentHashMap<String, Db>>(
           new ConcurrentHashMap<String, Db>());
 
-  // DB that contains all builtins
-  private static Db builtinsDb_;
-
   // Cache of data sources.
   protected final CatalogObjectCache<DataSource> dataSources_;
 
@@ -88,8 +83,6 @@ public abstract class Catalog {
 
   public Catalog() {
     dataSources_ = new CatalogObjectCache<DataSource>();
-    builtinsDb_ = new BuiltinsDb(BUILTINS_DB);
-    addDb(builtinsDb_);
   }
 
   /**
@@ -103,8 +96,6 @@ public abstract class Catalog {
     this();
     metaStoreClientPool_.initClients(numClients, initialCnxnTimeoutSec);
   }
-
-  public Db getBuiltinsDb() { return builtinsDb_; }
 
   /**
    * Adds a new database to the catalog, replacing any existing database with the same
@@ -288,10 +279,6 @@ public abstract class Catalog {
     return db.getFunction(desc, mode);
   }
 
-  public static Function getBuiltin(Function desc, Function.CompareMode mode) {
-    return builtinsDb_.getFunction(desc, mode);
-  }
-
   /**
    * Removes a function from the catalog. Increments the catalog version and returns
    * the Function object that was removed if the function existed, otherwise returns
@@ -345,7 +332,7 @@ public abstract class Catalog {
    * The results are sorted in String.CASE_INSENSITIVE_ORDER.
    * matcher must not be null.
    */
-  private List<String> filterStringsByPattern(Iterable<String> candidates,
+  public static List<String> filterStringsByPattern(Iterable<String> candidates,
       PatternMatcher matcher) {
     Preconditions.checkNotNull(matcher);
     List<String> filtered = Lists.newArrayList();
@@ -356,9 +343,9 @@ public abstract class Catalog {
     return filtered;
   }
 
-  private static class CatalogObjectOrder implements Comparator<CatalogObject> {
+  private static class CatalogObjectOrder implements Comparator<HasName> {
     @Override
-    public int compare(CatalogObject o1, CatalogObject o2) {
+    public int compare(HasName o1, HasName o2) {
       return String.CASE_INSENSITIVE_ORDER.compare(o1.getName(), o2.getName());
     }
   }
@@ -370,7 +357,7 @@ public abstract class Catalog {
    * The results are sorted in CATALOG_OBJECT_ORDER.
    * matcher must not be null.
    */
-  private <T extends CatalogObject> List<T> filterCatalogObjectsByPattern(
+  public static <T extends HasName> List<T> filterCatalogObjectsByPattern(
       Iterable<? extends T> candidates, PatternMatcher matcher) {
     Preconditions.checkNotNull(matcher);
     List<T> filtered = Lists.newArrayList();
@@ -575,8 +562,7 @@ public abstract class Catalog {
       case DATA_SOURCE:
         return "DATA_SOURCE:" + catalogObject.getData_source().getName().toLowerCase();
       case CATALOG:
-        return "CATALOG:" +
-            TUniqueIdUtil.PrintId(catalogObject.getCatalog().catalog_service_id);
+        return "CATALOG_SERVICE_ID";
       default:
         throw new IllegalStateException(
             "Unsupported catalog object type: " + catalogObject.getType());

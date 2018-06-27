@@ -58,7 +58,8 @@ enum THdfsFileFormat {
   SEQUENCE_FILE,
   AVRO,
   PARQUET,
-  KUDU
+  KUDU,
+  ORC
 }
 
 // TODO: Since compression is also enabled for Kudu columns, we should
@@ -73,7 +74,8 @@ enum THdfsCompression {
   SNAPPY_BLOCKED,
   LZO,
   LZ4,
-  ZLIB
+  ZLIB,
+  ZSTD
 }
 
 enum TColumnEncoding {
@@ -237,6 +239,7 @@ struct THdfsPartitionLocation {
 }
 
 // Represents an HDFS partition
+// TODO(vercegovac): rename to TFsPartition
 struct THdfsPartition {
   1: required byte lineDelim
   2: required byte fieldDelim
@@ -279,6 +282,11 @@ struct THdfsPartition {
   18: optional bool has_incremental_stats
 }
 
+// Constant partition ID used for THdfsPartition.prototype_partition above.
+// Must be < 0 to avoid collisions
+const i64 PROTOTYPE_PARTITION_ID = -1;
+
+
 struct THdfsTable {
   1: required string hdfsBaseDir
 
@@ -294,8 +302,12 @@ struct THdfsTable {
   // Set to the table's Avro schema if this is an Avro table
   6: optional string avroSchema
 
-  // map from partition id to partition metadata
+  // Map from partition id to partition metadata.
+  // Does not include the special prototype partition -1 (see below).
   4: required map<i64, THdfsPartition> partitions
+
+  // Prototype partition, used when creating new partitions during insert.
+  10: required THdfsPartition prototype_partition
 
   // Each TNetworkAddress is a datanode which contains blocks of a file in the table.
   // Used so that each THdfsFileBlock can just reference an index in this list rather
@@ -467,7 +479,11 @@ enum TPrivilegeScope {
 enum TPrivilegeLevel {
   ALL,
   INSERT,
-  SELECT
+  SELECT,
+  REFRESH,
+  CREATE,
+  ALTER,
+  DROP
 }
 
 // Represents a privilege in an authorization policy. Privileges contain the level

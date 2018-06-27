@@ -53,12 +53,12 @@ import org.apache.impala.analysis.TupleIsNullPredicate;
 import org.apache.impala.analysis.UnionStmt;
 import org.apache.impala.analysis.UnionStmt.UnionOperand;
 import org.apache.impala.catalog.ColumnStats;
-import org.apache.impala.catalog.DataSourceTable;
+import org.apache.impala.catalog.FeDataSourceTable;
+import org.apache.impala.catalog.FeFsPartition;
+import org.apache.impala.catalog.FeFsTable;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.HBaseTable;
-import org.apache.impala.catalog.HdfsPartition;
-import org.apache.impala.catalog.HdfsTable;
 import org.apache.impala.catalog.KuduTable;
-import org.apache.impala.catalog.Table;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.InternalException;
@@ -1098,6 +1098,14 @@ public class SingleNodePlanner {
     // Set output smap of rootNode *before* creating a SelectNode for proper resolution.
     rootNode.setOutputSmap(outputSmap);
 
+    // Add runtime cardinality check if needed
+    if (inlineViewRef.getViewStmt().isRuntimeScalar()) {
+      rootNode = new CardinalityCheckNode(ctx_.getNextNodeId(), rootNode,
+          inlineViewRef.getViewStmt().getOrigSqlString());
+      rootNode.setOutputSmap(outputSmap);
+      rootNode.init(ctx_.getRootAnalyzer());
+    }
+
     // If the inline view has a LIMIT/OFFSET or unassigned conjuncts due to analytic
     // functions, we may have conjuncts that need to be assigned to a SELECT node on
     // top of the current plan root node.
@@ -1204,7 +1212,7 @@ public class SingleNodePlanner {
     // Do partition pruning before deciding which slots to materialize because we might
     // end up removing some predicates.
     HdfsPartitionPruner pruner = new HdfsPartitionPruner(tupleDesc);
-    List<HdfsPartition> partitions = pruner.prunePartitions(analyzer, conjuncts, false);
+    List<? extends FeFsPartition> partitions = pruner.prunePartitions(analyzer, conjuncts, false);
 
     // Mark all slots referenced by the remaining conjuncts as materialized.
     analyzer.materializeSlots(conjuncts);
@@ -1221,11 +1229,9 @@ public class SingleNodePlanner {
     if (fastPartitionKeyScans && tupleDesc.hasClusteringColsOnly()) {
       HashSet<List<Expr>> uniqueExprs = new HashSet<List<Expr>>();
 
-      for (HdfsPartition partition: partitions) {
+      for (FeFsPartition partition: partitions) {
         // Ignore empty partitions to match the behavior of the scan based approach.
-        if (partition.isDefaultPartition() || partition.getSize() == 0) {
-          continue;
-        }
+        if (partition.getSize() == 0) continue;
         List<Expr> exprs = Lists.newArrayList();
         for (SlotDescriptor slotDesc: tupleDesc.getSlots()) {
           // UnionNode.init() will go through all the slots in the tuple descriptor so
@@ -1293,10 +1299,11 @@ public class SingleNodePlanner {
       Expr.removeDuplicates(conjuncts);
     }
 
-    Table table = tblRef.getTable();
-    if (table instanceof HdfsTable) {
+    // TODO(todd) introduce FE interfaces for DataSourceTable, HBaseTable, KuduTable
+    FeTable table = tblRef.getTable();
+    if (table instanceof FeFsTable) {
       return createHdfsScanPlan(tblRef, aggInfo, conjuncts, analyzer);
-    } else if (table instanceof DataSourceTable) {
+    } else if (table instanceof FeDataSourceTable) {
       scanNode = new DataSourceScanNode(ctx_.getNextNodeId(), tblRef.getDesc(),
           conjuncts);
       scanNode.init(analyzer);

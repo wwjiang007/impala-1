@@ -28,6 +28,7 @@
 
 #include "common/global-types.h"
 #include "common/status.h"
+#include "gen-cpp/CatalogObjects_generated.h"
 #include "gen-cpp/PlanNodes_types.h"
 #include "gen-cpp/StatestoreService_types.h"
 #include "gen-cpp/Types_types.h" // for TNetworkAddress
@@ -87,6 +88,12 @@ class Scheduler {
   /// IP address of this backend.
   Status Init(const TNetworkAddress& backend_address,
       const TNetworkAddress& krpc_address, const IpAddr& ip);
+
+  /// Test helper that updates the local backend address to reflect whatever
+  /// ephemeral port was assigned during server startup. Should only be called
+  /// from backend tests. Not safe to call concurrently while queries are being
+  /// scheduled.
+  void UpdateLocalBackendAddrForBeTest();
 
   /// Populates given query schedule and assigns fragments to hosts based on scan
   /// ranges in the query exec request.
@@ -332,6 +339,10 @@ class Scheduler {
   Status GetRequestPool(const std::string& user, const TQueryOptions& query_options,
       std::string* pool) const;
 
+  /// Generates scan ranges from 'specs' and places them in 'generated_scan_ranges'.
+  Status GenerateScanRanges(const std::vector<TFileSplitGeneratorSpec>& specs,
+      std::vector<TScanRangeLocationList>* generated_scan_ranges);
+
   /// Compute the assignment of scan ranges to hosts for each scan node in
   /// the schedule's TQueryExecRequest.plan_exec_info.
   /// Unpartitioned fragments are assigned to the coordinator. Populate the schedule's
@@ -343,7 +354,8 @@ class Scheduler {
 
   /// Process the list of scan ranges of a single plan node and compute scan range
   /// assignments (returned in 'assignment'). The result is a mapping from hosts to their
-  /// assigned scan ranges per plan node.
+  /// assigned scan ranges per plan node. Inputs that are scan range specs are used to
+  /// generate scan ranges.
   ///
   /// If exec_at_coord is true, all scan ranges will be assigned to the coordinator host.
   /// Otherwise the assignment is computed for each scan range as follows:
@@ -404,7 +416,8 @@ class Scheduler {
 
   /// Computes BackendExecParams for all backends assigned in the query. Must be called
   /// after ComputeFragmentExecParams().
-  void ComputeBackendExecParams(QuerySchedule* schedule);
+  void ComputeBackendExecParams(
+      const BackendConfig& executor_config, QuerySchedule* schedule);
 
   /// Compute the FragmentExecParams for all plans in the schedule's
   /// TQueryExecRequest.plan_exec_info.
@@ -436,8 +449,7 @@ class Scheduler {
   /// The maximum number of instances is the value of query option mt_dop.
   /// For HDFS, this attempts to load balance among instances by computing the average
   /// number of bytes per instances and then in a single pass assigning scan ranges to
-  /// each
-  /// instances to roughly meet that average.
+  /// each instance to roughly meet that average.
   /// For all other storage mgrs, it load-balances the number of splits per instance.
   void CreateScanInstances(
       PlanNodeId scan_id, FragmentExecParams* fragment_params, QuerySchedule* schedule);

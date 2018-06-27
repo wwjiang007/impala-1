@@ -164,8 +164,7 @@ public class AnalyzeAuthStmtsTest extends AnalyzerTest {
           formatArgs));
       AnalyzesOk(String.format("%s INSERT ON DATABASE functional %s myrole",
           formatArgs));
-      AnalysisError(String.format("%s INSERT ON SERVER %s myrole", formatArgs),
-          "Only 'ALL' privilege may be applied at SERVER scope in privilege spec.");
+      AnalyzesOk(String.format("%s INSERT ON SERVER %s myrole", formatArgs));
       AnalysisError(String.format("%s INSERT ON URI 'hdfs:////abc//123' %s myrole",
           formatArgs), "Only 'ALL' privilege may be applied at URI scope in privilege " +
           "spec.");
@@ -179,8 +178,7 @@ public class AnalyzeAuthStmtsTest extends AnalyzerTest {
           "%s SELECT ON TABLE functional_kudu.alltypessmall %s myrole", formatArgs));
       AnalyzesOk(String.format("%s SELECT ON DATABASE functional %s myrole",
           formatArgs));
-      AnalysisError(String.format("%s SELECT ON SERVER %s myrole", formatArgs),
-          "Only 'ALL' privilege may be applied at SERVER scope in privilege spec.");
+      AnalyzesOk(String.format("%s SELECT ON SERVER %s myrole", formatArgs));
       AnalysisError(String.format("%s SELECT ON URI 'hdfs:////abc//123' %s myrole",
           formatArgs), "Only 'ALL' privilege may be applied at URI scope in privilege " +
           "spec.");
@@ -219,6 +217,50 @@ public class AnalyzeAuthStmtsTest extends AnalyzerTest {
           "functional.does_not_exist %s myrole", formatArgs), "Error setting " +
           "privileges for table 'functional.does_not_exist'. Verify that the table " +
           "exists and that you have permissions to issue a GRANT/REVOKE statement.");
+
+      // REFRESH privilege
+      AnalyzesOk(String.format(
+          "%s REFRESH ON TABLE functional.alltypes %s myrole", formatArgs));
+      AnalyzesOk(String.format(
+          "%s REFRESH ON DATABASE functional %s myrole", formatArgs));
+      AnalyzesOk(String.format("%s REFRESH ON SERVER %s myrole", formatArgs));
+      AnalyzesOk(String.format("%s REFRESH ON SERVER server1 %s myrole",
+          formatArgs));
+      AnalysisError(String.format(
+          "%s REFRESH ON URI 'hdfs:////abc//123' %s myrole", formatArgs),
+          "Only 'ALL' privilege may be applied at URI scope in privilege spec.");
+
+      // CREATE privilege
+      AnalyzesOk(String.format("%s CREATE ON SERVER %s myrole", formatArgs));
+      AnalyzesOk(String.format("%s CREATE ON SERVER server1 %s myrole", formatArgs));
+      AnalyzesOk(String.format(
+          "%s CREATE ON DATABASE functional %s myrole", formatArgs));
+      AnalysisError(String.format(
+          "%s CREATE ON TABLE functional.alltypes %s myrole", formatArgs),
+          "Create-level privileges on tables are not supported.");
+      AnalysisError(String.format(
+          "%s CREATE ON URI 'hdfs:////abc//123' %s myrole", formatArgs),
+          "Only 'ALL' privilege may be applied at URI scope in privilege spec.");
+
+      // ALTER privilege
+      AnalyzesOk(String.format("%s ALTER ON SERVER %s myrole", formatArgs));
+      AnalyzesOk(String.format("%s ALTER ON SERVER server1 %s myrole", formatArgs));
+      AnalyzesOk(String.format("%s ALTER ON DATABASE functional %s myrole", formatArgs));
+      AnalyzesOk(String.format(
+          "%s ALTER ON TABLE functional.alltypes %s myrole", formatArgs));
+      AnalysisError(String.format(
+          "%s ALTER ON URI 'hdfs:////abc/123' %s myrole", formatArgs),
+          "Only 'ALL' privilege may be applied at URI scope in privilege spec.");
+
+      // DROP privilege
+      AnalyzesOk(String.format("%s DROP ON SERVER %s myrole", formatArgs));
+      AnalyzesOk(String.format("%s DROP ON SERVER server1 %s myrole", formatArgs));
+      AnalyzesOk(String.format("%s DROP ON DATABASE functional %s myrole", formatArgs));
+      AnalyzesOk(String.format(
+          "%s DROP ON TABLE functional.alltypes %s myrole", formatArgs));
+      AnalysisError(String.format(
+          "%s DROP ON URI 'hdfs:////abc/123' %s myrole", formatArgs),
+          "Only 'ALL' privilege may be applied at URI scope in privilege spec.");
     }
 
     AnalysisContext authDisabledCtx = createAuthDisabledAnalysisCtx();

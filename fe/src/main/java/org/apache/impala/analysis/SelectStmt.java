@@ -24,9 +24,9 @@ import java.util.Set;
 
 import org.apache.impala.analysis.Path.PathType;
 import org.apache.impala.catalog.Column;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.StructField;
 import org.apache.impala.catalog.StructType;
-import org.apache.impala.catalog.Table;
 import org.apache.impala.catalog.TableLoadingException;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.ColumnAliasGenerator;
@@ -255,6 +255,7 @@ public class SelectStmt extends QueryStmt {
 
     // Remember the SQL string before inline-view expression substitution.
     sqlString_ = toSql();
+    if (origSqlString_ == null) origSqlString_ = sqlString_;
     resolveInlineViewRefs(analyzer);
 
     // If this block's select-project-join portion returns an empty result set and the
@@ -270,7 +271,7 @@ public class SelectStmt extends QueryStmt {
     if (sortInfo_ != null && hasLimit()) {
       // When there is a LIMIT clause in conjunction with an ORDER BY, the ordering exprs
       // must be added in the column lineage graph.
-      graph.addDependencyPredicates(sortInfo_.getOrderingExprs());
+      graph.addDependencyPredicates(sortInfo_.getSortExprs());
     }
 
     if (aggInfo_ != null) {
@@ -472,7 +473,7 @@ public class SelectStmt extends QueryStmt {
       // The resolved path targets a registered tuple descriptor of a catalog
       // table. Expand the '*' based on the Hive-column order.
       TupleDescriptor tupleDesc = resolvedPath.destTupleDesc();
-      Table table = tupleDesc.getTable();
+      FeTable table = tupleDesc.getTable();
       for (Column c: table.getColumnsInHiveOrder()) {
         addStarResultExpr(resolvedPath, analyzer, c.getName());
       }
@@ -563,7 +564,7 @@ public class SelectStmt extends QueryStmt {
         && (havingPred_ == null
             || !havingPred_.contains(Expr.isAggregatePredicate()))
         && (sortInfo_ == null
-            || !TreeNode.contains(sortInfo_.getOrderingExprs(),
+            || !TreeNode.contains(sortInfo_.getSortExprs(),
                                   Expr.isAggregatePredicate()))) {
       // We're not computing aggregates but we still need to register the HAVING
       // clause which could, e.g., contain a constant expression evaluating to false.
@@ -644,7 +645,7 @@ public class SelectStmt extends QueryStmt {
     }
     if (sortInfo_ != null) {
       // TODO: Avoid evaluating aggs in ignored order-bys
-      TreeNode.collect(sortInfo_.getOrderingExprs(), Expr.isAggregatePredicate(),
+      TreeNode.collect(sortInfo_.getSortExprs(), Expr.isAggregatePredicate(),
           aggExprs);
     }
 
@@ -723,10 +724,10 @@ public class SelectStmt extends QueryStmt {
       }
     }
     if (sortInfo_ != null) {
-      sortInfo_.substituteOrderingExprs(combinedSmap, analyzer);
+      sortInfo_.substituteSortExprs(combinedSmap, analyzer);
       if (LOG.isTraceEnabled()) {
         LOG.trace("post-agg orderingExprs: " +
-            Expr.debugString(sortInfo_.getOrderingExprs()));
+            Expr.debugString(sortInfo_.getSortExprs()));
       }
     }
 
@@ -742,7 +743,7 @@ public class SelectStmt extends QueryStmt {
     }
     if (orderByElements_ != null) {
       for (int i = 0; i < orderByElements_.size(); ++i) {
-        if (!sortInfo_.getOrderingExprs().get(i).isBound(
+        if (!sortInfo_.getSortExprs().get(i).isBound(
             finalAggInfo.getOutputTupleId())) {
           throw new AnalysisException(
               "ORDER BY expression not produced by aggregation output "
@@ -840,7 +841,7 @@ public class SelectStmt extends QueryStmt {
     ArrayList<Expr> analyticExprs = Lists.newArrayList();
     TreeNode.collect(resultExprs_, AnalyticExpr.class, analyticExprs);
     if (sortInfo_ != null) {
-      TreeNode.collect(sortInfo_.getOrderingExprs(), AnalyticExpr.class,
+      TreeNode.collect(sortInfo_.getSortExprs(), AnalyticExpr.class,
           analyticExprs);
     }
     if (analyticExprs.isEmpty()) return;
@@ -880,10 +881,10 @@ public class SelectStmt extends QueryStmt {
       LOG.trace("post-analytic selectListExprs: " + Expr.debugString(resultExprs_));
     }
     if (sortInfo_ != null) {
-      sortInfo_.substituteOrderingExprs(smap, analyzer);
+      sortInfo_.substituteSortExprs(smap, analyzer);
       if (LOG.isTraceEnabled()) {
         LOG.trace("post-analytic orderingExprs: " +
-            Expr.debugString(sortInfo_.getOrderingExprs()));
+            Expr.debugString(sortInfo_.getSortExprs()));
       }
     }
   }
@@ -1078,22 +1079,33 @@ public class SelectStmt extends QueryStmt {
   public SelectStmt clone() { return new SelectStmt(this); }
 
   /**
-   * Check if the stmt returns a single row. This can happen
+   * Check if the stmt returns at most one row. This can happen
    * in the following cases:
    * 1. select stmt with a 'limit 1' clause
    * 2. select stmt with an aggregate function and no group by.
    * 3. select stmt with no from clause.
+   * 4. select from an inline view that returns at most one row.
    *
    * This function may produce false negatives because the cardinality of the
    * result set also depends on the data a stmt is processing.
    */
   public boolean returnsSingleRow() {
+    Preconditions.checkState(isAnalyzed());
     // limit 1 clause
-    if (limitElement_ != null && limitElement_.getLimit() == 1) return true;
+    if (limitElement_ != null && hasLimit() && limitElement_.getLimit() == 1) return true;
     // No from clause (base tables or inline views)
     if (fromClause_.isEmpty()) return true;
     // Aggregation with no group by and no DISTINCT
     if (hasAggInfo() && !hasGroupByClause() && !selectList_.isDistinct()) return true;
+    // Select from an inline view that returns at most one row.
+    List<TableRef> tableRefs = fromClause_.getTableRefs();
+    if (tableRefs.size() == 1 && tableRefs.get(0) instanceof InlineViewRef) {
+      InlineViewRef inlineView = (InlineViewRef)tableRefs.get(0);
+      if (inlineView.queryStmt_ instanceof SelectStmt) {
+        SelectStmt selectStmt = (SelectStmt)inlineView.queryStmt_;
+        return selectStmt.returnsSingleRow();
+      }
+    }
     // In all other cases, return false.
     return false;
   }

@@ -50,6 +50,7 @@ import org.apache.impala.thrift.TCatalogObjectType;
 import org.apache.impala.thrift.TDescribeOutputStyle;
 import org.apache.impala.thrift.TFunctionCategory;
 import org.apache.impala.thrift.THdfsFileFormat;
+import org.apache.impala.thrift.TOwnerType;
 import org.apache.impala.thrift.TPrivilegeLevel;
 import org.apache.impala.thrift.TShowStatsOp;
 import org.apache.impala.thrift.TTablePropertyType;
@@ -244,6 +245,15 @@ parser code {:
 
     return result.toString();
   }
+
+  /**
+   * This methods checks if a given ident matches the given keyword.
+   */
+  public void checkIdentKeyword(String keyword, String ident) throws Exception {
+    if (!keyword.equals(ident.toUpperCase())) {
+      parseError("identifier", SqlParserSymbols.IDENT, keyword);
+    }
+  }
 :};
 
 // List of keywords. Please keep them sorted alphabetically.
@@ -263,8 +273,8 @@ terminal
   KW_IN, KW_INCREMENTAL, KW_INIT_FN, KW_INNER, KW_INPATH, KW_INSERT, KW_INT,
   KW_INTERMEDIATE, KW_INTERVAL, KW_INTO, KW_INVALIDATE, KW_IREGEXP, KW_IS, KW_JOIN,
   KW_KUDU, KW_LAST, KW_LEFT, KW_LIKE, KW_LIMIT, KW_LINES, KW_LOAD, KW_LOCATION, KW_MAP,
-  KW_MERGE_FN, KW_METADATA, KW_NOT, KW_NULL, KW_NULLS, KW_OFFSET, KW_ON, KW_OR, KW_ORDER,
-  KW_OUTER, KW_OVER, KW_OVERWRITE, KW_PARQUET, KW_PARQUETFILE, KW_PARTITION,
+  KW_MERGE_FN, KW_METADATA, KW_NOT, KW_NULL, KW_NULLS, KW_OFFSET, KW_ON, KW_OR, KW_ORC,
+  KW_ORDER, KW_OUTER, KW_OVER, KW_OVERWRITE, KW_PARQUET, KW_PARQUETFILE, KW_PARTITION,
   KW_PARTITIONED, KW_PARTITIONS, KW_PRECEDING, KW_PREPARE_FN, KW_PRIMARY, KW_PRODUCED,
   KW_PURGE, KW_RANGE, KW_RCFILE, KW_RECOVER, KW_REFRESH, KW_REGEXP, KW_RENAME,
   KW_REPEATABLE, KW_REPLACE, KW_REPLICATION, KW_RESTRICT, KW_RETURNS, KW_REVOKE,
@@ -407,8 +417,12 @@ nonterminal PartitionKeyValue partition_key_value;
 nonterminal PartitionKeyValue static_partition_key_value;
 nonterminal Qualifier union_op;
 
+// For ALTER DATABASE.
+nonterminal AlterDbStmt alter_db_stmt;
+
 nonterminal PartitionDef partition_def;
 nonterminal List<PartitionDef> partition_def_list;
+nonterminal CommentOnStmt comment_on_stmt;
 nonterminal AlterTableStmt alter_tbl_stmt;
 nonterminal StatementBase alter_view_stmt;
 nonterminal ComputeStatsStmt compute_stats_stmt;
@@ -431,7 +445,7 @@ nonterminal StructField struct_field_def;
 nonterminal KuduPartitionParam hash_partition_param;
 nonterminal List<RangePartition> range_params_list;
 nonterminal RangePartition range_param;
-nonterminal Pair<Expr, Boolean> opt_lower_range_val,
+nonterminal Pair<List<Expr>, Boolean> opt_lower_range_val,
    opt_upper_range_val;
 nonterminal ArrayList<KuduPartitionParam> hash_partition_param_list;
 nonterminal ArrayList<KuduPartitionParam> partition_param_list;
@@ -443,7 +457,7 @@ nonterminal ArrayList<StructField> struct_field_def_list;
 // Options for DDL commands - CREATE/DROP/ALTER
 nonterminal HdfsCachingOp cache_op_val, opt_cache_op_val;
 nonterminal BigDecimal opt_cache_op_replication;
-nonterminal String comment_val, opt_comment_val;
+nonterminal String comment_val, opt_comment_val, nullable_comment_val;
 nonterminal Boolean external_val;
 nonterminal Boolean purge_val;
 nonterminal String opt_init_string_val;
@@ -594,6 +608,8 @@ stmt ::=
   {: RESULT = describe; :}
   | describe_table_stmt:describe
   {: RESULT = describe; :}
+  | alter_db_stmt:alter_db
+  {: RESULT = alter_db; :}
   | alter_tbl_stmt:alter_tbl
   {: RESULT = alter_tbl; :}
   | alter_view_stmt:alter_view
@@ -650,6 +666,8 @@ stmt ::=
   {: RESULT = grant_privilege; :}
   | revoke_privilege_stmt:revoke_privilege
   {: RESULT = revoke_privilege; :}
+  | comment_on_stmt:comment_on
+  {: RESULT = comment_on; :}
   | stmt:s SEMICOLON
   {: RESULT = s; :}
   ;
@@ -960,6 +978,14 @@ privilege ::=
   {: RESULT = TPrivilegeLevel.SELECT; :}
   | KW_INSERT
   {: RESULT = TPrivilegeLevel.INSERT; :}
+  | KW_REFRESH
+  {: RESULT = TPrivilegeLevel.REFRESH; :}
+  | KW_CREATE
+  {: RESULT = TPrivilegeLevel.CREATE; :}
+  | KW_ALTER
+  {: RESULT = TPrivilegeLevel.ALTER; :}
+  | KW_DROP
+  {: RESULT = TPrivilegeLevel.DROP; :}
   | KW_ALL
   {: RESULT = TPrivilegeLevel.ALL; :}
   ;
@@ -998,6 +1024,34 @@ partition_def_list ::=
   {:
     list.add(item);
     RESULT = list;
+  :}
+  ;
+
+comment_on_stmt ::=
+  KW_COMMENT KW_ON KW_DATABASE ident_or_default:db_name KW_IS nullable_comment_val:comment
+  {: RESULT = new CommentOnDbStmt(db_name, comment); :}
+  | KW_COMMENT KW_ON KW_TABLE table_name:table KW_IS nullable_comment_val:comment
+  {: RESULT = new CommentOnTableStmt(table, comment); :}
+  | KW_COMMENT KW_ON KW_VIEW table_name:table KW_IS nullable_comment_val:comment
+  {: RESULT = new CommentOnViewStmt(table, comment); :}
+  ;
+
+// Introducing OWNER and USER keywords has a potential to be a breaking change,
+// such that any names that use OWNER or USER will need to be escaped. By using IDENT
+// token we can make OWNER and USER to be keywords only in these statements.
+alter_db_stmt ::=
+  KW_ALTER KW_DATABASE ident_or_default:db KW_SET IDENT:owner_id IDENT:user_id
+  ident_or_default:user
+  {:
+    parser.checkIdentKeyword("OWNER", owner_id);
+    parser.checkIdentKeyword("USER", user_id);
+    RESULT = new AlterDbSetOwnerStmt(db, new Owner(TOwnerType.USER, user));
+  :}
+  | KW_ALTER KW_DATABASE ident_or_default:db KW_SET IDENT:owner_id KW_ROLE
+    ident_or_default:role
+  {:
+    parser.checkIdentKeyword("OWNER", owner_id);
+    RESULT = new AlterDbSetOwnerStmt(db, new Owner(TOwnerType.ROLE, role));
   :}
   ;
 
@@ -1385,18 +1439,26 @@ range_param ::=
 
 opt_lower_range_val ::=
   expr:l LESSTHAN
-  {: RESULT = new Pair<Expr, Boolean>(l, false); :}
+  {: RESULT = new Pair<List<Expr>, Boolean>(Lists.newArrayList(l), false); :}
   | expr:l LESSTHAN EQUAL
-  {: RESULT = new Pair<Expr, Boolean>(l, true); :}
+  {: RESULT = new Pair<List<Expr>, Boolean>(Lists.newArrayList(l), true); :}
+  | LPAREN expr_list:l RPAREN LESSTHAN
+  {: RESULT = new Pair<List<Expr>, Boolean>(l, false); :}
+  | LPAREN expr_list:l RPAREN LESSTHAN EQUAL
+  {: RESULT = new Pair<List<Expr>, Boolean>(l, true); :}
   | /* empty */
   {: RESULT = null; :}
   ;
 
 opt_upper_range_val ::=
   LESSTHAN expr:l
-  {: RESULT = new Pair<Expr, Boolean>(l, false); :}
+  {: RESULT = new Pair<List<Expr>, Boolean>(Lists.newArrayList(l), false); :}
   | LESSTHAN EQUAL expr:l
-  {: RESULT = new Pair<Expr, Boolean>(l, true); :}
+  {: RESULT = new Pair<List<Expr>, Boolean>(Lists.newArrayList(l), true); :}
+  | LESSTHAN LPAREN expr_list:l RPAREN
+  {: RESULT = new Pair<List<Expr>, Boolean>(l, false); :}
+  | LESSTHAN EQUAL LPAREN expr_list:l RPAREN
+  {: RESULT = new Pair<List<Expr>, Boolean>(l, true); :}
   | /* empty */
   {: RESULT = null; :}
   ;
@@ -1463,6 +1525,13 @@ opt_comment_val ::=
   KW_COMMENT STRING_LITERAL:comment
   {: RESULT = comment; :}
   | /* empty */
+  {: RESULT = null; :}
+  ;
+
+nullable_comment_val ::=
+  STRING_LITERAL:comment
+  {: RESULT = comment; :}
+  | KW_NULL
   {: RESULT = null; :}
   ;
 
@@ -1554,6 +1623,8 @@ file_format_val ::=
   {: RESULT = THdfsFileFormat.PARQUET; :}
   | KW_PARQUETFILE
   {: RESULT = THdfsFileFormat.PARQUET; :}
+  | KW_ORC
+  {: RESULT = THdfsFileFormat.ORC; :}
   | KW_TEXTFILE
   {: RESULT = THdfsFileFormat.TEXT; :}
   | KW_SEQUENCEFILE
@@ -3478,6 +3549,8 @@ word ::=
   | KW_ON:r
   {: RESULT = r.toString(); :}
   | KW_OR:r
+  {: RESULT = r.toString(); :}
+  | KW_ORC:r
   {: RESULT = r.toString(); :}
   | KW_ORDER:r
   {: RESULT = r.toString(); :}

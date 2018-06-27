@@ -30,8 +30,8 @@ import org.apache.impala.authorization.AuthorizeableTable;
 import org.apache.impala.authorization.Privilege;
 import org.apache.impala.authorization.PrivilegeRequest;
 import org.apache.impala.catalog.AuthorizationException;
-import org.apache.impala.catalog.Db;
-import org.apache.impala.catalog.ImpaladCatalog;
+import org.apache.impala.catalog.FeCatalog;
+import org.apache.impala.catalog.FeDb;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.ImpalaException;
@@ -62,7 +62,7 @@ public class AnalysisContext {
   private final EventSequence timeline_;
 
   // Set in analyzeAndAuthorize().
-  private ImpaladCatalog catalog_;
+  private FeCatalog catalog_;
   private AnalysisResult analysisResult_;
 
   // Use Hive's scheme for auto-generating column labels. Only used for testing.
@@ -75,7 +75,7 @@ public class AnalysisContext {
     timeline_ = timeline;
   }
 
-  public ImpaladCatalog getCatalog() { return catalog_; }
+  public FeCatalog getCatalog() { return catalog_; }
   public TQueryCtx getQueryCtx() { return queryCtx_; }
   public TQueryOptions getQueryOptions() {
     return queryCtx_.client_request.query_options;
@@ -149,6 +149,9 @@ public class AnalysisContext {
     public UpdateStmt getUpdateStmt() { return (UpdateStmt) stmt_; }
     public boolean isDeleteStmt() { return stmt_ instanceof DeleteStmt; }
     public DeleteStmt getDeleteStmt() { return (DeleteStmt) stmt_; }
+    public boolean isCommentOnStmt() { return stmt_ instanceof CommentOnStmt; }
+
+    public boolean isAlterDbStmt() { return stmt_ instanceof AlterDbStmt; }
 
     public boolean isCatalogOp() {
       return isUseStmt() || isViewMetadataStmt() || isDdlStmt();
@@ -161,7 +164,8 @@ public class AnalysisContext {
           isAlterViewStmt() || isComputeStatsStmt() || isCreateUdfStmt() ||
           isCreateUdaStmt() || isDropFunctionStmt() || isCreateTableAsSelectStmt() ||
           isCreateDataSrcStmt() || isDropDataSrcStmt() || isDropStatsStmt() ||
-          isCreateDropRoleStmt() || isGrantRevokeStmt() || isTruncateStmt();
+          isCreateDropRoleStmt() || isGrantRevokeStmt() || isTruncateStmt() ||
+          isCommentOnStmt() || isAlterDbStmt();
     }
 
     private boolean isViewMetadataStmt() {
@@ -349,6 +353,16 @@ public class AnalysisContext {
       return (ShowCreateFunctionStmt) stmt_;
     }
 
+    public CommentOnStmt getCommentOnStmt() {
+      Preconditions.checkState(isCommentOnStmt());
+      return (CommentOnStmt) stmt_;
+    }
+
+    public AlterDbStmt getAlterDbStmt() {
+      Preconditions.checkState(isAlterDbStmt());
+      return (AlterDbStmt) stmt_;
+    }
+
     public StatementBase getStmt() { return stmt_; }
     public Analyzer getAnalyzer() { return analyzer_; }
     public Set<TAccessEvent> getAccessEvents() { return analyzer_.getAccessEvents(); }
@@ -419,52 +433,47 @@ public class AnalysisContext {
   private void analyze(StmtTableCache stmtTableCache) throws AnalysisException {
     Preconditions.checkNotNull(analysisResult_);
     Preconditions.checkNotNull(analysisResult_.stmt_);
-    try {
+    analysisResult_.analyzer_ = createAnalyzer(stmtTableCache);
+    analysisResult_.stmt_.analyze(analysisResult_.analyzer_);
+    boolean isExplain = analysisResult_.isExplainStmt();
+
+    // Apply expr and subquery rewrites.
+    boolean reAnalyze = false;
+    ExprRewriter rewriter = analysisResult_.analyzer_.getExprRewriter();
+    if (analysisResult_.requiresExprRewrite()) {
+      rewriter.reset();
+      analysisResult_.stmt_.rewriteExprs(rewriter);
+      reAnalyze = rewriter.changed();
+    }
+    if (analysisResult_.requiresSubqueryRewrite()) {
+      new StmtRewriter.SubqueryRewriter().rewrite(analysisResult_);
+      reAnalyze = true;
+    }
+    if (reAnalyze) {
+      // The rewrites should have no user-visible effect. Remember the original result
+      // types and column labels to restore them after the rewritten stmt has been
+      // reset() and re-analyzed. For a CTAS statement, the types represent column types
+      // of the table that will be created, including the partition columns, if any.
+      List<Type> origResultTypes = Lists.newArrayList();
+      for (Expr e: analysisResult_.stmt_.getResultExprs()) {
+        origResultTypes.add(e.getType());
+      }
+      List<String> origColLabels =
+          Lists.newArrayList(analysisResult_.stmt_.getColLabels());
+
+      // Re-analyze the stmt with a new analyzer.
       analysisResult_.analyzer_ = createAnalyzer(stmtTableCache);
+      analysisResult_.stmt_.reset();
       analysisResult_.stmt_.analyze(analysisResult_.analyzer_);
-      boolean isExplain = analysisResult_.isExplainStmt();
 
-      // Apply expr and subquery rewrites.
-      boolean reAnalyze = false;
-      ExprRewriter rewriter = analysisResult_.analyzer_.getExprRewriter();
-      if (analysisResult_.requiresExprRewrite()) {
-        rewriter.reset();
-        analysisResult_.stmt_.rewriteExprs(rewriter);
-        reAnalyze = rewriter.changed();
+      // Restore the original result types and column labels.
+      analysisResult_.stmt_.castResultExprs(origResultTypes);
+      analysisResult_.stmt_.setColLabels(origColLabels);
+      if (LOG.isTraceEnabled()) {
+        LOG.trace("rewrittenStmt: " + analysisResult_.stmt_.toSql());
       }
-      if (analysisResult_.requiresSubqueryRewrite()) {
-        StmtRewriter.rewrite(analysisResult_);
-        reAnalyze = true;
-      }
-      if (reAnalyze) {
-        // The rewrites should have no user-visible effect. Remember the original result
-        // types and column labels to restore them after the rewritten stmt has been
-        // reset() and re-analyzed. For a CTAS statement, the types represent column types
-        // of the table that will be created, including the partition columns, if any.
-        List<Type> origResultTypes = Lists.newArrayList();
-        for (Expr e: analysisResult_.stmt_.getResultExprs()) {
-          origResultTypes.add(e.getType());
-        }
-        List<String> origColLabels =
-            Lists.newArrayList(analysisResult_.stmt_.getColLabels());
-
-        // Re-analyze the stmt with a new analyzer.
-        analysisResult_.analyzer_ = createAnalyzer(stmtTableCache);
-        analysisResult_.stmt_.reset();
-        analysisResult_.stmt_.analyze(analysisResult_.analyzer_);
-
-        // Restore the original result types and column labels.
-        analysisResult_.stmt_.castResultExprs(origResultTypes);
-        analysisResult_.stmt_.setColLabels(origColLabels);
-        if (LOG.isTraceEnabled()) {
-          LOG.trace("rewrittenStmt: " + analysisResult_.stmt_.toSql());
-        }
-        if (isExplain) analysisResult_.stmt_.setIsExplain();
-        Preconditions.checkState(!analysisResult_.requiresSubqueryRewrite());
-      }
-    } catch (AnalysisException e) {
-      // Don't wrap AnalysisExceptions in another AnalysisException
-      throw e;
+      if (isExplain) analysisResult_.stmt_.setIsExplain();
+      Preconditions.checkState(!analysisResult_.requiresSubqueryRewrite());
     }
   }
 
@@ -619,7 +628,7 @@ public class AnalysisContext {
    */
   private boolean checkSystemDbAccess(String dbName, Privilege privilege)
       throws AuthorizationException {
-    Db db = catalog_.getDb(dbName);
+    FeDb db = catalog_.getDb(dbName);
     if (db != null && db.isSystemDb()) {
       switch (privilege) {
         case VIEW_METADATA:

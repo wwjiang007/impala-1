@@ -35,8 +35,10 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.impala.analysis.AlterDbStmt;
 import org.apache.impala.analysis.AnalysisContext;
 import org.apache.impala.analysis.AnalysisContext.AnalysisResult;
+import org.apache.impala.analysis.CommentOnStmt;
 import org.apache.impala.analysis.CreateDataSrcStmt;
 import org.apache.impala.analysis.CreateDropRoleStmt;
 import org.apache.impala.analysis.CreateUdaStmt;
@@ -66,22 +68,24 @@ import org.apache.impala.authorization.AuthorizationChecker;
 import org.apache.impala.authorization.AuthorizationConfig;
 import org.apache.impala.authorization.AuthorizeableTable;
 import org.apache.impala.authorization.ImpalaInternalAdminUser;
+import org.apache.impala.authorization.Privilege;
 import org.apache.impala.authorization.PrivilegeRequest;
 import org.apache.impala.authorization.PrivilegeRequestBuilder;
 import org.apache.impala.authorization.User;
 import org.apache.impala.catalog.Catalog;
 import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.Column;
-import org.apache.impala.catalog.DataSource;
-import org.apache.impala.catalog.DataSourceTable;
 import org.apache.impala.catalog.DatabaseNotFoundException;
-import org.apache.impala.catalog.Db;
+import org.apache.impala.catalog.FeCatalog;
+import org.apache.impala.catalog.FeDataSource;
+import org.apache.impala.catalog.FeDataSourceTable;
+import org.apache.impala.catalog.FeDb;
+import org.apache.impala.catalog.FeFsTable;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.HBaseTable;
-import org.apache.impala.catalog.HdfsTable;
 import org.apache.impala.catalog.ImpaladCatalog;
 import org.apache.impala.catalog.KuduTable;
-import org.apache.impala.catalog.Table;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FileSystemUtil;
@@ -93,13 +97,16 @@ import org.apache.impala.planner.HdfsScanNode;
 import org.apache.impala.planner.PlanFragment;
 import org.apache.impala.planner.Planner;
 import org.apache.impala.planner.ScanNode;
+import org.apache.impala.thrift.TAlterDbParams;
 import org.apache.impala.thrift.TCatalogOpRequest;
 import org.apache.impala.thrift.TCatalogOpType;
 import org.apache.impala.thrift.TCatalogServiceRequestHeader;
 import org.apache.impala.thrift.TColumn;
 import org.apache.impala.thrift.TColumnValue;
+import org.apache.impala.thrift.TCommentOnParams;
 import org.apache.impala.thrift.TCreateDropRoleParams;
 import org.apache.impala.thrift.TDdlExecRequest;
+import org.apache.impala.thrift.TDdlExecResponse;
 import org.apache.impala.thrift.TDdlType;
 import org.apache.impala.thrift.TDescribeOutputStyle;
 import org.apache.impala.thrift.TDescribeResult;
@@ -138,6 +145,7 @@ import org.apache.thrift.TException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Predicates;
 import com.google.common.collect.Lists;
@@ -155,39 +163,53 @@ public class Frontend {
   // Max time to wait for a catalog update notification.
   public static final long MAX_CATALOG_UPDATE_WAIT_TIME_MS = 2 * 1000;
 
-  //TODO: Make the reload interval configurable.
+  // TODO: Make the reload interval configurable.
   private static final int AUTHORIZATION_POLICY_RELOAD_INTERVAL_SECS = 5 * 60;
 
-  private final AtomicReference<ImpaladCatalog> impaladCatalog_ =
-      new AtomicReference<ImpaladCatalog>();
+  private final FeCatalogManager catalogManager_;
   private final AuthorizationConfig authzConfig_;
-  private final AtomicReference<AuthorizationChecker> authzChecker_;
+  /**
+   * Authorization checker. Initialized and periodically loaded by a task
+   * running on the {@link #policyReader_} thread.
+   */
+  private final AtomicReference<AuthorizationChecker> authzChecker_ =
+      new AtomicReference<>();
   private final ScheduledExecutorService policyReader_ =
       Executors.newScheduledThreadPool(1);
-  private final String defaultKuduMasterHosts_;
 
-  public Frontend(AuthorizationConfig authorizationConfig,
-      String defaultKuduMasterHosts) {
-    this(authorizationConfig, new ImpaladCatalog(defaultKuduMasterHosts));
+  public Frontend(AuthorizationConfig authorizationConfig) {
+    this(authorizationConfig, FeCatalogManager.createFromBackendConfig());
   }
 
   /**
-   * C'tor used by tests to pass in a custom ImpaladCatalog.
+   * Create a frontend with a specific catalog instance which will not allow
+   * updates and will be used for all requests.
    */
-  public Frontend(AuthorizationConfig authorizationConfig, ImpaladCatalog catalog) {
+  @VisibleForTesting
+  public Frontend(AuthorizationConfig authorizationConfig,
+      FeCatalog testCatalog) {
+    this(authorizationConfig, FeCatalogManager.createForTests(testCatalog));
+  }
+
+  private Frontend(AuthorizationConfig authorizationConfig,
+      FeCatalogManager catalogManager) {
     authzConfig_ = authorizationConfig;
-    impaladCatalog_.set(catalog);
-    defaultKuduMasterHosts_ = catalog.getDefaultKuduMasterHosts();
-    authzChecker_ = new AtomicReference<AuthorizationChecker>(
-        new AuthorizationChecker(authzConfig_, impaladCatalog_.get().getAuthPolicy()));
+    catalogManager_ = catalogManager;
+
+    // Load the authorization policy once at startup, initializing
+    // authzChecker_. This ensures that, if the policy fails to load,
+    // we will throw an exception and fail to start.
+    AuthorizationPolicyReader policyReaderTask =
+        new AuthorizationPolicyReader(authzConfig_);
+    policyReaderTask.run();
+
     // If authorization is enabled, reload the policy on a regular basis.
     if (authzConfig_.isEnabled() && authzConfig_.isFileBasedPolicy()) {
       // Stagger the reads across nodes
       Random randomGen = new Random(UUID.randomUUID().hashCode());
       int delay = AUTHORIZATION_POLICY_RELOAD_INTERVAL_SECS + randomGen.nextInt(60);
 
-      policyReader_.scheduleAtFixedRate(
-          new AuthorizationPolicyReader(authzConfig_),
+      policyReader_.scheduleAtFixedRate(policyReaderTask,
           delay, AUTHORIZATION_POLICY_RELOAD_INTERVAL_SECS, TimeUnit.SECONDS);
     }
   }
@@ -214,26 +236,16 @@ public class Frontend {
     }
   }
 
-  public ImpaladCatalog getCatalog() { return impaladCatalog_.get(); }
+  public FeCatalog getCatalog() { return catalogManager_.getOrCreateCatalog(); }
+
   public AuthorizationChecker getAuthzChecker() { return authzChecker_.get(); }
 
   public TUpdateCatalogCacheResponse updateCatalogCache(
       TUpdateCatalogCacheRequest req) throws CatalogException, TException {
-    if (req.is_delta) return impaladCatalog_.get().updateCatalog(req);
-
-    // If this is not a delta, this update should replace the current
-    // Catalog contents so create a new catalog and populate it.
-    ImpaladCatalog catalog = new ImpaladCatalog(defaultKuduMasterHosts_);
-
-    TUpdateCatalogCacheResponse response = catalog.updateCatalog(req);
-
-    // Now that the catalog has been updated, replace the references to
-    // impaladCatalog_/authzChecker_. This ensures that clients don't see the catalog
-    // disappear. The catalog is guaranteed to be ready since updateCatalog() has a
-    // postcondition of isReady() == true.
-    impaladCatalog_.set(catalog);
-    authzChecker_.set(new AuthorizationChecker(authzConfig_, catalog.getAuthPolicy()));
-    return response;
+    TUpdateCatalogCacheResponse resp = catalogManager_.updateCatalogCache(req);
+    authzChecker_.set(new AuthorizationChecker(
+        authzConfig_, getCatalog().getAuthPolicy()));
+    return resp;
   }
 
   /**
@@ -333,21 +345,18 @@ public class Frontend {
       req.setDdl_type(TDdlType.ALTER_TABLE);
       req.setAlter_table_params(analysis.getAlterTableStmt().toThrift());
       ddl.setDdl_params(req);
-      metadata.setColumns(Collections.<TColumn>emptyList());
     } else if (analysis.isAlterViewStmt()) {
       ddl.op_type = TCatalogOpType.DDL;
       TDdlExecRequest req = new TDdlExecRequest();
       req.setDdl_type(TDdlType.ALTER_VIEW);
       req.setAlter_view_params(analysis.getAlterViewStmt().toThrift());
       ddl.setDdl_params(req);
-      metadata.setColumns(Collections.<TColumn>emptyList());
     } else if (analysis.isCreateTableStmt()) {
       ddl.op_type = TCatalogOpType.DDL;
       TDdlExecRequest req = new TDdlExecRequest();
       req.setDdl_type(TDdlType.CREATE_TABLE);
       req.setCreate_table_params(analysis.getCreateTableStmt().toThrift());
       ddl.setDdl_params(req);
-      metadata.setColumns(Collections.<TColumn>emptyList());
     } else if (analysis.isCreateTableAsSelectStmt()) {
       ddl.op_type = TCatalogOpType.DDL;
       TDdlExecRequest req = new TDdlExecRequest();
@@ -355,29 +364,24 @@ public class Frontend {
       req.setCreate_table_params(
           analysis.getCreateTableAsSelectStmt().getCreateStmt().toThrift());
       ddl.setDdl_params(req);
-      metadata.setColumns(Arrays.asList(
-          new TColumn("summary", Type.STRING.toThrift())));
     } else if (analysis.isCreateTableLikeStmt()) {
       ddl.op_type = TCatalogOpType.DDL;
       TDdlExecRequest req = new TDdlExecRequest();
       req.setDdl_type(TDdlType.CREATE_TABLE_LIKE);
       req.setCreate_table_like_params(analysis.getCreateTableLikeStmt().toThrift());
       ddl.setDdl_params(req);
-      metadata.setColumns(Collections.<TColumn>emptyList());
     } else if (analysis.isCreateViewStmt()) {
       ddl.op_type = TCatalogOpType.DDL;
       TDdlExecRequest req = new TDdlExecRequest();
       req.setDdl_type(TDdlType.CREATE_VIEW);
       req.setCreate_view_params(analysis.getCreateViewStmt().toThrift());
       ddl.setDdl_params(req);
-      metadata.setColumns(Collections.<TColumn>emptyList());
     } else if (analysis.isCreateDbStmt()) {
       ddl.op_type = TCatalogOpType.DDL;
       TDdlExecRequest req = new TDdlExecRequest();
       req.setDdl_type(TDdlType.CREATE_DATABASE);
       req.setCreate_db_params(analysis.getCreateDbStmt().toThrift());
       ddl.setDdl_params(req);
-      metadata.setColumns(Collections.<TColumn>emptyList());
     } else if (analysis.isCreateUdfStmt()) {
       ddl.op_type = TCatalogOpType.DDL;
       CreateUdfStmt stmt = (CreateUdfStmt) analysis.getStmt();
@@ -385,7 +389,6 @@ public class Frontend {
       req.setDdl_type(TDdlType.CREATE_FUNCTION);
       req.setCreate_fn_params(stmt.toThrift());
       ddl.setDdl_params(req);
-      metadata.setColumns(Collections.<TColumn>emptyList());
     } else if (analysis.isCreateUdaStmt()) {
       ddl.op_type = TCatalogOpType.DDL;
       TDdlExecRequest req = new TDdlExecRequest();
@@ -393,7 +396,6 @@ public class Frontend {
       CreateUdaStmt stmt = (CreateUdaStmt)analysis.getStmt();
       req.setCreate_fn_params(stmt.toThrift());
       ddl.setDdl_params(req);
-      metadata.setColumns(Collections.<TColumn>emptyList());
     } else if (analysis.isCreateDataSrcStmt()) {
       ddl.op_type = TCatalogOpType.DDL;
       TDdlExecRequest req = new TDdlExecRequest();
@@ -401,21 +403,18 @@ public class Frontend {
       CreateDataSrcStmt stmt = (CreateDataSrcStmt)analysis.getStmt();
       req.setCreate_data_source_params(stmt.toThrift());
       ddl.setDdl_params(req);
-      metadata.setColumns(Collections.<TColumn>emptyList());
     } else if (analysis.isComputeStatsStmt()) {
       ddl.op_type = TCatalogOpType.DDL;
       TDdlExecRequest req = new TDdlExecRequest();
       req.setDdl_type(TDdlType.COMPUTE_STATS);
       req.setCompute_stats_params(analysis.getComputeStatsStmt().toThrift());
       ddl.setDdl_params(req);
-      metadata.setColumns(Collections.<TColumn>emptyList());
     } else if (analysis.isDropDbStmt()) {
       ddl.op_type = TCatalogOpType.DDL;
       TDdlExecRequest req = new TDdlExecRequest();
       req.setDdl_type(TDdlType.DROP_DATABASE);
       req.setDrop_db_params(analysis.getDropDbStmt().toThrift());
       ddl.setDdl_params(req);
-      metadata.setColumns(Collections.<TColumn>emptyList());
     } else if (analysis.isDropTableOrViewStmt()) {
       ddl.op_type = TCatalogOpType.DDL;
       TDdlExecRequest req = new TDdlExecRequest();
@@ -423,7 +422,6 @@ public class Frontend {
       req.setDdl_type(stmt.isDropTable() ? TDdlType.DROP_TABLE : TDdlType.DROP_VIEW);
       req.setDrop_table_or_view_params(stmt.toThrift());
       ddl.setDdl_params(req);
-      metadata.setColumns(Collections.<TColumn>emptyList());
     } else if (analysis.isTruncateStmt()) {
       ddl.op_type = TCatalogOpType.DDL;
       TDdlExecRequest req = new TDdlExecRequest();
@@ -431,7 +429,6 @@ public class Frontend {
       req.setDdl_type(TDdlType.TRUNCATE_TABLE);
       req.setTruncate_params(stmt.toThrift());
       ddl.setDdl_params(req);
-      metadata.setColumns(Collections.<TColumn>emptyList());
     } else if (analysis.isDropFunctionStmt()) {
       ddl.op_type = TCatalogOpType.DDL;
       TDdlExecRequest req = new TDdlExecRequest();
@@ -439,7 +436,6 @@ public class Frontend {
       DropFunctionStmt stmt = (DropFunctionStmt)analysis.getStmt();
       req.setDrop_fn_params(stmt.toThrift());
       ddl.setDdl_params(req);
-      metadata.setColumns(Collections.<TColumn>emptyList());
     } else if (analysis.isDropDataSrcStmt()) {
       ddl.op_type = TCatalogOpType.DDL;
       TDdlExecRequest req = new TDdlExecRequest();
@@ -447,7 +443,6 @@ public class Frontend {
       DropDataSrcStmt stmt = (DropDataSrcStmt)analysis.getStmt();
       req.setDrop_data_source_params(stmt.toThrift());
       ddl.setDdl_params(req);
-      metadata.setColumns(Collections.<TColumn>emptyList());
     } else if (analysis.isDropStatsStmt()) {
       ddl.op_type = TCatalogOpType.DDL;
       TDdlExecRequest req = new TDdlExecRequest();
@@ -455,7 +450,6 @@ public class Frontend {
       DropStatsStmt stmt = (DropStatsStmt) analysis.getStmt();
       req.setDrop_stats_params(stmt.toThrift());
       ddl.setDdl_params(req);
-      metadata.setColumns(Collections.<TColumn>emptyList());
     } else if (analysis.isResetMetadataStmt()) {
       ddl.op_type = TCatalogOpType.RESET_METADATA;
       ResetMetadataStmt resetMetadataStmt = (ResetMetadataStmt) analysis.getStmt();
@@ -498,7 +492,6 @@ public class Frontend {
       req.setCreate_drop_role_params(params);
       ddl.op_type = TCatalogOpType.DDL;
       ddl.setDdl_params(req);
-      metadata.setColumns(Collections.<TColumn>emptyList());
     } else if (analysis.isGrantRevokeRoleStmt()) {
       GrantRevokeRoleStmt grantRoleStmt = (GrantRevokeRoleStmt) analysis.getStmt();
       TGrantRevokeRoleParams params = grantRoleStmt.toThrift();
@@ -507,7 +500,6 @@ public class Frontend {
       req.setGrant_revoke_role_params(params);
       ddl.op_type = TCatalogOpType.DDL;
       ddl.setDdl_params(req);
-      metadata.setColumns(Collections.<TColumn>emptyList());
     } else if (analysis.isGrantRevokePrivStmt()) {
       GrantRevokePrivStmt grantRevokePrivStmt = (GrantRevokePrivStmt) analysis.getStmt();
       TGrantRevokePrivParams params = grantRevokePrivStmt.toThrift();
@@ -517,9 +509,28 @@ public class Frontend {
       req.setGrant_revoke_priv_params(params);
       ddl.op_type = TCatalogOpType.DDL;
       ddl.setDdl_params(req);
-      metadata.setColumns(Collections.<TColumn>emptyList());
+    } else if (analysis.isCommentOnStmt()) {
+      CommentOnStmt commentOnStmt = analysis.getCommentOnStmt();
+      TCommentOnParams params = commentOnStmt.toThrift();
+      TDdlExecRequest req = new TDdlExecRequest();
+      req.setDdl_type(TDdlType.COMMENT_ON);
+      req.setComment_on_params(params);
+      ddl.op_type = TCatalogOpType.DDL;
+      ddl.setDdl_params(req);
+    } else if (analysis.isAlterDbStmt()) {
+      AlterDbStmt alterDbStmt = analysis.getAlterDbStmt();
+      TAlterDbParams params = alterDbStmt.toThrift();
+      TDdlExecRequest req = new TDdlExecRequest();
+      req.setDdl_type(TDdlType.ALTER_DATABASE);
+      req.setAlter_db_params(params);
+      ddl.op_type = TCatalogOpType.DDL;
+      ddl.setDdl_params(req);
     } else {
       throw new IllegalStateException("Unexpected CatalogOp statement type.");
+    }
+    // All DDL commands return a string summarizing the outcome of the DDL.
+    if (ddl.op_type == TCatalogOpType.DDL) {
+      metadata.setColumns(Arrays.asList(new TColumn("summary", Type.STRING.toThrift())));
     }
     result.setResult_set_metadata(metadata);
     ddl.setSync_ddl(result.getQuery_options().isSync_ddl());
@@ -548,7 +559,7 @@ public class Frontend {
     // Get the destination for the load. If the load is targeting a partition,
     // this the partition location. Otherwise this is the table location.
     String destPathString = null;
-    ImpaladCatalog catalog = impaladCatalog_.get();
+    FeCatalog catalog = getCatalog();
     if (request.isSetPartition_spec()) {
       destPathString = catalog.getHdfsPartition(tableName.getDb(),
           tableName.getTbl(), request.getPartition_spec()).getLocation();
@@ -609,7 +620,7 @@ public class Frontend {
    */
   public List<String> getTableNames(String dbName, PatternMatcher matcher,
       User user) throws ImpalaException {
-    List<String> tblNames = impaladCatalog_.get().getTableNames(dbName, matcher);
+    List<String> tblNames = getCatalog().getTableNames(dbName, matcher);
     if (authzConfig_.isEnabled()) {
       Iterator<String> iter = tblNames.iterator();
       while (iter.hasNext()) {
@@ -628,7 +639,7 @@ public class Frontend {
    * Returns a list of columns of a table using 'matcher' and are accessible
    * to the given user.
    */
-  public List<Column> getColumns(Table table, PatternMatcher matcher,
+  public List<Column> getColumns(FeTable table, PatternMatcher matcher,
       User user) throws InternalException {
     Preconditions.checkNotNull(table);
     Preconditions.checkNotNull(matcher);
@@ -651,15 +662,15 @@ public class Frontend {
    * Returns all databases in catalog cache that match the pattern of 'matcher' and are
    * accessible to 'user'.
    */
-  public List<Db> getDbs(PatternMatcher matcher, User user)
+  public List<? extends FeDb> getDbs(PatternMatcher matcher, User user)
       throws InternalException {
-    List<Db> dbs = impaladCatalog_.get().getDbs(matcher);
+    List<? extends FeDb> dbs = getCatalog().getDbs(matcher);
     // If authorization is enabled, filter out the databases the user does not
     // have permissions on.
     if (authzConfig_.isEnabled()) {
-      Iterator<Db> iter = dbs.iterator();
+      Iterator<? extends FeDb> iter = dbs.iterator();
       while (iter.hasNext()) {
-        Db db = iter.next();
+        FeDb db = iter.next();
         if (!isAccessibleToUser(db, user)) iter.remove();
       }
     }
@@ -669,7 +680,7 @@ public class Frontend {
   /**
    * Check whether database is accessible to given user.
    */
-  private boolean isAccessibleToUser(Db db, User user)
+  private boolean isAccessibleToUser(FeDb db, User user)
       throws InternalException {
     if (db.getName().toLowerCase().equals(Catalog.DEFAULT_DB.toLowerCase())) {
       // Default DB should always be shown.
@@ -684,8 +695,8 @@ public class Frontend {
    * Returns all data sources that match the pattern. If pattern is null,
    * matches all data sources.
    */
-  public List<DataSource> getDataSrcs(String pattern) {
-    return impaladCatalog_.get().getDataSources(
+  public List<? extends FeDataSource> getDataSrcs(String pattern) {
+    return getCatalog().getDataSources(
         PatternMatcher.createHivePatternMatcher(pattern));
   }
 
@@ -694,7 +705,7 @@ public class Frontend {
    */
   public TResultSet getColumnStats(String dbName, String tableName)
       throws ImpalaException {
-    Table table = impaladCatalog_.get().getTable(dbName, tableName);
+    FeTable table = getCatalog().getTable(dbName, tableName);
     TResultSet result = new TResultSet();
     TResultSetMetadata resultSchema = new TResultSetMetadata();
     result.setSchema(resultSchema);
@@ -722,13 +733,13 @@ public class Frontend {
    */
   public TResultSet getTableStats(String dbName, String tableName, TShowStatsOp op)
       throws ImpalaException {
-    Table table = impaladCatalog_.get().getTable(dbName, tableName);
-    if (table instanceof HdfsTable) {
-      return ((HdfsTable) table).getTableStats();
+    FeTable table = getCatalog().getTable(dbName, tableName);
+    if (table instanceof FeFsTable) {
+      return ((FeFsTable) table).getTableStats();
     } else if (table instanceof HBaseTable) {
       return ((HBaseTable) table).getTableStats();
-    } else if (table instanceof DataSourceTable) {
-      return ((DataSourceTable) table).getTableStats();
+    } else if (table instanceof FeDataSourceTable) {
+      return ((FeDataSourceTable) table).getTableStats();
     } else if (table instanceof KuduTable) {
       if (op == TShowStatsOp.RANGE_PARTITIONS) {
         return ((KuduTable) table).getRangePartitions();
@@ -748,7 +759,7 @@ public class Frontend {
   public List<Function> getFunctions(TFunctionCategory category,
       String dbName, String fnPattern, boolean exactMatch)
       throws DatabaseNotFoundException {
-    Db db = impaladCatalog_.get().getDb(dbName);
+    FeDb db = getCatalog().getDb(dbName);
     if (db == null) {
       throw new DatabaseNotFoundException("Database '" + dbName + "' not found");
     }
@@ -776,7 +787,7 @@ public class Frontend {
    */
   public TDescribeResult describeDb(String dbName, TDescribeOutputStyle outputStyle)
       throws ImpalaException {
-    Db db = impaladCatalog_.get().getDb(dbName);
+    FeDb db = getCatalog().getDb(dbName);
     return DescribeResultFactory.buildDescribeDbResult(db, outputStyle);
   }
 
@@ -786,14 +797,65 @@ public class Frontend {
    * the table metadata.
    */
   public TDescribeResult describeTable(TTableName tableName,
-      TDescribeOutputStyle outputStyle) throws ImpalaException {
-    Table table = impaladCatalog_.get().getTable(tableName.db_name, tableName.table_name);
+      TDescribeOutputStyle outputStyle, User user) throws ImpalaException {
+    FeTable table = getCatalog().getTable(tableName.db_name, tableName.table_name);
+    List<Column> filteredColumns;
+    if (authzConfig_.isEnabled()) {
+      // First run a table check
+      PrivilegeRequest privilegeRequest = new PrivilegeRequestBuilder()
+          .allOf(Privilege.SELECT).onTable(table.getDb().getName(), table.getName())
+          .toRequest();
+      if (!authzChecker_.get().hasAccess(user, privilegeRequest)) {
+        // Filter out columns that the user is not authorized to see.
+        filteredColumns = new ArrayList<Column>();
+        for (Column col: table.getColumnsInHiveOrder()) {
+          String colName = col.getName();
+          privilegeRequest = new PrivilegeRequestBuilder()
+              .allOf(Privilege.SELECT)
+              .onColumn(table.getDb().getName(), table.getName(), colName)
+              .toRequest();
+          if (authzChecker_.get().hasAccess(user, privilegeRequest)) {
+            filteredColumns.add(col);
+          }
+        }
+      } else {
+        // User has table-level access
+        filteredColumns = table.getColumnsInHiveOrder();
+      }
+    } else {
+      // Authorization is disabled
+      filteredColumns = table.getColumnsInHiveOrder();
+    }
     if (outputStyle == TDescribeOutputStyle.MINIMAL) {
-      return DescribeResultFactory.buildDescribeMinimalResult(table);
+      if (!(table instanceof KuduTable)) {
+        return DescribeResultFactory.buildDescribeMinimalResult(
+            Column.columnsToStruct(filteredColumns));
+      }
+      return DescribeResultFactory.buildKuduDescribeMinimalResult(filteredColumns);
     } else {
       Preconditions.checkArgument(outputStyle == TDescribeOutputStyle.FORMATTED ||
           outputStyle == TDescribeOutputStyle.EXTENDED);
-      return DescribeResultFactory.buildDescribeFormattedResult(table);
+      TDescribeResult result = DescribeResultFactory.buildDescribeFormattedResult(table,
+          filteredColumns);
+      // Filter out LOCATION text
+      if (authzConfig_.isEnabled()) {
+        PrivilegeRequest privilegeRequest = new PrivilegeRequestBuilder()
+            .allOf(Privilege.VIEW_METADATA)
+            .onTable(table.getDb().getName(),table.getName())
+            .toRequest();
+        // Only filter if the user doesn't have table access.
+        if (!authzChecker_.get().hasAccess(user, privilegeRequest)) {
+          List<TResultRow> results = new ArrayList<TResultRow>();
+          for(TResultRow row: result.getResults()) {
+            String stringVal = row.getColVals().get(0).getString_val();
+            if (!stringVal.contains("Location")) {
+              results.add(row);
+            }
+          }
+          result.setResults(results);
+        }
+      }
+      return result;
     }
   }
 
@@ -842,7 +904,7 @@ public class Frontend {
     Set<TTableName> tablesWithMissingDiskIds = Sets.newTreeSet();
     for (ScanNode scanNode: scanNodes) {
       result.putToPer_node_scan_ranges(
-          scanNode.getId().asInt(), scanNode.getScanRangeLocations());
+          scanNode.getId().asInt(), scanNode.getScanRangeSpecs());
 
       TTableName tableName = scanNode.getTupleDesc().getTableName().toThrift();
       if (scanNode.isTableMissingStats()) tablesMissingStats.add(tableName);
@@ -979,11 +1041,11 @@ public class Frontend {
       if (thriftLineageGraph != null && thriftLineageGraph.isSetQuery_text()) {
         result.catalog_op_request.setLineage_graph(thriftLineageGraph);
       }
-      // Set MT_DOP=4 for COMPUTE STATS on Parquet tables, unless the user has already
+      // Set MT_DOP=4 for COMPUTE STATS on Parquet/ORC tables, unless the user has already
       // provided another value for MT_DOP.
       if (!queryOptions.isSetMt_dop() &&
           analysisResult.isComputeStatsStmt() &&
-          analysisResult.getComputeStatsStmt().isParquetOnly()) {
+          analysisResult.getComputeStatsStmt().isColumnar()) {
         queryOptions.setMt_dop(4);
       }
       // If unset, set MT_DOP to 0 to simplify the rest of the code.
@@ -1025,6 +1087,11 @@ public class Frontend {
       queryExecRequest.setLineage_graph(thriftLineageGraph);
     }
 
+    // Override the per_host_mem_estimate sent to the backend if needed. The explain
+    // string is already generated at this point so this does not change the estimate
+    // shown in the plan.
+    checkAndOverrideMemEstimate(queryExecRequest, queryOptions);
+
     if (analysisResult.isExplainStmt()) {
       // Return the EXPLAIN request
       createExplainRequest(explainString.toString(), result);
@@ -1057,14 +1124,14 @@ public class Frontend {
 
       // create finalization params of insert stmt
       InsertStmt insertStmt = analysisResult.getInsertStmt();
-      if (insertStmt.getTargetTable() instanceof HdfsTable) {
+      if (insertStmt.getTargetTable() instanceof FeFsTable) {
         TFinalizeParams finalizeParams = new TFinalizeParams();
         finalizeParams.setIs_overwrite(insertStmt.isOverwrite());
         finalizeParams.setTable_name(insertStmt.getTargetTableName().getTbl());
         finalizeParams.setTable_id(DescriptorTable.TABLE_SINK_ID);
         String db = insertStmt.getTargetTableName().getDb();
         finalizeParams.setTable_db(db == null ? queryCtx.session.database : db);
-        HdfsTable hdfsTable = (HdfsTable) insertStmt.getTargetTable();
+        FeFsTable hdfsTable = (FeFsTable) insertStmt.getTargetTable();
         finalizeParams.setHdfs_base_dir(hdfsTable.getHdfsBaseDir());
         finalizeParams.setStaging_dir(
             hdfsTable.getHdfsBaseDir() + "/_impala_insert_staging");
@@ -1079,6 +1146,21 @@ public class Frontend {
     timeline.markEvent("Planning finished");
     result.setTimeline(timeline.toThrift());
     return result;
+  }
+
+  /**
+   * The MAX_MEM_ESTIMATE_FOR_ADMISSION query option can override the planner memory
+   * estimate if set. Sets queryOptions.per_host_mem_estimate if the override is
+   * effective.
+   */
+  private void checkAndOverrideMemEstimate(TQueryExecRequest queryExecRequest,
+      TQueryOptions queryOptions) {
+    if (queryOptions.isSetMax_mem_estimate_for_admission()
+        && queryOptions.getMax_mem_estimate_for_admission() > 0) {
+      long effectiveMemEstimate = Math.min(queryExecRequest.getPer_host_mem_estimate(),
+              queryOptions.getMax_mem_estimate_for_admission());
+      queryExecRequest.setPer_host_mem_estimate(effectiveMemEstimate);
+    }
   }
 
   /**
@@ -1130,10 +1212,10 @@ public class Frontend {
    */
   public TResultSet getTableFiles(TShowFilesParams request)
       throws ImpalaException{
-    Table table = impaladCatalog_.get().getTable(request.getTable_name().getDb_name(),
+    FeTable table = getCatalog().getTable(request.getTable_name().getDb_name(),
         request.getTable_name().getTable_name());
-    if (table instanceof HdfsTable) {
-      return ((HdfsTable) table).getFiles(request.getPartition_set());
+    if (table instanceof FeFsTable) {
+      return ((FeFsTable) table).getFiles(request.getPartition_set());
     } else {
       throw new InternalException("SHOW FILES only supports Hdfs table. " +
           "Unsupported table class: " + table.getClass());

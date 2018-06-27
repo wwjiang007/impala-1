@@ -35,6 +35,7 @@
 #include "runtime/mem-tracker.h"
 #include "util/coding-util.h"
 
+#include <limits>
 #include <vector>
 #include <sstream>
 #include <gutil/strings/substitute.h>
@@ -60,7 +61,7 @@ HdfsTableSink::HdfsTableSink(const RowDescriptor* row_desc, const TDataSink& tsi
     RuntimeState* state)
   : DataSink(row_desc, "HdfsTableSink", state),
     table_desc_(nullptr),
-    default_partition_(nullptr),
+    prototype_partition_(nullptr),
     table_id_(tsink.table_sink.target_table_id),
     skip_header_line_count_(
         tsink.table_sink.hdfs_table_sink.__isset.skip_header_line_count ?
@@ -97,13 +98,6 @@ Status HdfsTableSink::Prepare(RuntimeState* state, MemTracker* parent_mem_tracke
   RETURN_IF_ERROR(ScalarExprEvaluator::Create(partition_key_exprs_, state,
       state->obj_pool(), expr_perm_pool_.get(), expr_results_pool_.get(),
       &partition_key_expr_evals_));
-
-  // TODO: Consider a system-wide random number generator, initialised in a single place.
-  ptime now = microsec_clock::local_time();
-  long seed = (now.time_of_day().seconds() * 1000)
-    + (now.time_of_day().total_microseconds() / 1000);
-  VLOG_QUERY << "Random seed: " << seed;
-  srand(seed);
 
   // Resolve table id and set input tuple descriptor.
   table_desc_ = static_cast<const HdfsTableDescriptor*>(
@@ -149,74 +143,67 @@ Status HdfsTableSink::Open(RuntimeState* state) {
   DCHECK_EQ(partition_key_exprs_.size(), partition_key_expr_evals_.size());
   RETURN_IF_ERROR(ScalarExprEvaluator::Open(partition_key_expr_evals_, state));
 
-  // Get file format for default partition in table descriptor, and build a map from
-  // partition key values to partition descriptor for multiple output format support. The
-  // map is keyed on the concatenation of the non-constant keys of the PARTITION clause of
-  // the INSERT statement.
+  // Build a map from partition key values to partition descriptor for multiple output
+  // format support. The map is keyed on the concatenation of the non-constant keys of
+  // the PARTITION clause of the INSERT statement.
   for (const HdfsTableDescriptor::PartitionIdToDescriptorMap::value_type& id_to_desc:
        table_desc_->partition_descriptors()) {
-    if (id_to_desc.first == g_ImpalaInternalService_constants.DEFAULT_PARTITION_ID) {
-      default_partition_ = id_to_desc.second;
-    } else {
-      // Build a map whose key is computed from the value of dynamic partition keys for a
-      // particular partition, and whose value is the descriptor for that partition.
+    // Build a map whose key is computed from the value of dynamic partition keys for a
+    // particular partition, and whose value is the descriptor for that partition.
 
-      // True if this partition might be written to, false otherwise.
-      // A partition may be written to iff:
-      // For all partition key exprs e, either:
-      //   1. e is not constant
-      //   2. The value supplied by the query for this partition key is equal to e's
-      //   constant value.
-      // Only relevant partitions are remembered in partition_descriptor_map_.
-      bool relevant_partition = true;
-      HdfsPartitionDescriptor* partition = id_to_desc.second;
-      DCHECK_EQ(partition->partition_key_value_evals().size(),
-          partition_key_expr_evals_.size());
-      vector<ScalarExprEvaluator*> dynamic_partition_key_value_evals;
-      for (size_t i = 0; i < partition_key_expr_evals_.size(); ++i) {
-        // Remember non-constant partition key exprs for building hash table of Hdfs files
-        DCHECK(&partition_key_expr_evals_[i]->root() == partition_key_exprs_[i]);
-        if (!partition_key_exprs_[i]->is_constant()) {
-          dynamic_partition_key_value_evals.push_back(
-              partition->partition_key_value_evals()[i]);
-        } else {
-          // Deal with the following: one partition has (year=2009, month=3); another has
-          // (year=2010, month=3).
-          // A query like: INSERT INTO TABLE... PARTITION(year=2009) SELECT month FROM...
-          // would lead to both partitions having the same key modulo ignored constant
-          // partition keys. So only keep a reference to the partition which matches
-          // partition_key_values for constant values, since only that is written to.
-          void* table_partition_key_value =
-              partition->partition_key_value_evals()[i]->GetValue(nullptr);
-          void* target_partition_key_value =
-              partition_key_expr_evals_[i]->GetValue(nullptr);
-          if (table_partition_key_value == nullptr
-              && target_partition_key_value == nullptr) {
-            continue;
-          }
-          if (table_partition_key_value == nullptr
-              || target_partition_key_value == nullptr
-              || !RawValue::Eq(table_partition_key_value, target_partition_key_value,
-                     partition_key_expr_evals_[i]->root().type())) {
-            relevant_partition = false;
-            break;
-          }
+    // True if this partition might be written to, false otherwise.
+    // A partition may be written to iff:
+    // For all partition key exprs e, either:
+    //   1. e is not constant
+    //   2. The value supplied by the query for this partition key is equal to e's
+    //   constant value.
+    // Only relevant partitions are remembered in partition_descriptor_map_.
+    bool relevant_partition = true;
+    HdfsPartitionDescriptor* partition = id_to_desc.second;
+    DCHECK_EQ(partition->partition_key_value_evals().size(),
+        partition_key_expr_evals_.size());
+    vector<ScalarExprEvaluator*> dynamic_partition_key_value_evals;
+    for (size_t i = 0; i < partition_key_expr_evals_.size(); ++i) {
+      // Remember non-constant partition key exprs for building hash table of Hdfs files
+      DCHECK(&partition_key_expr_evals_[i]->root() == partition_key_exprs_[i]);
+      if (!partition_key_exprs_[i]->is_constant()) {
+        dynamic_partition_key_value_evals.push_back(
+            partition->partition_key_value_evals()[i]);
+      } else {
+        // Deal with the following: one partition has (year=2009, month=3); another has
+        // (year=2010, month=3).
+        // A query like: INSERT INTO TABLE... PARTITION(year=2009) SELECT month FROM...
+        // would lead to both partitions having the same key modulo ignored constant
+        // partition keys. So only keep a reference to the partition which matches
+        // partition_key_values for constant values, since only that is written to.
+        void* table_partition_key_value =
+            partition->partition_key_value_evals()[i]->GetValue(nullptr);
+        void* target_partition_key_value =
+            partition_key_expr_evals_[i]->GetValue(nullptr);
+        if (table_partition_key_value == nullptr
+            && target_partition_key_value == nullptr) {
+          continue;
+        }
+        if (table_partition_key_value == nullptr
+            || target_partition_key_value == nullptr
+            || !RawValue::Eq(table_partition_key_value, target_partition_key_value,
+                   partition_key_expr_evals_[i]->root().type())) {
+          relevant_partition = false;
+          break;
         }
       }
-      if (relevant_partition) {
-        string key;
-        // Pass nullptr as row, since all of these expressions are constant, and can
-        // therefore be evaluated without a valid row context.
-        GetHashTblKey(nullptr, dynamic_partition_key_value_evals, &key);
-        DCHECK(partition_descriptor_map_.find(key) == partition_descriptor_map_.end())
-            << "Partitions with duplicate 'static' keys found during INSERT";
-        partition_descriptor_map_[key] = partition;
-      }
+    }
+    if (relevant_partition) {
+      string key;
+      // Pass nullptr as row, since all of these expressions are constant, and can
+      // therefore be evaluated without a valid row context.
+      GetHashTblKey(nullptr, dynamic_partition_key_value_evals, &key);
+      DCHECK(partition_descriptor_map_.find(key) == partition_descriptor_map_.end())
+          << "Partitions with duplicate 'static' keys found during INSERT";
+      partition_descriptor_map_[key] = partition;
     }
   }
-  if (default_partition_ == nullptr) {
-    return Status("No default partition found for HdfsTextTableSink");
-  }
+  prototype_partition_ = CHECK_NOTNULL(table_desc_->prototype_partition_descriptor());
   return Status::OK();
 }
 
@@ -367,9 +354,22 @@ Status HdfsTableSink::CreateNewTmpFile(RuntimeState* state,
     return Status(GetHdfsErrorMsg("Temporary HDFS file already exists: ",
         output_partition->current_file_name));
   }
-  uint64_t block_size = output_partition->partition_descriptor->block_size();
-  if (block_size == 0) block_size = output_partition->writer->default_block_size();
 
+  // This is the block size from the HDFS partition metadata.
+  uint64_t block_size = output_partition->partition_descriptor->block_size();
+  // hdfsOpenFile takes a 4 byte integer as the block size.
+  if (block_size > numeric_limits<int32_t>::max()) {
+    return Status(Substitute("HDFS block size must be smaller than 2GB but is configured "
+        "in the HDFS partition to $0.", block_size));
+  }
+
+  if (block_size == 0) block_size = output_partition->writer->default_block_size();
+  if (block_size > numeric_limits<int32_t>::max()) {
+    return Status(Substitute("HDFS block size must be smaller than 2GB but the target "
+        "table requires $0.", block_size));
+  }
+
+  DCHECK_LE(block_size, numeric_limits<int32_t>::max());
   output_partition->tmp_hdfs_file = hdfsOpenFile(output_partition->hdfs_connection,
       tmp_hdfs_file_name_cstr, O_WRONLY, 0, 0, block_size);
 
@@ -403,8 +403,9 @@ Status HdfsTableSink::CreateNewTmpFile(RuntimeState* state,
   COUNTER_ADD(files_created_counter_, 1);
 
   if (!ShouldSkipStaging(state, output_partition)) {
-    // Save the ultimate destination for this file (it will be moved by the coordinator)
-    (*state->hdfs_files_to_move())[output_partition->current_file_name] = final_location;
+    // Save the ultimate destination for this file (it will be moved by the coordinator).
+    state->dml_exec_state()->AddFileToMove(
+        output_partition->current_file_name, final_location);
   }
 
   ++output_partition->num_files;
@@ -555,7 +556,7 @@ inline Status HdfsTableSink::GetOutputPartition(RuntimeState* state, const Tuple
   existing_partition = partition_keys_to_output_partitions_.find(key);
   if (existing_partition == partition_keys_to_output_partitions_.end()) {
     // Create a new OutputPartition, and add it to partition_keys_to_output_partitions.
-    const HdfsPartitionDescriptor* partition_descriptor = default_partition_;
+    const HdfsPartitionDescriptor* partition_descriptor = prototype_partition_;
     PartitionDescriptorMap::const_iterator it = partition_descriptor_map_.find(key);
     if (it != partition_descriptor_map_.end()) {
       partition_descriptor = it->second;
@@ -573,21 +574,15 @@ inline Status HdfsTableSink::GetOutputPartition(RuntimeState* state, const Tuple
       return status;
     }
 
-    // Save the partition name so that the coordinator can create the partition directory
-    // structure if needed
-    DCHECK(state->per_partition_status()->find(partition->partition_name) ==
-        state->per_partition_status()->end());
-    TInsertPartitionStatus partition_status;
-    partition_status.__set_num_modified_rows(0L);
-    partition_status.__set_id(partition_descriptor->id());
-    partition_status.__set_stats(TInsertStats());
-    partition_status.__set_partition_base_dir(table_desc_->hdfs_base_dir());
-    state->per_partition_status()->insert(
-        make_pair(partition->partition_name, partition_status));
+    // Save the partition name so that the coordinator can create the partition
+    // directory structure if needed.
+    state->dml_exec_state()->AddPartition(
+        partition->partition_name, partition_descriptor->id(),
+        &table_desc_->hdfs_base_dir());
 
     if (!no_more_rows && !ShouldSkipStaging(state, partition.get())) {
-      // Indicate that temporary directory is to be deleted after execution
-      (*state->hdfs_files_to_move())[partition->tmp_hdfs_dir_name] = "";
+      // Indicate that temporary directory is to be deleted after execution.
+      state->dml_exec_state()->AddFileToMove(partition->tmp_hdfs_dir_name, "");
     }
 
     partition_keys_to_output_partitions_[key].first = std::move(partition);
@@ -643,17 +638,8 @@ Status HdfsTableSink::FinalizePartitionFile(RuntimeState* state,
   // OutputPartition writer could be nullptr if there is no row to output.
   if (partition->writer.get() != nullptr) {
     RETURN_IF_ERROR(partition->writer->Finalize());
-
-    // Track total number of appended rows per partition in runtime
-    // state. partition->num_rows counts number of rows appended is per-file.
-    PartitionStatusMap::iterator it =
-        state->per_partition_status()->find(partition->partition_name);
-
-    // Should have been created in GetOutputPartition() when the partition was
-    // initialised.
-    DCHECK(it != state->per_partition_status()->end());
-    it->second.num_modified_rows += partition->num_rows;
-    DataSink::MergeDmlStats(partition->writer->stats(), &it->second.stats);
+    state->dml_exec_state()->UpdatePartition(
+        partition->partition_name, partition->num_rows, &partition->writer->stats());
   }
 
   RETURN_IF_ERROR(ClosePartitionFile(state, partition));

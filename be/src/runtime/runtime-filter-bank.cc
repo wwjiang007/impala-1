@@ -27,6 +27,7 @@
 #include "runtime/mem-tracker.h"
 #include "runtime/query-state.h"
 #include "runtime/runtime-filter.inline.h"
+#include "runtime/runtime-state.h"
 #include "service/impala-server.h"
 #include "util/bit-util.h"
 #include "util/bloom-filter.h"
@@ -262,7 +263,8 @@ void RuntimeFilterBank::Close() {
   obj_pool_.Clear();
   mem_pool_.FreeAll();
   if (buffer_pool_client_.is_registered()) {
-    VLOG_FILE << "RuntimeFilterBank (Fragment Id: " << state_->fragment_instance_id()
+    VLOG_FILE << "RuntimeFilterBank (Fragment Id: "
+              << PrintId(state_->fragment_instance_id())
               << ") returning reservation " << total_bloom_filter_mem_required_;
     state_->query_state()->initial_reservations()->Return(
         &buffer_pool_client_, total_bloom_filter_mem_required_);

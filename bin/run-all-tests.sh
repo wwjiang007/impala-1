@@ -55,6 +55,10 @@ fi
 # Extra arguments passed to start-impala-cluster for tests. These do not apply to custom
 # cluster tests.
 : ${TEST_START_CLUSTER_ARGS:=}
+# Extra args to pass to run-tests.py
+: ${RUN_TESTS_ARGS:=}
+# Extra args to pass to run-custom-cluster-tests.sh
+: ${RUN_CUSTOM_CLUSTER_TESTS_ARGS:=}
 if [[ "${TARGET_FILESYSTEM}" == "local" ]]; then
   # TODO: Remove abort_on_config_error flag from here and create-load-data.sh once
   # checkConfiguration() accepts the local filesystem (see IMPALA-1850).
@@ -63,6 +67,12 @@ if [[ "${TARGET_FILESYSTEM}" == "local" ]]; then
   FE_TEST=false
 else
   TEST_START_CLUSTER_ARGS="${TEST_START_CLUSTER_ARGS} --cluster_size=3"
+fi
+
+if [[ "${ERASURE_CODING}" = true ]]; then
+  # We do not run FE tests when erasure coding is enabled because planner tests
+  # would fail.
+  FE_TEST=false
 fi
 
 # If KRPC tests are disabled, pass the flag to disable KRPC during cluster start.
@@ -130,14 +140,6 @@ LOG_DIR="${IMPALA_EE_TEST_LOGS_DIR}"
 # Enable core dumps
 ulimit -c unlimited || true
 
-if [[ "${TARGET_FILESYSTEM}" == "hdfs" ]]; then
-  # To properly test HBase integeration, HBase regions are split and assigned by this
-  # script. Restarting HBase will change the region server assignment. Run split-hbase.sh
-  # before running any test.
-  run-step "Split and assign HBase regions" split-hbase.log \
-      "${IMPALA_HOME}/testdata/bin/split-hbase.sh"
-fi
-
 for i in $(seq 1 $NUM_TEST_ITERATIONS)
 do
   TEST_RET_CODE=0
@@ -188,7 +190,8 @@ do
   if [[ "$EE_TEST" == true ]]; then
     # Run end-to-end tests.
     # KERBEROS TODO - this will need to deal with ${KERB_ARGS}
-    if ! "${IMPALA_HOME}/tests/run-tests.py" ${COMMON_PYTEST_ARGS} ${EE_TEST_FILES}; then
+    if ! "${IMPALA_HOME}/tests/run-tests.py" ${COMMON_PYTEST_ARGS} \
+        ${RUN_TESTS_ARGS} ${EE_TEST_FILES}; then
       #${KERB_ARGS};
       TEST_RET_CODE=1
     fi
@@ -220,7 +223,8 @@ do
     # Run the custom-cluster tests after all other tests, since they will restart the
     # cluster repeatedly and lose state.
     # TODO: Consider moving in to run-tests.py.
-    if ! "${IMPALA_HOME}/tests/run-custom-cluster-tests.sh" ${COMMON_PYTEST_ARGS}; then
+    if ! "${IMPALA_HOME}/tests/run-custom-cluster-tests.sh" ${COMMON_PYTEST_ARGS} \
+        ${RUN_CUSTOM_CLUSTER_TESTS_ARGS}; then
       TEST_RET_CODE=1
     fi
     export IMPALA_MAX_LOG_FILES="${IMPALA_MAX_LOG_FILES_SAVE}"

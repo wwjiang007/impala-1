@@ -84,6 +84,7 @@ create table tab (a int not null primary key)
 partition by range (a) (partition value = false)
 stored as kudu
 ---- RESULTS
+'Table has been created.'
 ====
 ---- QUERY
 # Invalid hostname
@@ -103,11 +104,25 @@ create table tdata_non_existing_host
 Couldn't resolve this master's address bogus.host.name:7051
 ====
 ---- QUERY
+# Valid host with whitespace
+create table tdata_master_addresses_whitespace (id int primary key) stored as kudu
+  tblproperties('kudu.master_addresses' = '  localhost  ')
+---- RESULTS
+'Table has been created.'
+====
+---- QUERY
+insert into tdata_master_addresses_whitespace values (0), (1)
+---- DML_RESULTS: tdata_master_addresses_whitespace
+0
+1
+====
+---- QUERY
 # Test that string case is ignored
 create table ignore_column_case (Id int, NAME string, vAlf float, vali bigint,
   primary key (Id, NAME)) PARTITION BY RANGE (PARTITION VALUE = (1, 'Martin'))
   STORED AS KUDU
 ---- RESULTS
+'Table has been created.'
 ====
 ---- QUERY
 insert into ignore_column_case values (1, 'Martin', 1.0, 10);
@@ -133,6 +148,7 @@ create table tbl_with_null_defaults (x int primary key, i1 tinyint default null,
   valdec8 decimal(18) default null, valdec16 decimal(38) default null)
   partition by hash (x) partitions 3 stored as kudu
 ---- RESULTS
+'Table has been created.'
 ====
 ---- QUERY
 insert into tbl_with_null_defaults (x) values (1);
@@ -169,6 +185,7 @@ partition by range (
   partition '2009-01-03 00:00:00' <= VALUES
 ) stored as kudu
 ---- RESULTS
+'Table has been created.'
 ====
 ---- QUERY
 show range partitions ts_ranges
@@ -224,6 +241,7 @@ create table ts_default (i int primary key, ts1 timestamp,
                          ts2 timestamp default cast('2009-01-01 00:00:00' as timestamp))
 partition by hash(i) partitions 3 stored as kudu
 ---- RESULTS
+'Table has been created.'
 ====
 ---- QUERY
 insert into ts_default (i) values (1);
@@ -255,6 +273,7 @@ INT,TIMESTAMP,TIMESTAMP
 create table unpartitioned_kudu_table (col0 bigint primary key, col1 string)
 stored as kudu
 ---- RESULTS
+'Table has been created.'
 ---- ERRORS
 Unpartitioned Kudu tables are inefficient for large data sizes.
 ====
@@ -300,6 +319,7 @@ create table create_decimal
  primary key (decimal_4))
 stored as kudu;
 ---- RESULTS
+'Table has been created.'
 ====
 ---- QUERY
 # Create as select table with decimal columns and primary key
@@ -315,4 +335,14 @@ select * from ctas_decimal;
 132842,333,12345.6789000000,0.12345678900000000000000000000000000000,0.77889,1
 ---- TYPES
 DECIMAL,DECIMAL,DECIMAL,DECIMAL,DECIMAL,DECIMAL
+====
+---- QUERY
+# IMPALA-6954: CTAS with an expr rewrite.
+create table ctas_rewrite primary key(id)
+partition by range(id) (partition 0 <= values < 100) stored as kudu
+as select id, tinyint_col from functional.alltypes
+where id between 0 and 1;
+show range partitions ctas_rewrite;
+---- RESULTS
+'0 <= VALUES < 100'
 ====

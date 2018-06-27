@@ -18,21 +18,25 @@
 package org.apache.impala.util;
 
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.hive.metastore.IMetaStoreClient;
+import org.apache.hadoop.hive.metastore.Warehouse;
+import org.apache.hadoop.hive.metastore.api.ConfigValSecurityException;
+import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.hadoop.hive.metastore.api.MetaException;
 import org.apache.hadoop.hive.metastore.api.Partition;
+import org.apache.hadoop.hive.metastore.api.Table;
+import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.HdfsTable;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.compat.MetastoreShim;
 import org.apache.log4j.Logger;
 import org.apache.thrift.TException;
 
-import org.apache.impala.catalog.HdfsTable;
-import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TColumn;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
@@ -58,6 +62,10 @@ public class MetaStoreUtil {
   // The longest strings Hive accepts for [serde] property values.
   public static final int MAX_PROPERTY_VALUE_LENGTH = 4000;
 
+  // Maximum owner length. The owner can be user or role.
+  // https://github.com/apache/hive/blob/13fbae57321f3525cabb326df702430d61c242f9/standalone-metastore/src/main/resources/package.jdo#L63
+  public static final int MAX_OWNER_LENGTH = 128;
+
   // The default maximum number of partitions to fetch from the Hive metastore in one
   // RPC.
   private static final short DEFAULT_MAX_PARTITIONS_PER_RPC = 1000;
@@ -67,6 +75,13 @@ public class MetaStoreUtil {
   // and defaults to DEFAULT_MAX_PARTITION_BATCH_SIZE if the value is not present in the
   // Hive configuration.
   private static short maxPartitionsPerRpc_ = DEFAULT_MAX_PARTITIONS_PER_RPC;
+
+  // The configuration key that Hive uses to set the null partition key value.
+  public static final String NULL_PARTITION_KEY_VALUE_CONF_KEY =
+      "hive.exec.default.partition.name";
+  // The default value for the above configuration key.
+  public static final String DEFAULT_NULL_PARTITION_KEY_VALUE =
+      "__HIVE_DEFAULT_PARTITION__";
 
   static {
     // Get the value from the Hive configuration, if present.
@@ -85,6 +100,15 @@ public class MetaStoreUtil {
           "default: %d", maxPartitionsPerRpc_, DEFAULT_MAX_PARTITIONS_PER_RPC));
       maxPartitionsPerRpc_ = DEFAULT_MAX_PARTITIONS_PER_RPC;
     }
+  }
+
+  /**
+   * Return the value that Hive is configured to use for NULL partition key values.
+   */
+  public static String getNullPartitionKeyValue(IMetaStoreClient client)
+      throws ConfigValSecurityException, TException {
+    return client.getConfigValue(
+        NULL_PARTITION_KEY_VALUE_CONF_KEY, DEFAULT_NULL_PARTITION_KEY_VALUE);
   }
 
   /**
@@ -240,5 +264,21 @@ public class MetaStoreUtil {
       if (rightColNames.contains(leftCol.toLowerCase())) outputList.add(leftCol);
     }
     return Joiner.on(",").join(outputList);
+  }
+
+  public static List<String> getPartValsFromName(Table msTbl, String partName)
+      throws MetaException, CatalogException {
+    Preconditions.checkNotNull(msTbl);
+    LinkedHashMap<String, String> hm = Warehouse.makeSpecFromName(partName);
+    List<String> partVals = Lists.newArrayList();
+    for (FieldSchema field: msTbl.getPartitionKeys()) {
+      String key = field.getName();
+      String val = hm.get(key);
+      if (val == null) {
+        throw new CatalogException("Incomplete partition name - missing " + key);
+      }
+      partVals.add(val);
+    }
+    return partVals;
   }
 }

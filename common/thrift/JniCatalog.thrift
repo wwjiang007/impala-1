@@ -52,6 +52,38 @@ enum TDdlType {
   GRANT_PRIVILEGE,
   REVOKE_PRIVILEGE,
   TRUNCATE_TABLE,
+  COMMENT_ON,
+  ALTER_DATABASE
+}
+
+enum TOwnerType {
+  USER,
+  ROLE
+}
+
+// Types of ALTER DATABASE commands supported.
+enum TAlterDbType {
+  SET_OWNER
+}
+
+// Parameters for ALTER DATABASE SET OWNER commands.
+struct TAlterDbSetOwnerParams {
+  // The owner type.
+  1: required TOwnerType owner_type
+
+  // The owner name.
+  2: required string owner_name
+}
+
+struct TAlterDbParams {
+  // The type of ALTER DATABASE command.
+  1: required TAlterDbType alter_type
+
+  // Name of the database to alter.
+  2: required string db
+
+  // Parameters for ALTER DATABASE SET OWNER commands.
+  3: optional TAlterDbSetOwnerParams set_owner_params
 }
 
 // Types of ALTER TABLE commands supported.
@@ -88,6 +120,9 @@ struct TCreateDbParams {
 
   // Do not throw an error if a database of the same name already exists.
   4: optional bool if_not_exists
+
+  // Owner of the database
+  5: required string owner
 }
 
 // Parameters of CREATE DATA SOURCE commands
@@ -627,3 +662,17 @@ struct TGetCatalogUsageResponse{
   2: required list<TTableUsageMetrics> frequently_accessed_tables
 }
 
+struct TCommentOnParams {
+  // Contents of comment to alter. When this field is not set, the comment will be removed.
+  1: optional string comment
+
+  //--------------------------------------
+  // Only one of these fields can be set.
+  //--------------------------------------
+
+  // Name of database to alter.
+  2: optional string db
+
+  // Name of table/view to alter.
+  3: optional CatalogObjects.TTableName table_name
+}

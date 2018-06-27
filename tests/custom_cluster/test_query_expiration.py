@@ -29,16 +29,19 @@ class TestQueryExpiration(CustomClusterTestSuite):
 
   def _check_num_executing(self, impalad, expected):
     in_flight_queries = impalad.service.get_in_flight_queries()
+    # Guard against too few in-flight queries.
+    assert expected <= len(in_flight_queries)
     actual = 0
     for query in in_flight_queries:
       if query["executing"]:
         actual += 1
       else:
         assert query["waiting"]
-    assert actual == expected
+    assert actual == expected, '%s out of %s queries with expected (%s) status' \
+        % (actual, len(in_flight_queries), expected)
 
   @pytest.mark.execute_serially
-  @CustomClusterTestSuite.with_args("--idle_query_timeout=6 --logbuflevel=-1")
+  @CustomClusterTestSuite.with_args("--idle_query_timeout=8 --logbuflevel=-1")
   def test_query_expiration(self, vector):
     """Confirm that single queries expire if not fetched"""
     impalad = self.cluster.get_first_impalad()
@@ -46,20 +49,20 @@ class TestQueryExpiration(CustomClusterTestSuite):
     num_expired = impalad.service.get_metric_value('impala-server.num-queries-expired')
     handles = []
 
-    # This query will time out with the default idle timeout (6s).
+    # This query will time out with the default idle timeout (8s).
     query1 = "SELECT SLEEP(1000000)"
     default_timeout_expire_handle = client.execute_async(query1)
     handles.append(default_timeout_expire_handle)
 
     # This query will hit a lower time limit.
-    client.execute("SET EXEC_TIME_LIMIT_S=1")
+    client.execute("SET EXEC_TIME_LIMIT_S=3")
     time_limit_expire_handle = client.execute_async(query1);
     handles.append(time_limit_expire_handle)
 
     # This query will hit a lower idle timeout instead of the default timeout or time
     # limit.
     client.execute("SET EXEC_TIME_LIMIT_S=5")
-    client.execute("SET QUERY_TIMEOUT_S=1")
+    client.execute("SET QUERY_TIMEOUT_S=3")
     short_timeout_expire_handle = client.execute_async("SELECT SLEEP(2000000)")
     handles.append(short_timeout_expire_handle)
     client.execute("SET EXEC_TIME_LIMIT_S=0")
@@ -86,14 +89,14 @@ class TestQueryExpiration(CustomClusterTestSuite):
     assert (client.get_state(default_timeout_expire_handle2) ==
             client.QUERY_STATES['FINISHED'])
     self.__expect_expired(client, query1, short_timeout_expire_handle,
-        "Query [0-9a-f]+:[0-9a-f]+ expired due to client inactivity \(timeout is 1s000ms\)")
+        "Query [0-9a-f]+:[0-9a-f]+ expired due to client inactivity \(timeout is 3s000ms\)")
     self.__expect_expired(client, query1, time_limit_expire_handle,
-        "Query [0-9a-f]+:[0-9a-f]+ expired due to execution time limit of 1s000ms")
+        "Query [0-9a-f]+:[0-9a-f]+ expired due to execution time limit of 3s000ms")
     self._check_num_executing(impalad, 2)
     self.assert_impalad_log_contains('INFO', "Expiring query due to client inactivity: "
         "[0-9a-f]+:[0-9a-f]+, last activity was at: \d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d")
     self.assert_impalad_log_contains('INFO',
-        "Expiring query [0-9a-f]+:[0-9a-f]+ due to execution time limit of 1s")
+        "Expiring query [0-9a-f]+:[0-9a-f]+ due to execution time limit of 3s")
 
     # Wait until the remaining queries expire. The time limit query will have hit
     # expirations but only one should be counted.
@@ -109,7 +112,7 @@ class TestQueryExpiration(CustomClusterTestSuite):
 
     # Check that we didn't wait too long to be expired (double the timeout is sufficiently
     # large to avoid most noise in measurement)
-    assert time() - before < 12
+    assert time() - before < 16
 
     client.execute("SET QUERY_TIMEOUT_S=0")
     # Synchronous execution; calls fetch() and query should not time out.
@@ -176,11 +179,9 @@ class TestQueryExpiration(CustomClusterTestSuite):
     """Try to fetch 'expected_state' from 'client' within 'timeout' seconds.
     Fail if unable."""
     start_time = time()
-    actual_state = None
-    while (time() - start_time < timeout):
+    actual_state = client.get_state(handle)
+    while (actual_state != expected_state and time() - start_time < timeout):
       actual_state = client.get_state(handle)
-      if actual_state == expected_state:
-        break
     assert expected_state == actual_state
 
   @pytest.mark.execute_serially

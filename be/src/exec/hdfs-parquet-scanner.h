@@ -20,7 +20,6 @@
 #define IMPALA_EXEC_HDFS_PARQUET_SCANNER_H
 
 #include "codegen/impala-ir.h"
-#include "common/global-flags.h"
 #include "exec/hdfs-scanner.h"
 #include "exec/parquet-common.h"
 #include "exec/parquet-scratch-tuple-batch.h"
@@ -34,7 +33,7 @@ class CollectionValueBuilder;
 struct HdfsFileDesc;
 
 /// Internal schema representation and resolution.
-class SchemaNode;
+struct SchemaNode;
 
 /// Class that implements Parquet definition and repetition level decoding.
 class ParquetLevelDecoder;
@@ -69,8 +68,8 @@ class BoolColumnReader;
 /// the split size, the mid point guarantees that we have at least 50% of the row group in
 /// the current split. ProcessSplit() then computes the column ranges for these row groups
 /// and submits them to the IoMgr for immediate scheduling (so they don't surface in
-/// DiskIoMgr::GetNextRange()). Scheduling them immediately also guarantees they are all
-/// read at once.
+/// RequestContext::GetNextUnstartedRange()). Scheduling them immediately also guarantees
+/// they are all read at once.
 ///
 /// Like the other scanners, each parquet scanner object is one to one with a
 /// ScannerContext. Unlike the other scanners though, the context will have multiple
@@ -328,7 +327,7 @@ class HdfsParquetScanner : public HdfsScanner {
   virtual ~HdfsParquetScanner() {}
 
   /// Issue just the footer range for each file.  We'll then parse the footer and pick
-  /// out the columns we want.
+  /// out the columns we want. 'files' must not be empty.
   static Status IssueInitialRanges(HdfsScanNodeBase* scan_node,
                                    const std::vector<HdfsFileDesc*>& files)
                                    WARN_UNUSED_RESULT;
@@ -344,7 +343,7 @@ class HdfsParquetScanner : public HdfsScanner {
       llvm::Function** process_scratch_batch_fn)
       WARN_UNUSED_RESULT;
 
-  /// The repetition level is set to this value to indicate the end of a row group.
+  /// The rep and def levels are set to this value to indicate the end of a row group.
   static const int16_t ROW_GROUP_END = numeric_limits<int16_t>::min();
   /// Indicates an invalid definition or repetition level.
   static const int16_t INVALID_LEVEL = -1;
@@ -361,14 +360,7 @@ class HdfsParquetScanner : public HdfsScanner {
   template<typename InternalType, parquet::Type::type PARQUET_TYPE, bool MATERIALIZED>
   friend class ScalarColumnReader;
   friend class BoolColumnReader;
-
-  /// Size of the file footer.  This is a guess.  If this value is too little, we will
-  /// need to issue another read.
-  static const int64_t FOOTER_SIZE = 1024 * 100;
-  static_assert(FOOTER_SIZE <= READ_SIZE_MIN_VALUE,
-      "FOOTER_SIZE can not be greater than READ_SIZE_MIN_VALUE.\n"
-      "You can increase FOOTER_SIZE if you want, "
-      "just don't forget to increase READ_SIZE_MIN_VALUE as well.");
+  friend class HdfsParquetScannerTest;
 
   /// Index of the current row group being processed. Initialized to -1 which indicates
   /// that we have not started processing the first row group yet (GetNext() has not yet
@@ -391,45 +383,15 @@ class HdfsParquetScanner : public HdfsScanner {
   /// the scanner. Stored in 'obj_pool_'.
   vector<ScalarExprEvaluator*> min_max_conjunct_evals_;
 
-  /// Cached runtime filter contexts, one for each filter that applies to this column,
-  /// owned by instances of this class.
-  vector<const FilterContext*> filter_ctxs_;
-
-  struct LocalFilterStats {
-    /// Total number of rows to which each filter was applied
-    int64_t considered;
-
-    /// Total number of rows that each filter rejected.
-    int64_t rejected;
-
-    /// Total number of rows that each filter could have been applied to (if it were
-    /// available from row 0).
-    int64_t total_possible;
-
-    /// Use known-width type to act as logical boolean.  Set to 1 if corresponding filter
-    /// in filter_ctxs_ should be applied, 0 if it was ineffective and was disabled.
-    uint8_t enabled;
-
-    /// Padding to ensure structs do not straddle cache-line boundary.
-    uint8_t padding[7];
-
-    LocalFilterStats() : considered(0), rejected(0), total_possible(0), enabled(1) { }
-  };
-
   /// Pool used for allocating caches of definition/repetition levels and tuples for
   /// dictionary filtering. The definition/repetition levels are populated by the
   /// level readers. The pool is freed in Close().
   boost::scoped_ptr<MemPool> perm_pool_;
 
-  /// Track statistics of each filter (one for each filter in filter_ctxs_) per scanner so
-  /// that expensive aggregation up to the scan node can be performed once, during
-  /// Close().
-  vector<LocalFilterStats> filter_stats_;
-
   /// Number of scratch batches processed so far.
   int64_t row_batches_produced_;
 
-  /// Column reader for each materialized columns for this file.
+  /// Column reader for each top-level materialized slot in the output tuple.
   std::vector<ParquetColumnReader*> column_readers_;
 
   /// Column readers will write slot values into this scratch batch for
@@ -460,6 +422,9 @@ class HdfsParquetScanner : public HdfsScanner {
   /// These are pointers to elements of column_readers_. The readers are either top-level
   /// or nested within a collection.
   std::vector<BaseScalarColumnReader*> non_dict_filterable_readers_;
+
+  /// Flattened list of all scalar column readers in column_readers_.
+  std::vector<BaseScalarColumnReader*> scalar_readers_;
 
   /// Flattened collection column readers that point to readers in column_readers_.
   std::vector<CollectionColumnReader*> collection_readers_;
@@ -511,10 +476,6 @@ class HdfsParquetScanner : public HdfsScanner {
   Status EvaluateStatsConjuncts(const parquet::FileMetaData& file_metadata,
       const parquet::RowGroup& row_group, bool* skip_row_group) WARN_UNUSED_RESULT;
 
-  /// Check runtime filters' effectiveness every BATCHES_PER_FILTER_SELECTIVITY_CHECK
-  /// row batches. Will update 'filter_stats_'.
-  void CheckFiltersEffectiveness();
-
   /// Advances 'row_group_idx_' to the next non-empty row group and initializes
   /// the column readers to scan it. Recoverable errors are logged to the runtime
   /// state. Only returns a non-OK status if a non-recoverable error is encountered
@@ -548,24 +509,6 @@ class HdfsParquetScanner : public HdfsScanner {
   /// materialized tuples. This is a separate function so it can be codegened.
   int ProcessScratchBatch(RowBatch* dst_batch);
 
-  /// Evaluates 'row' against the i-th runtime filter for this scan node and returns
-  /// true if 'row' finds a match in the filter. Returns false otherwise.
-  bool EvalRuntimeFilter(int i, TupleRow* row);
-
-  /// Evaluates runtime filters (if any) against the given row. Returns true if
-  /// they passed, false otherwise. Maintains the runtime filter stats, determines
-  /// whether the filters are effective, and disables them if they are not. This is
-  /// replaced by generated code at runtime.
-  bool EvalRuntimeFilters(TupleRow* row);
-
-  /// Codegen EvalRuntimeFilters() by unrolling the loop in the interpreted version
-  /// and emitting a customized version of EvalRuntimeFilter() for each filter in
-  /// 'filter_ctxs'. Return error status on failure. The generated function is returned
-  /// via 'fn'.
-  static Status CodegenEvalRuntimeFilters(LlvmCodeGen* codegen,
-      const std::vector<ScalarExpr*>& filter_exprs, llvm::Function** fn)
-      WARN_UNUSED_RESULT;
-
   /// Reads data using 'column_readers' to materialize the tuples of a CollectionValue
   /// allocated from 'coll_value_builder'. Increases 'coll_items_read_counter_' by the
   /// number of items in this collection and descendant collections.
@@ -591,10 +534,6 @@ class HdfsParquetScanner : public HdfsScanner {
   /// and does not read any data values.
   inline bool ReadCollectionItem(const std::vector<ParquetColumnReader*>& column_readers,
       bool materialize_tuple, MemPool* pool, Tuple* tuple) const;
-
-  /// Find and return the last split in the file if it is assigned to this scan node.
-  /// Returns NULL otherwise.
-  static io::ScanRange* FindFooterSplit(HdfsFileDesc* file);
 
   /// Process the file footer and parse file_metadata_.  This should be called with the
   /// last FOOTER_SIZE bytes in context_.
@@ -627,12 +566,30 @@ class HdfsParquetScanner : public HdfsScanner {
       WARN_UNUSED_RESULT;
 
   /// Walks file_metadata_ and initiates reading the materialized columns.  This
-  /// initializes 'column_readers' and issues the reads for the columns. 'column_readers'
-  /// includes a mix of scalar readers from multiple schema nodes (i.e., readers of
-  /// top-level scalar columns and readers of scalar columns within a collection node).
-  Status InitScalarColumns(
-      int row_group_idx, const std::vector<BaseScalarColumnReader*>& column_readers)
-      WARN_UNUSED_RESULT;
+  /// initializes 'scalar_readers_' and divides reservation between the columns but
+  /// does not start any scan ranges.
+  Status InitScalarColumns() WARN_UNUSED_RESULT;
+
+  /// Decides how to divide stream_->reservation() between the columns. May increase
+  /// the reservation if more reservation would enable more efficient I/O for the
+  /// current columns being scanned. Sets the reservation on each corresponding reader
+  /// in 'column_readers'.
+  Status DivideReservationBetweenColumns(
+      const std::vector<BaseScalarColumnReader*>& column_readers);
+
+  /// Compute the ideal reservation to scan a file with scan range lengths
+  /// 'col_range_lengths' given the min and max buffer size of the singleton DiskIoMgr
+  /// in ExecEnv.
+  static int64_t ComputeIdealReservation(const std::vector<int64_t>& col_range_lengths);
+
+  /// Helper for DivideReservationBetweenColumns(). Implements the core algorithm for
+  /// dividing a reservation of 'reservation_to_distribute' bytes between columns with
+  /// scan range lengths 'col_range_lengths' given a min and max buffer size. Returns
+  /// a vector with an entry per column with the index into 'col_range_lengths' and the
+  /// amount of reservation in bytes to give to that column.
+  static std::vector<std::pair<int, int64_t>> DivideReservationBetweenColumnsHelper(
+      int64_t min_buffer_size, int64_t max_buffer_size,
+      const std::vector<int64_t>& col_range_lengths, int64_t reservation_to_distribute);
 
   /// Initializes the column readers in collection_readers_.
   void InitCollectionColumns();
@@ -668,7 +625,8 @@ class HdfsParquetScanner : public HdfsScanner {
   /// Partitions the readers into scalar and collection readers. The collection readers
   /// are flattened into collection_readers_. The scalar readers are partitioned into
   /// dict_filterable_readers_ and non_dict_filterable_readers_ depending on whether
-  /// dictionary filtering is enabled and the reader can be dictionary filtered.
+  /// dictionary filtering is enabled and the reader can be dictionary filtered. All
+  /// scalar readers are also flattened into scalar_readers_.
   void PartitionReaders(const vector<ParquetColumnReader*>& readers,
                         bool can_eval_dict_filters);
 

@@ -24,12 +24,18 @@ import pytest
 import re
 import sys
 import threading
+from copy import copy
 from time import sleep, time
 
+from beeswaxd.BeeswaxService import QueryState
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
 from tests.common.environ import specific_build_type_timeout, IMPALAD_BUILD
 from tests.common.impala_test_suite import ImpalaTestSuite
+from tests.common.skip import (
+    SkipIfS3,
+    SkipIfADLS,
+    SkipIfEC)
 from tests.common.test_dimensions import (
     create_single_exec_option_dimension,
     create_uncompressed_text_dimension)
@@ -37,6 +43,7 @@ from tests.common.test_vector import ImpalaTestDimension
 from tests.hs2.hs2_test_suite import HS2TestSuite, needs_session
 from ImpalaService import ImpalaHiveServer2Service
 from TCLIService import TCLIService
+from tests.verifiers.metric_verifier import MetricVerifier
 
 LOG = logging.getLogger('admission_test')
 
@@ -137,6 +144,11 @@ QUERY_END_BEHAVIORS = ['EOS', 'CLIENT_CANCEL', 'QUERY_TIMEOUT', 'CLIENT_CLOSE']
 # The timeout used for the QUERY_TIMEOUT end behaviour
 QUERY_END_TIMEOUT_S = 1
 
+# Regex that matches the first part of the profile info string added when a query is
+# queued.
+INITIAL_QUEUE_REASON_REGEX = \
+    "Initial admission queue reason: waited [0-9]* ms, reason: .*"
+
 def impalad_admission_ctrl_flags(max_requests, max_queued, pool_max_mem,
     proc_mem_limit = None, queue_wait_timeout_ms=None):
   extra_flags = ""
@@ -145,8 +157,7 @@ def impalad_admission_ctrl_flags(max_requests, max_queued, pool_max_mem,
   if queue_wait_timeout_ms is not None:
     extra_flags += " -queue_wait_timeout_ms={0}".format(queue_wait_timeout_ms)
   return ("-vmodule admission-controller=3 -default_pool_max_requests {0} "
-      "-default_pool_max_queued {1} -default_pool_mem_limit {2} "
-      "-disable_admission_control=false {3}".format(
+      "-default_pool_max_queued {1} -default_pool_mem_limit {2} {3}".format(
       max_requests, max_queued, pool_max_mem, extra_flags))
 
 
@@ -156,8 +167,7 @@ def impalad_admission_ctrl_config_args(additional_args=""):
   fs_allocation_path = os.path.join(resources_dir, "fair-scheduler-test2.xml")
   llama_site_path = os.path.join(resources_dir, "llama-site-test2.xml")
   return ("-vmodule admission-controller=3 -fair_scheduler_allocation_path %s "
-        "-llama_site_path %s -disable_admission_control=false %s" %\
-        (fs_allocation_path, llama_site_path, additional_args))
+        "-llama_site_path %s %s" % (fs_allocation_path, llama_site_path, additional_args))
 
 def log_metrics(log_prefix, metrics):
   LOG.info("%sadmitted=%s, queued=%s, dequeued=%s, rejected=%s, "\
@@ -241,6 +251,35 @@ class TestAdmissionController(TestAdmissionControllerBase, HS2TestSuite):
     get_profile_resp = self.hs2_client.GetRuntimeProfile(get_profile_req)
     HS2TestSuite.check_response(get_profile_resp)
     self.__check_query_options(get_profile_resp.profile, expected_options)
+
+  def _execute_and_collect_profiles(self, queries, timeout_s, config_options={}):
+    """Submit the query statements in 'queries' in parallel to the first impalad in
+    the cluster. After submission, the results are fetched from the queries in
+    sequence and their profiles are collected. Wait for up to timeout_s for
+    each query to finish. Returns the profile strings."""
+    client = self.cluster.impalads[0].service.create_beeswax_client()
+    try:
+      handles = []
+      profiles = []
+      client.set_configuration(config_options)
+      for query in queries:
+        handles.append(client.execute_async(query))
+      for query, handle in zip(queries, handles):
+        self._wait_for_state(client, handle, client.QUERY_STATES['FINISHED'], timeout_s)
+        results = self.client.fetch(query, handle)
+        profiles.append(self.client.get_runtime_profile(handle))
+      return profiles
+    finally:
+      client.close()
+
+  def _wait_for_state(self, client, handle, expected_state, timeout):
+    """Try to fetch 'expected_state' from 'client' within 'timeout' seconds.
+    Fail if unable."""
+    start_time = time()
+    actual_state = client.get_state(handle)
+    while (actual_state != expected_state and time() - start_time < timeout):
+      actual_state = client.get_state(handle)
+    assert expected_state == actual_state
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
@@ -381,21 +420,31 @@ class TestAdmissionController(TestAdmissionControllerBase, HS2TestSuite):
       assert re.search("Rejected query from pool default-pool: request memory needed "
           ".* is greater than pool max mem resources 10.00 MB", str(ex))
 
+  @SkipIfS3.hdfs_block_size
+  @SkipIfADLS.hdfs_block_size
+  @SkipIfEC.fix_later
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
       impalad_args=impalad_admission_ctrl_flags(max_requests=1, max_queued=1,
-          pool_max_mem=10 * 1024 * 1024, proc_mem_limit=1024 * 1024 * 1024),
+          pool_max_mem=40 * 1024 * 1024, proc_mem_limit=1024 * 1024 * 1024),
       statestored_args=_STATESTORED_ARGS)
-  def test_reject_min_reservation(self, vector):
-    """Test that the query will be rejected by admission control if:
-       a) the largest per-backend min buffer reservation is larger than the query mem
-          limit
-       b) the largest per-backend min buffer reservation is larger than the
-          buffer_pool_limit query option
-       c) the cluster-wide min-buffer reservation size is larger than the pool memory
-          resources.
-    """
+  def test_memory_rejection(self, vector):
+    """Test that rejection of queries based on reservation and estimates works as
+    expected. The test depends on scanner memory estimates, which different on remote
+    filesystems with different (synthetic) block sizes."""
+    # Test that the query will be rejected by admission control if:
+    # a) the largest per-backend min buffer reservation is larger than the query mem limit
+    # b) the largest per-backend min buffer reservation is larger than the
+    #    buffer_pool_limit query option
+    # c) the cluster-wide min-buffer reservation size is larger than the pool memory
+    #    resources.
     self.run_test_case('QueryTest/admission-reject-min-reservation', vector)
+
+    # Test that queries are rejected based on memory estimates. Set num_nodes=1 to
+    # avoid unpredictability from scheduling on different backends.
+    exec_options = vector.get_value('exec_option')
+    exec_options['num_nodes'] = 1
+    self.run_test_case('QueryTest/admission-reject-mem-estimate', vector)
 
   # Process mem_limit used in test_mem_limit_upper_bound
   PROC_MEM_TEST_LIMIT = 1024 * 1024 * 1024
@@ -412,6 +461,206 @@ class TestAdmissionController(TestAdmissionControllerBase, HS2TestSuite):
     # Setting requested memory equal to process memory limit
     exec_options['mem_limit'] = self.PROC_MEM_TEST_LIMIT
     self.execute_query_expect_success(self.client, query, exec_options)
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+      impalad_args=impalad_admission_ctrl_flags(max_requests=2, max_queued=1,
+      pool_max_mem=10 * PROC_MEM_TEST_LIMIT,
+      queue_wait_timeout_ms=2 * STATESTORE_RPC_FREQUENCY_MS),
+      start_args="--per_impalad_args=-mem_limit=3G;-mem_limit=3G;-mem_limit=2G",
+      statestored_args=_STATESTORED_ARGS)
+  def test_heterogeneous_proc_mem_limit(self, vector):
+    """ Test to ensure that the admission controller takes into account the actual proc
+    mem limits of each impalad. Starts a cluster where the last impalad has a smaller
+    proc mem limit than other impalads and runs queries where admission/rejection decision
+    depends on the coordinator knowing the other impalad's mem limits.
+    The queue_wait_timeout_ms has been set to be more than the prioritized statestore
+    update time, so that the queries don't time out before receiving updates to pool
+    stats"""
+    # Choose a query that runs on all 3 backends.
+    query = "select * from functional.alltypesagg, (select 1) B limit 1"
+    # Successfully run a query with mem limit equal to the lowest process memory among
+    # impalads
+    exec_options = copy(vector.get_value('exec_option'))
+    exec_options['mem_limit'] = "2G"
+    self.execute_query_expect_success(self.client, query, exec_options)
+    # Test that a query scheduled to run on a single node and submitted to the impalad
+    # with higher proc mem limit succeeds.
+    exec_options = copy(vector.get_value('exec_option'))
+    exec_options['mem_limit'] = "3G"
+    exec_options['num_nodes'] = "1"
+    self.execute_query_expect_success(self.client, query, exec_options)
+    # Exercise rejection checks in admission controller.
+    try:
+      exec_options = copy(vector.get_value('exec_option'))
+      exec_options['mem_limit'] = "3G"
+      self.execute_query(query, exec_options)
+    except ImpalaBeeswaxException as e:
+      assert re.search("Rejected query from pool \S+: request memory needed 3.00 GB per "
+          "node is greater than process mem limit 2.00 GB of \S+", str(e)), str(e)
+    # Exercise queuing checks in admission controller.
+    try:
+      impalad_with_2g_mem = self.cluster.impalads[2].service.create_beeswax_client()
+      impalad_with_2g_mem.set_configuration_option('mem_limit', '1G')
+      impalad_with_2g_mem.execute_async("select sleep(1000)")
+      # Wait for statestore update to update the mem admitted in each node.
+      sleep(STATESTORE_RPC_FREQUENCY_MS/1000)
+      exec_options = copy(vector.get_value('exec_option'))
+      exec_options['mem_limit'] = "2G"
+      # Since Queuing is synchronous and we can't close the previous query till this
+      # returns, we wait for this to timeout instead.
+      self.execute_query(query, exec_options)
+    except ImpalaBeeswaxException as e:
+      assert re.search("Queued reason: Not enough memory available on host \S+.Needed "
+          "2.00 GB but only 1.00 GB out of 2.00 GB was available.", str(e)), str(e)
+    finally:
+      if impalad_with_2g_mem is not None:
+        impalad_with_2g_mem.close()
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+    impalad_args= "--logbuflevel=-1 " + impalad_admission_ctrl_flags(max_requests=1,
+        max_queued=1, pool_max_mem=PROC_MEM_TEST_LIMIT),
+    statestored_args=_STATESTORED_ARGS)
+  def test_cancellation(self):
+    """ Test to confirm that all Async cancellation windows are hit and are able to
+    succesfully cancel the query"""
+    impalad = self.cluster.impalads[0]
+    client = impalad.service.create_beeswax_client()
+    try:
+      client.set_configuration_option("debug_action", "CRS_BEFORE_ADMISSION:SLEEP@2000")
+      client.set_configuration_option("mem_limit", self.PROC_MEM_TEST_LIMIT + 1 )
+      handle = client.execute_async("select 1")
+      sleep(1)
+      client.close_query(handle)
+      self.assert_impalad_log_contains('INFO',
+          "Ready to be Rejected but already cancelled, query id=")
+      client.clear_configuration()
+
+      client.set_configuration_option("debug_action", "CRS_BEFORE_ADMISSION:SLEEP@2000")
+      handle = client.execute_async("select 1")
+      sleep(1)
+      client.close_query(handle)
+      self.assert_impalad_log_contains('INFO',
+          "Ready to be Admitted immediately but already cancelled, query id=")
+
+      client.set_configuration_option("debug_action",
+          "CRS_AFTER_COORD_STARTS:SLEEP@2000")
+      handle = client.execute_async("select 1")
+      sleep(1)
+      client.close_query(handle)
+      self.assert_impalad_log_contains('INFO',
+          "Cancelled right after starting the coordinator query id=")
+
+      client.clear_configuration()
+      handle = client.execute_async("select sleep(10000)")
+      client.set_configuration_option("debug_action",
+          "AC_AFTER_ADMISSION_OUTCOME:SLEEP@2000")
+      queued_query_handle = client.execute_async("select 1")
+      sleep(1)
+      assert client.get_state(queued_query_handle) == QueryState.COMPILED
+      assert "Admission result: Queued" in client.get_runtime_profile(queued_query_handle)
+      # Only cancel the queued query, because close will wait till it unregisters, this
+      # gives us a chance to close the running query and allow the dequeue thread to
+      # dequeue the queue query
+      client.cancel(queued_query_handle)
+      client.close_query(handle)
+      client.close_query(queued_query_handle)
+      queued_profile = client.get_runtime_profile(queued_query_handle)
+      assert "Admission result: Cancelled (queued)" in queued_profile
+      self.assert_impalad_log_contains('INFO', "Dequeued cancelled query=")
+      client.clear_configuration()
+
+      handle = client.execute_async("select sleep(10000)")
+      queued_query_handle = client.execute_async("select 1")
+      sleep(1)
+      assert client.get_state(queued_query_handle) == QueryState.COMPILED
+      assert "Admission result: Queued" in client.get_runtime_profile(queued_query_handle)
+      client.close_query(queued_query_handle)
+      client.close_query(handle)
+      queued_profile = client.get_runtime_profile(queued_query_handle)
+      assert "Admission result: Cancelled (queued)" in queued_profile
+      for i in self.cluster.impalads:
+        i.service.wait_for_metric_value("impala-server.num-fragments-in-flight", 0)
+      assert self.cluster.impalads[0].service.get_metric_value(
+        "admission-controller.agg-num-running.default-pool") == 0
+      assert self.cluster.impalads[0].service.get_metric_value(
+        "admission-controller.total-admitted.default-pool") == 3
+      assert self.cluster.impalads[0].service.get_metric_value(
+        "admission-controller.total-queued.default-pool") == 2
+    finally:
+      client.close()
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+      impalad_args=impalad_admission_ctrl_flags(max_requests=1, max_queued=10,
+          pool_max_mem=1024 * 1024 * 1024),
+      statestored_args=_STATESTORED_ARGS)
+  def test_queue_reasons_num_queries(self):
+    """Test that queue details appear in the profile when queued based on num_queries."""
+    # Run a bunch of queries - one should get admitted immediately, the rest should
+    # be dequeued one-by-one.
+    STMT = "select sleep(100)"
+    TIMEOUT_S = 60
+    EXPECTED_REASON = \
+        "Latest admission queue reason: number of running queries 1 is at or over limit 1"
+    NUM_QUERIES = 5
+    profiles = self._execute_and_collect_profiles([STMT for i in xrange(NUM_QUERIES)],
+        TIMEOUT_S)
+
+    num_reasons = len([profile for profile in profiles if EXPECTED_REASON in profile])
+    assert num_reasons == NUM_QUERIES - 1, \
+        "All queries except first should have been queued: " + '\n===\n'.join(profiles)
+    init_queue_reasons = self.__extract_init_queue_reasons(profiles)
+    assert len(init_queue_reasons) == NUM_QUERIES - 1, \
+        "All queries except first should have been queued: " + '\n===\n'.join(profiles)
+    over_limit_details = [detail
+        for detail in init_queue_reasons if 'number of running queries' in detail]
+    assert len(over_limit_details) == 1, \
+        "One query initially queued because of num_queries: " + '\n===\n'.join(profiles)
+    queue_not_empty_details = [detail
+        for detail in init_queue_reasons if 'queue is not empty' in detail]
+    assert len(queue_not_empty_details) == NUM_QUERIES - 2, \
+        "Others queued because of non-empty queue: " + '\n===\n'.join(profiles)
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+      impalad_args=impalad_admission_ctrl_flags(max_requests=10, max_queued=10,
+          pool_max_mem=10 * 1024 * 1024),
+      statestored_args=_STATESTORED_ARGS)
+  def test_queue_reasons_memory(self):
+    """Test that queue details appear in the profile when queued based on memory."""
+    # Run a bunch of queries with mem_limit set so that only one can be admitted at a
+    # time- one should get admitted immediately, the rest should be dequeued one-by-one.
+    STMT = "select sleep(100)"
+    TIMEOUT_S = 60
+    EXPECTED_REASON = "Latest admission queue reason: Not enough aggregate memory " +\
+        "available in pool default-pool with max mem resources 10.00 MB. Needed " +\
+        "9.00 MB but only 1.00 MB was available."
+    NUM_QUERIES = 5
+    profiles = self._execute_and_collect_profiles([STMT for i in xrange(NUM_QUERIES)],
+        TIMEOUT_S, {'mem_limit':'9mb'})
+
+    num_reasons = len([profile for profile in profiles if EXPECTED_REASON in profile])
+    assert num_reasons == NUM_QUERIES - 1, \
+        "All queries except first should have been queued: " + '\n===\n'.join(profiles)
+    init_queue_reasons = self.__extract_init_queue_reasons(profiles)
+    assert len(init_queue_reasons) == NUM_QUERIES - 1, \
+        "All queries except first should have been queued: " + '\n===\n'.join(profiles)
+    over_limit_details = [detail for detail in init_queue_reasons
+        if 'Not enough aggregate memory available' in detail]
+    assert len(over_limit_details) == 1, \
+        "One query initially queued because of memory: " + '\n===\n'.join(profiles)
+    queue_not_empty_details = [detail
+        for detail in init_queue_reasons if 'queue is not empty' in detail]
+    assert len(queue_not_empty_details) == NUM_QUERIES - 2, \
+        "Others queued because of non-empty queue: " + '\n===\n'.join(profiles)
+
+  def __extract_init_queue_reasons(self, profiles):
+    """Return a list of the 'Admission Queue details' strings found in 'profiles'"""
+    matches = [re.search(INITIAL_QUEUE_REASON_REGEX, profile) for profile in profiles]
+    return [match.group(0) for match in matches if match is not None]
+
 
 class TestAdmissionControllerStress(TestAdmissionControllerBase):
   """Submits a number of queries (parameterized) with some delay between submissions
@@ -514,10 +763,26 @@ class TestAdmissionControllerStress(TestAdmissionControllerBase):
     metrics = {'admitted': 0, 'queued': 0, 'dequeued': 0, 'rejected' : 0,
         'released': 0, 'timed-out': 0}
     for impalad in self.impalads:
-      for short_name in metrics.keys():
-        metrics[short_name] += impalad.service.get_metric_value(\
-            metric_key(self.pool_name, 'total-%s' % short_name), 0)
+      keys = [metric_key(self.pool_name, 'total-%s' % short_name)
+              for short_name in metrics.keys()]
+      values = impalad.service.get_metric_values(keys, [0] * len(keys))
+      for short_name, value in zip(metrics.keys(), values):
+        metrics[short_name] += value
     return metrics
+
+  def get_consistent_admission_metrics(self, num_submitted):
+    """Same as get_admission_metrics() except retries until it gets consistent metrics for
+    num_submitted queries. See IMPALA-6227 for an example of problems with inconsistent
+    metrics where a dequeued query is reflected in dequeued but not admitted."""
+    ATTEMPTS = 5
+    for i in xrange(ATTEMPTS):
+      metrics = self.get_admission_metrics()
+      admitted_immediately = num_submitted - metrics['queued'] - metrics['rejected']
+      if admitted_immediately + metrics['dequeued'] == metrics['admitted']:
+        return metrics
+      LOG.info("Got inconsistent metrics {0}".format(metrics))
+    assert False, "Could not get consistent metrics for {0} queries after {1} attempts: "\
+        "{2}".format(num_submitted, ATTEMPTS, metrics)
 
   def wait_for_metric_changes(self, metric_names, initial, expected_delta):
     """
@@ -675,16 +940,20 @@ class TestAdmissionControllerStress(TestAdmissionControllerBase):
 
           LOG.info("Submitting query %s", self.query_num)
           self.query_handle = client.execute_async(query)
-        except ImpalaBeeswaxException as e:
-          if re.search("Rejected.*queue full", str(e)):
+          client.wait_for_admission_control(self.query_handle)
+          admission_result = client.get_admission_result(self.query_handle)
+          assert len(admission_result) > 0
+          if "Rejected" in admission_result:
             LOG.info("Rejected query %s", self.query_num)
             self.query_state = 'REJECTED'
+            self.query_handle = None
             return
-          elif "exceeded timeout" in str(e):
+          elif "timeout" in admission_result:
             LOG.info("Query %s timed out", self.query_num)
             self.query_state = 'TIMED OUT'
+            self.query_handle = None
             return
-          else:
+        except ImpalaBeeswaxException as e:
             raise e
         finally:
           self.lock.release()
@@ -834,7 +1103,7 @@ class TestAdmissionControllerStress(TestAdmissionControllerBase):
     # Admit queries in waves until all queries are done. A new wave of admission
     # is started by killing some of the running queries.
     while len(self.executing_threads) > 0:
-      curr_metrics = self.get_admission_metrics();
+      curr_metrics = self.get_consistent_admission_metrics(num_queries);
       log_metrics("Main loop, curr_metrics: ", curr_metrics);
       num_to_end = len(self.executing_threads)
       LOG.info("Main loop, will request %s queries to end", num_to_end)
@@ -856,7 +1125,7 @@ class TestAdmissionControllerStress(TestAdmissionControllerBase):
       # state or we may find an impalad dequeue more requests after we capture metrics.
       self.wait_for_statestore_updates(10)
 
-    final_metrics = self.get_admission_metrics();
+    final_metrics = self.get_consistent_admission_metrics(num_queries);
     log_metrics("Final metrics: ", final_metrics);
     metric_deltas = compute_metric_deltas(final_metrics, initial_metrics)
     assert metric_deltas['timed-out'] == 0

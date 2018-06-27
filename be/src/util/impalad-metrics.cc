@@ -46,12 +46,6 @@ const char* ImpaladMetricKeys::HASH_TABLE_TOTAL_BYTES =
     "impala-server.hash-table.total-bytes";
 const char* ImpaladMetricKeys::IO_MGR_NUM_OPEN_FILES =
     "impala-server.io-mgr.num-open-files";
-const char* ImpaladMetricKeys::IO_MGR_NUM_BUFFERS =
-    "impala-server.io-mgr.num-buffers";
-const char* ImpaladMetricKeys::IO_MGR_TOTAL_BYTES =
-    "impala-server.io-mgr.total-bytes";
-const char* ImpaladMetricKeys::IO_MGR_NUM_UNUSED_BUFFERS =
-    "impala-server.io-mgr.num-unused-buffers";
 const char* ImpaladMetricKeys::IO_MGR_BYTES_READ =
     "impala-server.io-mgr.bytes-read";
 const char* ImpaladMetricKeys::IO_MGR_LOCAL_BYTES_READ =
@@ -211,11 +205,8 @@ void ImpaladMetrics::CreateMetrics(MetricGroup* m) {
       ImpaladMetricKeys::NUM_FILES_OPEN_FOR_INSERT, 0);
 
   // Initialize IO mgr metrics
-  IO_MGR_NUM_OPEN_FILES = m->AddGauge(ImpaladMetricKeys::IO_MGR_NUM_OPEN_FILES, 0);
-  IO_MGR_NUM_BUFFERS = m->AddGauge(ImpaladMetricKeys::IO_MGR_NUM_BUFFERS, 0);
-  IO_MGR_TOTAL_BYTES = m->AddGauge(ImpaladMetricKeys::IO_MGR_TOTAL_BYTES, 0);
-  IO_MGR_NUM_UNUSED_BUFFERS = m->AddGauge(
-      ImpaladMetricKeys::IO_MGR_NUM_UNUSED_BUFFERS, 0);
+  IO_MGR_NUM_OPEN_FILES = m->AddGauge(
+      ImpaladMetricKeys::IO_MGR_NUM_OPEN_FILES, 0);
   IO_MGR_NUM_CACHED_FILE_HANDLES = m->AddGauge(
       ImpaladMetricKeys::IO_MGR_NUM_CACHED_FILE_HANDLES, 0);
   IO_MGR_NUM_FILE_HANDLES_OUTSTANDING = m->AddGauge(
@@ -245,12 +236,17 @@ void ImpaladMetrics::CreateMetrics(MetricGroup* m) {
       ImpaladMetricKeys::IO_MGR_CACHED_FILE_HANDLES_HIT_RATIO);
 
   // Initialize catalog metrics
-  CATALOG_NUM_DBS = m->AddGauge(ImpaladMetricKeys::CATALOG_NUM_DBS, 0);
-  CATALOG_NUM_TABLES = m->AddGauge(ImpaladMetricKeys::CATALOG_NUM_TABLES, 0);
-  CATALOG_VERSION = m->AddGauge(ImpaladMetricKeys::CATALOG_VERSION, 0);
-  CATALOG_TOPIC_VERSION = m->AddGauge(ImpaladMetricKeys::CATALOG_TOPIC_VERSION, 0);
-  CATALOG_SERVICE_ID = m->AddProperty<string>(ImpaladMetricKeys::CATALOG_SERVICE_ID, "");
-  CATALOG_READY = m->AddProperty<bool>(ImpaladMetricKeys::CATALOG_READY, false);
+  MetricGroup* catalog_metrics = m->GetOrCreateChildGroup("catalog");
+  CATALOG_NUM_DBS = catalog_metrics->AddGauge(ImpaladMetricKeys::CATALOG_NUM_DBS, 0);
+  CATALOG_NUM_TABLES =
+      catalog_metrics->AddGauge(ImpaladMetricKeys::CATALOG_NUM_TABLES, 0);
+  CATALOG_VERSION = catalog_metrics->AddGauge(ImpaladMetricKeys::CATALOG_VERSION, 0);
+  CATALOG_TOPIC_VERSION =
+      catalog_metrics->AddGauge(ImpaladMetricKeys::CATALOG_TOPIC_VERSION, 0);
+  CATALOG_SERVICE_ID =
+      catalog_metrics->AddProperty<string>(ImpaladMetricKeys::CATALOG_SERVICE_ID, "");
+  CATALOG_READY =
+      catalog_metrics->AddProperty<bool>(ImpaladMetricKeys::CATALOG_READY, false);
 
   // Maximum duration to be tracked by the query durations metric. No particular reasoning
   // behind five hours, except to say that there's some threshold beyond which queries

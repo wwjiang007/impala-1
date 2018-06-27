@@ -20,6 +20,7 @@ package org.apache.impala.catalog;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -31,25 +32,22 @@ import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.impala.analysis.Expr;
 import org.apache.impala.analysis.LiteralExpr;
-import org.apache.impala.analysis.NullLiteral;
 import org.apache.impala.analysis.PartitionKeyValue;
-import org.apache.impala.analysis.ToSqlUtils;
 import org.apache.impala.common.FileSystemUtil;
-import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.Pair;
 import org.apache.impala.common.Reference;
 import org.apache.impala.fb.FbCompression;
 import org.apache.impala.fb.FbFileBlock;
 import org.apache.impala.fb.FbFileDesc;
-import org.apache.impala.thrift.ImpalaInternalServiceConstants;
+import org.apache.impala.thrift.CatalogObjectsConstants;
 import org.apache.impala.thrift.TAccessLevel;
 import org.apache.impala.thrift.TExpr;
 import org.apache.impala.thrift.TExprNode;
 import org.apache.impala.thrift.THdfsFileDesc;
 import org.apache.impala.thrift.THdfsPartition;
+import org.apache.impala.thrift.THdfsPartitionLocation;
 import org.apache.impala.thrift.TNetworkAddress;
 import org.apache.impala.thrift.TPartitionStats;
-import org.apache.impala.thrift.TTableStats;
 import org.apache.impala.util.HdfsCachingUtil;
 import org.apache.impala.util.ListMap;
 import org.slf4j.Logger;
@@ -66,7 +64,6 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
-import com.google.common.primitives.Ints;
 import com.google.flatbuffers.FlatBufferBuilder;
 
 /**
@@ -75,7 +72,7 @@ import com.google.flatbuffers.FlatBufferBuilder;
  * order with NULLs sorting last. The ordering is useful for displaying partitions
  * in SHOW statements.
  */
-public class HdfsPartition implements Comparable<HdfsPartition> {
+public class HdfsPartition implements FeFsPartition, PrunablePartition {
   /**
    * Metadata for a single file in this partition.
    */
@@ -86,7 +83,7 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
 
     // Minimum block size in bytes allowed for synthetic file blocks (other than the last
     // block, which may be shorter).
-    private final static long MIN_SYNTHETIC_BLOCK_SIZE = 1024 * 1024;
+    public final static long MIN_SYNTHETIC_BLOCK_SIZE = 1024 * 1024;
 
     // Internal representation of a file descriptor using a FlatBuffer.
     private final FbFileDesc fbFileDescriptor_;
@@ -102,56 +99,62 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
      * Creates the file descriptor of a file represented by 'fileStatus' with blocks
      * stored in 'blockLocations'. 'fileSystem' is the filesystem where the
      * file resides and 'hostIndex' stores the network addresses of the hosts that store
-     * blocks of the parent HdfsTable. Populates 'numUnknownDiskIds' with the number of
-     * unknown disk ids.
+     * blocks of the parent HdfsTable. 'isEc' indicates whether the file is erasure-coded.
+     * Populates 'numUnknownDiskIds' with the number of unknown disk ids.
      */
     public static FileDescriptor create(FileStatus fileStatus,
         BlockLocation[] blockLocations, FileSystem fileSystem,
-        ListMap<TNetworkAddress> hostIndex, Reference<Long> numUnknownDiskIds)
-        throws IOException {
+        ListMap<TNetworkAddress> hostIndex, boolean isEc,
+        Reference<Long> numUnknownDiskIds) throws IOException {
       Preconditions.checkState(FileSystemUtil.supportsStorageIds(fileSystem));
       FlatBufferBuilder fbb = new FlatBufferBuilder(1);
       int[] fbFileBlockOffsets = new int[blockLocations.length];
       int blockIdx = 0;
       for (BlockLocation loc: blockLocations) {
-        fbFileBlockOffsets[blockIdx++] = FileBlock.createFbFileBlock(fbb, loc, hostIndex,
-            numUnknownDiskIds);
+        if (isEc) {
+          fbFileBlockOffsets[blockIdx++] = FileBlock.createFbFileBlock(fbb,
+              loc.getOffset(), loc.getLength(),
+              (short) hostIndex.getIndex(REMOTE_NETWORK_ADDRESS));
+        } else {
+          fbFileBlockOffsets[blockIdx++] =
+              FileBlock.createFbFileBlock(fbb, loc, hostIndex, numUnknownDiskIds);
+        }
       }
-      return new FileDescriptor(createFbFileDesc(fbb, fileStatus, fbFileBlockOffsets));
+      return new FileDescriptor(createFbFileDesc(fbb, fileStatus, fbFileBlockOffsets,
+          isEc));
     }
 
     /**
      * Creates the file descriptor of a file represented by 'fileStatus' that
      * resides in a filesystem that doesn't support the BlockLocation API (e.g. S3).
-     * fileFormat' is the file format of the partition where this file resides and
-     * 'hostIndex' stores the network addresses of the hosts that store blocks of
-     * the parent HdfsTable.
      */
-    public static FileDescriptor createWithSynthesizedBlockMd(FileStatus fileStatus,
-        HdfsFileFormat fileFormat, ListMap<TNetworkAddress> hostIndex) {
+    public static FileDescriptor createWithNoBlocks(FileStatus fileStatus) {
       FlatBufferBuilder fbb = new FlatBufferBuilder(1);
-      int[] fbFileBlockOffets =
-          synthesizeFbBlockMd(fbb, fileStatus, fileFormat, hostIndex);
-      return new FileDescriptor(createFbFileDesc(fbb, fileStatus, fbFileBlockOffets));
+      return new FileDescriptor(createFbFileDesc(fbb, fileStatus, null, false));
     }
 
     /**
      * Serializes the metadata of a file descriptor represented by 'fileStatus' into a
-     * FlatBuffer using 'fbb' and returns the associated FbFileDesc object. 'blockOffsets'
-     * are the offsets of the serialized block metadata of this file in the underlying
-     * buffer.
+     * FlatBuffer using 'fbb' and returns the associated FbFileDesc object.
+     * 'fbFileBlockOffsets' are the offsets of the serialized block metadata of this file
+     * in the underlying buffer. Can be null if there are no blocks.
      */
     private static FbFileDesc createFbFileDesc(FlatBufferBuilder fbb,
-        FileStatus fileStatus, int[] fbFileBlockOffets) {
+        FileStatus fileStatus, int[] fbFileBlockOffets, boolean isEc) {
       int fileNameOffset = fbb.createString(fileStatus.getPath().getName());
-      int blockVectorOffset = FbFileDesc.createFileBlocksVector(fbb, fbFileBlockOffets);
+      // A negative block vector offset is used when no block offsets are specified.
+      int blockVectorOffset = -1;
+      if (fbFileBlockOffets != null) {
+        blockVectorOffset = FbFileDesc.createFileBlocksVector(fbb, fbFileBlockOffets);
+      }
       FbFileDesc.startFbFileDesc(fbb);
       FbFileDesc.addFileName(fbb, fileNameOffset);
       FbFileDesc.addLength(fbb, fileStatus.getLen());
       FbFileDesc.addLastModificationTime(fbb, fileStatus.getModificationTime());
+      FbFileDesc.addIsEc(fbb, isEc);
       HdfsCompression comp = HdfsCompression.fromFileName(fileStatus.getPath().getName());
       FbFileDesc.addCompression(fbb, comp.toFb());
-      FbFileDesc.addFileBlocks(fbb, blockVectorOffset);
+      if (blockVectorOffset >= 0) FbFileDesc.addFileBlocks(fbb, blockVectorOffset);
       fbb.finish(FbFileDesc.endFbFileDesc(fbb));
       // To eliminate memory fragmentation, copy the contents of the FlatBuffer to the
       // smallest possible ByteBuffer.
@@ -161,38 +164,17 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
       return FbFileDesc.getRootAsFbFileDesc((ByteBuffer)compressedBb.flip());
     }
 
-    /**
-     * Synthesizes the block metadata of a file represented by 'fileStatus' that resides
-     * in a filesystem that doesn't support the BlockLocation API. The block metadata
-     * consist of the length and offset of each file block. It serializes the
-     * block metadata into a FlatBuffer using 'fbb' and returns their offsets in the
-     * underlying buffer. 'fileFormat' is the file format of the underlying partition and
-     * 'hostIndex' stores the network addresses of the hosts that store the blocks of the
-     * parent HdfsTable.
-     */
-    private static int[] synthesizeFbBlockMd(FlatBufferBuilder fbb, FileStatus fileStatus,
-        HdfsFileFormat fileFormat, ListMap<TNetworkAddress> hostIndex) {
-      long start = 0;
-      long remaining = fileStatus.getLen();
-      long blockSize = fileStatus.getBlockSize();
-      if (blockSize < MIN_SYNTHETIC_BLOCK_SIZE) blockSize = MIN_SYNTHETIC_BLOCK_SIZE;
-      if (!fileFormat.isSplittable(HdfsCompression.fromFileName(
-          fileStatus.getPath().getName()))) {
-        blockSize = remaining;
-      }
-      List<Integer> fbFileBlockOffets = Lists.newArrayList();
-      while (remaining > 0) {
-        long len = Math.min(remaining, blockSize);
-        fbFileBlockOffets.add(FileBlock.createFbFileBlock(fbb, start, len,
-            (short) hostIndex.getIndex(REMOTE_NETWORK_ADDRESS)));
-        remaining -= len;
-        start += len;
-      }
-      return Ints.toArray(fbFileBlockOffets);
-    }
-
     public String getFileName() { return fbFileDescriptor_.fileName(); }
     public long getFileLength() { return fbFileDescriptor_.length(); }
+
+    /** Compute the total length of files in fileDescs */
+    public static long computeTotalFileLength(Collection<FileDescriptor> fileDescs) {
+      long totalLength = 0;
+      for (FileDescriptor fileDesc: fileDescs) {
+        totalLength += fileDesc.getFileLength();
+      }
+      return totalLength;
+    }
 
     public HdfsCompression getFileCompression() {
       return HdfsCompression.valueOf(FbCompression.name(fbFileDescriptor_.compression()));
@@ -200,6 +182,7 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
 
     public long getModificationTime() { return fbFileDescriptor_.lastModificationTime(); }
     public int getNumFileBlocks() { return fbFileDescriptor_.fileBlocksLength(); }
+    public boolean getIsEc() {return fbFileDescriptor_.isEc(); }
 
     public FbFileBlock getFbFileBlock(int idx) {
       return fbFileDescriptor_.fileBlocks(idx);
@@ -458,81 +441,33 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
   // store intermediate state for statistics computations.
   private Map<String, String> hmsParameters_;
 
+  @Override // FeFsPartition
   public HdfsStorageDescriptor getInputFormatDescriptor() {
     return fileFormatDescriptor_;
   }
 
-  public boolean isDefaultPartition() {
-    return id_ == ImpalaInternalServiceConstants.DEFAULT_PARTITION_ID;
-  }
-
-  /**
-   * Returns true if the partition resides at a location which can be cached (e.g. HDFS).
-   */
+  @Override // FeFsPartition
   public boolean isCacheable() {
     return FileSystemUtil.isPathCacheable(new Path(getLocation()));
   }
 
-  /**
-   * Return a partition name formed by concatenating partition keys and their values,
-   * compatible with the way Hive names partitions. Reuses Hive's
-   * org.apache.hadoop.hive.common.FileUtils.makePartName() function to build the name
-   * string because there are a number of special cases for how partition names are URL
-   * escaped.
-   * TODO: Consider storing the PartitionKeyValue in HdfsPartition. It would simplify
-   * this code would be useful in other places, such as fromThrift().
-   */
+  @Override // FeFsPartition
   public String getPartitionName() {
-    List<String> partitionCols = Lists.newArrayList();
-    for (int i = 0; i < getTable().getNumClusteringCols(); ++i) {
-      partitionCols.add(getTable().getColumns().get(i).getName());
-    }
-
-    return org.apache.hadoop.hive.common.FileUtils.makePartName(
-        partitionCols, getPartitionValuesAsStrings(true));
+    // TODO: Consider storing the PartitionKeyValue in HdfsPartition. It would simplify
+    // this code would be useful in other places, such as fromThrift().
+    return FeCatalogUtils.getPartitionName(this);
   }
 
-  /**
-   * Returns a list of partition values as strings. If mapNullsToHiveKey is true, any NULL
-   * value is returned as the table's default null partition key string value, otherwise
-   * they are returned as 'NULL'.
-   */
+  @Override
   public List<String> getPartitionValuesAsStrings(boolean mapNullsToHiveKey) {
-    List<String> ret = Lists.newArrayList();
-    for (LiteralExpr partValue: getPartitionValues()) {
-      if (mapNullsToHiveKey) {
-        ret.add(PartitionKeyValue.getPartitionKeyValueString(
-                partValue, getTable().getNullPartitionKeyValue()));
-      } else {
-        ret.add(partValue.getStringValue());
-      }
-    }
-    return ret;
+    return FeCatalogUtils.getPartitionValuesAsStrings(this, mapNullsToHiveKey);
   }
 
-  /**
-   * Utility method which returns a string of conjuncts of equality exprs to exactly
-   * select this partition (e.g. ((month=2009) AND (year=2012)).
-   * TODO: Remove this when the TODO elsewhere in this file to save and expose the
-   * list of TPartitionKeyValues has been resolved.
-   */
+  @Override // FeFsPartition
   public String getConjunctSql() {
-    List<String> partColSql = Lists.newArrayList();
-    for (Column partCol: getTable().getClusteringColumns()) {
-      partColSql.add(ToSqlUtils.getIdentSql(partCol.getName()));
-    }
-
-    List<String> conjuncts = Lists.newArrayList();
-    for (int i = 0; i < partColSql.size(); ++i) {
-      LiteralExpr partVal = getPartitionValues().get(i);
-      String partValSql = partVal.toSql();
-      if (partVal instanceof NullLiteral || partValSql.isEmpty()) {
-        conjuncts.add(partColSql.get(i) + " IS NULL");
-      } else {
-        conjuncts.add(partColSql.get(i) + "=" + partValSql);
-      }
-    }
-    return "(" + Joiner.on(" AND " ).join(conjuncts) + ")";
+    // TODO: Remove this when the TODO elsewhere in this file to save and expose the
+    // list of TPartitionKeyValues has been resolved.
+    return FeCatalogUtils.getConjunctSqlForPartition(this);
   }
 
   /**
@@ -555,13 +490,24 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
    * Returns the storage location (HDFS path) of this partition. Should only be called
    * for partitioned tables.
    */
+  @Override
   public String getLocation() {
     return (location_ != null) ? location_.toString() : null;
   }
+
+  @Override
+  public THdfsPartitionLocation getLocationAsThrift() {
+    return location_ != null ? location_.toThrift() : null;
+  }
+
+  @Override // FeFsPartition
   public Path getLocationPath() { return new Path(getLocation()); }
+  @Override // FeFsPartition
   public long getId() { return id_; }
+  @Override // FeFsPartition
   public HdfsTable getTable() { return table_; }
   public void setNumRows(long numRows) { numRows_ = numRows; }
+  @Override // FeFsPartition
   public long getNumRows() { return numRows_; }
   public boolean isMarkedCached() { return isMarkedCached_; }
   void markCached() { isMarkedCached_ = true; }
@@ -578,6 +524,7 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
         fileFormatDescriptor_.getFileFormat().serializationLib());
   }
 
+  @Override // FeFsPartition
   public HdfsFileFormat getFileFormat() {
     return fileFormatDescriptor_.getFileFormat();
   }
@@ -590,30 +537,24 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
     return cachedMsPartitionDescriptor_.sdSerdeInfo;
   }
 
-  // May return null if no per-partition stats were recorded, or if the per-partition
-  // stats could not be deserialised from the parameter map.
+  @Override // FeFsPartition
   public TPartitionStats getPartitionStats() {
-    try {
-      return PartitionStatsUtil.partStatsFromParameters(hmsParameters_);
-    } catch (ImpalaException e) {
-      LOG.warn("Could not deserialise incremental stats state for " + getPartitionName() +
-          ", consider DROP INCREMENTAL STATS ... PARTITION ... and recomputing " +
-          "incremental stats for this table.");
-      return null;
-    }
+    return PartitionStatsUtil.getPartStatsOrWarn(this);
   }
 
+  @Override // FeFsPartition
   public boolean hasIncrementalStats() {
+    // TODO: performance of this could improve substantially, since
+    // getPartitionStats() performs a bunch of expensive deserialization,
+    // only to end up throwing away the result.
     TPartitionStats partStats = getPartitionStats();
     return partStats != null && partStats.intermediate_col_stats != null;
   }
 
-  /**
-   * Returns the HDFS permissions Impala has to this partition's directory - READ_ONLY,
-   * READ_WRITE, etc.
-   */
+  @Override // FeFsPartition
   public TAccessLevel getAccessLevel() { return accessLevel_; }
 
+  @Override // FeFsPartition
   public Map<String, String> getParameters() { return hmsParameters_; }
 
   public void putToParameters(String k, String v) { hmsParameters_.put(k, v); }
@@ -629,17 +570,18 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
   public void markDirty() { isDirty_ = true; }
   public boolean isDirty() { return isDirty_; }
 
-  /**
-   * Returns an immutable list of partition key expressions
-   */
+  @Override // FeFsPartition
   public List<LiteralExpr> getPartitionValues() { return partitionKeyValues_; }
+  @Override // FeFsPartition
   public LiteralExpr getPartitionValue(int i) { return partitionKeyValues_.get(i); }
+  @Override // FeFsPartition
   public List<HdfsPartition.FileDescriptor> getFileDescriptors() {
     return fileDescriptors_;
   }
   public void setFileDescriptors(List<FileDescriptor> descriptors) {
     fileDescriptors_ = descriptors;
   }
+  @Override // FeFsPartition
   public int getNumFileDescriptors() {
     return fileDescriptors_ == null ? 0 : fileDescriptors_.size();
   }
@@ -761,17 +703,6 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
     } else {
       hmsParameters_ = Maps.newHashMap();
     }
-
-    // TODO: instead of raising an exception, we should consider marking this partition
-    // invalid and moving on, so that table loading won't fail and user can query other
-    // partitions.
-    for (FileDescriptor fileDescriptor: fileDescriptors_) {
-      StringBuilder errorMsg = new StringBuilder();
-      if (!getInputFormatDescriptor().getFileFormat().isFileCompressionTypeSupported(
-          fileDescriptor.getFileName(), errorMsg)) {
-        throw new RuntimeException(errorMsg.toString());
-      }
-    }
   }
 
   public HdfsPartition(HdfsTable table,
@@ -788,19 +719,17 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
         accessLevel);
   }
 
-  public static HdfsPartition defaultPartition(
+  public static HdfsPartition prototypePartition(
       HdfsTable table, HdfsStorageDescriptor storageDescriptor) {
     List<LiteralExpr> emptyExprList = Lists.newArrayList();
     List<FileDescriptor> emptyFileDescriptorList = Lists.newArrayList();
     return new HdfsPartition(table, null, emptyExprList,
         storageDescriptor, emptyFileDescriptorList,
-        ImpalaInternalServiceConstants.DEFAULT_PARTITION_ID, null,
+        CatalogObjectsConstants.PROTOTYPE_PARTITION_ID, null,
         TAccessLevel.READ_WRITE);
   }
 
-  /**
-   * Return the size (in bytes) of all the files inside this partition
-   */
+  @Override
   public long getSize() {
     long result = 0;
     for (HdfsPartition.FileDescriptor fileDescriptor: fileDescriptors_) {
@@ -816,20 +745,18 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
       .toString();
   }
 
-  private static Predicate<String> isIncrementalStatsKey = new Predicate<String>() {
-    @Override
-    public boolean apply(String key) {
-      return !(key.startsWith(PartitionStatsUtil.INCREMENTAL_STATS_NUM_CHUNKS)
-          || key.startsWith(PartitionStatsUtil.INCREMENTAL_STATS_CHUNK_PREFIX));
-    }
-  };
+  public static Predicate<String> IS_NOT_INCREMENTAL_STATS_KEY =
+      new Predicate<String>() {
+        @Override
+        public boolean apply(String key) {
+          return !(key.startsWith(PartitionStatsUtil.INCREMENTAL_STATS_NUM_CHUNKS)
+              || key.startsWith(PartitionStatsUtil.INCREMENTAL_STATS_CHUNK_PREFIX));
+        }
+      };
 
-  /**
-   * Returns hmsParameters_ after filtering out all the partition
-   * incremental stats information.
-   */
-  private Map<String, String> getFilteredHmsParameters() {
-    return Maps.filterKeys(hmsParameters_, isIncrementalStatsKey);
+  @Override
+  public Map<String, String> getFilteredHmsParameters() {
+    return Maps.filterKeys(hmsParameters_, IS_NOT_INCREMENTAL_STATS_KEY);
   }
 
   public static HdfsPartition fromThrift(HdfsTable table,
@@ -845,7 +772,7 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
         thriftPartition.blockSize);
 
     List<LiteralExpr> literalExpr = Lists.newArrayList();
-    if (id != ImpalaInternalServiceConstants.DEFAULT_PARTITION_ID) {
+    if (id != CatalogObjectsConstants.PROTOTYPE_PARTITION_ID) {
       List<Column> clusterCols = Lists.newArrayList();
       for (int i = 0; i < table.getNumClusteringCols(); ++i) {
         clusterCols.add(table.getColumns().get(i));
@@ -914,50 +841,15 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
     }
   }
 
-  public THdfsPartition toThrift(boolean includeFileDesc,
-      boolean includeIncrementalStats) {
-    List<TExpr> thriftExprs = Expr.treesToThrift(getPartitionValues());
-
-    THdfsPartition thriftHdfsPart = new THdfsPartition(
-        fileFormatDescriptor_.getLineDelim(),
-        fileFormatDescriptor_.getFieldDelim(),
-        fileFormatDescriptor_.getCollectionDelim(),
-        fileFormatDescriptor_.getMapKeyDelim(),
-        fileFormatDescriptor_.getEscapeChar(),
-        fileFormatDescriptor_.getFileFormat().toThrift(), thriftExprs,
-        fileFormatDescriptor_.getBlockSize());
-    if (location_ != null) thriftHdfsPart.setLocation(location_.toThrift());
-    thriftHdfsPart.setStats(new TTableStats(numRows_));
-    thriftHdfsPart.setAccess_level(accessLevel_);
-    thriftHdfsPart.setIs_marked_cached(isMarkedCached_);
-    thriftHdfsPart.setId(getId());
-    thriftHdfsPart.setHas_incremental_stats(hasIncrementalStats());
-    // IMPALA-4902: Shallow-clone the map to avoid concurrent modifications. One thread
-    // may try to serialize the returned THdfsPartition after releasing the table's lock,
-    // and another thread doing DDL may modify the map.
-    thriftHdfsPart.setHms_parameters(Maps.newHashMap(
-        includeIncrementalStats ? hmsParameters_ : getFilteredHmsParameters()));
-    if (includeFileDesc) {
-      // Add block location information
-      long numBlocks = 0;
-      long totalFileBytes = 0;
-      for (FileDescriptor fd: fileDescriptors_) {
-        thriftHdfsPart.addToFile_desc(fd.toThrift());
-        numBlocks += fd.getNumFileBlocks();
-        totalFileBytes += fd.getFileLength();
-      }
-      thriftHdfsPart.setNum_blocks(numBlocks);
-      thriftHdfsPart.setTotal_file_size_bytes(totalFileBytes);
-    }
-    return thriftHdfsPart;
-  }
-
   /**
-   * Comparison method to allow ordering of HdfsPartitions by their partition-key values.
+   * Comparator to allow ordering of partitions by their partition-key values.
    */
-  @Override
-  public int compareTo(HdfsPartition o) {
-    return comparePartitionKeyValues(partitionKeyValues_, o.getPartitionValues());
+  public static final KeyValueComparator KV_COMPARATOR = new KeyValueComparator();
+  public static class KeyValueComparator implements Comparator<FeFsPartition> {
+    @Override
+    public int compare(FeFsPartition o1, FeFsPartition o2) {
+      return comparePartitionKeyValues(o1.getPartitionValues(), o2.getPartitionValues());
+    }
   }
 
   @VisibleForTesting

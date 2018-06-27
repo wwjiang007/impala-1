@@ -21,6 +21,7 @@
 #include <limits>
 #include <gutil/strings/substitute.h>
 
+#include "runtime/coordinator.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/row-batch.h"
 #include "runtime/runtime-state.h"
@@ -71,6 +72,7 @@ ClientRequestState::ClientRequestState(
     child_query_executor_(new ChildQueryExecutor),
     exec_env_(exec_env),
     session_(session),
+    coord_exec_called_(false),
     // Profile is assigned name w/ id after planning
     profile_(RuntimeProfile::Create(&profile_pool_, "Query")),
     server_profile_(RuntimeProfile::Create(&profile_pool_, "ImpalaServer")),
@@ -90,7 +92,7 @@ ClientRequestState::ClientRequestState(
 
   profile_->set_name("Query (id=" + PrintId(query_id()) + ")");
   summary_profile_->AddInfoString("Session ID", PrintId(session_id()));
-  summary_profile_->AddInfoString("Session Type", PrintTSessionType(session_type()));
+  summary_profile_->AddInfoString("Session Type", PrintThriftEnum(session_type()));
   if (session_type() == TSessionType::HIVESERVER2) {
     summary_profile_->AddInfoString("HiveServer2 Protocol Version",
         Substitute("V$0", 1 + session->hs2_version));
@@ -101,19 +103,19 @@ ClientRequestState::ClientRequestState(
       TimePrecision::Nanosecond));
   summary_profile_->AddInfoString("End Time", "");
   summary_profile_->AddInfoString("Query Type", "N/A");
-  summary_profile_->AddInfoString("Query State", PrintQueryState(query_state_));
+  summary_profile_->AddInfoString("Query State", PrintThriftEnum(BeeswaxQueryState()));
   summary_profile_->AddInfoString("Query Status", "OK");
   summary_profile_->AddInfoString("Impala Version", GetVersionString(/* compact */ true));
   summary_profile_->AddInfoString("User", effective_user());
   summary_profile_->AddInfoString("Connected User", connected_user());
   summary_profile_->AddInfoString("Delegated User", do_as_user());
   summary_profile_->AddInfoString("Network Address",
-      lexical_cast<string>(session_->network_address));
+      TNetworkAddressToString(session_->network_address));
   summary_profile_->AddInfoString("Default Db", default_db());
   summary_profile_->AddInfoStringRedacted(
       "Sql Statement", query_ctx_.client_request.stmt);
   summary_profile_->AddInfoString("Coordinator",
-      TNetworkAddressToString(exec_env->backend_address()));
+      TNetworkAddressToString(exec_env->GetThriftBackendAddress()));
 }
 
 ClientRequestState::~ClientRequestState() {
@@ -139,7 +141,7 @@ Status ClientRequestState::Exec(TExecRequest* exec_request) {
   exec_request_ = *exec_request;
 
   profile_->AddChild(server_profile_);
-  summary_profile_->AddInfoString("Query Type", PrintTStmtType(stmt_type()));
+  summary_profile_->AddInfoString("Query Type", PrintThriftEnum(stmt_type()));
   summary_profile_->AddInfoString("Query Options (set by configuration)",
       DebugQueryOptions(query_ctx_.client_request.query_options));
   summary_profile_->AddInfoString("Query Options (set by configuration and planner)",
@@ -149,15 +151,17 @@ Status ClientRequestState::Exec(TExecRequest* exec_request) {
     case TStmtType::QUERY:
     case TStmtType::DML:
       DCHECK(exec_request_.__isset.query_exec_request);
-      return ExecQueryOrDmlRequest(exec_request_.query_exec_request);
+      RETURN_IF_ERROR(ExecAsyncQueryOrDmlRequest(exec_request_.query_exec_request));
+      break;
     case TStmtType::EXPLAIN: {
       request_result_set_.reset(new vector<TResultRow>(
           exec_request_.explain_result.results));
-      return Status::OK();
+      break;
     }
     case TStmtType::DDL: {
       DCHECK(exec_request_.__isset.catalog_op_request);
-      return ExecDdlRequest();
+      RETURN_IF_ERROR(ExecDdlRequest());
+      break;
     }
     case TStmtType::LOAD: {
       DCHECK(exec_request_.__isset.load_data_request);
@@ -184,7 +188,7 @@ Status ClientRequestState::Exec(TExecRequest* exec_request) {
       RETURN_IF_ERROR(parent_server_->ProcessCatalogUpdateResult(
           *catalog_op_executor_->update_catalog_result(),
           exec_request_.query_options.sync_ddl));
-      return Status::OK();
+      break;
     }
     case TStmtType::SET: {
       DCHECK(exec_request_.__isset.set_query_option_request);
@@ -210,13 +214,20 @@ Status ClientRequestState::Exec(TExecRequest* exec_request) {
             exec_request_.set_query_option_request.is_set_all;
         PopulateResultForSet(is_set_all);
       }
-      return Status::OK();
+      break;
     }
     default:
       stringstream errmsg;
-      errmsg << "Unknown  exec request stmt type: " << exec_request_.stmt_type;
+      errmsg << "Unknown exec request stmt type: " << exec_request_.stmt_type;
       return Status(errmsg.str());
   }
+
+  if (async_exec_thread_.get() != nullptr) {
+    UpdateNonErrorOperationState(TOperationState::PENDING_STATE);
+  } else {
+    UpdateNonErrorOperationState(TOperationState::RUNNING_STATE);
+  }
+  return Status::OK();
 }
 
 void ClientRequestState::PopulateResultForSet(bool is_set_all) {
@@ -362,8 +373,8 @@ Status ClientRequestState::ExecLocalCatalogOp(
     }
     case TCatalogOpType::DESCRIBE_TABLE: {
       TDescribeResult response;
-      RETURN_IF_ERROR(frontend_->DescribeTable(catalog_op.describe_table_params,
-          &response));
+      const TDescribeTableParams& params = catalog_op.describe_table_params;
+      RETURN_IF_ERROR(frontend_->DescribeTable(params, query_ctx_.session, &response));
       // Set the result set
       request_result_set_.reset(new vector<TResultRow>(response.results));
       return Status::OK();
@@ -398,7 +409,7 @@ Status ClientRequestState::ExecLocalCatalogOp(
   }
 }
 
-Status ClientRequestState::ExecQueryOrDmlRequest(
+Status ClientRequestState::ExecAsyncQueryOrDmlRequest(
     const TQueryExecRequest& query_exec_request) {
   // we always need at least one plan fragment
   DCHECK(query_exec_request.plan_exec_info.size() > 0);
@@ -467,29 +478,56 @@ Status ClientRequestState::ExecQueryOrDmlRequest(
     lock_guard<mutex> l(lock_);
     RETURN_IF_ERROR(UpdateQueryStatus(status));
   }
+  RETURN_IF_ERROR(Thread::Create("query-exec-state", "async-exec-thread",
+      &ClientRequestState::FinishExecQueryOrDmlRequest, this, &async_exec_thread_, true));
+  return Status::OK();
+}
 
-  if (exec_env_->admission_controller() != nullptr) {
-    status = exec_env_->admission_controller()->AdmitQuery(schedule_.get());
-    {
-      lock_guard<mutex> l(lock_);
-      RETURN_IF_ERROR(UpdateQueryStatus(status));
+void ClientRequestState::FinishExecQueryOrDmlRequest() {
+  DebugActionNoFail(schedule_->query_options(), "CRS_BEFORE_ADMISSION");
+
+  DCHECK(exec_env_->admission_controller() != nullptr);
+  Status admit_status = ExecEnv::GetInstance()->admission_controller()->AdmitQuery(
+      schedule_.get(), &admit_outcome_);
+  {
+    lock_guard<mutex> l(lock_);
+    if (!UpdateQueryStatus(admit_status).ok()) return;
+  }
+  coord_.reset(new Coordinator(*schedule_, query_events_));
+  Status exec_status = coord_->Exec();
+
+  DebugActionNoFail(schedule_->query_options(), "CRS_AFTER_COORD_STARTS");
+
+  bool cancelled = false;
+  Status cancellation_status;
+  {
+    lock_guard<mutex> l(lock_);
+    if (!UpdateQueryStatus(exec_status).ok()) return;
+    cancelled = is_cancelled_;
+    if (!cancelled) {
+      // Once the lock is dropped, any future calls to Cancel() are responsible for
+      // calling Coordinator::Cancel(), so while holding the lock we need to both perform
+      // a check for cancellation and make the coord_ visible.
+      coord_exec_called_.Store(true);
+    } else {
+      VLOG_QUERY << "Cancelled right after starting the coordinator query id="
+                 << PrintId(schedule_->query_id());
+      discard_result(UpdateQueryStatus(Status::CANCELLED));
     }
   }
 
-  coord_.reset(new Coordinator(*schedule_, query_events_));
-  status = coord_->Exec();
-  {
-    lock_guard<mutex> l(lock_);
-    RETURN_IF_ERROR(UpdateQueryStatus(status));
+  if (cancelled) {
+    coord_->Cancel();
+    return;
   }
 
   profile_->AddChild(coord_->query_profile());
-  return Status::OK();
+  UpdateNonErrorOperationState(TOperationState::RUNNING_STATE);
 }
 
 Status ClientRequestState::ExecDdlRequest() {
   string op_type = catalog_op_type() == TCatalogOpType::DDL ?
-      PrintTDdlType(ddl_type()) : PrintTCatalogOpType(catalog_op_type());
+      PrintThriftEnum(ddl_type()) : PrintThriftEnum(catalog_op_type());
   summary_profile_->AddInfoString("DDL Type", op_type);
 
   if (catalog_op_type() != TCatalogOpType::DDL &&
@@ -515,6 +553,8 @@ Status ClientRequestState::ExecDdlRequest() {
 
     if (child_queries.size() > 0) {
       RETURN_IF_ERROR(child_query_executor_->ExecAsync(move(child_queries)));
+    } else {
+      SetResultSet({"No partitions selected for incremental stats update."});
     }
     return Status::OK();
   }
@@ -551,7 +591,7 @@ Status ClientRequestState::ExecDdlRequest() {
     // wait for another catalog update if any partitions were altered as a result
     // of the operation.
     DCHECK(exec_request_.__isset.query_exec_request);
-    RETURN_IF_ERROR(ExecQueryOrDmlRequest(exec_request_.query_exec_request));
+    RETURN_IF_ERROR(ExecAsyncQueryOrDmlRequest(exec_request_.query_exec_request));
   }
 
   // Set the results to be reported to the client.
@@ -568,11 +608,13 @@ void ClientRequestState::Done() {
   // Update latest observed Kudu timestamp stored in the session from the coordinator.
   // Needs to take the session_ lock which must not be taken while holding lock_, so this
   // must happen before taking lock_ below.
-  if (coord_.get() != NULL) {
+  Coordinator* coordinator = GetCoordinator();
+  if (coordinator != nullptr) {
     // This is safe to access on coord_ after Wait() has been called.
-    uint64_t latest_kudu_ts = coord_->GetLatestKuduInsertTimestamp();
+    uint64_t latest_kudu_ts =
+        coordinator->dml_exec_state()->GetKuduLatestObservedTimestamp();
     if (latest_kudu_ts > 0) {
-      VLOG_RPC << "Updating session (id=" << session_id()  << ") with latest "
+      VLOG_RPC << "Updating session (id=" << PrintId(session_id())  << ") with latest "
                << "observed Kudu timestamp: " << latest_kudu_ts;
       lock_guard<mutex> session_lock(session_->lock);
       session_->kudu_latest_observed_ts = std::max<uint64_t>(
@@ -596,7 +638,7 @@ void ClientRequestState::Done() {
 Status ClientRequestState::Exec(const TMetadataOpRequest& exec_request) {
   TResultSet metadata_op_result;
   // Like the other Exec(), fill out as much profile information as we're able to.
-  summary_profile_->AddInfoString("Query Type", PrintTStmtType(TStmtType::DDL));
+  summary_profile_->AddInfoString("Query Type", PrintThriftEnum(TStmtType::DDL));
   RETURN_IF_ERROR(frontend_->ExecHiveServer2MetadataOp(exec_request,
       &metadata_op_result));
   result_metadata_ = metadata_op_result.schema;
@@ -644,8 +686,14 @@ void ClientRequestState::Wait() {
     discard_result(UpdateQueryStatus(status));
   }
   if (status.ok()) {
-    UpdateNonErrorQueryState(beeswax::QueryState::FINISHED);
+    if (stmt_type() == TStmtType::DDL) {
+      DCHECK(catalog_op_type() != TCatalogOpType::DDL || request_result_set_ != nullptr);
+    }
+    UpdateNonErrorOperationState(TOperationState::FINISHED_STATE);
   }
+  // UpdateQueryStatus() or UpdateNonErrorOperationState() have updated operation_state_.
+  DCHECK(operation_state_ == TOperationState::FINISHED_STATE ||
+      operation_state_ == TOperationState::ERROR_STATE);
 }
 
 Status ClientRequestState::WaitInternal() {
@@ -654,6 +702,10 @@ Status ClientRequestState::WaitInternal() {
     MarkInactive();
     return Status::OK();
   }
+
+  // Wait until the query has passed through admission control and is either running or
+  // cancelled or encountered an error.
+  if (async_exec_thread_.get() != nullptr) async_exec_thread_->Join();
 
   vector<ChildQuery*> child_queries;
   Status child_queries_status = child_query_executor_->WaitForAll(&child_queries);
@@ -664,8 +716,8 @@ Status ClientRequestState::WaitInternal() {
   }
   if (!child_queries.empty()) query_events_->MarkEvent("Child queries finished");
 
-  if (coord_.get() != NULL) {
-    RETURN_IF_ERROR(coord_->Wait());
+  if (GetCoordinator() != NULL) {
+    RETURN_IF_ERROR(GetCoordinator()->Wait());
     RETURN_IF_ERROR(UpdateCatalog());
   }
 
@@ -676,7 +728,7 @@ Status ClientRequestState::WaitInternal() {
 
   if (!returns_result_set()) {
     // Queries that do not return a result are finished at this point. This includes
-    // DML operations and a subset of the DDL operations.
+    // DML operations.
     eos_ = true;
   } else if (catalog_op_type() == TCatalogOpType::DDL &&
       ddl_type() == TDdlType::CREATE_TABLE_AS_SELECT) {
@@ -720,17 +772,31 @@ Status ClientRequestState::RestartFetch() {
   return Status::OK();
 }
 
-void ClientRequestState::UpdateNonErrorQueryState(
-    beeswax::QueryState::type query_state) {
+void ClientRequestState::UpdateNonErrorOperationState(TOperationState::type new_state) {
   lock_guard<mutex> l(lock_);
-  DCHECK(query_state != beeswax::QueryState::EXCEPTION);
-  if (query_state_ < query_state) UpdateQueryState(query_state);
+  switch (new_state) {
+    case TOperationState::PENDING_STATE:
+      if (operation_state_ == TOperationState::INITIALIZED_STATE) {
+        UpdateOperationState(new_state);
+      }
+      break;
+    case TOperationState::RUNNING_STATE:
+    case TOperationState::FINISHED_STATE:
+      if (operation_state_ == TOperationState::INITIALIZED_STATE
+          || operation_state_ == TOperationState::PENDING_STATE
+          || operation_state_ == TOperationState::RUNNING_STATE) {
+        UpdateOperationState(new_state);
+      }
+      break;
+    default:
+      DCHECK(false) << "A non-error state expected but got: " << new_state;
+  }
 }
 
 Status ClientRequestState::UpdateQueryStatus(const Status& status) {
   // Preserve the first non-ok status
   if (!status.ok() && query_status_.ok()) {
-    UpdateQueryState(beeswax::QueryState::EXCEPTION);
+    UpdateOperationState(TOperationState::ERROR_STATE);
     query_status_ = status;
     summary_profile_->AddInfoStringRedacted("Query Status", query_status_.GetDetail());
   }
@@ -740,12 +806,13 @@ Status ClientRequestState::UpdateQueryStatus(const Status& status) {
 
 Status ClientRequestState::FetchRowsInternal(const int32_t max_rows,
     QueryResultSet* fetched_rows) {
-  DCHECK(query_state_ != beeswax::QueryState::EXCEPTION);
+  // Wait() guarantees that we've transitioned at least to FINISHED_STATE (and any
+  // state beyond that should have a non-OK query_status_ set).
+  DCHECK(operation_state_ == TOperationState::FINISHED_STATE);
 
   if (eos_) return Status::OK();
 
   if (request_result_set_ != NULL) {
-    UpdateQueryState(beeswax::QueryState::FINISHED);
     int num_rows = 0;
     const vector<TResultRow>& all_rows = (*(request_result_set_.get()));
     // max_rows <= 0 means no limit
@@ -759,7 +826,8 @@ Status ClientRequestState::FetchRowsInternal(const int32_t max_rows,
     return Status::OK();
   }
 
-  if (coord_.get() == nullptr) {
+  Coordinator* coordinator = GetCoordinator();
+  if (coordinator == nullptr) {
     return Status("Client tried to fetch rows on a query that produces no results.");
   }
 
@@ -772,9 +840,6 @@ Status ClientRequestState::FetchRowsInternal(const int32_t max_rows,
     num_rows_fetched_ += num_rows_fetched_from_cache;
     if (num_rows_fetched_from_cache >= max_rows) return Status::OK();
   }
-
-  // results will be ready after this call
-  UpdateQueryState(beeswax::QueryState::FINISHED);
 
   // Maximum number of rows to be fetched from the coord.
   int32_t max_coord_rows = max_rows;
@@ -790,7 +855,7 @@ Status ClientRequestState::FetchRowsInternal(const int32_t max_rows,
     // concurrently.
     // TODO: Simplify this.
     lock_.unlock();
-    Status status = coord_->GetNext(fetched_rows, max_coord_rows, &eos_);
+    Status status = coordinator->GetNext(fetched_rows, max_coord_rows, &eos_);
     lock_.lock();
     int num_fetched = fetched_rows->size() - before;
     DCHECK(max_coord_rows <= 0 || num_fetched <= max_coord_rows) << Substitute(
@@ -829,7 +894,7 @@ Status ClientRequestState::FetchRowsInternal(const int32_t max_rows,
     // Upper-bound on memory required to add fetched_rows to the cache.
     int64_t delta_bytes =
         fetched_rows->ByteSize(num_rows_fetched_from_cache, fetched_rows->size());
-    MemTracker* query_mem_tracker = coord_->query_mem_tracker();
+    MemTracker* query_mem_tracker = coordinator->query_mem_tracker();
     // Count the cached rows towards the mem limit.
     if (UNLIKELY(!query_mem_tracker->TryConsume(delta_bytes))) {
       string details("Failed to allocate memory for result cache.");
@@ -873,19 +938,18 @@ Status ClientRequestState::Cancel(bool check_inflight, const Status* cause) {
     }
   }
 
-  Coordinator* coord;
   {
     lock_guard<mutex> lock(lock_);
-    // If the query is completed or cancelled, no need to update state.
-    bool already_done = eos_ || query_state_ == beeswax::QueryState::EXCEPTION;
+    // If the query has reached a terminal state, no need to update the state.
+    bool already_done = eos_ || operation_state_ == TOperationState::ERROR_STATE;
     if (!already_done && cause != NULL) {
       DCHECK(!cause->ok());
       discard_result(UpdateQueryStatus(*cause));
       query_events_->MarkEvent("Cancelled");
-      DCHECK_EQ(query_state_, beeswax::QueryState::EXCEPTION);
+      DCHECK_EQ(operation_state_, TOperationState::ERROR_STATE);
     }
-    // Get a copy of the coordinator pointer while holding 'lock_'.
-    coord = coord_.get();
+
+    admit_outcome_.Set(AdmissionOutcome::CANCELLED);
     is_cancelled_ = true;
   } // Release lock_ before doing cancellation work.
 
@@ -894,9 +958,10 @@ Status ClientRequestState::Cancel(bool check_inflight, const Status* cause) {
   // involves RPCs and can take quite some time.
   child_query_executor_->Cancel();
 
-  // Cancel the parent query. 'lock_' should not be held because cancellation involves
-  // RPCs and can block for a long time.
-  if (coord != NULL) coord->Cancel(cause);
+  // Ensure the parent query is cancelled if execution has started (if the query was not
+  // started, cancellation is handled by the 'async-exec-thread' thread). 'lock_' should
+  // not be held because cancellation involves RPCs and can block for a long time.
+  if (GetCoordinator() != nullptr) GetCoordinator()->Cancel();
   return Status::OK();
 }
 
@@ -916,9 +981,9 @@ Status ClientRequestState::UpdateCatalog() {
     catalog_update.__set_sync_ddl(exec_request().query_options.sync_ddl);
     catalog_update.__set_header(TCatalogServiceRequestHeader());
     catalog_update.header.__set_requesting_user(effective_user());
-    if (!coord()->PrepareCatalogUpdate(&catalog_update)) {
+    if (!GetCoordinator()->dml_exec_state()->PrepareCatalogUpdate(&catalog_update)) {
       VLOG_QUERY << "No partitions altered, not updating metastore (query id: "
-                 << query_id() << ")";
+                 << PrintId(query_id()) << ")";
     } else {
       // TODO: We track partitions written to, not created, which means
       // that we do more work than is necessary, because written-to
@@ -1024,10 +1089,8 @@ void ClientRequestState::SetCreateTableAsSelectResultSet() {
   // There will only be rows inserted in the case a new table was created as part of this
   // operation.
   if (catalog_op_executor_->ddl_exec_response()->new_table_created) {
-    DCHECK(coord_.get());
-    for (const PartitionStatusMap::value_type& p: coord_->per_partition_status()) {
-      total_num_rows_inserted += p.second.num_modified_rows;
-    }
+    DCHECK(GetCoordinator());
+    total_num_rows_inserted = GetCoordinator()->dml_exec_state()->GetNumModifiedRows();
   }
   const string& summary_msg = Substitute("Inserted $0 row(s)", total_num_rows_inserted);
   VLOG_QUERY << summary_msg;
@@ -1089,22 +1152,50 @@ Status ClientRequestState::UpdateTableAndColumnStats(
 }
 
 void ClientRequestState::ClearResultCache() {
-  if (result_cache_ == NULL) return;
+  if (result_cache_ == nullptr) return;
   // Update result set cache metrics and mem limit accounting.
   ImpaladMetrics::RESULTSET_CACHE_TOTAL_NUM_ROWS->Increment(-result_cache_->size());
   int64_t total_bytes = result_cache_->ByteSize();
   ImpaladMetrics::RESULTSET_CACHE_TOTAL_BYTES->Increment(-total_bytes);
-  if (coord_ != NULL) {
-    DCHECK(coord_->query_mem_tracker() != NULL);
-    coord_->query_mem_tracker()->Release(total_bytes);
+  Coordinator* coordinator = GetCoordinator();
+  if (coordinator != nullptr) {
+    DCHECK(coordinator->query_mem_tracker() != nullptr);
+    coordinator->query_mem_tracker()->Release(total_bytes);
   }
-  result_cache_.reset(NULL);
+  result_cache_.reset();
 }
 
-void ClientRequestState::UpdateQueryState(
-    beeswax::QueryState::type query_state) {
-  query_state_ = query_state;
-  summary_profile_->AddInfoString("Query State", PrintQueryState(query_state_));
+void ClientRequestState::UpdateOperationState(
+    TOperationState::type operation_state) {
+  operation_state_ = operation_state;
+  summary_profile_->AddInfoString("Query State", PrintThriftEnum(BeeswaxQueryState()));
 }
 
+beeswax::QueryState::type ClientRequestState::BeeswaxQueryState() const {
+  switch (operation_state_) {
+    case TOperationState::INITIALIZED_STATE: return beeswax::QueryState::CREATED;
+    case TOperationState::PENDING_STATE: return beeswax::QueryState::COMPILED;
+    case TOperationState::RUNNING_STATE: return beeswax::QueryState::RUNNING;
+    case TOperationState::FINISHED_STATE: return beeswax::QueryState::FINISHED;
+    case TOperationState::ERROR_STATE: return beeswax::QueryState::EXCEPTION;
+    default: {
+      DCHECK(false) << "Add explicit translation for all used TOperationState values";
+      return beeswax::QueryState::EXCEPTION;
+    }
+  }
+}
+
+// It is safe to use 'coord_' directly for the following two methods since they are safe
+// to call concurrently with Coordinator::Exec(). See comments for 'coord_' and
+// 'coord_exec_called_' for more details.
+Status ClientRequestState::UpdateBackendExecStatus(
+    const TReportExecStatusParams& params) {
+  DCHECK(coord_.get());
+  return coord_->UpdateBackendExecStatus(params);
+}
+
+void ClientRequestState::UpdateFilter(const TUpdateFilterParams& params) {
+  DCHECK(coord_.get());
+  coord_->UpdateFilter(params);
+}
 }

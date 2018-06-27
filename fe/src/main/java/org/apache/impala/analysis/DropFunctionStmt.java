@@ -22,7 +22,7 @@ import java.util.ArrayList;
 import org.apache.impala.authorization.AuthorizeableFn;
 import org.apache.impala.authorization.Privilege;
 import org.apache.impala.authorization.PrivilegeRequest;
-import org.apache.impala.catalog.Db;
+import org.apache.impala.catalog.FeDb;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
@@ -74,7 +74,7 @@ public class DropFunctionStmt extends StatementBase {
 
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
-    fnName_.analyze(analyzer);
+    fnName_.analyze(analyzer, false);
 
     if (hasSignature()) {
       fnArgs_.analyze(analyzer);
@@ -85,13 +85,10 @@ public class DropFunctionStmt extends StatementBase {
           false);
     }
 
-    // For now, if authorization is enabled, the user needs ALL on the server
-    // to drop functions.
-    // TODO: this is not the right granularity but acceptable for now.
     analyzer.registerPrivReq(new PrivilegeRequest(
-        new AuthorizeableFn(desc_.signatureString()), Privilege.ALL));
+        new AuthorizeableFn(desc_.dbName(), desc_.signatureString()), Privilege.DROP));
 
-    Db db =  analyzer.getDb(desc_.dbName(), Privilege.DROP, false);
+    FeDb db =  analyzer.getDb(desc_.dbName(), false);
     if (db == null && !ifExists_) {
       throw new AnalysisException(Analyzer.DB_DOES_NOT_EXIST_ERROR_MSG + desc_.dbName());
     }

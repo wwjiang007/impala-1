@@ -34,23 +34,19 @@
 # this script because scripts outside this repository may need to be updated and that
 # is not practical at this time.
 
-export JAVA_HOME="${JAVA_HOME:-/usr/java/default}"
-if [ ! -d "$JAVA_HOME" ]; then
-  echo "JAVA_HOME must be set to the location of your JDK!"
-  return 1
-fi
-export JAVA="$JAVA_HOME/bin/java"
-if [[ ! -e "$JAVA" ]]; then
-  echo "Could not find java binary at $JAVA" >&2
-  return 1
+if ! [[ "'$IMPALA_HOME'" =~ [[:blank:]] ]]; then
+  if [ -z "$IMPALA_HOME" ]; then
+    if [[ ! -z "$ZSH_NAME" ]]; then
+      export IMPALA_HOME=$(dirname "$(cd $(dirname ${(%):-%x}) >/dev/null && pwd)")
+    else
+      export IMPALA_HOME=$(dirname "$(cd $(dirname "${BASH_SOURCE[0]}") >/dev/null && pwd)")
+    fi
+  fi
 fi
 
-if [ -z "$IMPALA_HOME" ]; then
-  if [[ ! -z "$ZSH_NAME" ]]; then
-    export IMPALA_HOME=$(dirname "$(cd $(dirname ${(%):-%x}) >/dev/null && pwd)")
-  else
-    export IMPALA_HOME=$(dirname "$(cd $(dirname "${BASH_SOURCE[0]}") >/dev/null && pwd)")
-  fi
+if [[ "'$IMPALA_HOME'" =~ [[:blank:]] ]]; then
+  echo "IMPALA_HOME cannot have spaces in the path"
+  exit 1
 fi
 
 export IMPALA_TOOLCHAIN=${IMPALA_TOOLCHAIN-"$IMPALA_HOME/toolchain"}
@@ -72,7 +68,7 @@ fi
 # moving to a different build of the toolchain, e.g. when a version is bumped or a
 # compile option is changed. The build id can be found in the output of the toolchain
 # build jobs, it is constructed from the build number and toolchain git hash prefix.
-export IMPALA_TOOLCHAIN_BUILD_ID=53-d95bb7f778
+export IMPALA_TOOLCHAIN_BUILD_ID=107-764a0ddc79
 # Versions of toolchain dependencies.
 # -----------------------------------
 export IMPALA_AVRO_VERSION=1.7.4-p4
@@ -85,6 +81,8 @@ export IMPALA_BREAKPAD_VERSION=97a98836768f8f0154f8f86e5e14c2bb7e74132e-p2
 unset IMPALA_BREAKPAD_URL
 export IMPALA_BZIP2_VERSION=1.0.6-p2
 unset IMPALA_BZIP2_URL
+export IMPALA_CCTZ_VERSION=2.2
+unset IMPALA_CCTZ_URL
 export IMPALA_CMAKE_VERSION=3.8.2-p1
 unset IMPALA_CMAKE_URL
 export IMPALA_CRCUTIL_VERSION=440ba7babeff77ffad992df3a10c767f184e946e-p1
@@ -105,14 +103,14 @@ export IMPALA_GTEST_VERSION=1.6.0
 unset IMPALA_GTEST_URL
 export IMPALA_LIBEV_VERSION=4.20
 unset IMPALA_LIBEV_URL
-export IMPALA_LLVM_VERSION=3.9.1
+export IMPALA_LLVM_VERSION=5.0.1
 unset IMPALA_LLVM_URL
-export IMPALA_LLVM_ASAN_VERSION=3.9.1
+export IMPALA_LLVM_ASAN_VERSION=5.0.1
 unset IMPALA_LLVM_ASAN_URL
 
 # Debug builds should use the release+asserts build to get additional coverage.
 # Don't use the LLVM debug build because the binaries are too large to distribute.
-export IMPALA_LLVM_DEBUG_VERSION=3.9.1-asserts
+export IMPALA_LLVM_DEBUG_VERSION=5.0.1-asserts
 unset IMPALA_LLVM_DEBUG_URL
 export IMPALA_LZ4_VERSION=1.7.5
 unset IMPALA_LZ4_URL
@@ -120,6 +118,8 @@ export IMPALA_OPENLDAP_VERSION=2.4.25
 unset IMPALA_OPENLDAP_URL
 export IMPALA_OPENSSL_VERSION=1.0.2l
 unset IMPALA_OPENSSL_URL
+export IMPALA_ORC_VERSION=1.4.3-p2
+unset IMPALA_ORC_URL
 export IMPALA_PROTOBUF_VERSION=2.6.1
 unset IMPALA_PROTOBUF_URL
 export IMPALA_POSTGRES_JDBC_DRIVER_VERSION=9.0-801
@@ -137,10 +137,8 @@ export IMPALA_TPC_DS_VERSION=2.1.0
 unset IMPALA_TPC_DS_URL
 export IMPALA_TPC_H_VERSION=2.17.0
 unset IMPALA_TPC_H_URL
-export IMPALA_THRIFT_VERSION=0.9.0-p11
+export IMPALA_THRIFT_VERSION=0.9.3-p4
 unset IMPALA_THRIFT_URL
-export IMPALA_THRIFT_JAVA_VERSION=0.9.0
-unset IMPALA_THRIFT_JAVA_URL
 export IMPALA_ZLIB_VERSION=1.2.8
 unset IMPALA_ZLIB_URL
 
@@ -151,34 +149,79 @@ if [[ $OSTYPE == "darwin"* ]]; then
   unset IMPALA_GPERFTOOLS_URL
   IMPALA_OPENSSL_VERSION=1.0.1p
   unset IMPALA_OPENSSL_URL
-  IMPALA_THRIFT_VERSION=0.9.2
-  unset IMPALA_THRIFT_URL
-  IMPALA_THRIFT_JAVA_VERSION=0.9.2
-  unset IMPALA_THRIFT_JAVA_URL
 fi
 
 # Kudu version in the toolchain; provides libkudu_client.so and minicluster binaries.
-export IMPALA_KUDU_VERSION=0eef8e0
+export IMPALA_KUDU_VERSION=a954418
 unset IMPALA_KUDU_URL
 
-# Kudu version used to identify Java client jar from maven
-export KUDU_JAVA_VERSION=1.7.0-cdh5.15.0-SNAPSHOT
 
 # Versions of Hadoop ecosystem dependencies.
 # ------------------------------------------
-export CDH_MAJOR_VERSION=5
-export IMPALA_HADOOP_VERSION=2.6.0-cdh5.15.0-SNAPSHOT
+# IMPALA_MINICLUSTER_PROFILE can have two values:
+# 2 represents:
+#    Hadoop 2.6
+#    HBase 1.2
+#    Hive 1.1
+#    Sentry 1.5
+#    Parquet 1.5
+#    Llama (used for Mini KDC) 1.0
+# 3 represents:
+#    Hadoop 3.0
+#    HBase 2.0
+#    Hive 2.1
+#    Sentry 2.0
+#    Parquet 1.9
+#
+# Impala 3.x defaults to profile 3 and marks profile 2 deprecated,
+# so that it may be removed in the 3.x line.
+
+DEFAULT_MINICLUSTER_PROFILE=3
+: ${IMPALA_MINICLUSTER_PROFILE_OVERRIDE:=$DEFAULT_MINICLUSTER_PROFILE}
+
+: ${CDH_DOWNLOAD_HOST:=native-toolchain.s3.amazonaws.com}
+export CDH_DOWNLOAD_HOST
+
+if [[ $IMPALA_MINICLUSTER_PROFILE_OVERRIDE == 2 ]]; then
+  echo "IMPALA_MINICLUSTER_PROFILE=2 is deprecated and may be removed in Impala 3.x"
+
+  export IMPALA_MINICLUSTER_PROFILE=2
+  export CDH_MAJOR_VERSION=5
+  export CDH_BUILD_NUMBER=44
+  export IMPALA_HADOOP_VERSION=2.6.0-cdh5.16.0-SNAPSHOT
+  export IMPALA_HBASE_VERSION=1.2.0-cdh5.16.0-SNAPSHOT
+  export IMPALA_HIVE_VERSION=1.1.0-cdh5.16.0-SNAPSHOT
+  export IMPALA_SENTRY_VERSION=1.5.1-cdh5.16.0-SNAPSHOT
+  export IMPALA_PARQUET_VERSION=1.5.0-cdh5.16.0-SNAPSHOT
+  export IMPALA_LLAMA_MINIKDC_VERSION=1.0.0
+  export IMPALA_KITE_VERSION=1.0.0-cdh5.16.0-SNAPSHOT
+  # Kudu version used to identify Java client jar from maven
+  export KUDU_JAVA_VERSION=1.8.0-cdh5.16.0-SNAPSHOT
+  # IMPALA-6972: Temporarily disable Hive parallelism during dataload
+  # The Hive version used for IMPALA_MINICLUSTER_PROFIILE=2 has a concurrency issue
+  # that intermittent fails parallel dataload.
+  export IMPALA_SERIAL_DATALOAD=1
+
+elif [[ $IMPALA_MINICLUSTER_PROFILE_OVERRIDE == 3 ]]; then
+  export IMPALA_MINICLUSTER_PROFILE=3
+  export CDH_MAJOR_VERSION=6
+  export CDH_BUILD_NUMBER=422770
+  export IMPALA_HADOOP_VERSION=3.0.0-cdh6.x-SNAPSHOT
+  export IMPALA_HBASE_VERSION=2.0.0-cdh6.x-SNAPSHOT
+  export IMPALA_HIVE_VERSION=2.1.1-cdh6.x-SNAPSHOT
+  export IMPALA_SENTRY_VERSION=2.0.0-cdh6.x-SNAPSHOT
+  export IMPALA_PARQUET_VERSION=1.9.0-cdh6.x-SNAPSHOT
+  export IMPALA_AVRO_JAVA_VERSION=1.8.2-cdh6.x-SNAPSHOT
+  export IMPALA_LLAMA_MINIKDC_VERSION=1.0.0
+  export IMPALA_KITE_VERSION=1.0.0-cdh6.x-SNAPSHOT
+  export KUDU_JAVA_VERSION=1.8.0-cdh6.x-SNAPSHOT
+fi
+
 unset IMPALA_HADOOP_URL
-export IMPALA_HBASE_VERSION=1.2.0-cdh5.15.0-SNAPSHOT
 unset IMPALA_HBASE_URL
-export IMPALA_HIVE_VERSION=1.1.0-cdh5.15.0-SNAPSHOT
 unset IMPALA_HIVE_URL
-export IMPALA_SENTRY_VERSION=1.5.1-cdh5.15.0-SNAPSHOT
 unset IMPALA_SENTRY_URL
-export IMPALA_PARQUET_VERSION=1.5.0-cdh5.15.0-SNAPSHOT
-export IMPALA_LLAMA_MINIKDC_VERSION=1.0.0
 unset IMPALA_LLAMA_MINIKDC_URL
-export IMPALA_KITE_VERSION=1.0.0-cdh5.15.0-SNAPSHOT
 
 # Source the branch and local config override files here to override any
 # variables above or any variables below that allow overriding via environment
@@ -186,6 +229,32 @@ export IMPALA_KITE_VERSION=1.0.0-cdh5.15.0-SNAPSHOT
 . "$IMPALA_HOME/bin/impala-config-branch.sh"
 if [ -f "$IMPALA_HOME/bin/impala-config-local.sh" ]; then
   . "$IMPALA_HOME/bin/impala-config-local.sh"
+fi
+
+# It is important to have a coherent view of the JAVA_HOME and JAVA executable.
+# The JAVA_HOME should be determined first, then the JAVA executable should be
+# derived from JAVA_HOME. bin/bootstrap_development.sh adds code to
+# bin/impala-config-local.sh to set JAVA_HOME, so it is important to pick up that
+# setting before deciding what JAVA_HOME to use.
+
+# Try to detect the system's JAVA_HOME
+# If javac exists, then the system has a Java SDK (JRE does not have javac).
+# Follow the symbolic links and use this to determine the system's JAVA_HOME.
+SYSTEM_JAVA_HOME="/usr/java/default"
+if [ -n "$(which javac)" ]; then
+  SYSTEM_JAVA_HOME=$(which javac | xargs readlink -f | sed "s:/bin/javac::")
+fi
+
+# Prefer the JAVA_HOME set in the environment, but use the system's JAVA_HOME otherwise
+export JAVA_HOME="${JAVA_HOME:-${SYSTEM_JAVA_HOME}}"
+if [ ! -d "$JAVA_HOME" ]; then
+  echo "JAVA_HOME must be set to the location of your JDK!"
+  return 1
+fi
+export JAVA="$JAVA_HOME/bin/java"
+if [[ ! -e "$JAVA" ]]; then
+  echo "Could not find java binary at $JAVA" >&2
+  return 1
 fi
 
 #########################################################################################
@@ -284,6 +353,7 @@ export HADOOP_LZO="${HADOOP_LZO-$IMPALA_HOME/../hadoop-lzo}"
 export IMPALA_LZO="${IMPALA_LZO-$IMPALA_HOME/../Impala-lzo}"
 export IMPALA_AUX_TEST_HOME="${IMPALA_AUX_TEST_HOME-$IMPALA_HOME/../Impala-auxiliary-tests}"
 export TARGET_FILESYSTEM="${TARGET_FILESYSTEM-hdfs}"
+export ERASURE_CODING="${ERASURE_CODING-false}"
 export FILESYSTEM_PREFIX="${FILESYSTEM_PREFIX-}"
 export S3_BUCKET="${S3_BUCKET-}"
 export azure_tenant_id="${azure_tenant_id-DummyAdlsTenantId}"
@@ -349,11 +419,17 @@ else
 fi
 
 if [ "${TARGET_FILESYSTEM}" = "s3" ]; then
-  if ${IMPALA_HOME}/bin/check-s3-access.sh; then
-    export DEFAULT_FS="s3a://${S3_BUCKET}"
-    export FILESYSTEM_PREFIX="${DEFAULT_FS}"
+  # We guard the S3 access check with a variable. This check hits a rate-limited endpoint
+  # on AWS and multiple inclusions of S3 can exceed the limit, causing the check to fail.
+  if [[ "${S3_ACCESS_VALIDATED}" -ne 1 ]]; then
+    if ${IMPALA_HOME}/bin/check-s3-access.sh; then
+      export S3_ACCESS_VALIDATED=1
+      export DEFAULT_FS="s3a://${S3_BUCKET}"
+    else
+      return 1
+    fi
   else
-    return 1
+    echo "S3 access already validated"
   fi
 elif [ "${TARGET_FILESYSTEM}" = "adls" ]; then
   # Basic error checking
@@ -397,7 +473,16 @@ elif [ "${TARGET_FILESYSTEM}" = "local" ]; then
   fi
   export DEFAULT_FS="${LOCAL_FS}"
   export FILESYSTEM_PREFIX="${LOCAL_FS}"
-elif [ "${TARGET_FILESYSTEM}" != "hdfs" ]; then
+elif [ "${TARGET_FILESYSTEM}" = "hdfs" ]; then
+  if [[ "${ERASURE_CODING}" = true ]]; then
+    if [[ "${IMPALA_MINICLUSTER_PROFILE}" -lt 3 ]]; then
+      echo "Hadoop 3 is required for HDFS erasure coding."
+      return 1
+    fi
+    export HDFS_ERASURECODE_POLICY="RS-3-2-1024k"
+    export HDFS_ERASURECODE_PATH="/test-warehouse"
+  fi
+else
   echo "Unsupported filesystem '$TARGET_FILESYSTEM'"
   echo "Valid values are: hdfs, isilon, s3, local"
   return 1
@@ -461,6 +546,15 @@ export HADOOP_CLASSPATH="${HADOOP_CLASSPATH-}:${HADOOP_HOME}/share/hadoop/tools/
 export LZO_JAR_PATH="$HADOOP_LZO/build/hadoop-lzo-0.4.15.jar"
 HADOOP_CLASSPATH+=":$LZO_JAR_PATH"
 
+if [[ $IMPALA_MINICLUSTER_PROFILE == 3 ]]; then
+  # Beware of adding entries from $HADOOP_HOME here, because they can change
+  # the order of the classpath, leading to configuration not showing up first.
+  HADOOP_CLASSPATH="$LZO_JAR_PATH"
+  # Add the path containing the hadoop-aws jar, which is required to access AWS from the
+  # minicluster.
+  HADOOP_CLASSPATH="${HADOOP_CLASSPATH}:${HADOOP_HOME}/share/hadoop/tools/lib/*"
+fi
+
 export MINI_DFS_BASE_DATA_DIR="$IMPALA_HOME/cdh-${CDH_MAJOR_VERSION}-hdfs-data"
 export PATH="$HADOOP_HOME/bin:$PATH"
 
@@ -475,7 +569,21 @@ export PATH="$HIVE_HOME/bin:$PATH"
 # Allow overriding of Hive source location in case we want to build Impala without
 # a complete Hive build.
 export HIVE_SRC_DIR=${HIVE_SRC_DIR_OVERRIDE:-"${HIVE_HOME}/src"}
-export HIVE_CONF_DIR="$IMPALA_FE_DIR/src/test/resources"
+# To configure Hive logging, there's a hive-log4j2.properties[.template]
+# file in fe/src/test/resources. To get it into the classpath earlier
+# than the hive-log4j2.properties file included in some Hive jars,
+# we must set HIVE_CONF_DIR. Additionally, on Hadoop 3, because of
+# https://issues.apache.org/jira/browse/HADOOP-15019, when HIVE_CONF_DIR happens to equal
+# HADOOP_CONF_DIR, it gets de-duped out of its pole position in the CLASSPATH variable,
+# so we add an extra "./" into the path to avoid that. Use HADOOP_SHELL_SCRIPT_DEBUG=true
+# to debug issues like this. Hive may log something like:
+#       Logging initialized using configuration in file:.../fe/src/test/resources/hive-log4j2.properties
+#
+# To debug log4j2 loading issues, add to HADOOP_CLIENT_OPTS:
+#   -Dorg.apache.logging.log4j.simplelog.StatusLogger.level=TRACE
+#
+# We use a unique -Dhive.log.file to distinguish the HiveMetaStore and HiveServer2 logs.
+export HIVE_CONF_DIR="$IMPALA_FE_DIR/./src/test/resources"
 
 # Hive looks for jar files in a single directory from HIVE_AUX_JARS_PATH plus
 # any jars in AUX_CLASSPATH. (Or a list of jars in HIVE_AUX_JARS_PATH.)
@@ -498,7 +606,7 @@ export AUX_CLASSPATH="$AUX_CLASSPATH:$HBASE_HOME/lib/hbase-server-${IMPALA_HBASE
 export AUX_CLASSPATH="$AUX_CLASSPATH:$HBASE_HOME/lib/hbase-protocol-${IMPALA_HBASE_VERSION}.jar"
 export AUX_CLASSPATH="$AUX_CLASSPATH:$HBASE_HOME/lib/hbase-hadoop-compat-${IMPALA_HBASE_VERSION}.jar"
 
-export HBASE_CONF_DIR="$HIVE_CONF_DIR"
+export HBASE_CONF_DIR="$IMPALA_FE_DIR/src/test/resources"
 
 # Set $THRIFT_HOME to the Thrift directory in toolchain.
 export THRIFT_HOME="${IMPALA_TOOLCHAIN}/thrift-${IMPALA_THRIFT_VERSION}"
@@ -528,6 +636,8 @@ export USER="${USER-`id -un`}"
 # TODO: figure out how to turn this off only the stuff that can't run with it.
 #LIBHDFS_OPTS="-Xcheck:jni -Xcheck:nabounds"
 export LIBHDFS_OPTS="${LIBHDFS_OPTS:-} -Djava.library.path=${HADOOP_LIB_DIR}/native/"
+LIBHDFS_OPTS+=" -XX:ErrorFile=${IMPALA_LOGS_DIR}/hs_err_pid%p.log"
+
 
 # IMPALA-5080: Our use of PermGen space sometimes exceeds the default maximum while
 # running tests that load UDF jars.
@@ -587,6 +697,8 @@ echo "POSTGRES_JDBC_DRIVER    = $POSTGRES_JDBC_DRIVER"
 echo "IMPALA_TOOLCHAIN        = $IMPALA_TOOLCHAIN"
 echo "DOWNLOAD_CDH_COMPONENTS = $DOWNLOAD_CDH_COMPONENTS"
 echo "IMPALA_MAVEN_OPTIONS    = $IMPALA_MAVEN_OPTIONS"
+echo "CDH_DOWNLOAD_HOST       = $CDH_DOWNLOAD_HOST"
+echo "CDH_BUILD_NUMBER        = $CDH_BUILD_NUMBER"
 
 # Kerberos things.  If the cluster exists and is kerberized, source
 # the required environment.  This is required for any hadoop tool to
@@ -608,4 +720,20 @@ else
   # everything set in the minikdc environment and explicitly unset it.
   unset `grep export "${MINIKDC_ENV}" | sed "s/.*export \([^=]*\)=.*/\1/" \
       | sort | uniq`
+fi
+
+if [[ $IMPALA_MINICLUSTER_PROFILE_OVERRIDE == 3 ]]; then
+  # Check for minimum required Java version
+  # Only issue Java version warning when running Java 7.
+  if $JAVA -version 2>&1 | grep -q 'java version "1.7'; then
+    cat << EOF
+
+WARNING: Your development environment is configured for Hadoop 3 and Java 7. Hadoop 3
+requires at least Java 8. Your JAVA binary currently points to $JAVA
+and reports the following version:
+
+EOF
+    $JAVA -version
+    echo
+  fi
 fi

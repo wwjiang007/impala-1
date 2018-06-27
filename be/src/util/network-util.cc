@@ -174,18 +174,13 @@ bool IsWildcardAddress(const string& ipaddress) {
 
 string TNetworkAddressToString(const TNetworkAddress& address) {
   stringstream ss;
-  ss << address;
+  ss << address.hostname << ":" << dec << address.port;
   return ss.str();
-}
-
-ostream& operator<<(ostream& out, const TNetworkAddress& hostport) {
-  out << hostport.hostname << ":" << dec << hostport.port;
-  return out;
 }
 
 /// Pick a random port in the range of ephemeral ports
 /// https://tools.ietf.org/html/rfc6335
-int FindUnusedEphemeralPort(vector<int>* used_ports) {
+int FindUnusedEphemeralPort() {
   static uint32_t LOWER = 49152, UPPER = 65000;
   random_device rd;
   srand(rd());
@@ -198,15 +193,10 @@ int FindUnusedEphemeralPort(vector<int>* used_ports) {
   server_address.sin_addr.s_addr = INADDR_ANY;
   for (int tries = 0; tries < 100; ++tries) {
     int port = LOWER + rand() % (UPPER - LOWER);
-    if (used_ports != nullptr
-        && find(used_ports->begin(), used_ports->end(), port) != used_ports->end()) {
-      continue;
-    }
     server_address.sin_port = htons(port);
     if (bind(sockfd, reinterpret_cast<struct sockaddr*>(&server_address),
         sizeof(server_address)) == 0) {
       close(sockfd);
-      if (used_ports != nullptr) used_ports->push_back(port);
       return port;
     }
   }

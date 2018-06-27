@@ -27,6 +27,7 @@ from getpass import getuser
 from time import sleep, time
 from optparse import OptionParser, SUPPRESS_HELP
 from testdata.common import cgroups
+from tests.common.environ import specific_build_type_timeout
 
 KUDU_MASTER_HOSTS = os.getenv('KUDU_MASTER_HOSTS', '127.0.0.1')
 DEFAULT_IMPALA_MAX_LOG_FILES = os.environ.get('IMPALA_MAX_LOG_FILES', 10)
@@ -84,6 +85,10 @@ parser.add_option("--kudu_master_hosts", default=KUDU_MASTER_HOSTS,
 # replica initialization. The ith delay is applied to the ith impalad.
 parser.add_option("--catalog_init_delays", dest="catalog_init_delays", default="",
                   help=SUPPRESS_HELP)
+# For testing: Semi-colon separated list of startup arguments to be passed per impalad.
+# The ith group of options is applied to the ith impalad.
+parser.add_option("--per_impalad_args", dest="per_impalad_args", type="string"
+                  ,default="", help=SUPPRESS_HELP)
 
 options, args = parser.parse_args()
 
@@ -106,6 +111,8 @@ CLUSTER_WAIT_TIMEOUT_IN_SECONDS = 240
 # Kills have a timeout to prevent automated scripts from hanging indefinitely.
 # It is set to a high value to avoid failing if processes are slow to shut down.
 KILL_TIMEOUT_IN_SECONDS = 240
+# For build types like ASAN, modify the default Kudu rpc timeout.
+KUDU_RPC_TIMEOUT = specific_build_type_timeout(0, slow_build_timeout=60000)
 
 def find_user_processes(binaries):
   """Returns an iterator over all processes owned by the current user with a matching
@@ -216,19 +223,29 @@ def start_impalad_instances(cluster_size, num_coordinators, use_exclusive_coordi
     # No impalad instances should be started.
     return
 
+  # Set mem_limit of each impalad to the smaller of 12GB or
+  # 1/cluster_size (typically 1/3) of 70% of system memory.
+  #
   # The default memory limit for an impalad is 80% of the total system memory. On a
   # mini-cluster with 3 impalads that means 240%. Since having an impalad be OOM killed
   # is very annoying, the mem limit will be reduced. This can be overridden using the
   # --impalad_args flag. virtual_memory().total returns the total physical memory.
   # The exact ratio to use is somewhat arbitrary. Peak memory usage during
   # tests depends on the concurrency of parallel tests as well as their ordering.
-  # At a ratio of 0.8, on 8-core, 68GB machines, ASAN builds can trigger the OOM
-  # killer, so this ratio is currently set to 0.7.
+  # On the other hand, to avoid using too much memory, we limit the
+  # memory choice here to max out at 12GB. This should be sufficient for tests.
+  #
+  # Beware that ASAN builds use more memory than regular builds.
   mem_limit = int(0.7 * psutil.virtual_memory().total / cluster_size)
+  mem_limit = min(12 * 1024 * 1024 * 1024, mem_limit)
 
   delay_list = []
   if options.catalog_init_delays != "":
     delay_list = [delay.strip() for delay in options.catalog_init_delays.split(",")]
+
+  per_impalad_args = []
+  if options.per_impalad_args != "":
+    per_impalad_args = [args.strip() for args in options.per_impalad_args.split(";")]
 
   # Start each impalad instance and optionally redirect the output to a log file.
   for i in range(cluster_size):
@@ -255,6 +272,9 @@ def start_impalad_instances(cluster_size, num_coordinators, use_exclusive_coordi
       # Must be prepended, otherwise the java options interfere.
       args = "-kudu_master_hosts %s %s" % (options.kudu_master_hosts, args)
 
+    if "kudu_client_rpc_timeout" not in args:
+      args = "-kudu_client_rpc_timeout_ms %s %s" % (KUDU_RPC_TIMEOUT, args)
+
     if i >= num_coordinators:
       args = "-is_coordinator=false %s" % (args)
     elif use_exclusive_coordinators:
@@ -266,6 +286,10 @@ def start_impalad_instances(cluster_size, num_coordinators, use_exclusive_coordi
 
     if options.disable_krpc:
       args = "-use_krpc=false %s" % (args)
+
+    # Appended at the end so they can override previous args.
+    if i < len(per_impalad_args):
+      args = "%s %s" % (args, per_impalad_args[i])
 
     stderr_log_file_path = os.path.join(options.log_dir, '%s-error.log' % service_name)
     exec_impala_process(IMPALAD_PATH, args, stderr_log_file_path)
@@ -331,8 +355,8 @@ def wait_for_catalog(impalad, timeout_in_seconds=CLUSTER_WAIT_TIMEOUT_IN_SECONDS
   num_tbls = 0
   while (time() - start_time < timeout_in_seconds):
     try:
-      num_dbs = impalad.service.get_metric_value('catalog.num-databases')
-      num_tbls = impalad.service.get_metric_value('catalog.num-tables')
+      num_dbs, num_tbls = impalad.service.get_metric_values(
+          ['catalog.num-databases', 'catalog.num-tables'])
       client_beeswax = impalad.service.create_beeswax_client()
       client_hs2 = impalad.service.create_hs2_client()
       break

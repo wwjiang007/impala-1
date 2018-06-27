@@ -30,7 +30,7 @@
 #include <llvm/Analysis/InstructionSimplify.h>
 #include <llvm/Analysis/Passes.h>
 #include <llvm/Analysis/TargetTransformInfo.h>
-#include <llvm/Bitcode/ReaderWriter.h>
+#include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/ExecutionEngine/ExecutionEngine.h>
 #include <llvm/ExecutionEngine/MCJIT.h>
 #include <llvm/IR/Constants.h>
@@ -124,7 +124,7 @@ string LlvmCodeGen::target_features_attr_;
 CodegenCallGraph LlvmCodeGen::shared_call_graph_;
 
 [[noreturn]] static void LlvmCodegenHandleError(
-    void* user_data, const std::string& reason, bool gen_crash_diag) {
+    void* user_data, const string& reason, bool gen_crash_diag) {
   LOG(FATAL) << "LLVM hit fatal error: " << reason.c_str();
 }
 
@@ -201,11 +201,12 @@ LlvmCodeGen::LlvmCodeGen(RuntimeState* state, ObjectPool* pool,
   load_module_timer_ = ADD_TIMER(profile_, "LoadTime");
   prepare_module_timer_ = ADD_TIMER(profile_, "PrepareTime");
   module_bitcode_size_ = ADD_COUNTER(profile_, "ModuleBitcodeSize", TUnit::BYTES);
-  codegen_timer_ = ADD_TIMER(profile_, "CodegenTime");
+  ir_generation_timer_ = ADD_TIMER(profile_, "IrGenerationTime");
   optimization_timer_ = ADD_TIMER(profile_, "OptimizationTime");
   compile_timer_ = ADD_TIMER(profile_, "CompileTime");
   num_functions_ = ADD_COUNTER(profile_, "NumFunctions", TUnit::UNIT);
   num_instructions_ = ADD_COUNTER(profile_, "NumInstructions", TUnit::UNIT);
+  llvm_thread_counters_ = ADD_THREAD_COUNTERS(profile_, "Codegen");
 }
 
 Status LlvmCodeGen::CreateFromFile(RuntimeState* state, ObjectPool* pool,
@@ -213,11 +214,12 @@ Status LlvmCodeGen::CreateFromFile(RuntimeState* state, ObjectPool* pool,
     scoped_ptr<LlvmCodeGen>* codegen) {
   codegen->reset(new LlvmCodeGen(state, pool, parent_mem_tracker, id));
   SCOPED_TIMER((*codegen)->profile_->total_time_counter());
+  SCOPED_THREAD_COUNTER_MEASUREMENT((*codegen)->llvm_thread_counters());
 
   unique_ptr<llvm::Module> loaded_module;
   Status status = (*codegen)->LoadModuleFromFile(file, &loaded_module);
   if (!status.ok()) goto error;
-  status = (*codegen)->Init(std::move(loaded_module));
+  status = (*codegen)->Init(move(loaded_module));
   if (!status.ok()) goto error;
   return Status::OK();
 error:
@@ -229,6 +231,8 @@ Status LlvmCodeGen::CreateFromMemory(RuntimeState* state, ObjectPool* pool,
     MemTracker* parent_mem_tracker, const string& id, scoped_ptr<LlvmCodeGen>* codegen) {
   codegen->reset(new LlvmCodeGen(state, pool, parent_mem_tracker, id));
   SCOPED_TIMER((*codegen)->profile_->total_time_counter());
+  SCOPED_TIMER((*codegen)->prepare_module_timer_);
+  SCOPED_THREAD_COUNTER_MEASUREMENT((*codegen)->llvm_thread_counters());
 
   // Select the appropriate IR version. We cannot use LLVM IR with SSE4.2 instructions on
   // a machine without SSE4.2 support.
@@ -247,10 +251,10 @@ Status LlvmCodeGen::CreateFromMemory(RuntimeState* state, ObjectPool* pool,
   unique_ptr<llvm::MemoryBuffer> module_ir_buf(
       llvm::MemoryBuffer::getMemBuffer(module_ir, "", false));
   unique_ptr<llvm::Module> loaded_module;
-  Status status = (*codegen)->LoadModuleFromMemory(std::move(module_ir_buf),
+  Status status = (*codegen)->LoadModuleFromMemory(move(module_ir_buf),
       module_name, &loaded_module);
   if (!status.ok()) goto error;
-  status = (*codegen)->Init(std::move(loaded_module));
+  status = (*codegen)->Init(move(loaded_module));
   if (!status.ok()) goto error;
   return Status::OK();
 error:
@@ -272,26 +276,27 @@ Status LlvmCodeGen::LoadModuleFromFile(
          << tmp_file_buffer.getError().message();
       return Status(ss.str());
     }
-    file_buffer = std::move(tmp_file_buffer.get());
+    file_buffer = move(tmp_file_buffer.get());
   }
 
   COUNTER_ADD(module_bitcode_size_, file_buffer->getBufferSize());
-  return LoadModuleFromMemory(std::move(file_buffer), file, module);
+  return LoadModuleFromMemory(move(file_buffer), file, module);
 }
 
 Status LlvmCodeGen::LoadModuleFromMemory(unique_ptr<llvm::MemoryBuffer> module_ir_buf,
     string module_name, unique_ptr<llvm::Module>* module) {
   DCHECK(!module_name.empty());
-  SCOPED_TIMER(prepare_module_timer_);
   COUNTER_ADD(module_bitcode_size_, module_ir_buf->getMemBufferRef().getBufferSize());
-  llvm::ErrorOr<unique_ptr<llvm::Module>> tmp_module =
-      getLazyBitcodeModule(std::move(module_ir_buf), context(), false);
-  if (!tmp_module) {
-    string diagnostic_err = diagnostic_handler_.GetErrorString();
-    return Status(diagnostic_err);
+  llvm::Expected<unique_ptr<llvm::Module>> tmp_module =
+      getOwningLazyBitcodeModule(move(module_ir_buf), context());
+  if (llvm::Error err = tmp_module.takeError()) {
+    string err_string;
+    llvm::handleAllErrors(
+        move(err), [&](llvm::ErrorInfoBase& eib) { err_string = eib.message(); });
+    return Status(err_string);
   }
 
-  *module = std::move(tmp_module.get());
+  *module = move(tmp_module.get());
 
   // We never run global constructors or destructors so let's strip them out for all
   // modules when we load them.
@@ -303,7 +308,6 @@ Status LlvmCodeGen::LoadModuleFromMemory(unique_ptr<llvm::MemoryBuffer> module_i
 
 // TODO: Create separate counters/timers (file size, load time) for each module linked
 Status LlvmCodeGen::LinkModuleFromLocalFs(const string& file) {
-  SCOPED_TIMER(profile_->total_time_counter());
   unique_ptr<llvm::Module> new_module;
   RETURN_IF_ERROR(LoadModuleFromFile(file, &new_module));
 
@@ -324,7 +328,7 @@ Status LlvmCodeGen::LinkModuleFromLocalFs(const string& file) {
     }
   }
 
-  bool error = llvm::Linker::linkModules(*module_, std::move(new_module));
+  bool error = llvm::Linker::linkModules(*module_, move(new_module));
   string diagnostic_err = diagnostic_handler_.GetErrorString();
   if (error) {
     stringstream ss;
@@ -335,11 +339,12 @@ Status LlvmCodeGen::LinkModuleFromLocalFs(const string& file) {
   return Status::OK();
 }
 
-Status LlvmCodeGen::LinkModuleFromHdfs(const string& hdfs_location) {
+Status LlvmCodeGen::LinkModuleFromHdfs(const string& hdfs_location, const time_t mtime) {
   if (linked_modules_.find(hdfs_location) != linked_modules_.end()) return Status::OK();
+  LibCacheEntryHandle handle;
   string local_path;
-  RETURN_IF_ERROR(LibCache::instance()->GetLocalLibPath(hdfs_location, LibCache::TYPE_IR,
-      &local_path));
+  RETURN_IF_ERROR(LibCache::instance()->GetLocalPath(
+      hdfs_location, LibCache::TYPE_IR, mtime, &handle, &local_path));
   RETURN_IF_ERROR(LinkModuleFromLocalFs(local_path));
   linked_modules_.insert(hdfs_location);
   return Status::OK();
@@ -363,6 +368,7 @@ Status LlvmCodeGen::CreateImpalaCodegen(RuntimeState* state,
   // Parse module for cross compiled functions and types
   SCOPED_TIMER(codegen->profile_->total_time_counter());
   SCOPED_TIMER(codegen->prepare_module_timer_);
+  SCOPED_THREAD_COUNTER_MEASUREMENT(codegen->llvm_thread_counters_);
 
   // Get type for StringValue
   codegen->string_value_type_ = codegen->GetStructType<StringValue>();
@@ -399,7 +405,7 @@ Status LlvmCodeGen::Init(unique_ptr<llvm::Module> module) {
   opt_level = llvm::CodeGenOpt::None;
 #endif
   module_ = module.get();
-  llvm::EngineBuilder builder(std::move(module));
+  llvm::EngineBuilder builder(move(module));
   builder.setEngineKind(llvm::EngineKind::JIT);
   builder.setOptLevel(opt_level);
   unique_ptr<ImpalaMCJITMemoryManager> memory_manager(new ImpalaMCJITMemoryManager);
@@ -618,14 +624,17 @@ void LlvmCodeGen::CreateIfElseBlocks(llvm::Function* fn, const string& if_name,
   *else_block = llvm::BasicBlock::Create(context(), else_name, fn, insert_before);
 }
 
-Status LlvmCodeGen::MaterializeFunctionHelper(llvm::Function* fn) {
+Status LlvmCodeGen::MaterializeFunction(llvm::Function* fn) {
   DCHECK(!is_compiled_);
   if (fn->isIntrinsic() || !fn->isMaterializable()) return Status::OK();
 
-  std::error_code err = module_->materialize(fn);
+  llvm::Error err = module_->materialize(fn);
   if (UNLIKELY(err)) {
+    string err_string;
+    llvm::handleAllErrors(
+        move(err), [&](llvm::ErrorInfoBase& eib) { err_string = eib.message(); });
     return Status(Substitute("Failed to materialize $0: $1",
-        fn->getName().str(), err.message()));
+        fn->getName().str(), err_string));
   }
 
   // Materialized functions are marked as not materializable by LLVM.
@@ -636,16 +645,10 @@ Status LlvmCodeGen::MaterializeFunctionHelper(llvm::Function* fn) {
     for (const string& callee : *callees) {
       llvm::Function* callee_fn = module_->getFunction(callee);
       DCHECK(callee_fn != nullptr);
-      RETURN_IF_ERROR(MaterializeFunctionHelper(callee_fn));
+      RETURN_IF_ERROR(MaterializeFunction(callee_fn));
     }
   }
   return Status::OK();
-}
-
-Status LlvmCodeGen::MaterializeFunction(llvm::Function* fn) {
-  SCOPED_TIMER(profile_->total_time_counter());
-  SCOPED_TIMER(prepare_module_timer_);
-  return MaterializeFunctionHelper(fn);
 }
 
 llvm::Function* LlvmCodeGen::GetFunction(const string& symbol, bool clone) {
@@ -723,8 +726,8 @@ bool LlvmCodeGen::VerifyFunction(llvm::Function* fn) {
 
   if (is_corrupt_) {
     string fn_name = fn->getName(); // llvm has some fancy operator overloading
-    LOG(ERROR) << "Function corrupt: " << fn_name;
-    fn->dump();
+    LOG(ERROR) << "Function corrupt: " << fn_name <<"\nFunction Dump: "
+        << LlvmCodeGen::Print(fn);
     return false;
   }
   return true;
@@ -783,8 +786,8 @@ llvm::Function* LlvmCodeGen::FnPrototype::GeneratePrototype(
   return fn;
 }
 
-Status LlvmCodeGen::LoadFunction(const TFunction& fn, const std::string& symbol,
-    const ColumnType* return_type, const std::vector<ColumnType>& arg_types,
+Status LlvmCodeGen::LoadFunction(const TFunction& fn, const string& symbol,
+    const ColumnType* return_type, const vector<ColumnType>& arg_types,
     int num_fixed_args, bool has_varargs, llvm::Function** llvm_fn,
     LibCacheEntry** cache_entry) {
   DCHECK_GE(arg_types.size(), num_fixed_args);
@@ -803,7 +806,7 @@ Status LlvmCodeGen::LoadFunction(const TFunction& fn, const std::string& symbol,
     // in a .so or a builtin using the UDF interface.
     void* fn_ptr;
     Status status = LibCache::instance()->GetSoFunctionPtr(
-        fn.hdfs_location, symbol, &fn_ptr, cache_entry);
+        fn.hdfs_location, symbol, fn.last_modified_time, &fn_ptr, cache_entry);
     if (!status.ok() && fn.binary_type == TFunctionBinaryType::BUILTIN) {
       // Builtins symbols should exist unless there is a version mismatch.
       status.AddDetail(
@@ -874,7 +877,7 @@ Status LlvmCodeGen::LoadFunction(const TFunction& fn, const std::string& symbol,
 
     // Link the UDF module into this query's main module so the UDF's functions are
     // available in the main module.
-    RETURN_IF_ERROR(LinkModuleFromHdfs(fn.hdfs_location));
+    RETURN_IF_ERROR(LinkModuleFromHdfs(fn.hdfs_location, fn.last_modified_time));
 
     *llvm_fn = GetFunction(symbol, true);
     if (*llvm_fn == NULL) {
@@ -1011,22 +1014,27 @@ llvm::Function* LlvmCodeGen::FinalizeFunction(llvm::Function* function) {
     return NULL;
   }
   finalized_functions_.insert(function);
-  if (FLAGS_dump_ir) function->dump();
+  if (FLAGS_dump_ir) {
+    string fn_name = function->getName();
+    LOG(INFO) << "Dump of Function "<< fn_name << ": " << LlvmCodeGen::Print(function);
+  }
   return function;
 }
 
 Status LlvmCodeGen::MaterializeModule() {
-  std::error_code err = module_->materializeAll();
+  llvm::Error err = module_->materializeAll();
   if (UNLIKELY(err)) {
+    string err_string;
+    llvm::handleAllErrors(
+        move(err), [&](llvm::ErrorInfoBase& eib) { err_string = eib.message(); });
     return Status(Substitute("Failed to materialize module $0: $1",
-        module_->getName().str(), err.message()));
+        module_->getName().str(), err_string));
   }
   return Status::OK();
 }
 
 // It's okay to call this function even if the module has been materialized.
 Status LlvmCodeGen::FinalizeLazyMaterialization() {
-  SCOPED_TIMER(prepare_module_timer_);
   for (llvm::Function& fn : module_->functions()) {
     if (fn.isMaterializable()) {
       DCHECK(!module_->isMaterialized());
@@ -1066,6 +1074,7 @@ Status LlvmCodeGen::FinalizeModule() {
 
   if (is_corrupt_) return Status("Module is corrupt.");
   SCOPED_TIMER(profile_->total_time_counter());
+  SCOPED_THREAD_COUNTER_MEASUREMENT(llvm_thread_counters_);
 
   // Clean up handcrafted functions that have not been finalized. Clean up is done by
   // deleting the function from the module. Any reference to deleted functions in the
@@ -1079,7 +1088,7 @@ Status LlvmCodeGen::FinalizeModule() {
   }
   string non_finalized_fns_str = ss.str();
   if (!non_finalized_fns_str.empty()) {
-    LOG(INFO) << "For query " << state_->query_id()
+    LOG(INFO) << "For query " << PrintId(state_->query_id())
               << " the following functions were not finalized and have been removed from "
                  "the module:\n"
               << non_finalized_fns_str;
@@ -1701,7 +1710,7 @@ void LlvmCodeGen::DiagnosticHandler::DiagnosticHandlerFn(
     info.print(diagnostic_printer);
     error_msg.flush();
     if (codegen->state_) {
-      LOG(INFO) << "Query " << codegen->state_->query_id() << " encountered a "
+      LOG(INFO) << "Query " << PrintId(codegen->state_->query_id()) << " encountered a "
           << codegen->diagnostic_handler_.error_str_;
     }
   }

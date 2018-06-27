@@ -108,7 +108,7 @@ class StatestoreSubscriberThriftIf : public StatestoreSubscriberIf {
 StatestoreSubscriber::StatestoreSubscriber(const std::string& subscriber_id,
     const TNetworkAddress& heartbeat_address, const TNetworkAddress& statestore_address,
     MetricGroup* metrics)
-    : subscriber_id_(subscriber_id), heartbeat_address_(heartbeat_address),
+    : subscriber_id_(subscriber_id),
       statestore_address_(statestore_address),
       thrift_iface_(new StatestoreSubscriberThriftIf(this)),
       failure_detector_(new TimeoutFailureDetector(
@@ -118,6 +118,7 @@ StatestoreSubscriber::StatestoreSubscriber(const std::string& subscriber_id,
                 FLAGS_statestore_subscriber_cnxn_retry_interval_ms, 0, 0, "",
                 !FLAGS_ssl_client_ca_certificate.empty())),
       metrics_(metrics->GetOrCreateChildGroup("statestore-subscriber")),
+      heartbeat_address_(heartbeat_address),
       is_registered_(false) {
   connected_to_statestore_metric_ =
       metrics_->AddProperty("statestore-subscriber.connected", false);
@@ -137,7 +138,8 @@ StatestoreSubscriber::StatestoreSubscriber(const std::string& subscriber_id,
 }
 
 Status StatestoreSubscriber::AddTopic(const Statestore::TopicId& topic_id,
-    bool is_transient, const UpdateCallback& callback) {
+    bool is_transient, bool populate_min_subscriber_topic_version,
+    const UpdateCallback& callback) {
   lock_guard<shared_mutex> exclusive_lock(lock_);
   if (is_registered_) return Status("Subscriber already started, can't add new topic");
   TopicRegistration& registration = topic_registrations_[topic_id];
@@ -150,6 +152,8 @@ Status StatestoreSubscriber::AddTopic(const Statestore::TopicId& topic_id,
     registration.update_interval_timer.Start();
   }
   registration.is_transient = is_transient;
+  registration.populate_min_subscriber_topic_version =
+      populate_min_subscriber_topic_version;
   return Status::OK();
 }
 
@@ -163,6 +167,8 @@ Status StatestoreSubscriber::Register() {
     TTopicRegistration thrift_topic;
     thrift_topic.topic_name = registration.first;
     thrift_topic.is_transient = registration.second.is_transient;
+    thrift_topic.populate_min_subscriber_topic_version =
+        registration.second.populate_min_subscriber_topic_version;
     request.topic_registrations.push_back(thrift_topic);
   }
 
@@ -219,6 +225,7 @@ Status StatestoreSubscriber::Start() {
     RETURN_IF_ERROR(builder.Build(&server));
     heartbeat_server_.reset(server);
     RETURN_IF_ERROR(heartbeat_server_->Start());
+    heartbeat_address_.port = heartbeat_server_->port();
 
     LOG(INFO) << "Registering with statestore";
     status = Register();

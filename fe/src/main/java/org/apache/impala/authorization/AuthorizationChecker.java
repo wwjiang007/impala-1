@@ -17,27 +17,24 @@
 
 package org.apache.impala.authorization;
 
+import java.util.Collections;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Set;
 
-import org.apache.commons.lang.reflect.ConstructorUtils;
+import org.apache.impala.authorization.Privilege.ImpalaAction;
 import org.apache.impala.catalog.AuthorizationException;
 import org.apache.impala.catalog.AuthorizationPolicy;
 import org.apache.impala.common.InternalException;
 import org.apache.sentry.core.common.ActiveRoleSet;
 import org.apache.sentry.core.common.Subject;
-import org.apache.sentry.core.model.db.DBModelAction;
 import org.apache.sentry.core.model.db.DBModelAuthorizable;
-import org.apache.sentry.policy.db.SimpleDBPolicyEngine;
-import org.apache.sentry.provider.cache.SimpleCacheProviderBackend;
-import org.apache.sentry.provider.common.ProviderBackend;
-import org.apache.sentry.provider.common.ProviderBackendContext;
 import org.apache.sentry.provider.common.ResourceAuthorizationProvider;
-import org.apache.sentry.provider.file.SimpleFileProviderBackend;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
+
+import org.apache.impala.util.SentryUtil;
 
 /**
  * Class used to check whether a user has access to a given resource.
@@ -68,38 +65,7 @@ public class AuthorizationChecker {
    */
   private static ResourceAuthorizationProvider createProvider(AuthorizationConfig config,
       AuthorizationPolicy policy) {
-    try {
-      ProviderBackend providerBe;
-      // Create the appropriate backend provider.
-      if (config.isFileBasedPolicy()) {
-        providerBe = new SimpleFileProviderBackend(config.getSentryConfig().getConfig(),
-            config.getPolicyFile());
-      } else {
-        // Note: The second parameter to the ProviderBackend is a "resourceFile" path
-        // which is not used by Impala. We cannot pass 'null' so instead pass an empty
-        // string.
-        providerBe = new SimpleCacheProviderBackend(config.getSentryConfig().getConfig(),
-            "");
-        Preconditions.checkNotNull(policy);
-        ProviderBackendContext context = new ProviderBackendContext();
-        context.setBindingHandle(policy);
-        providerBe.initialize(context);
-      }
-
-      SimpleDBPolicyEngine engine =
-          new SimpleDBPolicyEngine(config.getServerName(), providerBe);
-
-      // Try to create an instance of the specified policy provider class.
-      // Re-throw any exceptions that are encountered.
-      String policyFile = config.getPolicyFile() == null ? "" : config.getPolicyFile();
-      return (ResourceAuthorizationProvider) ConstructorUtils.invokeConstructor(
-          Class.forName(config.getPolicyProviderClassName()),
-          new Object[] {policyFile, engine});
-    } catch (Exception e) {
-      // Re-throw as unchecked exception.
-      throw new IllegalStateException(
-          "Error creating ResourceAuthorizationProvider: ", e);
-    }
+    return SentryAuthProvider.createProvider(config, policy);
   }
 
   /*
@@ -113,7 +79,16 @@ public class AuthorizationChecker {
    * local group mappings.
    */
   public Set<String> getUserGroups(User user) throws InternalException {
-    return provider_.getGroupMapping().getGroups(user.getShortName());
+    try {
+      return provider_.getGroupMapping().getGroups(user.getShortName());
+    } catch (Exception e) {
+      if (SentryUtil.isSentryGroupNotFound(e)) {
+        // Sentry 2.1+ throws exceptions when user does not exist; swallow the
+        // exception and just return an empty set for this case.
+        return Collections.emptySet();
+      }
+      throw new RuntimeException(e);
+    }
   }
 
   /**
@@ -125,18 +100,23 @@ public class AuthorizationChecker {
     Preconditions.checkNotNull(privilegeRequest);
 
     if (!hasAccess(user, privilegeRequest)) {
+      Privilege privilege = privilegeRequest.getPrivilege();
       if (privilegeRequest.getAuthorizeable() instanceof AuthorizeableFn) {
         throw new AuthorizationException(String.format(
-            "User '%s' does not have privileges to CREATE/DROP functions.",
-            user.getName()));
+            "User '%s' does not have privileges to %s functions in: %s",
+            user.getName(), privilege, privilegeRequest.getName()));
       }
 
-      Privilege privilege = privilegeRequest.getPrivilege();
       if (EnumSet.of(Privilege.ANY, Privilege.ALL, Privilege.VIEW_METADATA)
           .contains(privilege)) {
         throw new AuthorizationException(String.format(
             "User '%s' does not have privileges to access: %s",
             user.getName(), privilegeRequest.getName()));
+      } else if (privilege == Privilege.REFRESH) {
+          throw new AuthorizationException(String.format(
+              "User '%s' does not have privileges to execute " +
+              "'INVALIDATE METADATA/REFRESH' on: %s", user.getName(),
+              privilegeRequest.getName()));
       } else {
         throw new AuthorizationException(String.format(
             "User '%s' does not have privileges to execute '%s' on: %s",
@@ -160,7 +140,7 @@ public class AuthorizationChecker {
       return true;
     }
 
-    EnumSet<DBModelAction> actions = request.getPrivilege().getHiveActions();
+    EnumSet<ImpalaAction> actions = request.getPrivilege().getSentryActions();
 
     List<DBModelAuthorizable> authorizeables = Lists.newArrayList(
         server_.getHiveAuthorizeableHierarchy());
@@ -172,14 +152,19 @@ public class AuthorizationChecker {
     // The Hive Access API does not currently provide a way to check if the user
     // has any privileges on a given resource.
     if (request.getPrivilege().getAnyOf()) {
-      for (DBModelAction action: actions) {
+      for (ImpalaAction action: actions) {
         if (provider_.hasAccess(new Subject(user.getShortName()), authorizeables,
             EnumSet.of(action), ActiveRoleSet.ALL)) {
           return true;
         }
       }
       return false;
-    } else if (request.getPrivilege() == Privilege.CREATE && authorizeables.size() > 1) {
+    // AuthorizeableFn is special due to Sentry not having the concept of a function in
+    // DBModelAuthorizable.AuthorizableType. As a result, the list of authorizables for
+    // an AuthorizeableFn only contains the server and database, but not the function
+    // itself. So there is no need to remove the last authorizeable here.
+    } else if (request.getPrivilege() == Privilege.CREATE && authorizeables.size() > 1 &&
+        !(request.getAuthorizeable() instanceof AuthorizeableFn)) {
       // CREATE on an object requires CREATE on the parent,
       // so don't check access on the object we're creating.
       authorizeables.remove(authorizeables.size() - 1);

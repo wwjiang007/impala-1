@@ -17,20 +17,24 @@
 
 package org.apache.impala.testutil;
 
-import java.util.Set;
-
+import com.google.common.base.Preconditions;
 import org.apache.impala.analysis.TableName;
 import org.apache.impala.authorization.AuthorizationConfig;
 import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.CatalogServiceCatalog;
 import org.apache.impala.catalog.Db;
+import org.apache.impala.catalog.FeDb;
 import org.apache.impala.catalog.HdfsCachePool;
 import org.apache.impala.catalog.HdfsTable;
 import org.apache.impala.catalog.ImpaladCatalog;
+import org.apache.impala.catalog.Role;
+import org.apache.impala.catalog.RolePrivilege;
 import org.apache.impala.catalog.Table;
+import org.apache.impala.thrift.TPrivilege;
 import org.apache.impala.util.PatternMatcher;
 
-import com.google.common.base.Preconditions;
+import java.util.HashSet;
+import java.util.Set;
 
 /**
  * Mock catalog used for running FE tests that allows lazy-loading of tables without a
@@ -52,9 +56,9 @@ public class ImpaladTestCatalog extends ImpaladCatalog {
     CatalogServiceCatalog catalogServerCatalog =
         CatalogServiceTestCatalog.createWithAuth(authzConfig.getSentryConfig());
     // Bootstrap the catalog by adding all dbs, tables, and functions.
-    for (Db db: catalogServerCatalog.getDbs(PatternMatcher.MATCHER_MATCH_ALL)) {
+    for (FeDb db: catalogServerCatalog.getDbs(PatternMatcher.MATCHER_MATCH_ALL)) {
       // Adding DB should include all tables/fns in that database.
-      addDb(db);
+      addDb((Db)db);
     }
     authPolicy_ = catalogServerCatalog.getAuthPolicy();
     srcCatalog_ = catalogServerCatalog;
@@ -114,4 +118,19 @@ public class ImpaladTestCatalog extends ImpaladCatalog {
   @Override
   public void waitForCatalogUpdate(long timeoutMs) {
   }
+
+  public Role addRole(String roleName) {
+    return srcCatalog_.addRole(roleName, new HashSet<String>());
+  }
+
+  public Role addRoleGrantGroup(String roleName, String groupName) throws CatalogException {
+    return srcCatalog_.addRoleGrantGroup(roleName, groupName);
+  }
+
+  public RolePrivilege addRolePrivilege(String roleName, TPrivilege privilege)
+      throws CatalogException {
+    return srcCatalog_.addRolePrivilege(roleName, privilege);
+  }
+
+  public void removeRole(String roleName) { srcCatalog_.removeRole(roleName); }
 }

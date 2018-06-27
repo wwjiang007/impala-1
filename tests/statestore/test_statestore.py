@@ -17,6 +17,7 @@
 
 from collections import defaultdict
 import json
+import logging
 import socket
 import threading
 import traceback
@@ -38,6 +39,8 @@ from ErrorCodes.ttypes import TErrorCode
 from Status.ttypes import TStatus
 
 from tests.common.environ import specific_build_type_timeout
+
+LOG = logging.getLogger('test_statestore')
 
 # Tests for the statestore. The StatestoreSubscriber class is a skeleton implementation of
 # a Python-based statestore subscriber with additional hooks to allow testing. Each
@@ -174,6 +177,7 @@ class StatestoreSubscriber(object):
     # Variables to notify for updates on each topic.
     self.update_event = threading.Condition()
     self.heartbeat_cb, self.update_cb = heartbeat_cb, update_cb
+    self.subscriber_id = "python-test-client-%s" % uuid.uuid1()
     self.exception = None
 
   def Heartbeat(self, args):
@@ -250,7 +254,6 @@ class StatestoreSubscriber(object):
 
   def register(self, topics=None):
     """Call the Register() RPC"""
-    self.subscriber_id = "python-test-client-%s" % uuid.uuid1()
     if topics is None: topics = []
     request = Subscriber.TRegisterSubscriberRequest(
       topic_registrations=topics,
@@ -320,13 +323,14 @@ class StatestoreSubscriber(object):
 
 class TestStatestore():
   def make_topic_update(self, topic_name, key_template="foo", value_template="bar",
-                        num_updates=1):
+                        num_updates=1, clear_topic_entries=False):
     topic_entries = [
       Subscriber.TTopicItem(key=key_template + str(x), value=value_template + str(x))
       for x in xrange(num_updates)]
     return Subscriber.TTopicDelta(topic_name=topic_name,
                                   topic_entries=topic_entries,
-                                  is_delta=False)
+                                  is_delta=False,
+                                  clear_topic_entries=clear_topic_entries)
 
   def test_registration_ids_different(self):
     """Test that if a subscriber with the same id registers twice, the registration ID is
@@ -515,3 +519,167 @@ class TestStatestore():
           .wait_for_update(persistent_topic_name, 1)
           .wait_for_update(transient_topic_name, 1)
     )
+
+  def test_update_with_clear_entries_flag(self):
+    """Test that the statestore clears all topic entries when a subscriber
+    sets the clear_topic_entries flag in a topic update message (IMPALA-6948)."""
+    topic_name = "test_topic_%s" % str(uuid.uuid1())
+
+    def add_entries(sub, args):
+      updates = []
+      if (topic_name in args.topic_deltas and sub.update_counts[topic_name] == 1):
+        updates.append(self.make_topic_update(topic_name, num_updates=2,
+            key_template="old"))
+
+      if (topic_name in args.topic_deltas and sub.update_counts[topic_name] == 2):
+        updates.append(self.make_topic_update(topic_name, num_updates=1,
+            key_template="new", clear_topic_entries=True))
+
+      if len(updates) > 0:
+        return TUpdateStateResponse(status=STATUS_OK, topic_updates=updates,
+            skipped=False)
+
+      return DEFAULT_UPDATE_STATE_RESPONSE
+
+    def check_entries(sub, args):
+      if (topic_name in args.topic_deltas and sub.update_counts[topic_name] == 1):
+        assert len(args.topic_deltas[topic_name].topic_entries) == 1
+        assert args.topic_deltas[topic_name].topic_entries[0].key == "new0"
+
+      return DEFAULT_UPDATE_STATE_RESPONSE
+
+    reg = [TTopicRegistration(topic_name=topic_name, is_transient=False)]
+    sub1 = StatestoreSubscriber(update_cb=add_entries)
+    (
+      sub1.start()
+        .register(topics=reg)
+        .wait_for_update(topic_name, 1)
+        .kill()
+        .wait_for_failure()
+        .start()
+        .register(topics=reg)
+        .wait_for_update(topic_name, 1)
+    )
+
+    sub2 = StatestoreSubscriber(update_cb=check_entries)
+    (
+      sub2.start()
+        .register(topics=reg)
+        .wait_for_update(topic_name, 2)
+    )
+
+  def test_heartbeat_failure_reset(self):
+    """Regression test for IMPALA-6785: the heartbeat failure count for the subscriber ID
+    should be reset when it resubscribes, not after the first successful heartbeat. Delay
+    the heartbeat to force the topic update to finish first."""
+
+    sub = StatestoreSubscriber(heartbeat_cb=lambda sub, args: time.sleep(0.5))
+    topic_name = "test_heartbeat_failure_reset"
+    reg = TTopicRegistration(topic_name=topic_name, is_transient=True)
+    sub.start()
+    sub.register(topics=[reg])
+    LOG.info("Registered with id {0}".format(sub.subscriber_id))
+    sub.wait_for_heartbeat(1)
+    sub.kill()
+    LOG.info("Killed, waiting for statestore to detect failure via heartbeats")
+    sub.wait_for_failure()
+    # IMPALA-6785 caused only one topic update to be send. Wait for multiple updates to
+    # be received to confirm that the subsequent updates are being scheduled repeatedly.
+    target_updates = sub.update_counts[topic_name] + 5
+    sub.start()
+    sub.register(topics=[reg])
+    LOG.info("Re-registered with id {0}, waiting for update".format(sub.subscriber_id))
+    sub.wait_for_update(topic_name, target_updates)
+
+  def test_min_subscriber_topic_version(self):
+    self._do_test_min_subscriber_topic_version(False)
+
+  def test_min_subscriber_topic_version_with_straggler(self):
+    self._do_test_min_subscriber_topic_version(True)
+
+  def _do_test_min_subscriber_topic_version(self, simulate_straggler):
+    """Implementation of test that the 'min_subscriber_topic_version' flag is correctly
+    set when requested. This tests runs two subscribers concurrently and tracks the
+    minimum version each has processed. If 'simulate_straggler' is true, one subscriber
+    rejects updates so that its version is not advanced."""
+    topic_name = "test_min_subscriber_topic_version_%s" % uuid.uuid1()
+
+    # This lock is held while processing the update to protect last_to_versions.
+    update_lock = threading.Lock()
+    last_to_versions = {}
+    TOTAL_SUBSCRIBERS = 2
+    def callback(sub, args, is_producer, sub_name):
+      """Callback for subscriber to verify min_subscriber_topic_version behaviour.
+      If 'is_producer' is true, this acts as the producer, otherwise it acts as the
+      consumer. 'sub_name' is a name used to index into last_to_versions."""
+      if topic_name not in args.topic_deltas:
+        # The update doesn't contain our topic.
+        pass
+      with update_lock:
+        LOG.info("{0} got update {1}".format(sub_name,
+            repr(args.topic_deltas[topic_name])))
+        LOG.info("Versions: {0}".format(last_to_versions))
+        to_version = args.topic_deltas[topic_name].to_version
+        from_version = args.topic_deltas[topic_name].from_version
+        min_subscriber_topic_version = \
+            args.topic_deltas[topic_name].min_subscriber_topic_version
+
+        if is_producer:
+          assert min_subscriber_topic_version is not None
+          assert (to_version == 0 and min_subscriber_topic_version == 0) or\
+              min_subscriber_topic_version < to_version,\
+              "'to_version' hasn't been created yet by this subscriber."
+          # Only validate version once all subscribers have processed an update.
+          if len(last_to_versions) == TOTAL_SUBSCRIBERS:
+            min_to_version = min(last_to_versions.values())
+            assert min_subscriber_topic_version <= min_to_version,\
+                "The minimum subscriber topic version seen by the producer cannot get " +\
+                "ahead of the minimum version seem by the consumer, by definition."
+            assert min_subscriber_topic_version >= min_to_version - 2,\
+                "The min topic version can be two behind the last version seen by " + \
+                "this subscriber because the updates for both subscribers are " + \
+                "prepared in parallel and because it's possible that the producer " + \
+                "processes two updates in-between consumer updates. This is not " + \
+                "absolute but depends on updates not being delayed a large amount."
+        else:
+          # Consumer did not request topic version.
+          assert min_subscriber_topic_version is None
+
+        # Check the 'to_version' and update 'last_to_versions'.
+        last_to_version = last_to_versions.get(sub_name, 0)
+        if to_version > 0:
+          # Non-empty update.
+          assert from_version == last_to_version
+        # Stragglers should accept the first update then skip later ones.
+        skip_update = simulate_straggler and not is_producer and last_to_version > 0
+        if not skip_update: last_to_versions[sub_name] = to_version
+
+        if is_producer:
+          delta = self.make_topic_update(topic_name)
+          return TUpdateStateResponse(status=STATUS_OK, topic_updates=[delta],
+                                      skipped=False)
+        elif skip_update:
+          return TUpdateStateResponse(status=STATUS_OK, topic_updates=[], skipped=True)
+        else:
+          return DEFAULT_UPDATE_STATE_RESPONSE
+
+    # Two concurrent subscribers, which pushes out updates and checks the minimum
+    # version, the other which just consumes the updates.
+    def producer_callback(sub, args): return callback(sub, args, True, "producer")
+    def consumer_callback(sub, args): return callback(sub, args, False, "consumer")
+    consumer_sub = StatestoreSubscriber(update_cb=consumer_callback)
+    consumer_reg = TTopicRegistration(topic_name=topic_name, is_transient=True)
+    producer_sub = StatestoreSubscriber(update_cb=producer_callback)
+    producer_reg = TTopicRegistration(topic_name=topic_name, is_transient=True,
+        populate_min_subscriber_topic_version=True)
+    NUM_UPDATES = 6
+    (
+      consumer_sub.start()
+          .register(topics=[consumer_reg])
+    )
+    (
+      producer_sub.start()
+          .register(topics=[producer_reg])
+          .wait_for_update(topic_name, NUM_UPDATES)
+    )
+    consumer_sub.wait_for_update(topic_name, NUM_UPDATES)

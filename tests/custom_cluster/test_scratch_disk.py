@@ -39,7 +39,7 @@ class TestScratchDir(CustomClusterTestSuite):
       """
   # Buffer pool limit that is low enough to force Impala to spill to disk when executing
   # spill_query.
-  buffer_pool_limit = "32m"
+  buffer_pool_limit = "45m"
 
   def count_nonempty_dirs(self, dirs):
     count = 0
@@ -82,7 +82,8 @@ class TestScratchDir(CustomClusterTestSuite):
         scratch because all directories are on same disk."""
     normal_dirs = self.generate_dirs(5)
     self._start_impala_cluster([
-      '--impalad_args="-logbuflevel=-1 -scratch_dirs={0}"'.format(','.join(normal_dirs))])
+      '--impalad_args="-logbuflevel=-1 -scratch_dirs={0}"'.format(','.join(normal_dirs)),
+      '--impalad_args=--allow_multiple_scratch_dirs_per_device=false'])
     self.assert_impalad_log_contains("INFO", "Using scratch directory ",
                                     expected_count=1)
     exec_option = vector.get_value('exec_option')

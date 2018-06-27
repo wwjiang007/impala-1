@@ -19,7 +19,6 @@ package org.apache.impala.analysis;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.ListIterator;
 import java.util.Set;
 
 import org.apache.impala.catalog.Type;
@@ -87,6 +86,16 @@ public abstract class QueryStmt extends StatementBase {
 
   /////////////////////////////////////////
   // END: Members that need to be reset()
+
+  // Contains the post-analysis toSql() string before rewrites. I.e. table refs are
+  // resolved and fully qualified, but no rewrites happened yet. This string is showed
+  // to the user in some cases in order to display a statement that is very similar
+  // to what was originally issued.
+  protected String origSqlString_ = null;
+
+  // If true, we need a runtime check on this statement's result to check if it
+  // returns a single row.
+  protected boolean isRuntimeScalar_ = false;
 
   QueryStmt(ArrayList<OrderByElement> orderByElements, LimitElement limitElement) {
     orderByElements_ = orderByElements;
@@ -265,17 +274,16 @@ public abstract class QueryStmt extends StatementBase {
    */
   protected void createSortTupleInfo(Analyzer analyzer) throws AnalysisException {
     Preconditions.checkState(evaluateOrderBy_);
-
-    for (Expr orderingExpr: sortInfo_.getOrderingExprs()) {
+    for (Expr orderingExpr: sortInfo_.getSortExprs()) {
       if (orderingExpr.getType().isComplexType()) {
         throw new AnalysisException(String.format("ORDER BY expression '%s' with " +
             "complex type '%s' is not supported.", orderingExpr.toSql(),
             orderingExpr.getType().toSql()));
       }
     }
+    sortInfo_.createSortTupleInfo(resultExprs_, analyzer);
 
-    ExprSubstitutionMap smap = sortInfo_.createSortTupleInfo(resultExprs_, analyzer);
-
+    ExprSubstitutionMap smap = sortInfo_.getOutputSmap();
     for (int i = 0; i < smap.size(); ++i) {
       if (!(smap.getLhs().get(i) instanceof SlotRef)
           || !(smap.getRhs().get(i) instanceof SlotRef)) {
@@ -374,6 +382,11 @@ public abstract class QueryStmt extends StatementBase {
   public WithClause getWithClause() { return withClause_; }
   public boolean hasOrderByClause() { return orderByElements_ != null; }
   public boolean hasLimit() { return limitElement_.getLimitExpr() != null; }
+  public String getOrigSqlString() { return origSqlString_; }
+  public boolean isRuntimeScalar() { return isRuntimeScalar_; }
+  public void setIsRuntimeScalar(boolean isRuntimeScalar) {
+    isRuntimeScalar_ = isRuntimeScalar;
+  }
   public long getLimit() { return limitElement_.getLimit(); }
   public boolean hasOffset() { return limitElement_.getOffsetExpr() != null; }
   public long getOffset() { return limitElement_.getOffset(); }
@@ -384,7 +397,7 @@ public abstract class QueryStmt extends StatementBase {
     Preconditions.checkState(limit >= 0);
     long newLimit = hasLimit() ? Math.min(limit, getLimit()) : limit;
     limitElement_ = new LimitElement(new NumericLiteral(Long.toString(newLimit),
-        Type.BIGINT), null);
+        Type.BIGINT), limitElement_.getOffsetExpr());
   }
 
   /**
@@ -448,6 +461,8 @@ public abstract class QueryStmt extends StatementBase {
     sortInfo_ = (other.sortInfo_ != null) ? other.sortInfo_.clone() : null;
     analyzer_ = other.analyzer_;
     evaluateOrderBy_ = other.evaluateOrderBy_;
+    origSqlString_ = other.origSqlString_;
+    isRuntimeScalar_ = other.isRuntimeScalar_;
   }
 
   @Override

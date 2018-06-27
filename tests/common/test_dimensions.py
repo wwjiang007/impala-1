@@ -17,10 +17,11 @@
 
 # Common test dimensions and associated utility functions.
 
+import copy
 import os
 from itertools import product
 
-from tests.common.test_vector import ImpalaTestDimension
+from tests.common.test_vector import ImpalaTestDimension, ImpalaTestVector
 
 WORKLOAD_DIR = os.environ['IMPALA_WORKLOAD_DIR']
 
@@ -28,7 +29,7 @@ WORKLOAD_DIR = os.environ['IMPALA_WORKLOAD_DIR']
 # of what specific table format to target along with the exec options (num_nodes, etc)
 # to use when running the query.
 class TableFormatInfo(object):
-  KNOWN_FILE_FORMATS = ['text', 'seq', 'rc', 'parquet', 'avro', 'hbase']
+  KNOWN_FILE_FORMATS = ['text', 'seq', 'rc', 'parquet', 'orc', 'avro', 'hbase']
   if os.environ['KUDU_IS_SUPPORTED'] == 'true':
     KNOWN_FILE_FORMATS.append('kudu')
   KNOWN_COMPRESSION_CODECS = ['none', 'snap', 'gzip', 'bzip', 'def', 'lzo']
@@ -131,13 +132,13 @@ SINGLE_NODE_ONLY = [1]
 ALL_NODES_ONLY = [0]
 ALL_DISABLE_CODEGEN_OPTIONS = [True, False]
 
-def create_single_exec_option_dimension():
+def create_single_exec_option_dimension(num_nodes=0, disable_codegen_rows_threshold=5000):
   """Creates an exec_option dimension that will produce a single test vector"""
-  return create_exec_option_dimension(cluster_sizes=ALL_NODES_ONLY,
-                                      disable_codegen_options=[False],
-                                      # Make sure codegen kicks in for functional.alltypes.
-                                      disable_codegen_rows_threshold_options=[5000],
-                                      batch_sizes=[0])
+  return create_exec_option_dimension(cluster_sizes=[num_nodes],
+      disable_codegen_options=[False],
+      # Make sure codegen kicks in for functional.alltypes.
+      disable_codegen_rows_threshold_options=[disable_codegen_rows_threshold],
+      batch_sizes=[0])
 
 def create_exec_option_dimension(cluster_sizes=ALL_CLUSTER_SIZES,
                                  disable_codegen_options=ALL_DISABLE_CODEGEN_OPTIONS,
@@ -145,13 +146,15 @@ def create_exec_option_dimension(cluster_sizes=ALL_CLUSTER_SIZES,
                                  sync_ddl=None, exec_single_node_option=[0],
                                  # We already run with codegen on and off explicitly -
                                  # don't need automatic toggling.
-                                 disable_codegen_rows_threshold_options=[0]):
+                                 disable_codegen_rows_threshold_options=[0],
+                                 debug_action_options=[None]):
   exec_option_dimensions = {
       'abort_on_error': [1],
       'exec_single_node_rows_threshold': exec_single_node_option,
       'batch_size': batch_sizes,
       'disable_codegen': disable_codegen_options,
       'disable_codegen_rows_threshold': disable_codegen_rows_threshold_options,
+      'debug_action': debug_action_options,
       'num_nodes': cluster_sizes}
 
   if sync_ddl is not None:
@@ -178,6 +181,28 @@ def create_exec_option_dimension_from_dict(exec_option_dimensions):
 
   # Build a test vector out of it
   return ImpalaTestDimension('exec_option', *exec_option_dimension_values)
+
+def add_exec_option_dimension(test_suite, key, value):
+  """
+  Takes an ImpalaTestSuite object 'test_suite' and adds 'key=value' to every exec option
+  test dimension, leaving the number of tests that will be run unchanged.
+  """
+  for v in test_suite.ImpalaTestMatrix.dimensions["exec_option"]:
+    v.value[key] = value
+
+def extend_exec_option_dimension(test_suite, key, value):
+  """
+  Takes an ImpalaTestSuite object 'test_suite' and extends the exec option test dimension
+  by creating a copy of each existing exec option value that has 'key' set to 'value',
+  doubling the number of tests that will be run.
+  """
+  dim = test_suite.ImpalaTestMatrix.dimensions["exec_option"]
+  new_value = []
+  for v in dim:
+    new_value.append(ImpalaTestVector.Value(v.name, copy.copy(v.value)))
+    new_value[-1].value[key] = value
+  dim.extend(new_value)
+  test_suite.ImpalaTestMatrix.add_dimension(dim)
 
 def get_dataset_from_workload(workload):
   # TODO: We need a better way to define the workload -> dataset mapping so we can

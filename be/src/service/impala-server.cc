@@ -26,6 +26,7 @@
 #include <boost/unordered_set.hpp>
 #include <boost/bind.hpp>
 #include <boost/algorithm/string.hpp>
+#include <boost/algorithm/string/trim.hpp>
 #include <boost/lexical_cast.hpp>
 #include <gperftools/malloc_extension.h>
 #include <gutil/strings/substitute.h>
@@ -44,14 +45,17 @@
 #include "common/logging.h"
 #include "common/version.h"
 #include "exec/external-data-source-executor.h"
+#include "exprs/timezone_db.h"
 #include "rpc/authentication.h"
 #include "rpc/rpc-trace.h"
 #include "rpc/thrift-thread.h"
 #include "rpc/thrift-util.h"
 #include "runtime/client-cache.h"
+#include "runtime/coordinator.h"
 #include "runtime/data-stream-mgr.h"
 #include "runtime/exec-env.h"
 #include "runtime/lib-cache.h"
+#include "runtime/mem-tracker.h"
 #include "runtime/timestamp-value.h"
 #include "runtime/timestamp-value.inline.h"
 #include "runtime/tmp-file-mgr.h"
@@ -59,6 +63,7 @@
 #include "service/impala-http-handler.h"
 #include "service/impala-internal-service.h"
 #include "service/client-request-state.h"
+#include "service/frontend.h"
 #include "util/bit-util.h"
 #include "util/container-util.h"
 #include "util/debug-util.h"
@@ -98,10 +103,11 @@ using boost::get_system_time;
 using boost::system_time;
 using boost::uuids::random_generator;
 using boost::uuids::uuid;
+using namespace apache::hive::service::cli::thrift;
 using namespace apache::thrift;
 using namespace apache::thrift::transport;
-using namespace boost::posix_time;
 using namespace beeswax;
+using namespace boost::posix_time;
 using namespace rapidjson;
 using namespace strings;
 
@@ -109,12 +115,17 @@ DECLARE_string(nn);
 DECLARE_int32(nn_port);
 DECLARE_string(authorized_proxy_user_config);
 DECLARE_string(authorized_proxy_user_config_delimiter);
+DECLARE_string(authorized_proxy_group_config);
+DECLARE_string(authorized_proxy_group_config_delimiter);
 DECLARE_bool(abort_on_config_error);
 DECLARE_bool(disk_spill_encryption);
 DECLARE_bool(use_krpc);
+DECLARE_bool(use_local_catalog);
 
-DEFINE_int32(beeswax_port, 21000, "port on which Beeswax client requests are served");
-DEFINE_int32(hs2_port, 21050, "port on which HiveServer2 client requests are served");
+DEFINE_int32(beeswax_port, 21000, "port on which Beeswax client requests are served."
+    "If 0 or less, the Beeswax server is not started.");
+DEFINE_int32(hs2_port, 21050, "port on which HiveServer2 client requests are served."
+    "If 0 or less, the HiveServer2 server is not started.");
 
 DEFINE_int32(fe_service_threads, 64,
     "number of threads available to serve client requests");
@@ -307,29 +318,22 @@ ImpalaServer::ImpalaServer(ExecEnv* exec_env)
   }
 
   if (!FLAGS_authorized_proxy_user_config.empty()) {
-    // Parse the proxy user configuration using the format:
-    // <proxy user>=<comma separated list of users they are allowed to delegate>
-    // See FLAGS_authorized_proxy_user_config for more details.
-    vector<string> proxy_user_config;
-    split(proxy_user_config, FLAGS_authorized_proxy_user_config, is_any_of(";"),
-        token_compress_on);
-    if (proxy_user_config.size() > 0) {
-      for (const string& config: proxy_user_config) {
-        size_t pos = config.find("=");
-        if (pos == string::npos) {
-          CLEAN_EXIT_WITH_ERROR(Substitute("Invalid proxy user configuration. No "
-              "mapping value specified for the proxy user. For more information review "
-              "usage of the --authorized_proxy_user_config flag: $0", config));
-        }
-        string proxy_user = config.substr(0, pos);
-        string config_str = config.substr(pos + 1);
-        vector<string> parsed_allowed_users;
-        split(parsed_allowed_users, config_str,
-            is_any_of(FLAGS_authorized_proxy_user_config_delimiter), token_compress_on);
-        unordered_set<string> allowed_users(parsed_allowed_users.begin(),
-            parsed_allowed_users.end());
-        authorized_proxy_user_config_.insert(make_pair(proxy_user, allowed_users));
-      }
+    Status status = PopulateAuthorizedProxyConfig(FLAGS_authorized_proxy_user_config,
+        FLAGS_authorized_proxy_user_config_delimiter, &authorized_proxy_user_config_);
+    if (!status.ok()) {
+      CLEAN_EXIT_WITH_ERROR(Substitute("Invalid proxy user configuration."
+          "No mapping value specified for the proxy user. For more information review "
+          "usage of the --authorized_proxy_user_config flag: $0", status.GetDetail()));
+    }
+  }
+
+  if (!FLAGS_authorized_proxy_group_config.empty()) {
+    Status status = PopulateAuthorizedProxyConfig(FLAGS_authorized_proxy_group_config,
+        FLAGS_authorized_proxy_group_config_delimiter, &authorized_proxy_group_config_);
+    if (!status.ok()) {
+      CLEAN_EXIT_WITH_ERROR(Substitute("Invalid proxy group configuration. "
+          "No mapping value specified for the proxy group. For more information review "
+          "usage of the --authorized_proxy_group_config flag: $0", status.GetDetail()));
     }
   }
 
@@ -352,20 +356,20 @@ ImpalaServer::ImpalaServer(ExecEnv* exec_env)
 
   // Register the membership callback if running in a real cluster.
   if (!TestInfo::is_test()) {
-    auto cb = [this] (const StatestoreSubscriber::TopicDeltaMap& state,
-         vector<TTopicDelta>* topic_updates) {
+    auto cb = [this](const StatestoreSubscriber::TopicDeltaMap& state,
+        vector<TTopicDelta>* topic_updates) {
       this->MembershipCallback(state, topic_updates);
     };
-    ABORT_IF_ERROR(
-        exec_env->subscriber()->AddTopic(Statestore::IMPALA_MEMBERSHIP_TOPIC, true, cb));
+    ABORT_IF_ERROR(exec_env->subscriber()->AddTopic(
+        Statestore::IMPALA_MEMBERSHIP_TOPIC, true, false, cb));
 
-    if (FLAGS_is_coordinator) {
+    if (FLAGS_is_coordinator && !FLAGS_use_local_catalog) {
       auto catalog_cb = [this] (const StatestoreSubscriber::TopicDeltaMap& state,
           vector<TTopicDelta>* topic_updates) {
         this->CatalogUpdateCallback(state, topic_updates);
       };
       ABORT_IF_ERROR(exec_env->subscriber()->AddTopic(
-            CatalogServer::IMPALA_CATALOG_TOPIC, true, catalog_cb));
+          CatalogServer::IMPALA_CATALOG_TOPIC, true, true, catalog_cb));
     }
   }
 
@@ -392,6 +396,38 @@ ImpalaServer::ImpalaServer(ExecEnv* exec_env)
   is_coordinator_ = FLAGS_is_coordinator;
   is_executor_ = FLAGS_is_executor;
   exec_env_->SetImpalaServer(this);
+}
+
+Status ImpalaServer::PopulateAuthorizedProxyConfig(
+    const string& authorized_proxy_config,
+    const string& authorized_proxy_config_delimiter,
+    AuthorizedProxyMap* authorized_proxy_config_map) {
+  // Parse the proxy user configuration using the format:
+  // <proxy user>=<comma separated list of users/groups they are allowed to delegate>
+  // See FLAGS_authorized_proxy_user_config or FLAGS_authorized_proxy_group_config
+  // for more details.
+  vector<string> proxy_config;
+  split(proxy_config, authorized_proxy_config, is_any_of(";"),
+      token_compress_on);
+  if (proxy_config.size() > 0) {
+    for (const string& config: proxy_config) {
+      size_t pos = config.find("=");
+      if (pos == string::npos) {
+        return Status(config);
+      }
+      string proxy_user = config.substr(0, pos);
+      boost::trim(proxy_user);
+      string config_str = config.substr(pos + 1);
+      boost::trim(config_str);
+      vector<string> parsed_allowed_users_or_groups;
+      split(parsed_allowed_users_or_groups, config_str,
+          is_any_of(authorized_proxy_config_delimiter), token_compress_on);
+      unordered_set<string> allowed_users_or_groups(
+          parsed_allowed_users_or_groups.begin(), parsed_allowed_users_or_groups.end());
+      authorized_proxy_config_map->insert({proxy_user, allowed_users_or_groups});
+    }
+  }
+  return Status::OK();
 }
 
 Status ImpalaServer::LogLineageRecord(const ClientRequestState& client_request_state) {
@@ -427,6 +463,25 @@ Status ImpalaServer::LogLineageRecord(const ClientRequestState& client_request_s
 
 bool ImpalaServer::IsCoordinator() { return is_coordinator_; }
 bool ImpalaServer::IsExecutor() { return is_executor_; }
+
+int ImpalaServer::GetThriftBackendPort() {
+  DCHECK(thrift_be_server_ != nullptr);
+  return thrift_be_server_->port();
+}
+
+TNetworkAddress ImpalaServer::GetThriftBackendAddress() {
+  return MakeNetworkAddress(FLAGS_hostname, GetThriftBackendPort());
+}
+
+int ImpalaServer::GetBeeswaxPort() {
+  DCHECK(beeswax_server_ != nullptr);
+  return beeswax_server_->port();
+}
+
+int ImpalaServer::GetHS2Port() {
+  DCHECK(hs2_server_ != nullptr);
+  return hs2_server_->port();
+}
 
 const ImpalaServer::BackendDescriptorMap& ImpalaServer::GetKnownBackends() {
   return known_backends_;
@@ -484,16 +539,16 @@ Status ImpalaServer::LogAuditRecord(const ClientRequestState& request_state,
   if (request.stmt_type == TStmtType::DDL) {
     if (request.catalog_op_request.op_type == TCatalogOpType::DDL) {
       writer.String(
-          PrintTDdlType(request.catalog_op_request.ddl_params.ddl_type).c_str());
+          PrintThriftEnum(request.catalog_op_request.ddl_params.ddl_type).c_str());
     } else {
-      writer.String(PrintTCatalogOpType(request.catalog_op_request.op_type).c_str());
+      writer.String(PrintThriftEnum(request.catalog_op_request.op_type).c_str());
     }
   } else {
-    writer.String(PrintTStmtType(request.stmt_type).c_str());
+    writer.String(PrintThriftEnum(request.stmt_type).c_str());
   }
   writer.String("network_address");
-  writer.String(
-      lexical_cast<string>(request_state.session()->network_address).c_str());
+  writer.String(TNetworkAddressToString(
+      request_state.session()->network_address).c_str());
   writer.String("sql_statement");
   string stmt = replace_all_copy(request_state.sql_stmt(), "\n", " ");
   Redact(&stmt);
@@ -505,7 +560,7 @@ Status ImpalaServer::LogAuditRecord(const ClientRequestState& request_state,
     writer.String("name");
     writer.String(event.name.c_str());
     writer.String("object_type");
-    writer.String(PrintTCatalogObjectType(event.object_type).c_str());
+    writer.String(PrintThriftEnum(event.object_type).c_str());
     writer.String("privilege");
     writer.String(event.privilege.c_str());
     writer.EndObject();
@@ -610,8 +665,8 @@ Status ImpalaServer::GetRuntimeProfileStr(const TUniqueId& query_id,
   {
     shared_ptr<ClientRequestState> request_state = GetClientRequestState(query_id);
     if (request_state.get() != nullptr) {
-      // For queries in CREATED state, the profile information isn't populated yet.
-      if (request_state->query_state() == beeswax::QueryState::CREATED) {
+      // For queries in INITIALIZED_STATE, the profile information isn't populated yet.
+      if (request_state->operation_state() == TOperationState::INITIALIZED_STATE) {
         return Status::Expected("Query plan is not ready.");
       }
       lock_guard<mutex> l(*request_state->lock());
@@ -656,12 +711,15 @@ Status ImpalaServer::GetExecSummary(const TUniqueId& query_id, const string& use
       lock_guard<mutex> l(*request_state->lock());
       RETURN_IF_ERROR(CheckProfileAccess(user, request_state->effective_user(),
           request_state->user_has_profile_access()));
-      if (request_state->coord() != nullptr) {
-        request_state->coord()->GetTExecSummary(result);
+      if (request_state->operation_state() == TOperationState::PENDING_STATE) {
+        return Status::OK();
+      } else if (request_state->GetCoordinator() != nullptr) {
+        request_state->GetCoordinator()->GetTExecSummary(result);
         TExecProgress progress;
         progress.__set_num_completed_scan_ranges(
-            request_state->coord()->progress().num_complete());
-        progress.__set_total_scan_ranges(request_state->coord()->progress().total());
+            request_state->GetCoordinator()->progress().num_complete());
+        progress.__set_total_scan_ranges(
+            request_state->GetCoordinator()->progress().total());
         // TODO: does this not need to be synchronized?
         result->__set_progress(progress);
         return Status::OK();
@@ -750,7 +808,7 @@ void ImpalaServer::ArchiveQuery(const ClientRequestState& query) {
   // FLAGS_log_query_to_file will have been set to false
   if (FLAGS_log_query_to_file) {
     stringstream ss;
-    ss << UnixMillis() << " " << query.query_id() << " " << encoded_profile_str;
+    ss << UnixMillis() << " " << PrintId(query.query_id()) << " " << encoded_profile_str;
     status = profile_logger_->AppendEntry(ss.str());
     if (!status.ok()) {
       LOG_EVERY_N(WARNING, 1000) << "Could not write to profile log file file ("
@@ -763,7 +821,8 @@ void ImpalaServer::ArchiveQuery(const ClientRequestState& query) {
 
   if (FLAGS_query_log_size == 0) return;
   QueryStateRecord record(query, true, encoded_profile_str);
-  if (query.coord() != nullptr) query.coord()->GetTExecSummary(&record.exec_summary);
+  if (query.GetCoordinator() != nullptr)
+    query.GetCoordinator()->GetTExecSummary(&record.exec_summary);
   {
     lock_guard<mutex> l(query_log_lock_);
     // Add record to the beginning of the log, and to the lookup index.
@@ -779,7 +838,7 @@ void ImpalaServer::ArchiveQuery(const ClientRequestState& query) {
 
 ImpalaServer::~ImpalaServer() {}
 
-void ImpalaServer::AddPoolQueryOptions(TQueryCtx* ctx,
+void ImpalaServer::AddPoolConfiguration(TQueryCtx* ctx,
     const QueryOptionsMask& override_options_mask) {
   // Errors are not returned and are only logged (at level 2) because some incoming
   // requests are not expected to be mapped to a pool and will not have query options,
@@ -789,15 +848,16 @@ void ImpalaServer::AddPoolQueryOptions(TQueryCtx* ctx,
   Status status = exec_env_->request_pool_service()->ResolveRequestPool(*ctx,
       &resolved_pool);
   if (!status.ok()) {
-    VLOG_RPC << "Not adding pool query options for query=" << ctx->query_id
+    VLOG_RPC << "Not adding pool query options for query=" << PrintId(ctx->query_id)
              << " ResolveRequestPool status: " << status.GetDetail();
     return;
   }
+  ctx->__set_request_pool(resolved_pool);
 
   TPoolConfig config;
   status = exec_env_->request_pool_service()->GetPoolConfig(resolved_pool, &config);
   if (!status.ok()) {
-    VLOG_RPC << "Not adding pool query options for query=" << ctx->query_id
+    VLOG_RPC << "Not adding pool query options for query=" << PrintId(ctx->query_id)
              << " GetConfigPool status: " << status.GetDetail();
     return;
   }
@@ -894,7 +954,7 @@ Status ImpalaServer::ExecuteInternal(
     }
   }
 
-  if ((*request_state)->coord() != nullptr) {
+  if ((*request_state)->schedule() != nullptr) {
     const PerBackendExecParams& per_backend_params =
         (*request_state)->schedule()->per_backend_exec_params();
     if (!per_backend_params.empty()) {
@@ -905,16 +965,34 @@ Status ImpalaServer::ExecuteInternal(
       }
     }
   }
+
   return Status::OK();
 }
 
 void ImpalaServer::PrepareQueryContext(TQueryCtx* query_ctx) {
+  PrepareQueryContext(GetThriftBackendAddress(), query_ctx);
+}
+
+void ImpalaServer::PrepareQueryContext(
+    const TNetworkAddress& backend_addr, TQueryCtx* query_ctx) {
   query_ctx->__set_pid(getpid());
   int64_t now_us = UnixMicros();
-  query_ctx->__set_utc_timestamp_string(ToUtcStringFromUnixMicros(now_us));
-  query_ctx->__set_now_string(ToStringFromUnixMicros(now_us));
+  const Timezone& utc_tz = TimezoneDatabase::GetUtcTimezone();
+  string local_tz_name = TimezoneDatabase::LocalZoneName();
+  const Timezone* local_tz = TimezoneDatabase::FindTimezone(local_tz_name);
+  if (local_tz != nullptr) {
+    LOG(INFO) << "Found local timezone \"" << local_tz_name << "\".";
+  } else {
+    LOG(ERROR) << "Failed to find local timezone \"" << local_tz_name
+        << "\". Falling back to UTC";
+    local_tz_name = "UTC";
+    local_tz = &utc_tz;
+  }
+  query_ctx->__set_utc_timestamp_string(ToStringFromUnixMicros(now_us, utc_tz));
+  query_ctx->__set_now_string(ToStringFromUnixMicros(now_us, *local_tz));
   query_ctx->__set_start_unix_millis(now_us / MICROS_PER_MILLI);
-  query_ctx->__set_coord_address(ExecEnv::GetInstance()->backend_address());
+  query_ctx->__set_coord_address(backend_addr);
+  query_ctx->__set_local_time_zone(local_tz_name);
 
   // Creating a random_generator every time is not free, but
   // benchmarks show it to be slightly cheaper than contending for a
@@ -953,6 +1031,8 @@ Status ImpalaServer::RegisterQuery(shared_ptr<SessionState> session_state,
   }
   // Metric is decremented in UnregisterQuery().
   ImpaladMetrics::NUM_QUERIES_REGISTERED->Increment(1L);
+  VLOG_QUERY << "Registered query query_id=" << PrintId(query_id)
+             << " session_id=" << PrintId(request_state->session_id());
   return Status::OK();
 }
 
@@ -1003,7 +1083,7 @@ Status ImpalaServer::SetQueryInflight(shared_ptr<SessionState> session_state,
 
 Status ImpalaServer::UnregisterQuery(const TUniqueId& query_id, bool check_inflight,
     const Status* cause) {
-  VLOG_QUERY << "UnregisterQuery(): query_id=" << query_id;
+  VLOG_QUERY << "UnregisterQuery(): query_id=" << PrintId(query_id);
 
   RETURN_IF_ERROR(CancelInternal(query_id, check_inflight, cause));
 
@@ -1043,13 +1123,13 @@ Status ImpalaServer::UnregisterQuery(const TUniqueId& query_id, bool check_infli
     request_state->session()->inflight_queries.erase(query_id);
   }
 
-  if (request_state->coord() != nullptr) {
+  if (request_state->GetCoordinator() != nullptr) {
     TExecSummary t_exec_summary;
-    request_state->coord()->GetTExecSummary(&t_exec_summary);
+    request_state->GetCoordinator()->GetTExecSummary(&t_exec_summary);
     string exec_summary = PrintExecSummary(t_exec_summary);
     request_state->summary_profile()->AddInfoStringRedacted("ExecSummary", exec_summary);
     request_state->summary_profile()->AddInfoStringRedacted("Errors",
-        request_state->coord()->GetErrorLog());
+        request_state->GetCoordinator()->GetErrorLog());
 
     const PerBackendExecParams& per_backend_params =
         request_state->schedule()->per_backend_exec_params();
@@ -1192,12 +1272,12 @@ void ImpalaServer::ReportExecStatus(
     Status::Expected(err).SetTStatus(&return_val);
     return;
   }
-  request_state->coord()->UpdateBackendExecStatus(params).SetTStatus(&return_val);
+  request_state->UpdateBackendExecStatus(params).SetTStatus(&return_val);
 }
 
 void ImpalaServer::TransmitData(
     TTransmitDataResult& return_val, const TTransmitDataParams& params) {
-  VLOG_ROW << "TransmitData(): instance_id=" << params.dest_fragment_instance_id
+  VLOG_ROW << "TransmitData(): instance_id=" << PrintId(params.dest_fragment_instance_id)
            << " node_id=" << params.dest_node_id
            << " #rows=" << params.row_batch.num_rows
            << " sender_id=" << params.sender_id
@@ -1297,14 +1377,14 @@ void ImpalaServer::CancelFromThreadPool(uint32_t thread_id,
     Status status = UnregisterQuery(cancellation_work.query_id(), true,
         &cancellation_work.cause());
     if (!status.ok()) {
-      VLOG_QUERY << "Query de-registration (" << cancellation_work.query_id()
+      VLOG_QUERY << "Query de-registration (" << PrintId(cancellation_work.query_id())
                  << ") failed";
     }
   } else {
     Status status = CancelInternal(cancellation_work.query_id(), true,
         &cancellation_work.cause());
     if (!status.ok()) {
-      VLOG_QUERY << "Query cancellation (" << cancellation_work.query_id()
+      VLOG_QUERY << "Query cancellation (" << PrintId(cancellation_work.query_id())
                  << ") did not succeed: " << status.GetDetail();
     }
   }
@@ -1324,8 +1404,9 @@ Status ImpalaServer::AuthorizeProxyUser(const string& user, const string& do_as_
   stringstream error_msg;
   error_msg << "User '" << user << "' is not authorized to delegate to '"
             << do_as_user << "'.";
-  if (authorized_proxy_user_config_.size() == 0) {
-    error_msg << " User delegation is disabled.";
+  if (authorized_proxy_user_config_.size() == 0 &&
+      authorized_proxy_group_config_.size() == 0) {
+    error_msg << " User/group delegation is disabled.";
     VLOG(1) << error_msg;
     return Status::Expected(error_msg.str());
   }
@@ -1340,13 +1421,45 @@ Status ImpalaServer::AuthorizeProxyUser(const string& user, const string& do_as_
 
   // Check if the proxy user exists. If he/she does, then check if they are allowed
   // to delegate to the do_as_user.
-  ProxyUserMap::const_iterator proxy_user =
+  AuthorizedProxyMap::const_iterator proxy_user =
       authorized_proxy_user_config_.find(short_user);
   if (proxy_user != authorized_proxy_user_config_.end()) {
-    for (const string& user: proxy_user->second) {
-      if (user == "*" || user == do_as_user) return Status::OK();
+    boost::unordered_set<string> users = proxy_user->second;
+    if (users.find("*") != users.end() ||
+        users.find(do_as_user) != users.end()) {
+      return Status::OK();
     }
   }
+
+  if (authorized_proxy_group_config_.size() > 0) {
+    // Check if the groups of do_as_user are in the authorized proxy groups.
+    AuthorizedProxyMap::const_iterator proxy_group =
+        authorized_proxy_group_config_.find(short_user);
+    if (proxy_group != authorized_proxy_group_config_.end()) {
+      boost::unordered_set<string> groups = proxy_group->second;
+      if (groups.find("*") != groups.end()) return Status::OK();
+
+      TGetHadoopGroupsRequest req;
+      req.__set_user(do_as_user);
+      TGetHadoopGroupsResponse res;
+      int64_t start = MonotonicMillis();
+      Status status = exec_env_->frontend()->GetHadoopGroups(req, &res);
+      VLOG_QUERY << "Getting Hadoop groups for user: " << short_user << " took " <<
+          (PrettyPrinter::Print(MonotonicMillis() - start, TUnit::TIME_MS));
+      if (!status.ok()) {
+        LOG(ERROR) << "Error getting Hadoop groups for user: " << short_user << ": "
+            << status.GetDetail();
+        return status;
+      }
+
+      for (const string& do_as_group : res.groups) {
+        if (groups.find(do_as_group) != groups.end()) {
+          return Status::OK();
+        }
+      }
+    }
+  }
+
   VLOG(1) << error_msg;
   return Status::Expected(error_msg.str());
 }
@@ -1404,6 +1517,7 @@ void ImpalaServer::CatalogUpdateCallback(
   // Always update the minimum subscriber version for the catalog topic.
   {
     unique_lock<mutex> unique_lock(catalog_version_lock_);
+    DCHECK(delta.__isset.min_subscriber_topic_version);
     min_subscriber_catalog_topic_version_ = delta.min_subscriber_topic_version;
   }
   catalog_version_update_cv_.NotifyAll();
@@ -1529,10 +1643,15 @@ void ImpalaServer::MembershipCallback(
     // clear the saved mapping of known backends.
     if (!delta.is_delta) known_backends_.clear();
 
-    // Process membership additions.
+    // Process membership additions/deletions.
     for (const TTopicItem& item: delta.topic_entries) {
       if (item.deleted) {
-        known_backends_.erase(item.key);
+        auto entry = known_backends_.find(item.key);
+        // Remove stale connections to removed members.
+        if (entry != known_backends_.end()) {
+          exec_env_->impalad_client_cache()->CloseConnections(entry->second.address);
+          known_backends_.erase(item.key);
+        }
         continue;
       }
       uint32_t len = item.value.size();
@@ -1590,7 +1709,6 @@ void ImpalaServer::MembershipCallback(
             vector<TNetworkAddress>& failed_hosts = queries_to_cancel[*query_id];
             failed_hosts.push_back(loc_entry->first);
           }
-          exec_env_->impalad_client_cache()->CloseConnections(loc_entry->first);
           // We can remove the location wholesale once we know backend's failed. To do so
           // safely during iteration, we have to be careful not in invalidate the current
           // iterator, so copy the iterator to do the erase(..) and advance the original.
@@ -1617,9 +1735,9 @@ void ImpalaServer::MembershipCallback(
           cancellation_entry != queries_to_cancel.end();
           ++cancellation_entry) {
         stringstream cause_msg;
-        cause_msg << "Cancelled due to unreachable impalad(s): ";
+        cause_msg << "Failed due to unreachable impalad(s): ";
         for (int i = 0; i < cancellation_entry->second.size(); ++i) {
-          cause_msg << cancellation_entry->second[i];
+          cause_msg << TNetworkAddressToString(cancellation_entry->second[i]);
           if (i + 1 != cancellation_entry->second.size()) cause_msg << ", ";
         }
         string cause_str = cause_msg.str();
@@ -1639,8 +1757,10 @@ void ImpalaServer::AddLocalBackendToStatestore(
   TBackendDescriptor local_backend_descriptor;
   local_backend_descriptor.__set_is_coordinator(FLAGS_is_coordinator);
   local_backend_descriptor.__set_is_executor(FLAGS_is_executor);
-  local_backend_descriptor.__set_address(exec_env_->backend_address());
+  local_backend_descriptor.__set_address(exec_env_->GetThriftBackendAddress());
   local_backend_descriptor.ip_address = exec_env_->ip_address();
+  local_backend_descriptor.__set_proc_mem_limit(
+      exec_env_->process_mem_tracker()->limit());
   if (FLAGS_use_krpc) {
     const TNetworkAddress& krpc_address = exec_env_->krpc_address();
     DCHECK(IsResolvedAddress(krpc_address));
@@ -1678,13 +1798,13 @@ ImpalaServer::QueryStateRecord::QueryStateRecord(const ClientRequestState& reque
   end_time_us = request_state.end_time_us();
   has_coord = false;
 
-  Coordinator* coord = request_state.coord();
+  Coordinator* coord = request_state.GetCoordinator();
   if (coord != nullptr) {
     num_complete_fragments = coord->progress().num_complete();
     total_fragments = coord->progress().total();
     has_coord = true;
   }
-  query_state = request_state.query_state();
+  query_state = request_state.BeeswaxQueryState();
   num_rows_fetched = request_state.num_rows_fetched();
   query_status = request_state.query_status();
 
@@ -1714,7 +1834,11 @@ ImpalaServer::QueryStateRecord::QueryStateRecord(const ClientRequestState& reque
   }
   all_rows_returned = request_state.eos();
   last_active_time_ms = request_state.last_active_ms();
-  request_pool = request_state.request_pool();
+  // For statement types other than QUERY/DML, show an empty string for resource pool
+  // to indicate that they are not subjected to admission control.
+  if (stmt_type == TStmtType::QUERY || stmt_type == TStmtType::DML) {
+    resource_pool = request_state.request_pool();
+  }
   user_has_profile_access = request_state.user_has_profile_access();
 }
 
@@ -1780,13 +1904,15 @@ void ImpalaServer::ConnectionEnd(
     connection_to_sessions_map_.erase(it);
   }
 
-  LOG(INFO) << "Connection from client " << connection_context.network_address
-            << " closed, closing " << sessions_to_close.size() << " associated session(s)";
+  LOG(INFO) << "Connection from client "
+            << TNetworkAddressToString(connection_context.network_address)
+            << " closed, closing " << sessions_to_close.size()
+            << " associated session(s)";
 
   for (const TUniqueId& session_id: sessions_to_close) {
     Status status = CloseSessionInternal(session_id, true);
     if (!status.ok()) {
-      LOG(WARNING) << "Error closing session " << session_id << ": "
+      LOG(WARNING) << "Error closing session " << PrintId(session_id) << ": "
                    << status.GetDetail();
     }
   }
@@ -1840,7 +1966,7 @@ void ImpalaServer::UnregisterSessionTimeout(int32_t session_timeout) {
         int64_t last_accessed_ms = session_state.second->last_accessed_ms;
         int64_t session_timeout_ms = session_state.second->session_timeout * 1000;
         if (now - last_accessed_ms <= session_timeout_ms) continue;
-        LOG(INFO) << "Expiring session: " << session_state.first << ", user:"
+        LOG(INFO) << "Expiring session: " << PrintId(session_state.first) << ", user:"
                   << session_state.second->connected_user << ", last active: "
                   << ToStringFromUnixMillis(last_accessed_ms);
         session_state.second->expired = true;
@@ -1895,7 +2021,7 @@ void ImpalaServer::UnregisterSessionTimeout(int32_t session_timeout) {
         // If the query time limit expired, we must cancel the query.
         if (expiration_event->kind == ExpirationKind::EXEC_TIME_LIMIT) {
           int32_t exec_time_limit_s = query_state->query_options().exec_time_limit_s;
-          VLOG_QUERY << "Expiring query " << expiration_event->query_id
+          VLOG_QUERY << "Expiring query " << PrintId(expiration_event->query_id)
                      << " due to execution time limit of " << exec_time_limit_s << "s.";
           const string& err_msg = Substitute(
               "Query $0 expired due to execution time limit of $1",
@@ -1938,7 +2064,7 @@ void ImpalaServer::UnregisterSessionTimeout(int32_t session_timeout) {
           // Otherwise time to expire this query
           VLOG_QUERY
               << "Expiring query due to client inactivity: "
-              << expiration_event->query_id << ", last activity was at: "
+              << PrintId(expiration_event->query_id) << ", last activity was at: "
               << ToStringFromUnixMillis(query_state->last_active_ms());
           const string& err_msg = Substitute(
               "Query $0 expired due to client inactivity (timeout is $1)",
@@ -1989,7 +2115,7 @@ Status ImpalaServer::Start(int32_t thrift_be_port, int32_t beeswax_port,
   }
 
   // Start the internal service.
-  if (thrift_be_port > 0) {
+  if (thrift_be_port > 0 || (TestInfo::is_test() && thrift_be_port == 0)) {
     boost::shared_ptr<ImpalaInternalService> thrift_if(new ImpalaInternalService());
     boost::shared_ptr<TProcessor> be_processor(
         new ImpalaInternalServiceProcessor(thrift_if));
@@ -2013,11 +2139,11 @@ Status ImpalaServer::Start(int32_t thrift_be_port, int32_t beeswax_port,
 
   if (!FLAGS_is_coordinator) {
     LOG(INFO) << "Initialized executor Impala server on "
-              << ExecEnv::GetInstance()->backend_address();
+              << TNetworkAddressToString(GetThriftBackendAddress());
   } else {
     // Initialize the client servers.
     boost::shared_ptr<ImpalaServer> handler = shared_from_this();
-    if (beeswax_port > 0) {
+    if (beeswax_port > 0 || (TestInfo::is_test() && beeswax_port == 0)) {
       boost::shared_ptr<TProcessor> beeswax_processor(
           new ImpalaServiceProcessor(handler));
       boost::shared_ptr<TProcessorEventHandler> event_handler(
@@ -2043,7 +2169,7 @@ Status ImpalaServer::Start(int32_t thrift_be_port, int32_t beeswax_port,
       beeswax_server_->SetConnectionHandler(this);
     }
 
-    if (hs2_port > 0) {
+    if (hs2_port > 0 || (TestInfo::is_test() && hs2_port == 0)) {
       boost::shared_ptr<TProcessor> hs2_fe_processor(
           new ImpalaHiveServer2ServiceProcessor(handler));
       boost::shared_ptr<TProcessorEventHandler> event_handler(
@@ -2071,7 +2197,7 @@ Status ImpalaServer::Start(int32_t thrift_be_port, int32_t beeswax_port,
     }
   }
   LOG(INFO) << "Initialized coordinator/executor Impala server on "
-      << ExecEnv::GetInstance()->backend_address();
+      << TNetworkAddressToString(GetThriftBackendAddress());
 
   // Start the RPC services.
   RETURN_IF_ERROR(exec_env_->StartKrpcService());
@@ -2128,10 +2254,9 @@ void ImpalaServer::UpdateFilter(TUpdateFilterResult& result,
   shared_ptr<ClientRequestState> client_request_state =
       GetClientRequestState(params.query_id);
   if (client_request_state.get() == nullptr) {
-    LOG(INFO) << "Could not find client request state: " << params.query_id;
+    LOG(INFO) << "Could not find client request state: " << PrintId(params.query_id);
     return;
   }
-  client_request_state->coord()->UpdateFilter(params);
+  client_request_state->UpdateFilter(params);
 }
-
 }

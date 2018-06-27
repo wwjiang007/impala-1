@@ -125,8 +125,9 @@ class Frontend {
   /// field is set to MINIMAL, only the column definitions are returned. If set to
   /// FORMATTED|EXTENDED, extended metadata is returned (in addition to the column defs).
   /// This includes info about the table properties, SerDe properties, StorageDescriptor
-  /// properties, and more.
-  Status DescribeTable(const TDescribeTableParams& params, TDescribeResult* response);
+  /// properties, and more.  The current user session is needed for privileges checks.
+  Status DescribeTable(const TDescribeTableParams& params, const TSessionState& session,
+      TDescribeResult* response);
 
   /// Returns (in the output parameter) a string containing the CREATE TABLE command that
   /// creates the table specified in the params.
@@ -151,6 +152,10 @@ class Frontend {
   /// field.
   Status GetHadoopConfig(const TGetHadoopConfigRequest& request,
       TGetHadoopConfigResponse* response);
+
+  /// Returns (in the output parameter) the list of groups for the given user.
+  Status GetHadoopGroups(const TGetHadoopGroupsRequest& request,
+      TGetHadoopGroupsResponse* response);
 
   /// Loads a single file or set of files into a table or partition. Saves the RPC
   /// response in the TLoadDataResp output parameter. Returns OK if the operation
@@ -185,6 +190,7 @@ class Frontend {
   jmethodID get_explain_plan_id_;  // JniFrontend.getExplainPlan()
   jmethodID get_hadoop_config_id_;  // JniFrontend.getHadoopConfig(byte[])
   jmethodID get_hadoop_configs_id_;  // JniFrontend.getAllHadoopConfigs()
+  jmethodID get_hadoop_groups_id_;  // JniFrontend.getHadoopGroups()
   jmethodID check_config_id_; // JniFrontend.checkConfiguration()
   jmethodID update_catalog_cache_id_; // JniFrontend.updateCatalogCache(byte[][])
   jmethodID update_membership_id_; // JniFrontend.updateMembership()

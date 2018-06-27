@@ -70,14 +70,29 @@ void impala::OverlayQueryOptions(const TQueryOptions& src, const QueryOptionsMas
 #undef REMOVED_QUERY_OPT_FN
 }
 
+// Choose different print function based on the type.
+// TODO: In thrift 0.11.0 operator << is implemented for enums and this indirection can be
+// removed.
+template<typename T, typename std::enable_if_t<std::is_enum<T>::value>* = nullptr>
+string PrintQueryOptionValue(const T& option) {
+  return PrintThriftEnum(option);
+}
+
+template<typename T, typename std::enable_if_t<std::is_integral<T>::value>* = nullptr>
+string PrintQueryOptionValue(const T& option)  {
+  return std::to_string(option);
+}
+
+const string& PrintQueryOptionValue(const std::string& option)  {
+  return option;
+}
+
 void impala::TQueryOptionsToMap(const TQueryOptions& query_options,
     map<string, string>* configuration) {
 #define QUERY_OPT_FN(NAME, ENUM, LEVEL)\
   {\
     if (query_options.__isset.NAME) { \
-      stringstream val;\
-      val << query_options.NAME;\
-      (*configuration)[#ENUM] = val.str();\
+      (*configuration)[#ENUM] = PrintQueryOptionValue(query_options.NAME); \
     } else { \
       (*configuration)[#ENUM] = ""; \
     }\
@@ -370,7 +385,7 @@ Status impala::SetQueryOption(const string& key, const string& value,
         if (size < RuntimeFilterBank::MIN_BLOOM_FILTER_SIZE ||
             size > RuntimeFilterBank::MAX_BLOOM_FILTER_SIZE) {
           return Status(Substitute("$0 is not a valid Bloom filter size for $1. "
-                  "Valid sizes are in [$2, $3].", value, PrintTImpalaQueryOptions(
+                  "Valid sizes are in [$2, $3].", value, PrintThriftEnum(
                       static_cast<TImpalaQueryOptions::type>(option)),
                   RuntimeFilterBank::MIN_BLOOM_FILTER_SIZE,
                   RuntimeFilterBank::MAX_BLOOM_FILTER_SIZE));
@@ -382,7 +397,7 @@ Status impala::SetQueryOption(const string& key, const string& value,
             && FLAGS_min_buffer_size <= RuntimeFilterBank::MAX_BLOOM_FILTER_SIZE) {
           return Status(Substitute("$0 should not be less than $1 which is the minimum "
               "buffer size that can be allocated by the buffer pool",
-              PrintTImpalaQueryOptions(static_cast<TImpalaQueryOptions::type>(option)),
+              PrintThriftEnum(static_cast<TImpalaQueryOptions::type>(option)),
               FLAGS_min_buffer_size));
         }
         if (option == TImpalaQueryOptions::RUNTIME_BLOOM_FILTER_SIZE) {
@@ -630,6 +645,51 @@ Status impala::SetQueryOption(const string& key, const string& value,
                          "Only non-negative numbers are allowed.", value));
         }
         query_options->__set_exec_time_limit_s(time_limit);
+        break;
+      }
+      case TImpalaQueryOptions::SHUFFLE_DISTINCT_EXPRS: {
+        query_options->__set_shuffle_distinct_exprs(
+                iequals(value, "true") || iequals(value, "1"));
+        break;
+      }
+      case TImpalaQueryOptions::MAX_MEM_ESTIMATE_FOR_ADMISSION: {
+        int64_t bytes_limit;
+        RETURN_IF_ERROR(ParseMemValue(
+            value, "max memory estimate for admission", &bytes_limit));
+        query_options->__set_max_mem_estimate_for_admission(bytes_limit);
+        break;
+      }
+      case TImpalaQueryOptions::THREAD_RESERVATION_LIMIT:
+      case TImpalaQueryOptions::THREAD_RESERVATION_AGGREGATE_LIMIT: {
+        // Parsing logic is identical for these two options.
+        StringParser::ParseResult status;
+        int val = StringParser::StringToInt<int>(value.c_str(), value.size(), &status);
+        if (status != StringParser::PARSE_SUCCESS) {
+          return Status(Substitute("Invalid thread count: '$0'.", value));
+        }
+        if (val < -1) {
+          return Status(Substitute("Invalid thread count: '$0'. "
+              "Only -1 and non-negative values are allowed.", val));
+        }
+        if (option == TImpalaQueryOptions::THREAD_RESERVATION_LIMIT) {
+          query_options->__set_thread_reservation_limit(val);
+        } else {
+          DCHECK_EQ(option, TImpalaQueryOptions::THREAD_RESERVATION_AGGREGATE_LIMIT);
+          query_options->__set_thread_reservation_aggregate_limit(val);
+        }
+        break;
+      }
+      case TImpalaQueryOptions::KUDU_READ_MODE: {
+        if (iequals(value, "DEFAULT") || iequals(value, "0")) {
+          query_options->__set_kudu_read_mode(TKuduReadMode::DEFAULT);
+        } else if (iequals(value, "READ_LATEST") || iequals(value, "1")) {
+          query_options->__set_kudu_read_mode(TKuduReadMode::READ_LATEST);
+        } else if (iequals(value, "READ_AT_SNAPSHOT") || iequals(value, "2")) {
+          query_options->__set_kudu_read_mode(TKuduReadMode::READ_AT_SNAPSHOT);
+        } else {
+          return Status(Substitute("Invalid kudu_read_mode '$0'. Valid values are "
+              "DEFAULT, READ_LATEST, and READ_AT_SNAPSHOT.", value));
+        }
         break;
       }
       default:

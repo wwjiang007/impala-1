@@ -47,6 +47,7 @@ from tests.common.test_dimensions import (
     load_table_info_dimension)
 from tests.common.test_result_verifier import (
     apply_error_match_filter,
+    try_compile_regex,
     verify_raw_results,
     verify_runtime_profile)
 from tests.common.test_vector import ImpalaTestDimension
@@ -260,8 +261,9 @@ class ImpalaTestSuite(BaseTestSuite):
 
   def __verify_exceptions(self, expected_strs, actual_str, use_db):
     """
-    Verifies that at least one of the strings in 'expected_str' is a substring of the
-    actual exception string 'actual_str'.
+    Verifies that at least one of the strings in 'expected_str' is either:
+    * A row_regex: line that matches the actual exception string 'actual_str'
+    * A substring of the actual exception string 'actual_str'.
     """
     actual_str = actual_str.replace('\n', '')
     for expected_str in expected_strs:
@@ -274,7 +276,12 @@ class ImpalaTestSuite(BaseTestSuite):
       if use_db: expected_str = expected_str.replace('$DATABASE', use_db)
       # Strip newlines so we can split error message into multiple lines
       expected_str = expected_str.replace('\n', '')
-      if expected_str in actual_str: return
+      expected_regex = try_compile_regex(expected_str)
+      if expected_regex:
+        if expected_regex.match(actual_str): return
+      else:
+        # Not a regex - check if expected substring is present in actual.
+        if expected_str in actual_str: return
     assert False, 'Unexpected exception string. Expected: %s\nNot found in actual: %s' % \
       (expected_str, actual_str)
 
@@ -291,7 +298,8 @@ class ImpalaTestSuite(BaseTestSuite):
           replace_filenames_with_placeholder = False
         test_section[section_name] = test_section[section_name] \
                                      .replace('$NAMENODE', NAMENODE) \
-                                     .replace('$IMPALA_HOME', IMPALA_HOME)
+                                     .replace('$IMPALA_HOME', IMPALA_HOME) \
+                                     .replace('$USER', getuser())
         if use_db:
           test_section[section_name] = test_section[section_name].replace('$DATABASE', use_db)
     verify_raw_results(test_section, result, vector.get_value('table_format').file_format,
@@ -502,7 +510,7 @@ class ImpalaTestSuite(BaseTestSuite):
 
     Database names are dependent on the input format for table, which the table names
     remaining the same. A use database is issued before query execution. As such,
-    dabase names need to be build pre execution, this method wraps around the different
+    database names need to be build pre execution, this method wraps around the different
     execute methods and provides a common interface to issue the proper use command.
     """
     @wraps(function)
@@ -670,6 +678,14 @@ class ImpalaTestSuite(BaseTestSuite):
       tmpdir = tempfile.mkdtemp(prefix="impala-tests-")
       beeline_opts += ['--hiveconf', 'mapreduce.cluster.local.dir={0}'.format(tmpdir)]
     try:
+      # Remove HADOOP_CLASSPATH from environment. Beeline doesn't need it,
+      # and doing so avoids Hadoop 3's classpath de-duplication code from
+      # placing $HADOOP_CONF_DIR too late in the classpath to get the right
+      # log4j configuration file picked up. Some log4j configuration files
+      # in Hadoop's jars send logging to stdout, confusing Impala's test
+      # framework.
+      env = os.environ.copy()
+      env.pop("HADOOP_CLASSPATH", None)
       call = subprocess.Popen(
           ['beeline',
            '--outputformat=csv2',
@@ -677,7 +693,13 @@ class ImpalaTestSuite(BaseTestSuite):
            '-n', username,
            '-e', stmt] + beeline_opts,
           stdout=subprocess.PIPE,
-          stderr=subprocess.PIPE)
+          stderr=subprocess.PIPE,
+          # Beeline in Hive 2.1 will read from stdin even when "-e"
+          # is specified; explicitly make sure there's nothing to
+          # read to avoid hanging, especially when running interactively
+          # with py.test.
+          stdin=file("/dev/null"),
+          env=env)
       (stdout, stderr) = call.communicate()
       call.wait()
       if call.returncode != 0:

@@ -28,7 +28,6 @@
 #include "common/object-pool.h"
 #include "common/status.h"
 #include "gen-cpp/Types_types.h" // for TUniqueId
-#include "runtime/io/request-ranges.h"
 #include "util/collection-metrics.h"
 #include "util/condition-variable.h"
 #include "util/mem-range.h"
@@ -37,6 +36,12 @@
 #include "util/spinlock.h"
 
 namespace impala {
+namespace io {
+  class DiskIoMgr;
+  class RequestContext;
+  class ScanRange;
+  class WriteRange;
+}
 
 /// TmpFileMgr provides an abstraction for management of temporary (a.k.a. scratch) files
 /// on the filesystem and I/O to and from them. TmpFileMgr manages multiple scratch
@@ -84,6 +89,7 @@ class TmpFileMgr {
   /// Needs to be public for TmpFileMgrTest.
   typedef int DeviceId;
 
+  /// Same typedef as io::WriteRange::WriteDoneCallback.
   typedef std::function<void(const Status&)> WriteDoneCallback;
 
   /// Represents a group of temporary files - one per disk with a scratch directory. The
@@ -277,10 +283,7 @@ class TmpFileMgr {
    public:
     /// The write must be destroyed by passing it to FileGroup - destroying it before
     /// the write completes is an error.
-    ~WriteHandle() {
-      DCHECK(!write_in_flight_);
-      DCHECK(read_range_ == nullptr);
-    }
+    ~WriteHandle();
 
     /// Cancel any in-flight read synchronously.
     void CancelRead();
@@ -290,7 +293,7 @@ class TmpFileMgr {
     std::string TmpFilePath() const;
 
     /// The length of the write range in bytes.
-    int64_t len() const { return write_range_->len(); }
+    int64_t len() const;
 
     std::string DebugString();
 
@@ -303,14 +306,14 @@ class TmpFileMgr {
     /// Starts a write of 'buffer' to 'offset' of 'file'. 'write_in_flight_' must be false
     /// before calling. After returning, 'write_in_flight_' is true on success or false on
     /// failure and 'is_cancelled_' is set to true on failure.
-    Status Write(io::DiskIoMgr* io_mgr, io::RequestContext* io_ctx, File* file,
+    Status Write(io::RequestContext* io_ctx, File* file,
         int64_t offset, MemRange buffer,
-        io::WriteRange::WriteDoneCallback callback) WARN_UNUSED_RESULT;
+        WriteDoneCallback callback) WARN_UNUSED_RESULT;
 
     /// Retry the write after the initial write failed with an error, instead writing to
     /// 'offset' of 'file'. 'write_in_flight_' must be true before calling.
     /// After returning, 'write_in_flight_' is true on success or false on failure.
-    Status RetryWrite(io::DiskIoMgr* io_mgr, io::RequestContext* io_ctx, File* file,
+    Status RetryWrite(io::RequestContext* io_ctx, File* file,
         int64_t offset) WARN_UNUSED_RESULT;
 
     /// Called when the write has completed successfully or not. Sets 'write_in_flight_'
@@ -405,8 +408,8 @@ class TmpFileMgr {
   /// directory on the specified device id. The caller owns the returned handle and is
   /// responsible for deleting it. The file is not created - creation is deferred until
   /// the file is written.
-  Status NewFile(FileGroup* file_group, DeviceId device_id,
-      std::unique_ptr<File>* new_file) WARN_UNUSED_RESULT;
+  void NewFile(FileGroup* file_group, DeviceId device_id,
+    std::unique_ptr<File>* new_file);
 
   bool initialized_;
 

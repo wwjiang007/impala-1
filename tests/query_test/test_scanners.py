@@ -35,9 +35,14 @@ from tests.common.impala_test_suite import ImpalaTestSuite, LOG
 from tests.common.skip import (
     SkipIfS3,
     SkipIfADLS,
+    SkipIfEC,
     SkipIfIsilon,
-    SkipIfLocal)
-from tests.common.test_dimensions import create_single_exec_option_dimension
+    SkipIfLocal,
+    SkipIfNotHdfsMinicluster)
+from tests.common.test_dimensions import (
+    create_single_exec_option_dimension,
+    create_exec_option_dimension,
+    create_uncompressed_text_dimension)
 from tests.common.test_result_verifier import (
     parse_column_types,
     parse_column_labels,
@@ -49,6 +54,11 @@ from tests.util.hdfs_util import NAMENODE
 from tests.util.get_parquet_metadata import get_parquet_metadata
 from tests.util.test_file_parser import QueryTestSectionReader
 
+# Test scanners with denial of reservations at varying frequency. This will affect the
+# number of scanner threads that can be spun up.
+DEBUG_ACTION_DIMS = [None,
+  '-1:OPEN:SET_DENY_RESERVATION_PROBABILITY@0.5',
+  '-1:OPEN:SET_DENY_RESERVATION_PROBABILITY@1.0']
 
 class TestScannersAllTableFormats(ImpalaTestSuite):
   BATCH_SIZES = [0, 1, 16]
@@ -66,18 +76,20 @@ class TestScannersAllTableFormats(ImpalaTestSuite):
       cls.ImpalaTestMatrix.add_dimension(cls.create_table_info_dimension('pairwise'))
     cls.ImpalaTestMatrix.add_dimension(
         ImpalaTestDimension('batch_size', *TestScannersAllTableFormats.BATCH_SIZES))
+    cls.ImpalaTestMatrix.add_dimension(
+        ImpalaTestDimension('debug_action', *DEBUG_ACTION_DIMS))
 
   def test_scanners(self, vector):
     new_vector = deepcopy(vector)
     new_vector.get_value('exec_option')['batch_size'] = vector.get_value('batch_size')
+    new_vector.get_value('exec_option')['debug_action'] = vector.get_value('debug_action')
     self.run_test_case('QueryTest/scanners', new_vector)
 
   def test_hdfs_scanner_profile(self, vector):
-    if vector.get_value('table_format').file_format in ('kudu', 'hbase'):
+    if vector.get_value('table_format').file_format in ('kudu', 'hbase') or \
+       vector.get_value('exec_option')['num_nodes'] != 0:
       pytest.skip()
-    new_vector = deepcopy(vector)
-    new_vector.get_value('exec_option')['num_nodes'] = 0
-    self.run_test_case('QueryTest/hdfs_scanner_profile', new_vector)
+    self.run_test_case('QueryTest/hdfs_scanner_profile', vector)
 
 # Test all the scanners with a simple limit clause. The limit clause triggers
 # cancellation in the scanner code paths.
@@ -105,13 +117,37 @@ class TestScannersAllTableFormatsWithLimit(ImpalaTestSuite):
     query_template = "select * from alltypes limit %s"
     for i in range(1, iterations):
       # Vary the limit to vary the timing of cancellation
-      limit = (iterations * 100) % 1000 + 1
+      limit = (i * 100) % 1001 + 1
       query = query_template % limit
       result = self.execute_query(query, vector.get_value('exec_option'),
           table_format=vector.get_value('table_format'))
       assert len(result.data) == limit
       # IMPALA-3337: The error log should be empty.
       assert not result.log
+
+class TestScannersMixedTableFormats(ImpalaTestSuite):
+  BATCH_SIZES = [0, 1, 16]
+
+  @classmethod
+  def get_workload(cls):
+    return 'functional-query'
+
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestScannersMixedTableFormats, cls).add_test_dimensions()
+    # Only run with a single dimension format, since the table includes mixed formats.
+    cls.ImpalaTestMatrix.add_dimension(
+        create_uncompressed_text_dimension(cls.get_workload()))
+    cls.ImpalaTestMatrix.add_dimension(
+        ImpalaTestDimension('batch_size', *TestScannersAllTableFormats.BATCH_SIZES))
+    cls.ImpalaTestMatrix.add_dimension(
+        ImpalaTestDimension('debug_action', *DEBUG_ACTION_DIMS))
+
+  def test_mixed_format(self, vector):
+    new_vector = deepcopy(vector)
+    new_vector.get_value('exec_option')['batch_size'] = vector.get_value('batch_size')
+    new_vector.get_value('exec_option')['debug_action'] = vector.get_value('debug_action')
+    self.run_test_case('QueryTest/mixed-format', new_vector)
 
 # Test case to verify the scanners work properly when the table metadata (specifically the
 # number of columns in the table) does not match the number of columns in the data file.
@@ -171,6 +207,8 @@ class TestWideRow(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestWideRow, cls).add_test_dimensions()
+    cls.ImpalaTestMatrix.add_dimension(
+        create_exec_option_dimension(debug_action_options=DEBUG_ACTION_DIMS))
     # I can't figure out how to load a huge row into hbase
     cls.ImpalaTestMatrix.add_constraint(
       lambda v: v.get_value('table_format').file_format != 'hbase')
@@ -202,6 +240,8 @@ class TestWideTable(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestWideTable, cls).add_test_dimensions()
+    cls.ImpalaTestMatrix.add_dimension(
+        create_exec_option_dimension(debug_action_options=DEBUG_ACTION_DIMS))
     cls.ImpalaTestMatrix.add_dimension(ImpalaTestDimension("num_cols", *cls.NUM_COLS))
     # To cut down on test execution time, only run in exhaustive.
     if cls.exploration_strategy() != 'exhaustive':
@@ -244,6 +284,8 @@ class TestParquet(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestParquet, cls).add_test_dimensions()
+    cls.ImpalaTestMatrix.add_dimension(
+        create_exec_option_dimension(debug_action_options=DEBUG_ACTION_DIMS))
     cls.ImpalaTestMatrix.add_constraint(
       lambda v: v.get_value('table_format').file_format == 'parquet')
 
@@ -430,10 +472,22 @@ class TestParquet(ImpalaTestSuite):
         "/testdata/data/bad_codec.parquet", tbl_loc])
     self.run_test_case('QueryTest/parquet-bad-codec', vector, unique_database)
 
+  def test_num_values_def_levels_mismatch(self, vector, unique_database):
+    """IMPALA-6589: test the bad num_values handled correctly. """
+    self.client.execute(("""CREATE TABLE {0}.num_values_def_levels_mismatch (_c0 BOOLEAN)
+        STORED AS PARQUET""").format(unique_database))
+    tbl_loc = get_fs_path("/test-warehouse/%s.db/%s" % (unique_database,
+        "num_values_def_levels_mismatch"))
+    check_call(['hdfs', 'dfs', '-copyFromLocal', os.environ['IMPALA_HOME'] +
+        "/testdata/data/num_values_def_levels_mismatch.parquet", tbl_loc])
+    self.run_test_case('QueryTest/parquet-num-values-def-levels-mismatch',
+        vector, unique_database)
+
   @SkipIfS3.hdfs_block_size
   @SkipIfADLS.hdfs_block_size
   @SkipIfIsilon.hdfs_block_size
   @SkipIfLocal.multiple_impalad
+  @SkipIfEC.fix_later
   def test_misaligned_parquet_row_groups(self, vector):
     """IMPALA-3989: Test that no warnings are issued when misaligned row groups are
     encountered. Make sure that 'NumScannersWithNoReads' counters are set to the number of
@@ -490,6 +544,7 @@ class TestParquet(ImpalaTestSuite):
   @SkipIfADLS.hdfs_block_size
   @SkipIfIsilon.hdfs_block_size
   @SkipIfLocal.multiple_impalad
+  @SkipIfEC.fix_later
   def test_multiple_blocks(self, vector):
     # For IMPALA-1881. The table functional_parquet.lineitem_multiblock has 3 blocks, so
     # each impalad should read 1 scan range.
@@ -504,6 +559,7 @@ class TestParquet(ImpalaTestSuite):
   @SkipIfADLS.hdfs_block_size
   @SkipIfIsilon.hdfs_block_size
   @SkipIfLocal.multiple_impalad
+  @SkipIfEC.fix_later
   def test_multiple_blocks_one_row_group(self, vector):
     # For IMPALA-1881. The table functional_parquet.lineitem_multiblock_one_row_group has
     # 3 blocks but only one row group across these blocks. We test to see that only one
@@ -648,6 +704,34 @@ class TestParquet(ImpalaTestSuite):
       check_call(['hdfs', 'dfs', '-copyFromLocal', data_file_path, table_loc])
 
     self.run_test_case('QueryTest/parquet-decimal-formats', vector, unique_database)
+
+  def test_rle_encoded_bools(self, vector, unique_database):
+    """IMPALA-6324: Test that Impala decodes RLE encoded booleans correctly."""
+    self.client.execute(("""CREATE TABLE {0}.rle_encoded_bool (b boolean, i int)
+        STORED AS PARQUET""").format(unique_database))
+    table_loc = get_fs_path(
+        "/test-warehouse/{0}.db/{1}".format(unique_database, "rle_encoded_bool"))
+    check_call(['hdfs', 'dfs', '-copyFromLocal', os.environ['IMPALA_HOME'] +
+        "/testdata/data/rle_encoded_bool.parquet", table_loc])
+
+    self.run_test_case(
+        'QueryTest/parquet-rle-encoded-bool', vector, unique_database)
+
+  def test_dict_encoding_with_large_bit_width(self, vector, unique_database):
+    """IMPALA-7147: Test that Impala can decode dictionary encoded pages where the
+       dictionary index bit width is larger than the encoded byte's bit width.
+    """
+    TABLE_NAME = "dict_encoding_with_large_bit_width"
+    self.client.execute("CREATE TABLE {0}.{1} (i tinyint) STORED AS PARQUET".format(
+        unique_database, TABLE_NAME))
+    table_loc = get_fs_path(
+        "/test-warehouse/{0}.db/{1}".format(unique_database, TABLE_NAME))
+    check_call(['hdfs', 'dfs', '-copyFromLocal', os.environ['IMPALA_HOME'] +
+        "/testdata/data/{0}.parquet".format(TABLE_NAME), table_loc])
+
+    result = self.execute_query(
+        "select * from {0}.{1}".format(unique_database, TABLE_NAME))
+    assert(len(result.data) == 33)
 
 # We use various scan range lengths to exercise corner cases in the HDFS scanner more
 # thoroughly. In particular, it will exercise:
@@ -814,7 +898,7 @@ class TestTextScanRangeLengths(ImpalaTestSuite):
 @SkipIfLocal.hive
 class TestScanTruncatedFiles(ImpalaTestSuite):
   @classmethod
-  def get_workload(self):
+  def get_workload(cls):
     return 'functional-query'
 
   @classmethod
@@ -877,3 +961,124 @@ class TestUncompressedText(ImpalaTestSuite):
     check_call(['hdfs', 'dfs', '-copyFromLocal', os.environ['IMPALA_HOME'] +
           "/testdata/data/lazy_timestamp.csv", tbl_loc])
     self.run_test_case('QueryTest/select-lazy-timestamp', vector, unique_database)
+
+class TestOrc(ImpalaTestSuite):
+  @classmethod
+  def get_workload(cls):
+    return 'functional-query'
+
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestOrc, cls).add_test_dimensions()
+    cls.ImpalaTestMatrix.add_constraint(
+      lambda v: v.get_value('table_format').file_format == 'orc')
+
+  @SkipIfS3.hdfs_block_size
+  @SkipIfADLS.hdfs_block_size
+  @SkipIfEC.fix_later
+  @SkipIfIsilon.hdfs_block_size
+  @SkipIfLocal.multiple_impalad
+  def test_misaligned_orc_stripes(self, vector, unique_database):
+    self._build_lineitem_table_helper(unique_database, 'lineitem_threeblocks',
+        'lineitem_threeblocks.orc')
+    self._build_lineitem_table_helper(unique_database, 'lineitem_sixblocks',
+        'lineitem_sixblocks.orc')
+    self._build_lineitem_table_helper(unique_database,
+        'lineitem_orc_multiblock_one_stripe',
+        'lineitem_orc_multiblock_one_stripe.orc')
+
+    # functional_orc.alltypes is well-formatted. 'NumScannersWithNoReads' counters are
+    # set to 0.
+    table_name = 'functional_orc_def.alltypes'
+    self._misaligned_orc_stripes_helper(table_name, 7300)
+    # lineitem_threeblock.orc is ill-formatted but every scanner reads some stripes.
+    # 'NumScannersWithNoReads' counters are set to 0.
+    table_name = unique_database + '.lineitem_threeblocks'
+    self._misaligned_orc_stripes_helper(table_name, 16000)
+    # lineitem_sixblocks.orc is ill-formatted but every scanner reads some stripes.
+    # 'NumScannersWithNoReads' counters are set to 0.
+    table_name = unique_database + '.lineitem_sixblocks'
+    self._misaligned_orc_stripes_helper(table_name, 30000)
+    # Scanning lineitem_orc_multiblock_one_stripe.orc finds two scan ranges that end up
+    # doing no reads because the file is poorly formatted.
+    table_name = unique_database + '.lineitem_orc_multiblock_one_stripe'
+    self._misaligned_orc_stripes_helper(
+      table_name, 16000, num_scanners_with_no_reads=2)
+
+  def _build_lineitem_table_helper(self, db, tbl, file):
+    self.client.execute("create table %s.%s like tpch.lineitem stored as orc" % (db, tbl))
+    tbl_loc = get_fs_path("/test-warehouse/%s.db/%s" % (db, tbl))
+    # set block size to 156672 so lineitem_threeblocks.orc occupies 3 blocks,
+    # lineitem_sixblocks.orc occupies 6 blocks.
+    check_call(['hdfs', 'dfs', '-Ddfs.block.size=156672', '-copyFromLocal',
+        os.environ['IMPALA_HOME'] + "/testdata/LineItemMultiBlock/" + file, tbl_loc])
+
+  def _misaligned_orc_stripes_helper(
+          self, table_name, rows_in_table, num_scanners_with_no_reads=0):
+    """Checks if 'num_scanners_with_no_reads' indicates the expected number of scanners
+    that don't read anything because the underlying file is poorly formatted
+    """
+    query = 'select * from %s' % table_name
+    result = self.client.execute(query)
+    assert len(result.data) == rows_in_table
+
+    runtime_profile = str(result.runtime_profile)
+    num_scanners_with_no_reads_list = re.findall(
+      'NumScannersWithNoReads: ([0-9]*)', runtime_profile)
+
+    # This will fail if the number of impalads != 3
+    # The fourth fragment is the "Averaged Fragment"
+    assert len(num_scanners_with_no_reads_list) == 4
+
+    # Calculate the total number of scan ranges that ended up not reading anything because
+    # an underlying file was poorly formatted.
+    # Skip the Averaged Fragment; it comes first in the runtime profile.
+    total = 0
+    for n in num_scanners_with_no_reads_list[1:]:
+      total += int(n)
+    assert total == num_scanners_with_no_reads
+
+  def test_type_conversions(self, vector, unique_database):
+    # Create an "illtypes" table whose columns can't match the underlining ORC file's.
+    # Create an "safetypes" table likes above but ORC columns can still fit into it.
+    # Reuse the data files of functional_orc_def.alltypestiny
+    tbl_loc = get_fs_path("/test-warehouse/alltypestiny_orc_def")
+    self.client.execute("""create external table %s.illtypes (c1 boolean, c2 float,
+        c3 boolean, c4 tinyint, c5 smallint, c6 int, c7 boolean, c8 string, c9 int,
+        c10 float, c11 bigint) partitioned by (year int, month int) stored as ORC
+        location '%s';""" % (unique_database, tbl_loc))
+    self.client.execute("""create external table %s.safetypes (c1 bigint, c2 boolean,
+        c3 smallint, c4 int, c5 bigint, c6 bigint, c7 double, c8 double, c9 char(3),
+        c10 varchar(3), c11 timestamp) partitioned by (year int, month int) stored as ORC
+        location '%s';""" % (unique_database, tbl_loc))
+    self.client.execute("alter table %s.illtypes recover partitions" % unique_database)
+    self.client.execute("alter table %s.safetypes recover partitions" % unique_database)
+
+    # Create a decimal table whose precisions don't match the underlining orc files.
+    # Reuse the data files of functional_orc_def.decimal_tbl.
+    decimal_loc = get_fs_path("/test-warehouse/decimal_tbl_orc_def")
+    self.client.execute("""create external table %s.mismatch_decimals (d1 decimal(8,0),
+        d2 decimal(8,0), d3 decimal(19,10), d4 decimal(20,20), d5 decimal(2,0))
+        partitioned by (d6 decimal(9,0)) stored as orc location '%s'"""
+        % (unique_database, decimal_loc))
+    self.client.execute("alter table %s.mismatch_decimals recover partitions" % unique_database)
+
+    self.run_test_case('DataErrorsTest/orc-type-checks', vector, unique_database)
+
+class TestScannerReservation(ImpalaTestSuite):
+  @classmethod
+  def get_workload(self):
+    return 'functional-query'
+
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestScannerReservation, cls).add_test_dimensions()
+    # Only run with a single dimension - all queries are format-specific and
+    # reference tpch or tpch_parquet directly.
+    cls.ImpalaTestMatrix.add_dimension(
+        create_uncompressed_text_dimension(cls.get_workload()))
+
+  @SkipIfNotHdfsMinicluster.tuned_for_minicluster
+  def test_scanners(self, vector):
+    self.run_test_case('QueryTest/scanner-reservation', vector)
+

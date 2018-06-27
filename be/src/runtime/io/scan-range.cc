@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include "runtime/exec-env.h"
 #include "runtime/io/disk-io-mgr.h"
 #include "runtime/io/disk-io-mgr-internal.h"
 #include "util/error-util.h"
@@ -36,41 +37,43 @@ DEFINE_bool(use_hdfs_pread, false, "Enables using hdfsPread() instead of hdfsRea
 DEFINE_int64(adls_read_chunk_size, 128 * 1024, "The maximum read chunk size to use when "
     "reading from ADLS.");
 
+#ifndef NDEBUG
+DECLARE_int32(stress_disk_read_delay_ms);
+#endif
+
 // Implementation of the ScanRange functionality. Each ScanRange contains a queue
 // of ready buffers. For each ScanRange, there is only a single producer and
 // consumer thread, i.e. only one disk thread will push to a scan range at
 // any time and only one thread will remove from the queue. This is to guarantee
 // that buffers are queued and read in file order.
-
-bool ScanRange::EnqueueBuffer(
-    const unique_lock<mutex>& reader_lock, unique_ptr<BufferDescriptor> buffer) {
-  DCHECK(reader_lock.mutex() == &reader_->lock_ && reader_lock.owns_lock());
+bool ScanRange::EnqueueReadyBuffer(unique_ptr<BufferDescriptor> buffer) {
+  DCHECK(buffer->buffer_ != nullptr) << "Cannot enqueue freed buffer";
   {
     unique_lock<mutex> scan_range_lock(lock_);
     DCHECK(Validate()) << DebugString();
-    DCHECK(!eosr_returned_);
     DCHECK(!eosr_queued_);
-    if (is_cancelled_) {
-      // Return the buffer, this range has been cancelled
-      if (buffer->buffer_ != nullptr) {
-        io_mgr_->num_buffers_in_readers_.Add(1);
-        reader_->num_buffers_in_reader_.Add(1);
-      }
-      reader_->num_used_buffers_.Add(-1);
-      io_mgr_->ReturnBuffer(move(buffer));
+    if (!buffer->is_cached()) {
+      // All non-cached buffers are enqueued by disk threads. Indicate that the read
+      // finished.
+      DCHECK(read_in_flight_);
+      read_in_flight_ = false;
+    }
+    if (!cancel_status_.ok()) {
+      // This range has been cancelled, no need to enqueue the buffer.
+      CleanUpBuffer(scan_range_lock, move(buffer));
+      // One or more threads may be blocked in WaitForInFlightRead() waiting for the read
+      // to complete. Wake up all of them.
+      buffer_ready_cv_.NotifyAll();
       return false;
     }
-    reader_->num_ready_buffers_.Add(1);
+    // Clean up any surplus buffers. E.g. we may have allocated too many if the file was
+    // shorter than expected.
+    if (buffer->eosr()) CleanUpUnusedBuffers(scan_range_lock);
     eosr_queued_ = buffer->eosr();
     ready_buffers_.emplace_back(move(buffer));
-
-    DCHECK_LE(ready_buffers_.size(), DiskIoMgr::SCAN_RANGE_READY_BUFFER_LIMIT);
-    blocked_on_queue_ = ready_buffers_.size() == DiskIoMgr::SCAN_RANGE_READY_BUFFER_LIMIT;
   }
-
   buffer_ready_cv_.NotifyOne();
-
-  return blocked_on_queue_;
+  return true;
 }
 
 Status ScanRange::GetNext(unique_ptr<BufferDescriptor>* buffer) {
@@ -78,123 +81,291 @@ Status ScanRange::GetNext(unique_ptr<BufferDescriptor>* buffer) {
   bool eosr;
   {
     unique_lock<mutex> scan_range_lock(lock_);
-    if (eosr_returned_) return Status::OK();
     DCHECK(Validate()) << DebugString();
+    // No more buffers to return - return the cancel status or OK if not cancelled.
+    if (all_buffers_returned(scan_range_lock)) return cancel_status_;
 
-    while (ready_buffers_.empty() && !is_cancelled_) {
+    while (ready_buffers_.empty() && cancel_status_.ok()) {
       buffer_ready_cv_.Wait(scan_range_lock);
     }
-
-    if (is_cancelled_) {
-      DCHECK(!status_.ok());
-      return status_;
-    }
+    /// Propagate cancellation to the client if it happened while we were waiting.
+    RETURN_IF_ERROR(cancel_status_);
 
     // Remove the first ready buffer from the queue and return it
     DCHECK(!ready_buffers_.empty());
-    DCHECK_LE(ready_buffers_.size(), DiskIoMgr::SCAN_RANGE_READY_BUFFER_LIMIT);
     *buffer = move(ready_buffers_.front());
     ready_buffers_.pop_front();
-    eosr_returned_ = (*buffer)->eosr();
     eosr = (*buffer)->eosr();
+    DCHECK(!eosr || unused_iomgr_buffers_.empty()) << DebugString();
   }
 
-  // Update tracking counters. The buffer has now moved from the IoMgr to the
-  // caller.
-  io_mgr_->num_buffers_in_readers_.Add(1);
-  reader_->num_buffers_in_reader_.Add(1);
-  reader_->num_ready_buffers_.Add(-1);
-  reader_->num_used_buffers_.Add(-1);
-  if (eosr) reader_->num_finished_ranges_.Add(1);
+  // Update tracking counters. The buffer has now moved from the IoMgr to the caller.
+  if (eosr) reader_->RemoveActiveScanRange(this);
+  num_buffers_in_reader_.Add(1);
+  return Status::OK();
+}
 
-  Status status = (*buffer)->status_;
-  if (!status.ok()) {
-    io_mgr_->ReturnBuffer(move(*buffer));
-    return status;
-  }
+void ScanRange::ReturnBuffer(unique_ptr<BufferDescriptor> buffer_desc) {
+  vector<unique_ptr<BufferDescriptor>> buffers;
+  buffers.emplace_back(move(buffer_desc));
+  AddUnusedBuffers(move(buffers), true);
+}
 
-  unique_lock<mutex> reader_lock(reader_->lock_);
-
-  DCHECK(reader_->Validate()) << endl << reader_->DebugString();
-  if (reader_->state_ == RequestContext::Cancelled) {
-    reader_->blocked_ranges_.Remove(this);
-    Cancel(reader_->status_);
-    io_mgr_->ReturnBuffer(move(*buffer));
-    return status_;
-  }
-
+void ScanRange::AddUnusedBuffers(vector<unique_ptr<BufferDescriptor>>&& buffers,
+      bool returned) {
+  DCHECK_GT(buffers.size(), 0);
+  /// Keep track of whether the range was unblocked in this function. If so, we need
+  /// to schedule it so it resumes progress.
+  bool unblocked = false;
   {
-    // Check to see if we can re-schedule a blocked range. Note that EnqueueBuffer()
-    // may have been called after we released 'lock_' above so we need to re-check
-    // whether the queue is full.
     unique_lock<mutex> scan_range_lock(lock_);
-    if (blocked_on_queue_
-        && ready_buffers_.size() < DiskIoMgr::SCAN_RANGE_READY_BUFFER_LIMIT
-        && !eosr_queued_) {
-      blocked_on_queue_ = false;
-      // This scan range was blocked and is no longer, add it to the reader
-      // queue again.
-      reader_->blocked_ranges_.Remove(this);
-      reader_->ScheduleScanRange(this);
+    if (returned) {
+      // Buffers were in reader but now aren't.
+      num_buffers_in_reader_.Add(-buffers.size());
+    }
+
+    for (unique_ptr<BufferDescriptor>& buffer : buffers) {
+      // We should not hold onto the buffers in the following cases:
+      // 1. the scan range is using external buffers, e.g. cached buffers.
+      // 2. the scan range is cancelled
+      // 3. the scan range already hit eosr
+      // 4. we already have enough buffers to read the remainder of the scan range.
+      if (external_buffer_tag_ != ExternalBufferTag::NO_BUFFER
+          || !cancel_status_.ok()
+          || eosr_queued_
+          || unused_iomgr_buffer_bytes_ >= len_ - iomgr_buffer_cumulative_bytes_used_) {
+        CleanUpBuffer(scan_range_lock, move(buffer));
+      } else {
+        unused_iomgr_buffer_bytes_ += buffer->buffer_len();
+        unused_iomgr_buffers_.emplace_back(move(buffer));
+        if (blocked_on_buffer_) {
+          blocked_on_buffer_ = false;
+          unblocked = true;
+        }
+      }
     }
   }
-  return Status::OK();
+  // Must drop the ScanRange lock before acquiring the RequestContext lock.
+  if (unblocked) {
+    unique_lock<mutex> reader_lock(reader_->lock_);
+    // Reader may have been cancelled after we dropped 'scan_range_lock' above.
+    if (reader_->state_ == RequestContext::Cancelled) {
+      DCHECK(!cancel_status_.ok());
+    } else {
+      reader_->ScheduleScanRange(reader_lock, this);
+    }
+  }
+}
+
+unique_ptr<BufferDescriptor> ScanRange::GetUnusedBuffer(
+    const unique_lock<mutex>& scan_range_lock) {
+  DCHECK(scan_range_lock.mutex() == &lock_ && scan_range_lock.owns_lock());
+  if (unused_iomgr_buffers_.empty()) return nullptr;
+  unique_ptr<BufferDescriptor> result = move(unused_iomgr_buffers_.back());
+  unused_iomgr_buffers_.pop_back();
+  unused_iomgr_buffer_bytes_ -= result->buffer_len();
+  return result;
+}
+
+ReadOutcome ScanRange::DoRead(int disk_id) {
+  int64_t bytes_remaining = len_ - bytes_read_;
+  DCHECK_GT(bytes_remaining, 0);
+
+  unique_ptr<BufferDescriptor> buffer_desc;
+  {
+    unique_lock<mutex> lock(lock_);
+    DCHECK(!read_in_flight_);
+    if (!cancel_status_.ok()) return ReadOutcome::CANCELLED;
+
+    if (external_buffer_tag_ == ScanRange::ExternalBufferTag::CLIENT_BUFFER) {
+      buffer_desc = unique_ptr<BufferDescriptor>(new BufferDescriptor(
+          this, client_buffer_.data, client_buffer_.len));
+    } else {
+      DCHECK(external_buffer_tag_ == ScanRange::ExternalBufferTag::NO_BUFFER)
+          << "This code path does not handle other buffer types, i.e. HDFS cache"
+          << static_cast<int>(external_buffer_tag_);
+      buffer_desc = GetUnusedBuffer(lock);
+      if (buffer_desc == nullptr) {
+        // No buffer available - the range will be rescheduled when a buffer is added.
+        blocked_on_buffer_ = true;
+        return ReadOutcome::BLOCKED_ON_BUFFER;
+      }
+      iomgr_buffer_cumulative_bytes_used_ += buffer_desc->buffer_len();
+    }
+    read_in_flight_ = true;
+  }
+
+  // No locks in this section.  Only working on local vars.  We don't want to hold a
+  // lock across the read call.
+  Status read_status = Open(is_file_handle_caching_enabled());
+  if (read_status.ok()) {
+    COUNTER_ADD_IF_NOT_NULL(reader_->active_read_thread_counter_, 1L);
+    COUNTER_BITOR_IF_NOT_NULL(reader_->disks_accessed_bitmap_, 1LL << disk_id);
+
+    read_status = Read(buffer_desc->buffer_, buffer_desc->buffer_len_,
+        &buffer_desc->len_, &buffer_desc->eosr_);
+    buffer_desc->scan_range_offset_ = bytes_read_ - buffer_desc->len_;
+
+    COUNTER_ADD_IF_NOT_NULL(reader_->bytes_read_counter_, buffer_desc->len_);
+    COUNTER_ADD_IF_NOT_NULL(reader_->active_read_thread_counter_, -1L);
+  }
+
+  DCHECK(buffer_desc->buffer_ != nullptr);
+  DCHECK(!buffer_desc->is_cached()) << "HDFS cache reads don't go through this code path.";
+  if (!read_status.ok()) {
+    // Free buffer to release resources before we cancel the range so that all buffers
+    // are freed at cancellation.
+    buffer_desc->Free();
+    buffer_desc.reset();
+
+    // Propagate 'read_status' to the scan range. This will also wake up any waiting
+    // threads.
+    CancelInternal(read_status, true);
+    // No more reads for this scan range - we can close it.
+    Close();
+    return ReadOutcome::CANCELLED;
+  }
+
+  // After calling EnqueueReadyBuffer(), it is no longer valid to touch 'buffer_desc'.
+  // Store the state we need before calling EnqueueReadyBuffer().
+  bool eosr = buffer_desc->eosr_;
+  // Read successful - enqueue the buffer and return the appropriate outcome.
+  if (!EnqueueReadyBuffer(move(buffer_desc))) return ReadOutcome::CANCELLED;
+  if (eosr) {
+    // No more reads for this scan range - we can close it.
+    Close();
+    return ReadOutcome::SUCCESS_EOSR;
+  }
+  return ReadOutcome::SUCCESS_NO_EOSR;
+}
+
+void ScanRange::SetBlockedOnBuffer() {
+  unique_lock<mutex> lock(lock_);
+  blocked_on_buffer_ = true;
+}
+
+void ScanRange::CleanUpBuffer(
+    const boost::unique_lock<boost::mutex>& scan_range_lock,
+    unique_ptr<BufferDescriptor> buffer_desc) {
+  DCHECK(scan_range_lock.mutex() == &lock_ && scan_range_lock.owns_lock());
+  DCHECK(buffer_desc != nullptr);
+  DCHECK_EQ(this, buffer_desc->scan_range_);
+  buffer_desc->Free();
+
+  if (all_buffers_returned(scan_range_lock) && num_buffers_in_reader_.Load() == 0) {
+    // Close the scan range if there are no more buffers in the reader and no more buffers
+    // will be returned to readers in future. Close() is idempotent so it is ok to call
+    // multiple times during cleanup so long as the range is actually finished.
+    Close();
+  }
+}
+
+void ScanRange::CleanUpBuffers(vector<unique_ptr<BufferDescriptor>>&& buffers) {
+  unique_lock<mutex> lock(lock_);
+  for (unique_ptr<BufferDescriptor>& buffer : buffers) CleanUpBuffer(lock, move(buffer));
+}
+
+void ScanRange::CleanUpUnusedBuffers(const unique_lock<mutex>& scan_range_lock) {
+  while (!unused_iomgr_buffers_.empty()) {
+    CleanUpBuffer(scan_range_lock, GetUnusedBuffer(scan_range_lock));
+  }
 }
 
 void ScanRange::Cancel(const Status& status) {
   // Cancelling a range that was never started, ignore.
   if (io_mgr_ == nullptr) return;
+  CancelInternal(status, false);
+  // Wait until an in-flight read is finished. The read thread will clean up the
+  // buffer it used. Once the range is cancelled, no more reads should be started.
+  WaitForInFlightRead();
+  reader_->RemoveActiveScanRange(this);
+}
 
+void ScanRange::CancelInternal(const Status& status, bool read_error) {
+  DCHECK(io_mgr_ != nullptr);
   DCHECK(!status.ok());
   {
-    // Grab both locks to make sure that all working threads see is_cancelled_.
+    // Grab both locks to make sure that we don't change 'cancel_status_' while other
+    // threads are in critical sections.
     unique_lock<mutex> scan_range_lock(lock_);
-    unique_lock<mutex> hdfs_lock(hdfs_lock_);
-    DCHECK(Validate()) << DebugString();
-    if (is_cancelled_) return;
-    is_cancelled_ = true;
-    status_ = status;
+    {
+      unique_lock<mutex> hdfs_lock(hdfs_lock_);
+      DCHECK(Validate()) << DebugString();
+      // If already cancelled, preserve the original reason for cancellation. Most of the
+      // cleanup is not required if already cancelled, but we need to set
+      // 'read_in_flight_' to false.
+      if (cancel_status_.ok()) cancel_status_ = status;
+    }
+
+    /// Clean up 'ready_buffers_' while still holding 'lock_' to prevent other threads
+    /// from seeing inconsistent state.
+    while (!ready_buffers_.empty()) {
+      CleanUpBuffer(scan_range_lock, move(ready_buffers_.front()));
+      ready_buffers_.pop_front();
+    }
+
+    /// Clean up buffers that we don't need any more because we won't read any more data.
+    CleanUpUnusedBuffers(scan_range_lock);
+    if (read_error) {
+      DCHECK(read_in_flight_);
+      read_in_flight_ = false;
+    }
   }
   buffer_ready_cv_.NotifyAll();
-  CleanupQueuedBuffers();
 
   // For cached buffers, we can't close the range until the cached buffer is returned.
-  // Close() is called from DiskIoMgr::ReturnBuffer().
+  // Close() is called from ScanRange::CleanUpBufferLocked().
   if (external_buffer_tag_ != ExternalBufferTag::CACHED_BUFFER) Close();
 }
 
-void ScanRange::CleanupQueuedBuffers() {
-  DCHECK(is_cancelled_);
-  io_mgr_->num_buffers_in_readers_.Add(ready_buffers_.size());
-  reader_->num_buffers_in_reader_.Add(ready_buffers_.size());
-  reader_->num_used_buffers_.Add(-ready_buffers_.size());
-  reader_->num_ready_buffers_.Add(-ready_buffers_.size());
-
-  while (!ready_buffers_.empty()) {
-    io_mgr_->ReturnBuffer(move(ready_buffers_.front()));
-    ready_buffers_.pop_front();
-  }
+void ScanRange::WaitForInFlightRead() {
+  unique_lock<mutex> scan_range_lock(lock_);
+  while (read_in_flight_) buffer_ready_cv_.Wait(scan_range_lock);
 }
 
 string ScanRange::DebugString() const {
   stringstream ss;
   ss << "file=" << file_ << " disk_id=" << disk_id_ << " offset=" << offset_
      << " len=" << len_ << " bytes_read=" << bytes_read_
+     << " cancel_status=" << cancel_status_.GetDetail()
      << " buffer_queue=" << ready_buffers_.size()
+     << " num_buffers_in_readers=" << num_buffers_in_reader_.Load()
+     << " unused_iomgr_buffers=" << unused_iomgr_buffers_.size()
+     << " unused_iomgr_buffer_bytes=" << unused_iomgr_buffer_bytes_
+     << " blocked_on_buffer=" << blocked_on_buffer_
      << " hdfs_file=" << exclusive_hdfs_fh_;
   return ss.str();
 }
 
 bool ScanRange::Validate() {
   if (bytes_read_ > len_) {
-    LOG(WARNING) << "Bytes read tracking is wrong. Shouldn't read past the scan range."
+    LOG(ERROR) << "Bytes read tracking is wrong. Shouldn't read past the scan range."
                  << " bytes_read_=" << bytes_read_ << " len_=" << len_;
     return false;
   }
-  if (eosr_returned_ && !eosr_queued_) {
-    LOG(WARNING) << "Returned eosr to reader before finishing reading the scan range"
-                 << " eosr_returned_=" << eosr_returned_
-                 << " eosr_queued_=" << eosr_queued_;
+  if (!cancel_status_.ok() && !ready_buffers_.empty()) {
+    LOG(ERROR) << "Cancelled range should not have queued buffers " << DebugString();
+    return false;
+  }
+  int64_t unused_iomgr_buffer_bytes = 0;
+  for (auto& buffer : unused_iomgr_buffers_)
+    unused_iomgr_buffer_bytes += buffer->buffer_len();
+  if (unused_iomgr_buffer_bytes != unused_iomgr_buffer_bytes_) {
+    LOG(ERROR) << "unused_iomgr_buffer_bytes_ incorrect actual: "
+               << unused_iomgr_buffer_bytes_
+               << " vs. expected: " << unused_iomgr_buffer_bytes;
+    return false;
+  }
+  bool is_finished = !cancel_status_.ok() || eosr_queued_;
+  if (is_finished && !unused_iomgr_buffers_.empty()) {
+    LOG(ERROR) << "Held onto too many buffers " << unused_iomgr_buffers_.size()
+               << " bytes: " << unused_iomgr_buffer_bytes_
+               << " cancel_status: " << cancel_status_.GetDetail()
+               << " eosr_queued: " << eosr_queued_;
+    return false;
+  }
+  if (!is_finished && blocked_on_buffer_ && !unused_iomgr_buffers_.empty()) {
+    LOG(ERROR) << "Blocked despite having buffers: " << DebugString();
     return false;
   }
   return true;
@@ -203,18 +374,21 @@ bool ScanRange::Validate() {
 ScanRange::ScanRange()
   : RequestRange(RequestType::READ),
     num_remote_bytes_(0),
-    external_buffer_tag_(ExternalBufferTag::NO_BUFFER),
-    mtime_(-1) {}
+    external_buffer_tag_(ExternalBufferTag::NO_BUFFER) {}
 
 ScanRange::~ScanRange() {
   DCHECK(exclusive_hdfs_fh_ == nullptr) << "File was not closed.";
   DCHECK(external_buffer_tag_ != ExternalBufferTag::CACHED_BUFFER)
       << "Cached buffer was not released.";
+  DCHECK(!read_in_flight_);
+  DCHECK_EQ(0, ready_buffers_.size());
+  DCHECK_EQ(0, num_buffers_in_reader_.Load());
 }
 
 void ScanRange::Reset(hdfsFS fs, const char* file, int64_t len, int64_t offset,
     int disk_id, bool expected_local, const BufferOpts& buffer_opts, void* meta_data) {
   DCHECK(ready_buffers_.empty());
+  DCHECK(!read_in_flight_);
   DCHECK(file != nullptr);
   DCHECK_GE(len, 0);
   DCHECK_GE(offset, 0);
@@ -245,24 +419,23 @@ void ScanRange::Reset(hdfsFS fs, const char* file, int64_t len, int64_t offset,
 void ScanRange::InitInternal(DiskIoMgr* io_mgr, RequestContext* reader) {
   DCHECK(exclusive_hdfs_fh_ == nullptr);
   DCHECK(local_file_ == nullptr);
-  // Reader must provide MemTracker or a buffer.
-  DCHECK(external_buffer_tag_ == ExternalBufferTag::CLIENT_BUFFER
-      || reader->mem_tracker_ != nullptr);
+  DCHECK(!read_in_flight_);
   io_mgr_ = io_mgr;
   reader_ = reader;
   local_file_ = nullptr;
   exclusive_hdfs_fh_ = nullptr;
   bytes_read_ = 0;
-  is_cancelled_ = false;
-  eosr_queued_= false;
-  eosr_returned_= false;
-  blocked_on_queue_ = false;
+  unused_iomgr_buffer_bytes_ = 0;
+  iomgr_buffer_cumulative_bytes_used_ = 0;
+  cancel_status_ = Status::OK();
+  eosr_queued_ = false;
+  blocked_on_buffer_ = false;
   DCHECK(Validate()) << DebugString();
 }
 
 Status ScanRange::Open(bool use_file_handle_cache) {
   unique_lock<mutex> hdfs_lock(hdfs_lock_);
-  if (is_cancelled_) return Status::CANCELLED;
+  RETURN_IF_ERROR(cancel_status_);
 
   if (fs_ != nullptr) {
     if (exclusive_hdfs_fh_ != nullptr) return Status::OK();
@@ -302,9 +475,7 @@ Status ScanRange::Open(bool use_file_handle_cache) {
           "for file: $1: $2", offset_, file_, GetStrErrMsg()));
     }
   }
-  if (ImpaladMetrics::IO_MGR_NUM_OPEN_FILES != nullptr) {
-    ImpaladMetrics::IO_MGR_NUM_OPEN_FILES->Increment(1L);
-  }
+  ImpaladMetrics::IO_MGR_NUM_OPEN_FILES->Increment(1L);
   return Status::OK();
 }
 
@@ -327,11 +498,13 @@ void ScanRange::Close() {
       closed_file = true;
     }
 
-    if (FLAGS_use_hdfs_pread) {
+    if (FLAGS_use_hdfs_pread && IsHdfsPath(file())) {
       // Update Hedged Read Metrics.
       // We call it only if the --use_hdfs_pread flag is set, to avoid having the
       // libhdfs client malloc and free a hdfsHedgedReadMetrics object unnecessarily
       // otherwise. 'hedged_metrics' is only set upon success.
+      // We also avoid calling hdfsGetHedgedReadMetrics() when the file is not on HDFS
+      // (see HDFS-13417).
       struct hdfsHedgedReadMetrics* hedged_metrics;
       int success = hdfsGetHedgedReadMetrics(fs_, &hedged_metrics);
       if (success == 0) {
@@ -356,9 +529,7 @@ void ScanRange::Close() {
     local_file_ = nullptr;
     closed_file = true;
   }
-  if (closed_file && ImpaladMetrics::IO_MGR_NUM_OPEN_FILES != nullptr) {
-    ImpaladMetrics::IO_MGR_NUM_OPEN_FILES->Increment(-1L);
-  }
+  if (closed_file) ImpaladMetrics::IO_MGR_NUM_OPEN_FILES->Increment(-1L);
 }
 
 int64_t ScanRange::MaxReadChunkSize() const {
@@ -385,8 +556,15 @@ int64_t ScanRange::MaxReadChunkSize() const {
 // TODO: look at linux disk scheduling
 Status ScanRange::Read(
     uint8_t* buffer, int64_t buffer_len, int64_t* bytes_read, bool* eosr) {
+  DCHECK(read_in_flight_);
+  // Delay before acquiring the lock, to allow triggering IMPALA-6587 race.
+#ifndef NDEBUG
+  if (FLAGS_stress_disk_read_delay_ms > 0) {
+    SleepForMs(FLAGS_stress_disk_read_delay_ms);
+  }
+#endif
   unique_lock<mutex> hdfs_lock(hdfs_lock_);
-  if (is_cancelled_) return Status::CANCELLED;
+  RETURN_IF_ERROR(cancel_status_);
 
   *eosr = false;
   *bytes_read = 0;
@@ -415,7 +593,6 @@ Status ScanRange::Read(
     int64_t max_chunk_size = MaxReadChunkSize();
     Status status = Status::OK();
     {
-      ScopedTimer<MonotonicStopWatch> io_mgr_read_timer(&io_mgr_->read_timer_);
       ScopedTimer<MonotonicStopWatch> req_context_read_timer(reader_->read_timer_);
       while (*bytes_read < bytes_to_read) {
         int chunk_size = min(bytes_to_read - *bytes_read, max_chunk_size);
@@ -471,13 +648,11 @@ Status ScanRange::Read(
           }
           // The error may be due to a bad file handle. Reopen the file handle and retry.
           // Exclude this time from the read timers.
-          io_mgr_read_timer.Stop();
           req_context_read_timer.Stop();
           ++num_retries;
           RETURN_IF_ERROR(io_mgr_->ReopenCachedHdfsFileHandle(fs_, file_string(),
               mtime(), reader_, &borrowed_hdfs_fh));
           hdfs_file = borrowed_hdfs_fh->file();
-          io_mgr_read_timer.Start();
           req_context_read_timer.Start();
         }
         if (!status.ok()) break;
@@ -533,12 +708,12 @@ Status ScanRange::ReadFromCache(
 
   {
     unique_lock<mutex> hdfs_lock(hdfs_lock_);
-    if (is_cancelled_) return Status::CANCELLED;
+    RETURN_IF_ERROR(cancel_status_);
 
     DCHECK(exclusive_hdfs_fh_ != nullptr);
     DCHECK(external_buffer_tag_ == ExternalBufferTag::NO_BUFFER);
     cached_buffer_ =
-      hadoopReadZero(exclusive_hdfs_fh_->file(), io_mgr_->cached_read_options_, len());
+      hadoopReadZero(exclusive_hdfs_fh_->file(), io_mgr_->cached_read_options(), len());
     if (cached_buffer_ != nullptr) {
       external_buffer_tag_ = ExternalBufferTag::CACHED_BUFFER;
     }
@@ -568,20 +743,16 @@ Status ScanRange::ReadFromCache(
   }
 
   // Create a single buffer desc for the entire scan range and enqueue that.
-  // 'mem_tracker' is nullptr because the memory is owned by the HDFS java client,
-  // not the Impala backend.
+  // The memory is owned by the HDFS java client, not the Impala backend.
   unique_ptr<BufferDescriptor> desc = unique_ptr<BufferDescriptor>(new BufferDescriptor(
-      io_mgr_, reader_, this, reinterpret_cast<uint8_t*>(buffer), 0, nullptr));
+      this, reinterpret_cast<uint8_t*>(buffer), 0));
   desc->len_ = bytes_read;
   desc->scan_range_offset_ = 0;
   desc->eosr_ = true;
   bytes_read_ = bytes_read;
-  EnqueueBuffer(reader_lock, move(desc));
-  if (reader_->bytes_read_counter_ != nullptr) {
-    COUNTER_ADD(reader_->bytes_read_counter_, bytes_read);
-  }
+  EnqueueReadyBuffer(move(desc));
+  COUNTER_ADD_IF_NOT_NULL(reader_->bytes_read_counter_, bytes_read);
   *read_succeeded = true;
-  reader_->num_used_buffers_.Add(1);
   return Status::OK();
 }
 
@@ -600,4 +771,36 @@ void ScanRange::GetHdfsStatistics(hdfsFile hdfs_file) {
     }
     hdfsFileClearReadStatistics(hdfs_file);
   }
+}
+
+BufferDescriptor::BufferDescriptor(ScanRange* scan_range,
+    uint8_t* buffer, int64_t buffer_len)
+  : scan_range_(scan_range),
+    buffer_(buffer),
+    buffer_len_(buffer_len) {
+  DCHECK(scan_range != nullptr);
+  DCHECK(buffer != nullptr);
+  DCHECK_GE(buffer_len, 0);
+}
+
+BufferDescriptor::BufferDescriptor(ScanRange* scan_range,
+    BufferPool::ClientHandle* bp_client, BufferPool::BufferHandle handle) :
+  scan_range_(scan_range),
+  buffer_(handle.data()),
+  buffer_len_(handle.len()),
+  bp_client_(bp_client),
+  handle_(move(handle)) {
+  DCHECK(scan_range != nullptr);
+  DCHECK(bp_client_->is_registered());
+  DCHECK(handle_.is_open());
+}
+
+void BufferDescriptor::Free() {
+  DCHECK(buffer_ != nullptr);
+  if (!is_cached() && !is_client_buffer()) {
+    // Only buffers that were allocated by DiskIoMgr need to be freed.
+    ExecEnv::GetInstance()->buffer_pool()->FreeBuffer(
+        bp_client_, &handle_);
+  }
+  buffer_ = nullptr;
 }

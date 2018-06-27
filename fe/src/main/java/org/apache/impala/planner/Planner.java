@@ -32,9 +32,9 @@ import org.apache.impala.analysis.JoinOperator;
 import org.apache.impala.analysis.QueryStmt;
 import org.apache.impala.analysis.SortInfo;
 import org.apache.impala.analysis.TupleId;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.HBaseTable;
 import org.apache.impala.catalog.KuduTable;
-import org.apache.impala.catalog.Table;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.PrintUtils;
 import org.apache.impala.common.RuntimeEnv;
@@ -67,7 +67,7 @@ public class Planner {
 
   public static final ResourceProfile MIN_PER_HOST_RESOURCES =
       new ResourceProfileBuilder().setMemEstimateBytes(MIN_PER_HOST_MEM_ESTIMATE_BYTES)
-      .setMinReservationBytes(0).build();
+      .setMinMemReservationBytes(0).build();
 
   private final PlannerContext ctx_;
 
@@ -182,7 +182,7 @@ public class Planner {
       if (ctx_.isInsertOrCtas()) {
         InsertStmt insertStmt = ctx_.getAnalysisResult().getInsertStmt();
         List<Expr> exprs = Lists.newArrayList();
-        Table targetTable = insertStmt.getTargetTable();
+        FeTable targetTable = insertStmt.getTargetTable();
         Preconditions.checkNotNull(targetTable);
         if (targetTable instanceof KuduTable) {
           if (ctx_.isInsert()) {
@@ -264,12 +264,14 @@ public class Planner {
       TQueryExecRequest request, TExplainLevel explainLevel) {
     StringBuilder str = new StringBuilder();
     boolean hasHeader = false;
-    if (request.isSetMax_per_host_min_reservation()) {
-      str.append(String.format("Max Per-Host Resource Reservation: Memory=%s\n",
-          PrintUtils.printBytes(request.getMax_per_host_min_reservation())));
-      hasHeader = true;
-    }
-    if (request.isSetPer_host_mem_estimate()) {
+    // Only some requests (queries, DML, etc) have a resource profile.
+    if (request.isSetMax_per_host_min_mem_reservation()) {
+      Preconditions.checkState(request.isSetMax_per_host_thread_reservation());
+      Preconditions.checkState(request.isSetPer_host_mem_estimate());
+      str.append(String.format(
+          "Max Per-Host Resource Reservation: Memory=%s Threads=%d\n",
+          PrintUtils.printBytes(request.getMax_per_host_min_mem_reservation()),
+          request.getMax_per_host_thread_reservation()));
       str.append(String.format("Per-Host Resource Estimates: Memory=%s\n",
           PrintUtils.printBytes(request.getPer_host_mem_estimate())));
       hasHeader = true;
@@ -376,21 +378,25 @@ public class Planner {
 
     Preconditions.checkState(maxPerHostPeakResources.getMemEstimateBytes() >= 0,
         maxPerHostPeakResources.getMemEstimateBytes());
-    Preconditions.checkState(maxPerHostPeakResources.getMinReservationBytes() >= 0,
-        maxPerHostPeakResources.getMinReservationBytes());
+    Preconditions.checkState(maxPerHostPeakResources.getMinMemReservationBytes() >= 0,
+        maxPerHostPeakResources.getMinMemReservationBytes());
 
     maxPerHostPeakResources = MIN_PER_HOST_RESOURCES.max(maxPerHostPeakResources);
 
     // TODO: Remove per_host_mem_estimate from the TQueryExecRequest when AC no longer
     // needs it.
     request.setPer_host_mem_estimate(maxPerHostPeakResources.getMemEstimateBytes());
-    request.setMax_per_host_min_reservation(
-        maxPerHostPeakResources.getMinReservationBytes());
+    request.setMax_per_host_min_mem_reservation(
+        maxPerHostPeakResources.getMinMemReservationBytes());
+    request.setMax_per_host_thread_reservation(
+        maxPerHostPeakResources.getThreadReservation());
     if (LOG.isTraceEnabled()) {
       LOG.trace("Max per-host min reservation: " +
-          maxPerHostPeakResources.getMinReservationBytes());
+          maxPerHostPeakResources.getMinMemReservationBytes());
       LOG.trace("Max estimated per-host memory: " +
           maxPerHostPeakResources.getMemEstimateBytes());
+      LOG.trace("Max estimated per-host thread reservation: " +
+          maxPerHostPeakResources.getThreadReservation());
     }
   }
 
@@ -638,12 +644,9 @@ public class Planner {
     List<Boolean> isAscOrder = Collections.nCopies(orderingExprs.size(), true);
     List<Boolean> nullsFirstParams = Collections.nCopies(orderingExprs.size(), false);
     SortInfo sortInfo = new SortInfo(orderingExprs, isAscOrder, nullsFirstParams);
-
-    ExprSubstitutionMap smap = sortInfo.createSortTupleInfo(
-        insertStmt.getResultExprs(), analyzer);
+    sortInfo.createSortTupleInfo(insertStmt.getResultExprs(), analyzer);
     sortInfo.getSortTupleDescriptor().materializeSlots();
-
-    insertStmt.substituteResultExprs(smap, analyzer);
+    insertStmt.substituteResultExprs(sortInfo.getOutputSmap(), analyzer);
 
     PlanNode node = null;
     if (partialSort) {

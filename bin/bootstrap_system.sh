@@ -18,10 +18,12 @@
 # under the License.
 
 # This script bootstraps a system for Impala development from almost nothing; it is known
-# to work on Ubuntu 14.04 and 16.04. It clobbers some local environment and system
+# to work on Ubuntu 16.04. It clobbers some local environment and system
 # configurations, so it is best to run this in a fresh install. It also sets up the
 # ~/.bashrc for the calling user and impala-config-local.sh with some environment
 # variables to make Impala compile and run after this script is complete.
+# When IMPALA_HOME is set, the script will bootstrap Impala development in the
+# location specified.
 #
 # The intended user is a person who wants to start contributing code to Impala. This
 # script serves as an executable reference point for how to get started.
@@ -69,9 +71,9 @@ then
   exit 1
 fi
 
-if ! [[ $DISTRIB_RELEASE = 14.04 || $DISTRIB_RELEASE = 16.04 ]]
+if ! [[ $DISTRIB_RELEASE = 16.04 ]]
 then
-  echo "This script only supports Ubuntu 14.04 and 16.04" >&2
+  echo "This script only supports 16.04" >&2
   exit 1
 fi
 
@@ -89,25 +91,32 @@ function apt-get {
   return 1
 }
 
+echo ">>> Installing packages"
+
 apt-get update
 apt-get --yes install apt-utils
 apt-get --yes install git
 
+echo ">>> Checking out Impala"
+
 # If there is no Impala git repo, get one now
-if ! [[ -d ~/Impala ]]
+
+: ${IMPALA_HOME:=~/Impala}
+if ! [[ -d "$IMPALA_HOME" ]]
 then
-  time -p git clone https://git-wip-us.apache.org/repos/asf/impala.git ~/Impala
+  time -p git clone https://git-wip-us.apache.org/repos/asf/impala.git "$IMPALA_HOME"
 fi
-cd ~/Impala
+cd "$IMPALA_HOME"
 SET_IMPALA_HOME="export IMPALA_HOME=$(pwd)"
 echo "$SET_IMPALA_HOME" >> ~/.bashrc
 eval "$SET_IMPALA_HOME"
 
+echo ">>> Installing build tools"
 apt-get --yes install ccache g++ gcc libffi-dev liblzo2-dev libkrb5-dev \
         krb5-admin-server krb5-kdc krb5-user libsasl2-dev libsasl2-modules \
         libsasl2-modules-gssapi-mit libssl-dev make maven ninja-build ntp \
         ntpdate python-dev python-setuptools postgresql ssh wget vim-common psmisc \
-        lsof
+        lsof openjdk-8-jdk openjdk-8-source openjdk-8-dbg
 
 if ! { service --status-all | grep -E '^ \[ \+ \]  ssh$'; }
 then
@@ -118,16 +127,11 @@ fi
 # TODO: check that there is enough space on disk to do a build and data load
 # TODO: make this work with non-bash shells
 
-JDK_VERSION=8
-if [[ $DISTRIB_RELEASE = 14.04 ]]
-then
-  JDK_VERSION=7
-fi
-apt-get --yes install openjdk-${JDK_VERSION}-jdk openjdk-${JDK_VERSION}-source \
-  openjdk-${JDK_VERSION}-dbg
-SET_JAVA_HOME="export JAVA_HOME=/usr/lib/jvm/java-${JDK_VERSION}-openjdk-amd64"
+SET_JAVA_HOME="export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64"
 echo "$SET_JAVA_HOME" >> "${IMPALA_HOME}/bin/impala-config-local.sh"
 eval "$SET_JAVA_HOME"
+
+echo ">>> Configuring system"
 
 sudo service ntp stop
 sudo ntpdate us.pool.ntp.org
@@ -148,9 +152,6 @@ sudo service ntp start || grep docker /proc/1/cgroup
 if [[ $DISTRIB_RELEASE = 16.04 ]]
 then
   SET_LD_LIBRARY_PATH='export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}'
-elif [[ $DISTRIB_RELEASE = 14.04 ]]
-then
-  SET_LD_LIBRARY_PATH="unset LD_LIBRARY_PATH"
 fi
 echo "$SET_LD_LIBRARY_PATH" >> "${IMPALA_HOME}/bin/impala-config-local.sh"
 eval "$SET_LD_LIBRARY_PATH"
@@ -201,14 +202,20 @@ sudo chown $(whoami) /var/lib/hadoop-hdfs/
 echo "* - nofile 1048576" | sudo tee -a /etc/security/limits.conf
 
 # LZO is not needed to compile or run Impala, but it is needed for the data load
-if ! [[ -d ~/Impala-lzo ]]
+echo ">>> Checking out Impala-lzo"
+: ${IMPALA_LZO_HOME:="${IMPALA_HOME}/../Impala-lzo"}
+if ! [[ -d "$IMPALA_LZO_HOME" ]]
 then
-  git clone https://github.com/cloudera/impala-lzo.git ~/Impala-lzo
+  git clone https://github.com/cloudera/impala-lzo.git "$IMPALA_LZO_HOME"
 fi
-if ! [[ -d ~/hadoop-lzo ]]
+
+echo ">>> Checking out and building hadoop-lzo"
+
+: ${HADOOP_LZO_HOME:="${IMPALA_HOME}/../hadoop-lzo"}
+if ! [[ -d "$HADOOP_LZO_HOME" ]]
 then
-  git clone https://github.com/cloudera/hadoop-lzo.git ~/hadoop-lzo
+  git clone https://github.com/cloudera/hadoop-lzo.git "$HADOOP_LZO_HOME"
 fi
-cd ~/hadoop-lzo/
+cd "$HADOOP_LZO_HOME"
 time -p ant package
 cd "$IMPALA_HOME"

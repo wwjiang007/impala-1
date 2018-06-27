@@ -28,6 +28,12 @@ import sys
 import tempfile
 from time import sleep
 
+# This import is the actual ImpalaShell class from impala_shell.py.
+# We rename it to ImpalaShellClass here because we later import another
+# class called ImpalaShell from tests/shell/util.py, and we don't want
+# to mask it.
+from shell.impala_shell import ImpalaShell as ImpalaShellClass
+
 from tests.common.impala_service import ImpaladService
 from tests.common.skip import SkipIfLocal
 from util import assert_var_substitution, ImpalaShell
@@ -36,6 +42,9 @@ from util import move_shell_history, restore_shell_history
 SHELL_CMD = "%s/bin/impala-shell.sh" % os.environ['IMPALA_HOME']
 SHELL_HISTORY_FILE = os.path.expanduser("~/.impalahistory")
 QUERY_FILE_PATH = os.path.join(os.environ['IMPALA_HOME'], 'tests', 'shell')
+
+# Regex to match the interactive shell prompt that is expected after each command.
+PROMPT_REGEX = r'\[[^:]+:2100[0-9]\]'
 
 class TestImpalaShellInteractive(object):
   """Test the impala shell interactively"""
@@ -49,11 +58,11 @@ class TestImpalaShellInteractive(object):
   def teardown_class(cls):
     restore_shell_history(cls.tempfile_name)
 
-  def _expect_with_cmd(self, proc, cmd, expectations=()):
+  def _expect_with_cmd(self, proc, cmd, expectations=(), db="default"):
     """Executes a command on the expect process instance and verifies a set of
     assertions defined by the expections."""
     proc.sendline(cmd + ";")
-    proc.expect(":21000] >")
+    proc.expect(":21000] {db}>".format(db=db))
     if not expectations: return
     for e in expectations:
       assert e in proc.before
@@ -62,7 +71,7 @@ class TestImpalaShellInteractive(object):
   def test_local_shell_options(self):
     """Test that setting the local shell options works"""
     proc = pexpect.spawn(SHELL_CMD)
-    proc.expect(":21000] >")
+    proc.expect(":21000] default>")
     self._expect_with_cmd(proc, "set", ("LIVE_PROGRESS: False", "LIVE_SUMMARY: False"))
     self._expect_with_cmd(proc, "set live_progress=true")
     self._expect_with_cmd(proc, "set", ("LIVE_PROGRESS: True", "LIVE_SUMMARY: False"))
@@ -131,6 +140,13 @@ class TestImpalaShellInteractive(object):
     assert result.stdout.count("Welcome to the Impala shell") == 1
 
   @pytest.mark.execute_serially
+  def test_disconnected_shell(self):
+    """Test that the shell presents a disconnected prompt if it can't connect
+    """
+    result = run_impala_shell_interactive('asdf;', shell_args='-i foo')
+    assert ImpalaShellClass.DISCONNECTED_PROMPT in result.stdout
+
+  @pytest.mark.execute_serially
   def test_bash_cmd_timing(self):
     """Test existence of time output in bash commands run from shell"""
     args = "! ls;"
@@ -163,11 +179,14 @@ class TestImpalaShellInteractive(object):
     assert get_num_open_sessions(initial_impala_service) == num_sessions_initial + 1, \
         "Not connected to %s:21000" % hostname
     p.send_cmd("connect %s:21001" % hostname)
+
     # Wait for a little while
     sleep(2)
     # The number of sessions on the target impalad should have been incremented.
     assert get_num_open_sessions(target_impala_service) == num_sessions_target + 1, \
         "Not connected to %s:21001" % hostname
+    assert "[%s:21001] default>" % hostname in p.get_result().stdout
+
     # The number of sessions on the initial impalad should have been decremented.
     assert get_num_open_sessions(initial_impala_service) == num_sessions_initial, \
         "Connection to %s:21000 should have been closed" % hostname
@@ -213,8 +232,6 @@ class TestImpalaShellInteractive(object):
     Ensure that multiline queries are preserved when they're read back from history.
     Additionally, also test that comments are preserved.
     """
-    # regex for pexpect, a shell prompt is expected after each command..
-    prompt_regex = '\[{0}:2100[0-9]\]'.format(socket.getfqdn())
     # readline gets its input from tty, so using stdin does not work.
     child_proc = pexpect.spawn(SHELL_CMD)
     # List of (input query, expected text in output).
@@ -227,10 +244,10 @@ class TestImpalaShellInteractive(object):
         ("select /*comment*/\n1;", "[4]: select /*comment*/\n1;"),
         ("select\n/*comm\nent*/\n1;", "[5]: select\n/*comm\nent*/\n1;")]
     for query, _ in queries:
-      child_proc.expect(prompt_regex)
+      child_proc.expect(PROMPT_REGEX)
       child_proc.sendline(query)
       child_proc.expect("Fetched 1 row\(s\) in .*s")
-    child_proc.expect(prompt_regex)
+    child_proc.expect(PROMPT_REGEX)
     child_proc.sendline('quit;')
     p = ImpalaShell()
     p.send_cmd('history')
@@ -246,7 +263,7 @@ class TestImpalaShellInteractive(object):
       os.remove(SHELL_HISTORY_FILE)
     assert not os.path.exists(SHELL_HISTORY_FILE)
     child_proc = pexpect.spawn(SHELL_CMD)
-    child_proc.expect(":21000] >")
+    child_proc.expect(":21000] default>")
     self._expect_with_cmd(child_proc, "@1", ("Command index out of range"))
     self._expect_with_cmd(child_proc, "rerun -1", ("Command index out of range"))
     self._expect_with_cmd(child_proc, "select 'first_command'", ("first_command"))
@@ -254,7 +271,7 @@ class TestImpalaShellInteractive(object):
     self._expect_with_cmd(child_proc, "@ -1", ("first_command"))
     self._expect_with_cmd(child_proc, "select 'second_command'", ("second_command"))
     child_proc.sendline('history;')
-    child_proc.expect(":21000] >")
+    child_proc.expect(":21000] default>")
     assert '[1]: select \'first_command\';' in child_proc.before;
     assert '[2]: select \'second_command\';' in child_proc.before;
     assert '[3]: history;' in child_proc.before;
@@ -350,12 +367,9 @@ class TestImpalaShellInteractive(object):
   @pytest.mark.execute_serially
   def test_zero_row_fetch(self):
     # IMPALA-4418: DROP and USE are generally exceptional statements where
-    # the client does not fetch. However, when preceded by a comment, the
-    # Impala shell treats them like any other statement and will try to
-    # fetch - receiving 0 rows. For statements returning 0 rows we do not
+    # the client does not fetch. For statements returning 0 rows we do not
     # want an empty line in stdout.
     result = run_impala_shell_interactive("-- foo \n use default;")
-    assert "Fetched 0 row(s)" in result.stderr
     assert re.search('> \[', result.stdout)
     result = run_impala_shell_interactive("select * from functional.alltypes limit 0;")
     assert "Fetched 0 row(s)" in result.stderr
@@ -446,6 +460,55 @@ class TestImpalaShellInteractive(object):
       os.chdir(cwd)
 
   @pytest.mark.execute_serially
+  def test_line_with_leading_comment(self):
+    # IMPALA-2195: A line with a comment produces incorrect command.
+    try:
+      run_impala_shell_interactive('drop table if exists leading_comment;')
+      run_impala_shell_interactive('create table leading_comment (i int);')
+      result = run_impala_shell_interactive('-- comment\n'
+                                            'insert into leading_comment values(1);')
+      assert 'Modified 1 row(s)' in result.stderr
+      result = run_impala_shell_interactive('-- comment\n'
+                                            'select * from leading_comment;')
+      assert 'Fetched 1 row(s)' in result.stderr
+
+      result = run_impala_shell_interactive('/* comment */\n'
+                                            'select * from leading_comment;')
+      assert 'Fetched 1 row(s)' in result.stderr
+
+      result = run_impala_shell_interactive('/* comment1 */\n'
+                                            '-- comment2\n'
+                                            'select * from leading_comment;')
+      assert 'Fetched 1 row(s)' in result.stderr
+
+      result = run_impala_shell_interactive('/* comment1\n'
+                                            'comment2 */ select * from leading_comment;')
+      assert 'Fetched 1 row(s)' in result.stderr
+
+      result = run_impala_shell_interactive('/* select * from leading_comment */ '
+                                            'select * from leading_comment;')
+      assert 'Fetched 1 row(s)' in result.stderr
+
+      result = run_impala_shell_interactive('/* comment */ help use')
+      assert 'Executes a USE... query' in result.stdout
+
+      result = run_impala_shell_interactive('-- comment\n'
+                                            ' help use;')
+      assert 'Executes a USE... query' in result.stdout
+
+      result = run_impala_shell_interactive('/* comment1 */\n'
+                                            '-- comment2\n'
+                                            'desc leading_comment;')
+      assert 'Fetched 1 row(s)' in result.stderr
+
+      result = run_impala_shell_interactive('/* comment1 */\n'
+                                            '-- comment2\n'
+                                            'help use;')
+      assert 'Executes a USE... query' in result.stdout
+    finally:
+      run_impala_shell_interactive('drop table if exists leading_comment;')
+
+  @pytest.mark.execute_serially
   def test_line_ends_with_comment(self):
     # IMPALA-5269: Test lines that end with a comment.
     queries = ['select 1 + 1; --comment',
@@ -483,6 +546,116 @@ class TestImpalaShellInteractive(object):
              '*/')
     result = run_impala_shell_interactive(query)
     assert '| id   |' in result.stdout
+
+  @pytest.mark.execute_serially
+  def test_fix_infinite_loop(self):
+    # IMPALA-6337: Fix infinite loop.
+    result = run_impala_shell_interactive("select 1 + 1; \"\n;\";")
+    assert '| 2     |' in result.stdout
+    result = run_impala_shell_interactive("select '1234'\";\n;\n\";")
+    assert '| 1234 |' in result.stdout
+    result = run_impala_shell_interactive("select 1 + 1; \"\n;\"\n;")
+    assert '| 2     |' in result.stdout
+    result = run_impala_shell_interactive("select '1\\'23\\'4'\";\n;\n\";")
+    assert '| 1\'23\'4 |' in result.stdout
+    result = run_impala_shell_interactive("select '1\"23\"4'\";\n;\n\";")
+    assert '| 1"23"4 |' in result.stdout
+
+  @pytest.mark.execute_serially
+  def test_comment_with_quotes(self):
+    # IMPALA-2751: Comment does not need to have matching quotes
+    queries = [
+      "select -- '\n1;",
+      'select -- "\n1;',
+      "select -- \"'\n 1;",
+      "select /*'\n*/ 1;",
+      'select /*"\n*/ 1;',
+      "select /*\"'\n*/ 1;",
+      "with a as (\nselect 1\n-- '\n) select * from a",
+      'with a as (\nselect 1\n-- "\n) select * from a',
+      "with a as (\nselect 1\n-- '\"\n) select * from a",
+    ]
+    for query in queries:
+      result = run_impala_shell_interactive(query)
+      assert '| 1 |' in result.stdout
+
+  @pytest.mark.execute_serially
+  def test_shell_prompt(self):
+    proc = pexpect.spawn(SHELL_CMD)
+    proc.expect(":21000] default>")
+    self._expect_with_cmd(proc, "use foo", (), 'default')
+    self._expect_with_cmd(proc, "use functional", (), 'functional')
+    self._expect_with_cmd(proc, "use foo", (), 'functional')
+    self._expect_with_cmd(proc, 'use `tpch`', (), 'tpch')
+    self._expect_with_cmd(proc, 'use ` tpch `', (), 'tpch')
+
+    proc = pexpect.spawn(SHELL_CMD, ['-d', 'functional'])
+    proc.expect(":21000] functional>")
+    self._expect_with_cmd(proc, "use foo", (), 'functional')
+    self._expect_with_cmd(proc, "use tpch", (), 'tpch')
+    self._expect_with_cmd(proc, "use foo", (), 'tpch')
+
+    proc = pexpect.spawn(SHELL_CMD, ['-d', ' functional '])
+    proc.expect(":21000] functional>")
+
+    proc = pexpect.spawn(SHELL_CMD, ['-d', '` functional `'])
+    proc.expect(":21000] functional>")
+
+    # Start an Impala shell with an invalid DB.
+    proc = pexpect.spawn(SHELL_CMD, ['-d', 'foo'])
+    proc.expect(":21000] default>")
+    self._expect_with_cmd(proc, "use foo", (), 'default')
+    self._expect_with_cmd(proc, "use functional", (), 'functional')
+    self._expect_with_cmd(proc, "use foo", (), 'functional')
+
+  def test_strip_leading_comment(self):
+    """Test stripping leading comments from SQL statements"""
+    assert ('--delete\n', 'select 1') == \
+        ImpalaShellClass.strip_leading_comment('--delete\nselect 1')
+    assert ('--delete\n', 'select --do not delete\n1') == \
+        ImpalaShellClass.strip_leading_comment('--delete\nselect --do not delete\n1')
+    assert (None, 'select --do not delete\n1') == \
+        ImpalaShellClass.strip_leading_comment('select --do not delete\n1')
+
+    assert ('/*delete*/\n', 'select 1') == \
+        ImpalaShellClass.strip_leading_comment('/*delete*/\nselect 1')
+    assert ('/*delete\nme*/\n', 'select 1') == \
+        ImpalaShellClass.strip_leading_comment('/*delete\nme*/\nselect 1')
+    assert ('/*delete\nme*/\n', 'select 1') == \
+        ImpalaShellClass.strip_leading_comment('/*delete\nme*/\nselect 1')
+    assert ('/*delete*/', 'select 1') == \
+        ImpalaShellClass.strip_leading_comment('/*delete*/select 1')
+    assert ('/*delete*/ ', 'select /*do not delete*/ 1') == \
+        ImpalaShellClass.strip_leading_comment('/*delete*/ select /*do not delete*/ 1')
+    assert ('/*delete1*/ \n/*delete2*/ \n--delete3 \n', 'select /*do not delete*/ 1') == \
+        ImpalaShellClass.strip_leading_comment('/*delete1*/ \n'
+                                               '/*delete2*/ \n'
+                                               '--delete3 \n'
+                                               'select /*do not delete*/ 1')
+    assert (None, 'select /*do not delete*/ 1') == \
+        ImpalaShellClass.strip_leading_comment('select /*do not delete*/ 1')
+    assert ('/*delete*/\n', 'select c1 from\n'
+                            'a\n'
+                            'join -- +SHUFFLE\n'
+                            'b') == \
+        ImpalaShellClass.strip_leading_comment('/*delete*/\n'
+                                               'select c1 from\n'
+                                               'a\n'
+                                               'join -- +SHUFFLE\n'
+                                               'b')
+    assert ('/*delete*/\n', 'select c1 from\n'
+                            'a\n'
+                            'join /* +SHUFFLE */\n'
+                            'b') == \
+        ImpalaShellClass.strip_leading_comment('/*delete*/\n'
+                                               'select c1 from\n'
+                                               'a\n'
+                                               'join /* +SHUFFLE */\n'
+                                               'b')
+
+    assert (None, 'select 1') == \
+        ImpalaShellClass.strip_leading_comment('select 1')
+
 
 def run_impala_shell_interactive(input_lines, shell_args=None):
   """Runs a command in the Impala shell interactively."""

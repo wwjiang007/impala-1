@@ -130,8 +130,7 @@ void MemTracker::CloseAndUnregisterFromParent() {
 }
 
 void MemTracker::EnableReservationReporting(const ReservationTrackerCounters& counters) {
-  ReservationTrackerCounters* new_counters = new ReservationTrackerCounters(counters);
-  reservation_counters_.Store(new_counters);
+  delete reservation_counters_.Swap(new ReservationTrackerCounters(counters));
 }
 
 int64_t MemTracker::GetPoolMemReserved() {
@@ -196,7 +195,7 @@ MemTracker* MemTracker::CreateQueryMemTracker(const TUniqueId& id,
       ExecEnv::GetInstance()->pool_mem_trackers()->GetRequestPoolMemTracker(
           pool_name, true);
   MemTracker* tracker = obj_pool->Add(new MemTracker(
-      byte_limit, Substitute("Query($0)", lexical_cast<string>(id)), pool_tracker));
+      byte_limit, Substitute("Query($0)", PrintId(id)), pool_tracker));
   tracker->is_query_mem_tracker_ = true;
   tracker->query_id_ = id;
   return tracker;
@@ -221,6 +220,25 @@ void MemTracker::RegisterMetrics(MetricGroup* metrics, const string& prefix) {
       Substitute("$0.bytes-over-limit", prefix), -1);
 
   limit_metric_ = metrics->AddGauge(Substitute("$0.limit", prefix), limit_);
+}
+
+void MemTracker::TransferTo(MemTracker* dst, int64_t bytes) {
+  DCHECK_EQ(all_trackers_.back(), dst->all_trackers_.back())
+      << "Must have same root";
+  // Find the common ancestor and update trackers between 'this'/'dst' and
+  // the common ancestor. This logic handles all cases, including the
+  // two trackers being the same or being ancestors of each other because
+  // 'all_trackers_' includes the current tracker.
+  int ancestor_idx = all_trackers_.size() - 1;
+  int dst_ancestor_idx = dst->all_trackers_.size() - 1;
+  while (ancestor_idx > 0 && dst_ancestor_idx > 0
+      && all_trackers_[ancestor_idx - 1] == dst->all_trackers_[dst_ancestor_idx - 1]) {
+    --ancestor_idx;
+    --dst_ancestor_idx;
+  }
+  MemTracker* common_ancestor = all_trackers_[ancestor_idx];
+  ReleaseLocal(bytes, common_ancestor);
+  dst->ConsumeLocal(bytes, common_ancestor);
 }
 
 // Calling this on the query tracker results in output like:
@@ -370,7 +388,7 @@ Status MemTracker::MemLimitExceeded(RuntimeState* state, const std::string& deta
        << " without exceeding limit." << endl;
   }
   ss << "Error occurred on backend " << GetBackendString();
-  if (state != nullptr) ss << " by fragment " << state->fragment_instance_id();
+  if (state != nullptr) ss << " by fragment " << PrintId(state->fragment_instance_id());
   ss << endl;
   ExecEnv* exec_env = ExecEnv::GetInstance();
   MemTracker* process_tracker = exec_env->process_mem_tracker();

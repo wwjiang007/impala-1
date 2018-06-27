@@ -207,6 +207,23 @@ void Statestore::Topic::DeleteIfVersionsMatch(TopicEntry::Version version,
   }
 }
 
+void Statestore::Topic::ClearAllEntries() {
+  lock_guard<shared_mutex> write_lock(lock_);
+  entries_.clear();
+  topic_update_log_.clear();
+  int64_t key_size_metric_val = key_size_metric_->GetValue();
+  key_size_metric_->SetValue(std::max(static_cast<int64_t>(0),
+      key_size_metric_val - total_key_size_bytes_));
+  int64_t value_size_metric_val = value_size_metric_->GetValue();
+  value_size_metric_->SetValue(std::max(static_cast<int64_t>(0),
+      value_size_metric_val - total_value_size_bytes_));
+  int64_t topic_size_metric_val = topic_size_metric_->GetValue();
+  topic_size_metric_->SetValue(std::max(static_cast<int64_t>(0),
+      topic_size_metric_val - (total_value_size_bytes_ + total_key_size_bytes_)));
+  total_value_size_bytes_ = 0;
+  total_key_size_bytes_ = 0;
+}
+
 void Statestore::Topic::BuildDelta(const SubscriberId& subscriber_id,
     TopicEntry::Version last_processed_version, TTopicDelta* delta) {
   // If the subscriber version is > 0, send this update as a delta. Otherwise, this is
@@ -283,12 +300,14 @@ void Statestore::Topic::ToJson(Document* document, Value* topic_json) {
 Statestore::Subscriber::Subscriber(const SubscriberId& subscriber_id,
     const RegistrationId& registration_id, const TNetworkAddress& network_address,
     const vector<TTopicRegistration>& subscribed_topics)
-    : subscriber_id_(subscriber_id),
-      registration_id_(registration_id),
-      network_address_(network_address) {
-  for (const TTopicRegistration& topic: subscribed_topics) {
-    GetTopicsMapForId(topic.topic_name)->emplace(piecewise_construct,
-        forward_as_tuple(topic.topic_name), forward_as_tuple(topic.is_transient));
+  : subscriber_id_(subscriber_id),
+    registration_id_(registration_id),
+    network_address_(network_address) {
+  for (const TTopicRegistration& topic : subscribed_topics) {
+    GetTopicsMapForId(topic.topic_name)
+        ->emplace(piecewise_construct, forward_as_tuple(topic.topic_name),
+            forward_as_tuple(
+                topic.is_transient, topic.populate_min_subscriber_topic_version));
   }
 }
 
@@ -460,7 +479,7 @@ void Statestore::SubscribersHandler(const Webserver::ArgumentMap& args,
     Value subscriber_id(subscriber.second->id().c_str(), document->GetAllocator());
     sub_json.AddMember("id", subscriber_id, document->GetAllocator());
 
-    Value address(lexical_cast<string>(subscriber.second->network_address()).c_str(),
+    Value address(TNetworkAddressToString(subscriber.second->network_address()).c_str(),
         document->GetAllocator());
     sub_json.AddMember("address", address, document->GetAllocator());
 
@@ -548,8 +567,7 @@ Status Statestore::RegisterSubscriber(const SubscriberId& subscriber_id,
     shared_ptr<Subscriber> current_registration(
         new Subscriber(subscriber_id, *registration_id, location, topic_registrations));
     subscribers_.emplace(subscriber_id, current_registration);
-    failure_detector_->UpdateHeartbeat(
-        PrintId(current_registration->registration_id()), true);
+    failure_detector_->UpdateHeartbeat(subscriber_id, true);
     num_subscribers_metric_->SetValue(subscribers_.size());
     subscriber_set_metric_->Add(subscriber_id);
 
@@ -656,6 +674,15 @@ Status Statestore::SendTopicUpdate(Subscriber* subscriber, UpdateKind update_kin
       }
 
       Topic& topic = topic_it->second;
+      // Check if the subscriber indicated that the topic entries should be
+      // cleared.
+      if (update.__isset.clear_topic_entries && update.clear_topic_entries) {
+        DCHECK(!update.__isset.from_version);
+        LOG(INFO) << "Received request for clearing the entries of topic: "
+                  << update.topic_name << " from: " << subscriber->id();
+        topic.ClearAllEntries();
+      }
+
       // Update the topic and add transient entries separately to avoid holding both
       // locks at the same time and preventing concurrent topic updates.
       vector<TopicEntry::Version> entry_versions = topic.Put(update.topic_entries);
@@ -672,18 +699,22 @@ Status Statestore::SendTopicUpdate(Subscriber* subscriber, UpdateKind update_kin
   return Status::OK();
 }
 
-void Statestore::GatherTopicUpdates(const Subscriber& subscriber,
-    UpdateKind update_kind, TUpdateStateRequest* update_state_request) {
+void Statestore::GatherTopicUpdates(const Subscriber& subscriber, UpdateKind update_kind,
+    TUpdateStateRequest* update_state_request) {
+  DCHECK(update_kind == UpdateKind::TOPIC_UPDATE
+      || update_kind == UpdateKind::PRIORITY_TOPIC_UPDATE)
+      << static_cast<int>(update_kind);
+  // Indices into update_state_request->topic_deltas where we need to populate
+  // 'min_subscriber_topic_version'. GetMinSubscriberTopicVersion() is somewhat
+  // expensive so we want to avoid calling it unless necessary.
+  vector<TTopicDelta*> deltas_needing_min_version;
   {
-    DCHECK(update_kind == UpdateKind::TOPIC_UPDATE
-        || update_kind ==  UpdateKind::PRIORITY_TOPIC_UPDATE)
-        << static_cast<int>(update_kind);
     const bool is_priority = update_kind == UpdateKind::PRIORITY_TOPIC_UPDATE;
-    const Subscriber::Topics& subscribed_topics = is_priority
-        ? subscriber.priority_subscribed_topics()
-        : subscriber.non_priority_subscribed_topics();
+    const Subscriber::Topics& subscribed_topics = is_priority ?
+        subscriber.priority_subscribed_topics() :
+        subscriber.non_priority_subscribed_topics();
     shared_lock<shared_mutex> l(topics_map_lock_);
-    for (const auto& subscribed_topic: subscribed_topics) {
+    for (const auto& subscribed_topic : subscribed_topics) {
       auto topic_it = topics_.find(subscribed_topic.first);
       DCHECK(topic_it != topics_.end());
       TopicEntry::Version last_processed_version =
@@ -693,16 +724,20 @@ void Statestore::GatherTopicUpdates(const Subscriber& subscriber,
           update_state_request->topic_deltas[subscribed_topic.first];
       topic_delta.topic_name = subscribed_topic.first;
       topic_it->second.BuildDelta(subscriber.id(), last_processed_version, &topic_delta);
+      if (subscribed_topic.second.populate_min_subscriber_topic_version) {
+        deltas_needing_min_version.push_back(&topic_delta);
+      }
     }
   }
 
   // Fill in the min subscriber topic version. This must be done after releasing
   // topics_map_lock_.
-  lock_guard<mutex> l(subscribers_lock_);
-  typedef map<TopicId, TTopicDelta> TopicDeltaMap;
-  for (TopicDeltaMap::value_type& topic_delta: update_state_request->topic_deltas) {
-    topic_delta.second.__set_min_subscriber_topic_version(
-        GetMinSubscriberTopicVersion(topic_delta.first));
+  if (!deltas_needing_min_version.empty()) {
+    lock_guard<mutex> l(subscribers_lock_);
+    for (TTopicDelta* delta : deltas_needing_min_version) {
+      delta->__set_min_subscriber_topic_version(
+          GetMinSubscriberTopicVersion(delta->topic_name));
+    }
   }
 }
 
@@ -876,8 +911,11 @@ void Statestore::DoSubscriberUpdate(UpdateKind update_kind, int thread_id,
         // TODO: Consider if a metric to track the number of failures would be useful.
         LOG(INFO) << "Subscriber '" << subscriber->id() << "' has failed, disconnected "
                   << "or re-registered (last known registration ID: "
-                  << update.registration_id << ")";
+                  << PrintId(update.registration_id) << ")";
         UnregisterSubscriber(subscriber.get());
+      } else {
+        LOG(INFO) << "Failure was already detected for subscriber '" << subscriber->id()
+                  << "'. Won't send another " << update_kind_str;
       }
     } else {
       // Schedule the next message.
@@ -907,7 +945,7 @@ void Statestore::UnregisterSubscriber(Subscriber* subscriber) {
   heartbeat_client_cache_->CloseConnections(subscriber->network_address());
 
   // Prevent the failure detector from growing without bound
-  failure_detector_->EvictPeer(PrintId(subscriber->registration_id()));
+  failure_detector_->EvictPeer(subscriber->id());
 
   // Delete all transient entries
   {

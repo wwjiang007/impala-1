@@ -29,7 +29,7 @@ from parquet.ttypes import ColumnOrder, SortingColumn, TypeDefinedOrder
 from tests.common.environ import impalad_basedir
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.parametrize import UniqueDatabase
-from tests.common.skip import SkipIfIsilon, SkipIfLocal, SkipIfS3, SkipIfADLS
+from tests.common.skip import SkipIfEC, SkipIfIsilon, SkipIfLocal, SkipIfS3, SkipIfADLS
 from tests.common.test_dimensions import create_exec_option_dimension
 from tests.common.test_vector import ImpalaTestDimension
 from tests.util.filesystem_utils import get_fs_path
@@ -101,6 +101,7 @@ class TestInsertParquetQueries(ImpalaTestSuite):
     cls.ImpalaTestMatrix.add_constraint(
         lambda v: v.get_value('table_format').compression_codec == 'none')
 
+  @SkipIfEC.oom
   @SkipIfLocal.multiple_impalad
   @UniqueDatabase.parametrize(sync_ddl=True)
   def test_insert_parquet(self, vector, unique_database):
@@ -676,3 +677,12 @@ class TestHdfsParquetTableStatsWriter(ImpalaTestSuite):
 
     self._ctas_table_and_verify_stats(vector, unique_database, tmpdir.strpath,
       "functional_parquet.zipcode_incomes", expected_min_max_values)
+
+  def test_too_many_columns(self, vector, unique_database):
+    """Test that writing a Parquet table with too many columns results in an error."""
+    num_cols = 12000
+    query = "create table %s.wide stored as parquet as select \n" % unique_database
+    query += ", ".join(map(str, xrange(num_cols)))
+    query += ";\n"
+    result = self.execute_query_expect_failure(self.client, query);
+    assert "Minimum required block size must be less than 2GB" in str(result)

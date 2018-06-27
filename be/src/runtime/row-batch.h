@@ -29,7 +29,6 @@
 #include "kudu/util/slice.h"
 #include "runtime/bufferpool/buffer-pool.h"
 #include "runtime/descriptors.h"
-#include "runtime/io/disk-io-mgr.h"
 #include "runtime/mem-pool.h"
 
 namespace kudu {
@@ -56,14 +55,17 @@ class OutboundRowBatch {
   /// Returns the serialized tuple offsets' vector as a kudu::Slice.
   /// The tuple offsets vector is sent as KRPC sidecar.
   kudu::Slice TupleOffsetsAsSlice() const {
-    return kudu::Slice((uint8_t*)tuple_offsets_.data(),
+    return kudu::Slice(
+        const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(tuple_offsets_.data())),
         tuple_offsets_.size() * sizeof(tuple_offsets_[0]));
   }
 
   /// Returns the serialized tuple data's buffer as a kudu::Slice.
   /// The tuple data is sent as KRPC sidecar.
   kudu::Slice TupleDataAsSlice() const {
-    return kudu::Slice((uint8_t*)tuple_data_.data(), tuple_data_.length());
+    return kudu::Slice(
+        const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(tuple_data_.data())),
+        tuple_data_.length());
   }
 
   /// Returns true if the header has been intialized and ready to be sent.
@@ -312,6 +314,9 @@ class RowBatch {
   /// Transfer ownership of resources to dest.  This includes tuple data in mem
   /// pool and buffers.
   void TransferResourceOwnership(RowBatch* dest);
+
+  /// Update accounting so that attached memory is accounted against 'new_tracker'.
+  void SetMemTracker(MemTracker* new_tracker);
 
   void CopyRow(TupleRow* src, TupleRow* dest) {
     memcpy(dest, src, num_tuples_per_row_ * sizeof(Tuple*));

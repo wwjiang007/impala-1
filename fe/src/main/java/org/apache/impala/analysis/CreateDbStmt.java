@@ -17,9 +17,10 @@
 
 package org.apache.impala.analysis;
 
+import com.google.common.base.Preconditions;
 import org.apache.hadoop.fs.permission.FsAction;
 import org.apache.impala.authorization.Privilege;
-import org.apache.impala.catalog.Db;
+import org.apache.impala.catalog.FeDb;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.thrift.TCreateDbParams;
@@ -32,6 +33,8 @@ public class CreateDbStmt extends StatementBase {
   private final HdfsUri location_;
   private final String comment_;
   private final boolean ifNotExists_;
+  // Database owner. Set during analysis.
+  private String owner_;
 
   /**
    * Creates a database with the given name.
@@ -74,6 +77,7 @@ public class CreateDbStmt extends StatementBase {
     params.setComment(getComment());
     params.setLocation(location_ == null ? null : location_.toString());
     params.setIf_not_exists(getIfNotExists());
+    params.setOwner(getOwner());
     return params;
   }
 
@@ -88,7 +92,7 @@ public class CreateDbStmt extends StatementBase {
     // this Impala instance. If that happens, the caller will not get an
     // AnalysisException when creating the database, they will get a Hive
     // AlreadyExistsException once the request has been sent to the metastore.
-    Db db = analyzer.getDb(getDb(), Privilege.CREATE, false);
+    FeDb db = analyzer.getDb(getDb(), Privilege.CREATE, false);
     if (db != null && !ifNotExists_) {
       throw new AnalysisException(Analyzer.DB_ALREADY_EXISTS_ERROR_MSG + getDb());
     }
@@ -96,5 +100,12 @@ public class CreateDbStmt extends StatementBase {
     if (location_ != null) {
       location_.analyze(analyzer, Privilege.ALL, FsAction.READ_WRITE);
     }
+    owner_ = analyzer.getUser().getName();
   }
+
+  /**
+   * Can only be called after analysis, returns the owner of this database (the user from
+   * the current session).
+   */
+  public String getOwner() { return Preconditions.checkNotNull(owner_); }
 }

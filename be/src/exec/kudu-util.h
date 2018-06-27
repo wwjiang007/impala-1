@@ -32,6 +32,7 @@ struct tm;
 namespace impala {
 
 /// Takes a Kudu status and returns an impala one, if it's not OK.
+/// Evaluates the prepend argument only if the status is not OK.
 #define KUDU_RETURN_IF_ERROR(expr, prepend) \
   do { \
     kudu::Status _s = (expr); \
@@ -101,11 +102,17 @@ ColumnType KuduDataTypeToColumnType(kudu::client::KuduColumnSchema::DataType typ
 inline Status FromKuduStatus(
     const kudu::Status& k_status, const std::string prepend = "") {
   if (LIKELY(k_status.ok())) return Status::OK();
-  const string& err_msg = prepend.empty() ? k_status.ToString() :
+  const std::string& err_msg = prepend.empty() ? k_status.ToString() :
       strings::Substitute("$0: $1", prepend, k_status.ToString());
   VLOG(1) << err_msg;
   return Status::Expected(err_msg);
 }
+
+/// Converts 'mode' to its equivalent ReadMode, stored in 'out'. Possible values for
+/// 'mode' are 'READ_LATEST' and 'READ_AT_SNAPSHOT'. If 'mode' is invalid, an error is
+/// returned.
+Status StringToKuduReadMode(
+    const std::string& mode, kudu::client::KuduScanner::ReadMode* out) WARN_UNUSED_RESULT;
 
 } /// namespace impala
 #endif

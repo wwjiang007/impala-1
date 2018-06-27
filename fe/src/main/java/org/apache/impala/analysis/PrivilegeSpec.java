@@ -20,11 +20,11 @@ package org.apache.impala.analysis;
 import java.util.List;
 
 import org.apache.impala.authorization.Privilege;
-import org.apache.impala.catalog.DataSourceTable;
+import org.apache.impala.catalog.FeDataSourceTable;
+import org.apache.impala.catalog.FeTable;
+import org.apache.impala.catalog.FeView;
 import org.apache.impala.catalog.RolePrivilege;
-import org.apache.impala.catalog.Table;
 import org.apache.impala.catalog.TableLoadingException;
-import org.apache.impala.catalog.View;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TPrivilege;
 import org.apache.impala.thrift.TPrivilegeLevel;
@@ -188,10 +188,6 @@ public class PrivilegeSpec implements ParseNode {
 
     switch (scope_) {
       case SERVER:
-        if (privilegeLevel_ != TPrivilegeLevel.ALL) {
-          throw new AnalysisException("Only 'ALL' privilege may be applied at " +
-              "SERVER scope in privilege spec.");
-        }
         break;
       case DATABASE:
         Preconditions.checkState(!Strings.isNullOrEmpty(dbName_));
@@ -241,12 +237,12 @@ public class PrivilegeSpec implements ParseNode {
       throw new AnalysisException("Only 'SELECT' privileges are allowed " +
           "in a column privilege spec.");
     }
-    Table table = analyzeTargetTable(analyzer);
-    if (table instanceof View) {
+    FeTable table = analyzeTargetTable(analyzer);
+    if (table instanceof FeView) {
       throw new AnalysisException("Column-level privileges on views are not " +
           "supported.");
     }
-    if (table instanceof DataSourceTable) {
+    if (table instanceof FeDataSourceTable) {
       throw new AnalysisException("Column-level privileges on external data " +
           "source tables are not supported.");
     }
@@ -268,12 +264,16 @@ public class PrivilegeSpec implements ParseNode {
    * 1. The table name is not valid.
    * 2. Table is not loaded in the catalog.
    * 3. Table does not exist.
+   * 4. The privilege level is not supported on tables, e.g. CREATE.
    */
-  private Table analyzeTargetTable(Analyzer analyzer) throws AnalysisException {
+  private FeTable analyzeTargetTable(Analyzer analyzer) throws AnalysisException {
     Preconditions.checkState(scope_ == TPrivilegeScope.TABLE ||
         scope_ == TPrivilegeScope.COLUMN);
     Preconditions.checkState(!Strings.isNullOrEmpty(tableName_.getTbl()));
-    Table table = null;
+    if (privilegeLevel_ == TPrivilegeLevel.CREATE) {
+      throw new AnalysisException("Create-level privileges on tables are not supported.");
+    }
+    FeTable table = null;
     try {
       dbName_ = analyzer.getTargetDbName(tableName_);
       Preconditions.checkNotNull(dbName_);

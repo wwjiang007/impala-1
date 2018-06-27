@@ -27,12 +27,14 @@ import java.util.Arrays;
 import java.util.List;
 
 import org.apache.impala.analysis.TimestampArithmeticExpr.TimeUnit;
+import org.apache.impala.catalog.AggregateFunction;
 import org.apache.impala.catalog.Catalog;
 import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.Db;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.Function.CompareMode;
+import org.apache.impala.catalog.ImpaladCatalog;
 import org.apache.impala.catalog.PrimitiveType;
 import org.apache.impala.catalog.ScalarFunction;
 import org.apache.impala.catalog.ScalarType;
@@ -41,6 +43,7 @@ import org.apache.impala.catalog.TestSchemaUtils;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TExpr;
+import org.apache.impala.thrift.TFunction;
 import org.apache.impala.thrift.TFunctionBinaryType;
 import org.apache.impala.thrift.TQueryOptions;
 import org.junit.Assert;
@@ -1210,7 +1213,7 @@ public class AnalyzeExprsTest extends AnalyzerTest {
         Type.BIGINT, Type.FLOAT, Type.DOUBLE , Type.NULL };
     for (Type type1: numericTypes) {
       for (Type type2: numericTypes) {
-        Type t = Type.getAssignmentCompatibleType(type1, type2, false);
+        Type t = Type.getAssignmentCompatibleType(type1, type2, false, false);
         assertTrue(t.isScalarType());
         ScalarType compatibleType = (ScalarType) t;
         Type promotedType = compatibleType.getNextResolutionType();
@@ -1292,9 +1295,11 @@ public class AnalyzeExprsTest extends AnalyzerTest {
       for (Type type1: types) {
         for (Type type2: types) {
           // Prefer strict matching.
-          Type compatibleType = Type.getAssignmentCompatibleType(type1, type2, true);
+          Type compatibleType = Type.getAssignmentCompatibleType(
+              type1, type2, true, true);
           if (compatibleType.isInvalid()) {
-            compatibleType = Type.getAssignmentCompatibleType(type1, type2, false);
+            compatibleType = Type.getAssignmentCompatibleType(
+                type1, type2, false, false);
           }
           typeCastTest(type1, type2, false, null, cmpOp, compatibleType);
           typeCastTest(type1, type2, true, null, cmpOp, compatibleType);
@@ -2071,8 +2076,7 @@ public class AnalyzeExprsTest extends AnalyzerTest {
         "No matching function with signature: if(BOOLEAN).");
 
     // Test IsNull() conditional function.
-    for (PrimitiveType t: PrimitiveType.values()) {
-      String literal = typeToLiteralValue_.get(t);
+    for (String literal : typeToLiteralValue_.values()) {
       AnalyzesOk(String.format("select isnull(%s, %s)", literal, literal));
       AnalyzesOk(String.format("select isnull(%s, NULL)", literal));
       AnalyzesOk(String.format("select isnull(NULL, %s)", literal));
@@ -2147,6 +2151,81 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     AnalysisError("select udf(1, 2)",
          "No matching function with signature: default.udf(TINYINT, TINYINT).");
     catalog_.removeFunction(udf);
+  }
+
+  // Serializes to thrift and checks the mtime setting.
+  private void checkSerializedMTime(Expr expr, boolean expectMTime) {
+    Preconditions.checkNotNull(expr.getFn());
+    TExpr thriftExpr = expr.treeToThrift();
+    Preconditions.checkState(thriftExpr.getNodesSize() > 0);
+    Preconditions.checkState(thriftExpr.getNodes().get(0).isSetFn());
+    TFunction thriftFn = thriftExpr.getNodes().get(0).getFn();
+    if (expectMTime) {
+      assertTrue(thriftFn.getLast_modified_time() >= 0);
+    } else {
+      assertEquals(thriftFn.getLast_modified_time(), -1);
+    }
+  }
+
+  // Checks that 'expr', when serialized to thrift, has mtime
+  // set as expected. 'expr' must be a single function call.
+  private void testMTime(String expr, boolean expectMTime) {
+    SelectStmt stmt =
+        (SelectStmt) AnalyzesOk("select " + expr + " from functional.alltypes");
+    Preconditions.checkState(stmt.getSelectList().getItems().size() == 1);
+    TupleDescriptor tblRefDesc = stmt.fromClause_.get(0).getDesc();
+    tblRefDesc.materializeSlots();
+    tblRefDesc.computeMemLayout();
+    if (stmt.hasAggInfo()) {
+      TupleDescriptor intDesc = stmt.getAggInfo().intermediateTupleDesc_;
+      intDesc.materializeSlots();
+      intDesc.computeMemLayout();
+      checkSerializedMTime(stmt.getAggInfo().getAggregateExprs().get(0), expectMTime);
+      checkSerializedMTime(
+          stmt.getAggInfo().getMergeAggInfo().getAggregateExprs().get(0), expectMTime);
+    } else {
+      checkSerializedMTime(stmt.getSelectList().getItems().get(0).getExpr(), expectMTime);
+    }
+  }
+
+  @Test
+  public void TestFunctionMTime() {
+    // Expect unset mtime for builtin.
+    testMTime("sleep(1)", false);
+    testMTime("concat('a', 'b')", false);
+    testMTime("3 is null", false);
+    testMTime("1 < 3", false);
+    testMTime("1 + 1", false);
+    testMTime("avg(int_col)", false);
+
+    final String nativeSymbol =
+        "'_Z8IdentityPN10impala_udf15FunctionContextERKNS_10BooleanValE'";
+    final String nativeUdfPath = "/test-warehouse/libTestUdfs.so";
+    final String javaSymbol = "SYMBOL='org.apache.impala.TestUdf";
+    final String javaPath = "/test-warehouse/impala-hive-udfs.jar";
+    final String nativeUdaPath = "hdfs://localhost:20500/test-warehouse/libTestUdas.so";
+
+    // Spec for a bogus builtin that specifies a bogus path.
+    catalog_.addFunction(ScalarFunction.createForTesting("default", "udf_builtin_bug",
+        new ArrayList<Type>(), Type.INT, "/dummy", "dummy.class", null, null,
+        TFunctionBinaryType.BUILTIN));
+    // Valid specs for native and java udf/uda's.
+    catalog_.addFunction(ScalarFunction.createForTesting("default", "udf_jar",
+        Lists.<Type>newArrayList(Type.INT), Type.INT, javaPath, javaSymbol, null, null,
+        TFunctionBinaryType.JAVA));
+    catalog_.addFunction(ScalarFunction.createForTesting("default", "udf_native",
+        new ArrayList<Type>(), Type.INT, nativeUdfPath, nativeSymbol, null, null,
+        TFunctionBinaryType.NATIVE));
+    catalog_.addFunction(AggregateFunction.createForTesting(
+        new FunctionName("default", "uda"), Lists.<Type>newArrayList(Type.INT), Type.INT,
+        Type.INT, new HdfsUri(nativeUdaPath), "init_fn_symbol", "update_fn_symbol", null,
+        null, null, null, null, TFunctionBinaryType.NATIVE));
+
+    // Expect these to have mtime set.
+    testMTime("udf_builtin_bug()", false);
+    testMTime("udf_jar(3)", true);
+    testMTime("udf_native()", true);
+    testMTime("uda(int_col)", true);
   }
 
   @Test
@@ -2433,14 +2512,13 @@ public class AnalyzeExprsTest extends AnalyzerTest {
 
     AnalysisError("select round(cast(1.123 as decimal(10,3)), 5.1)",
         "No matching function with signature: round(DECIMAL(10,3), DECIMAL(2,1))");
-    AnalysisError("select round(cast(1.123 as decimal(30,20)), 40)",
-        "Cannot round/truncate to scales greater than 38.");
+    AnalyzesOk("select round(cast(1.123 as decimal(30,20)), 40)");
     for (final String alias : aliasesOfTruncate) {
-        AnalysisError(String.format("select truncate(cast(1.123 as decimal(10,3)), 40)",
-            alias), "Cannot round/truncate to scales greater than 38.");
+        AnalyzesOk(String.format("select %s(cast(1.123 as decimal(10,3)), 40)", alias));
         AnalyzesOk(String.format("select %s(NULL)", alias));
         AnalysisError(String.format("select %s(NULL, 1)", alias),
-            "Cannot resolve DECIMAL precision and scale from NULL type.");
+            String.format("Cannot resolve DECIMAL precision and scale from NULL type " +
+                "in %s function.", alias));
     }
     AnalysisError("select round(cast(1.123 as decimal(10,3)), NULL)",
         "round() cannot be called with a NULL second argument.");
@@ -2453,18 +2531,22 @@ public class AnalyzeExprsTest extends AnalyzerTest {
         "No matching function with signature: precision(FLOAT)");
 
     AnalysisError("select precision(NULL)",
-        "Cannot resolve DECIMAL precision and scale from NULL type.");
+        "Cannot resolve DECIMAL precision and scale from NULL type in " +
+            "precision function");
     AnalysisError("select scale(NULL)",
-        "Cannot resolve DECIMAL precision and scale from NULL type.");
+        "Cannot resolve DECIMAL precision and scale from NULL type in " +
+            "scale function.");
 
     testDecimalExpr("round(1.23)", ScalarType.createDecimalType(2, 0));
     testDecimalExpr("round(1.23, 1)", ScalarType.createDecimalType(3, 1));
     testDecimalExpr("round(1.23, 0)", ScalarType.createDecimalType(2, 0));
-    testDecimalExpr("round(1.23, 3)", ScalarType.createDecimalType(4, 3));
+    testDecimalExpr("round(1.23, 3)", ScalarType.createDecimalType(3, 2));
     testDecimalExpr("round(1.23, -1)", ScalarType.createDecimalType(2, 0));
     testDecimalExpr("round(1.23, -2)", ScalarType.createDecimalType(2, 0));
     testDecimalExpr("round(cast(1.23 as decimal(3,2)), -2)",
         ScalarType.createDecimalType(2, 0));
+    testDecimalExpr("round(cast(1.23 as decimal(30, 20)), 40)",
+        ScalarType.createDecimalType(30, 20));
 
     testDecimalExpr("ceil(123.45)", ScalarType.createDecimalType(4, 0));
     testDecimalExpr("floor(12.345)", ScalarType.createDecimalType(3, 0));
@@ -2477,12 +2559,56 @@ public class AnalyzeExprsTest extends AnalyzerTest {
         testDecimalExpr(String.format("%s(1.23, 0)", alias),
             ScalarType.createDecimalType(1, 0));
         testDecimalExpr(String.format("%s(1.23, 3)", alias),
-            ScalarType.createDecimalType(4, 3));
+            ScalarType.createDecimalType(3, 2));
         testDecimalExpr(String.format("%s(1.23, -1)", alias),
             ScalarType.createDecimalType(1, 0));
         testDecimalExpr(String.format("%s(1.23, -2)", alias),
             ScalarType.createDecimalType(1, 0));
+        testDecimalExpr(String.format("%s(cast(1.23 as decimal(30, 20)), 40)", alias),
+            ScalarType.createDecimalType(30, 20));
     }
+
+    AnalysisContext decimalV1Ctx = createAnalysisCtx();
+    decimalV1Ctx.getQueryOptions().setDecimal_v2(false);
+    AnalysisContext decimalV2Ctx = createAnalysisCtx();
+    decimalV2Ctx.getQueryOptions().setDecimal_v2(true);
+
+    testDecimalExpr("coalesce(cast(0.789 as decimal(19, 19)), " +
+        "cast(123 as decimal(19, 0)))", ScalarType.createDecimalType(38, 19));
+    AnalyzesOk("select coalesce(cast(0.789 as decimal(20, 20)), " +
+            "cast(123 as decimal(19, 0)))", decimalV1Ctx);
+    AnalysisError("select coalesce(cast(0.789 as decimal(20, 20)), " +
+        "cast(123 as decimal(19, 0)))", decimalV2Ctx,
+        "Cannot resolve DECIMAL types of the coalesce(DECIMAL(20,20), " +
+        "DECIMAL(19,0)) function arguments. You need to wrap the arguments in a CAST.");
+
+    testDecimalExpr("if(true, cast(0.789 as decimal(19, 19)), " +
+        "cast(123 as decimal(19, 0)))", ScalarType.createDecimalType(38, 19));
+    AnalyzesOk("select if(true, cast(0.789 as decimal(20, 20)), " +
+            "cast(123 as decimal(19, 0)))", decimalV1Ctx);
+    AnalysisError("select if(true, cast(0.789 as decimal(20, 20)), " +
+        "cast(123 as decimal(19, 0)))", decimalV2Ctx,
+        "Cannot resolve DECIMAL types of the if(BOOLEAN, " +
+        "DECIMAL(20,20), DECIMAL(19,0)) function arguments. " +
+        "You need to wrap the arguments in a CAST.");
+
+    testDecimalExpr("isnull(cast(0.789 as decimal(19, 19)), " +
+        "cast(123 as decimal(19, 0)))", ScalarType.createDecimalType(38, 19));
+    AnalyzesOk("select isnull(cast(0.789 as decimal(20, 20)), " +
+        "cast(123 as decimal(19, 0)))", decimalV1Ctx);
+    AnalysisError("select isnull(cast(0.789 as decimal(20, 20)), " +
+        "cast(123 as decimal(19, 0)))", decimalV2Ctx,
+        "Cannot resolve DECIMAL types of the isnull(DECIMAL(20,20), " +
+        "DECIMAL(19,0)) function arguments. You need to wrap the arguments in a CAST.");
+
+    testDecimalExpr("case 1 when 0 then cast(0.789 as decimal(19, 19)) " +
+        "else cast(123 as decimal(19, 0)) end", ScalarType.createDecimalType(38, 19));
+    AnalyzesOk("select case 1 when 0 then cast(0.789 as decimal(19, 19)) " +
+            "else cast(123 as decimal(20, 0)) end", decimalV1Ctx);
+    AnalysisError("select case 1 when 0 then cast(0.789 as decimal(19, 19)) " +
+        "else cast(123 as decimal(20, 0)) end", decimalV2Ctx,
+        "Incompatible return types 'DECIMAL(19,19)' and 'DECIMAL(20,0)' " +
+        "of exprs 'CAST(0.789 AS DECIMAL(19,19))' and 'CAST(123 AS DECIMAL(20,0))'.");
   }
 
   /**
@@ -2613,7 +2739,7 @@ public class AnalyzeExprsTest extends AnalyzerTest {
   @Test
   // IMPALA-2233: Regression test for loss of precision through implicit casts.
   public void TestImplicitArgumentCasts() throws AnalysisException {
-    FunctionName fnName = new FunctionName(Catalog.BUILTINS_DB, "greatest");
+    FunctionName fnName = new FunctionName(ImpaladCatalog.BUILTINS_DB, "greatest");
     Function tinyIntFn = new Function(fnName, new Type[] {ScalarType.DOUBLE},
         Type.DOUBLE, true);
     Function decimalFn = new Function(fnName,
@@ -2623,7 +2749,7 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     Assert.assertTrue(tinyIntFn.compare(decimalFn,
         CompareMode.IS_NONSTRICT_SUPERTYPE_OF));
     // Check that this resolves to the decimal version of the function.
-    Db db = catalog_.getDb(Catalog.BUILTINS_DB);
+    Db db = catalog_.getDb(ImpaladCatalog.BUILTINS_DB);
     Function foundFn = db.getFunction(decimalFn, CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
     assertNotNull(foundFn);
     Assert.assertTrue(foundFn.getArgs()[0].isDecimal());
@@ -2656,7 +2782,7 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     Assert.assertNotNull(foundFn);
     Assert.assertEquals(Type.DOUBLE, foundFn.getArgs()[0]);
 
-    FunctionName lagFnName = new FunctionName(Catalog.BUILTINS_DB, "lag");
+    FunctionName lagFnName = new FunctionName(ImpaladCatalog.BUILTINS_DB, "lag");
     // Timestamp should not be converted to string if string overload available.
     Function lagStringFn = new Function(lagFnName,
         new Type[] {ScalarType.STRING, Type.TINYINT}, Type.INVALID, false);

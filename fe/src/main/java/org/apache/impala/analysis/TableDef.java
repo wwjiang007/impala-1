@@ -17,6 +17,7 @@
 
 package org.apache.impala.analysis;
 
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -24,10 +25,10 @@ import java.util.Set;
 
 import org.apache.impala.authorization.Privilege;
 import org.apache.impala.catalog.Column;
+import org.apache.impala.catalog.FeFsTable;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.HdfsStorageDescriptor;
-import org.apache.impala.catalog.HdfsTable;
 import org.apache.impala.catalog.RowFormat;
-import org.apache.impala.catalog.Table;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.thrift.TAccessEvent;
@@ -88,8 +89,8 @@ class TableDef {
   // True if analyze() has been called.
   private boolean isAnalyzed_ = false;
 
-  //Kudu table name generated during analysis for managed Kudu tables
-  private String generatedKuduTableName_ = "";
+  // Generated Kudu properties set during analysis.
+  private Map<String, String> generatedKuduProperties_ = new HashMap<>();
 
   // END: Members that need to be reset()
   /////////////////////////////////////////
@@ -160,10 +161,9 @@ class TableDef {
 
   public void reset() {
     primaryKeyColDefs_.clear();
-    dataLayout_.reset();
     columnDefs_.clear();
     isAnalyzed_ = false;
-    generatedKuduTableName_ = "";
+    generatedKuduProperties_.clear();
   }
 
   public TableName getTblName() {
@@ -187,10 +187,10 @@ class TableDef {
   List<ColumnDef> getPrimaryKeyColumnDefs() { return primaryKeyColDefs_; }
   boolean isExternal() { return isExternal_; }
   boolean getIfNotExists() { return ifNotExists_; }
-  String getGeneratedKuduTableName() { return generatedKuduTableName_; }
-  void setGeneratedKuduTableName(String tableName) {
-    Preconditions.checkNotNull(tableName);
-    generatedKuduTableName_ = tableName;
+  Map<String, String> getGeneratedKuduProperties() { return generatedKuduProperties_; }
+  void putGeneratedKuduProperty(String key, String value) {
+    Preconditions.checkNotNull(key);
+    generatedKuduProperties_.put(key, value);
   }
   List<KuduPartitionParam> getKuduPartitionParams() {
     return dataLayout_.getKuduPartitionParams();
@@ -307,9 +307,9 @@ class TableDef {
    * must be an HDFS table. If there are errors during the analysis, this will throw an
    * AnalysisException.
    */
-  public static void analyzeSortColumns(List<String> sortCols, Table table)
+  public static void analyzeSortColumns(List<String> sortCols, FeTable table)
       throws AnalysisException {
-    Preconditions.checkState(table instanceof HdfsTable);
+    Preconditions.checkState(table instanceof FeFsTable);
     analyzeSortColumns(sortCols, Column.toColumnNames(table.getNonClusteringColumns()),
         Column.toColumnNames(table.getClusteringColumns()));
   }

@@ -25,11 +25,12 @@ import java.util.Set;
 import org.apache.impala.authorization.Privilege;
 import org.apache.impala.authorization.PrivilegeRequestBuilder;
 import org.apache.impala.catalog.Column;
+import org.apache.impala.catalog.FeTable;
+import org.apache.impala.catalog.FeView;
 import org.apache.impala.catalog.HBaseTable;
 import org.apache.impala.catalog.HdfsTable;
 import org.apache.impala.catalog.KuduColumn;
 import org.apache.impala.catalog.KuduTable;
-import org.apache.impala.catalog.Table;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.catalog.View;
 import org.apache.impala.common.AnalysisException;
@@ -114,7 +115,7 @@ public class InsertStmt extends StatementBase {
   private QueryStmt queryStmt_;
 
   // Set in analyze(). Contains metadata of target table to determine type of sink.
-  private Table table_;
+  private FeTable table_;
 
   // Set in analyze(). Exprs correspond to the partitionKeyValues, if specified, or to
   // the partition columns for Kudu tables.
@@ -332,7 +333,7 @@ public class InsertStmt extends StatementBase {
             "Unknown column '" + columnName + "' in column permutation");
       }
 
-      if (!mentionedColumnNames.add(columnName)) {
+      if (!mentionedColumnNames.add(column.getName())) {
         throw new AnalysisException(
             "Duplicate column '" + columnName + "' in column permutation");
       }
@@ -422,7 +423,7 @@ public class InsertStmt extends StatementBase {
     }
 
     // We do not support (in|up)serting into views.
-    if (table_ instanceof View) {
+    if (table_ instanceof FeView) {
       throw new AnalysisException(
           String.format("Impala does not support %sing into views: %s", getOpName(),
               table_.getFullName()));
@@ -494,10 +495,10 @@ public class InsertStmt extends StatementBase {
       }
       for (int colIdx = 0; colIdx < numClusteringCols; ++colIdx) {
         Column col = hdfsTable.getColumns().get(colIdx);
-        // Hive has a number of issues handling BOOLEAN partition columns (see HIVE-6590).
+        // Hive 1.x has a number of issues handling BOOLEAN partition columns (see HIVE-6590).
         // Instead of working around the Hive bugs, INSERT is disabled for BOOLEAN
-        // partitions in Impala. Once the Hive JIRA is resolved, we can remove this
-        // analysis check.
+        // partitions in Impala when built against Hive 1. HIVE-6590 is currently resolved,
+        // but not in Hive 2.3.2, the latest release as of 3/17/2018.
         if (col.getType() == Type.BOOLEAN) {
           throw new AnalysisException(String.format("INSERT into table with BOOLEAN " +
               "partition column (%s) is not supported: %s", col.getName(),
@@ -652,7 +653,7 @@ public class InsertStmt extends StatementBase {
    *           If an expression is not compatible with its target column
    */
   private void prepareExpressions(List<Column> selectExprTargetColumns,
-      List<Expr> selectListExprs, Table tbl, Analyzer analyzer)
+      List<Expr> selectListExprs, FeTable tbl, Analyzer analyzer)
       throws AnalysisException {
     // Temporary lists of partition key exprs and names in an arbitrary order.
     List<Expr> tmpPartitionKeyExprs = new ArrayList<Expr>();
@@ -669,7 +670,8 @@ public class InsertStmt extends StatementBase {
     for (int i = 0; i < selectListExprs.size(); ++i) {
       Column targetColumn = selectExprTargetColumns.get(i);
       Expr compatibleExpr = checkTypeCompatibility(
-          targetTableName_.toString(), targetColumn, selectListExprs.get(i));
+          targetTableName_.toString(), targetColumn, selectListExprs.get(i),
+          analyzer.getQueryOptions().isDecimal_v2());
       if (targetColumn.getPosition() < numClusteringCols) {
         // This is a dynamic clustering column
         tmpPartitionKeyExprs.add(compatibleExpr);
@@ -691,7 +693,8 @@ public class InsertStmt extends StatementBase {
           // tableColumns is guaranteed to exist after the earlier analysis checks
           Column tableColumn = table_.getColumn(pkv.getColName());
           Expr compatibleExpr = checkTypeCompatibility(
-              targetTableName_.toString(), tableColumn, pkv.getLiteralValue());
+              targetTableName_.toString(), tableColumn,
+              pkv.getLiteralValue(), analyzer.isDecimalV2());
           tmpPartitionKeyExprs.add(compatibleExpr);
           tmpPartitionKeyNames.add(pkv.getColName());
         }
@@ -723,7 +726,7 @@ public class InsertStmt extends StatementBase {
 
     // Finally, 'undo' the permutation so that the selectListExprs are in Hive column
     // order, and add NULL expressions to all missing columns, unless this is an UPSERT.
-    ArrayList<Column> columns = table_.getColumnsInHiveOrder();
+    List<Column> columns = table_.getColumnsInHiveOrder();
     for (int col = 0; col < columns.size(); ++col) {
       Column tblColumn = columns.get(col);
       boolean matchFound = false;
@@ -840,8 +843,8 @@ public class InsertStmt extends StatementBase {
 
   public List<PlanHint> getPlanHints() { return planHints_; }
   public TableName getTargetTableName() { return targetTableName_; }
-  public Table getTargetTable() { return table_; }
-  public void setTargetTable(Table table) { this.table_ = table; }
+  public FeTable getTargetTable() { return table_; }
+  public void setTargetTable(FeTable table) { this.table_ = table; }
   public boolean isOverwrite() { return overwrite_; }
 
   /**

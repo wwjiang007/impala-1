@@ -75,6 +75,11 @@ class TestFailpoints(ImpalaTestSuite):
     cls.ImpalaTestMatrix.add_dimension(
         create_exec_option_dimension([0], [False], [0]))
 
+    # Don't create PREPARE:WAIT debug actions because cancellation is not checked until
+    # after the prepare phase once execution is started.
+    cls.ImpalaTestMatrix.add_constraint(
+        lambda v: not (v.get_value('action') == 'CANCEL'
+                     and v.get_value('location') == 'PREPARE'))
     # Don't create CLOSE:WAIT debug actions to avoid leaking plan fragments (there's no
     # way to cancel a plan fragment once Close() has been called)
     cls.ImpalaTestMatrix.add_constraint(
@@ -90,9 +95,6 @@ class TestFailpoints(ImpalaTestSuite):
     location = vector.get_value('location')
     vector.get_value('exec_option')['mt_dop'] = vector.get_value('mt_dop')
 
-    if action == "CANCEL" and location == "PREPARE":
-      pytest.xfail(reason="IMPALA-5202 leads to a hang.")
-
     try:
       plan_node_ids = self.__parse_plan_nodes_from_explain(query, vector)
     except ImpalaBeeswaxException as e:
@@ -103,6 +105,9 @@ class TestFailpoints(ImpalaTestSuite):
 
     for node_id in plan_node_ids:
       debug_action = '%d:%s:%s' % (node_id, location, FAILPOINT_ACTION_MAP[action])
+      # IMPALA-7046: add jitter to backend startup to exercise various failure paths.
+      debug_action += '|COORD_BEFORE_EXEC_RPC:JITTER@100@0.3'
+
       LOG.info('Current debug action: SET DEBUG_ACTION=%s' % debug_action)
       vector.get_value('exec_option')['debug_action'] = debug_action
 

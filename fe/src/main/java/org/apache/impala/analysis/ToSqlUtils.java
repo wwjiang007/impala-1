@@ -41,15 +41,17 @@ import org.apache.hadoop.hive.metastore.TableType;
 import org.apache.hadoop.hive.ql.parse.HiveLexer;
 import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.Column;
+import org.apache.impala.catalog.FeTable;
+import org.apache.impala.catalog.FeView;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.HBaseTable;
 import org.apache.impala.catalog.HdfsCompression;
 import org.apache.impala.catalog.HdfsFileFormat;
+import org.apache.impala.catalog.HdfsTable;
 import org.apache.impala.catalog.KuduColumn;
 import org.apache.impala.catalog.KuduTable;
 import org.apache.impala.catalog.RowFormat;
 import org.apache.impala.catalog.Table;
-import org.apache.impala.catalog.View;
 import org.apache.impala.util.KuduUtil;
 
 /**
@@ -66,8 +68,10 @@ public class ToSqlUtils {
   /**
    * Removes all hidden properties from the given 'tblProperties' map.
    */
-  private static void removeHiddenTableProperties(Map<String, String> tblProperties) {
+  private static void removeHiddenTableProperties(Map<String, String> tblProperties,
+      Map<String, String> generatedTblProperties) {
     for (String key: HIDDEN_TABLE_PROPERTIES) tblProperties.remove(key);
+    generatedTblProperties.remove(KuduTable.KEY_TABLE_NAME);
   }
 
   /**
@@ -164,11 +168,17 @@ public class ToSqlUtils {
     for (ColumnDef col: stmt.getPartitionColumnDefs()) {
       partitionColsSql.add(col.toString());
     }
+    LinkedHashMap<String, String> properties = Maps.newLinkedHashMap(
+        stmt.getTblProperties());
+    LinkedHashMap<String, String> generatedProperties = Maps.newLinkedHashMap(
+        stmt.getGeneratedKuduProperties());
+    removeHiddenTableProperties(properties, generatedProperties);
+    properties.putAll(generatedProperties);
     String kuduParamsSql = getKuduPartitionByParams(stmt);
     // TODO: Pass the correct compression, if applicable.
     return getCreateTableSql(stmt.getDb(), stmt.getTbl(), stmt.getComment(), colsSql,
         partitionColsSql, stmt.getTblPrimaryKeyColumnNames(), kuduParamsSql,
-        stmt.getSortColumns(), stmt.getTblProperties(), stmt.getSerdeProperties(),
+        stmt.getSortColumns(), properties, stmt.getSerdeProperties(),
         stmt.isExternal(), stmt.getIfNotExists(), stmt.getRowFormat(),
         HdfsFileFormat.fromThrift(stmt.getFileFormat()), HdfsCompression.NONE, null,
         stmt.getLocation());
@@ -189,7 +199,10 @@ public class ToSqlUtils {
     // Use a LinkedHashMap to preserve the ordering of the table properties.
     LinkedHashMap<String, String> properties =
         Maps.newLinkedHashMap(innerStmt.getTblProperties());
-    removeHiddenTableProperties(properties);
+    LinkedHashMap<String, String> generatedProperties = Maps.newLinkedHashMap(
+        stmt.getCreateStmt().getGeneratedKuduProperties());
+    removeHiddenTableProperties(properties, generatedProperties);
+    properties.putAll(generatedProperties);
     String kuduParamsSql = getKuduPartitionByParams(innerStmt);
     // TODO: Pass the correct compression, if applicable.
     String createTableSql = getCreateTableSql(innerStmt.getDb(), innerStmt.getTbl(),
@@ -206,20 +219,20 @@ public class ToSqlUtils {
    * Returns a "CREATE TABLE" or "CREATE VIEW" statement that creates the specified
    * table.
    */
-  public static String getCreateTableSql(Table table) throws CatalogException {
+  public static String getCreateTableSql(FeTable table) throws CatalogException {
     Preconditions.checkNotNull(table);
-    if (table instanceof View) return getCreateViewSql((View)table);
+    if (table instanceof FeView) return getCreateViewSql((FeView)table);
     org.apache.hadoop.hive.metastore.api.Table msTable = table.getMetaStoreTable();
     // Use a LinkedHashMap to preserve the ordering of the table properties.
     LinkedHashMap<String, String> properties = Maps.newLinkedHashMap(msTable.getParameters());
-    if (properties.containsKey("transient_lastDdlTime")) {
-      properties.remove("transient_lastDdlTime");
+    if (properties.containsKey(Table.TBL_PROP_LAST_DDL_TIME)) {
+      properties.remove(Table.TBL_PROP_LAST_DDL_TIME);
     }
     boolean isExternal = msTable.getTableType() != null &&
         msTable.getTableType().equals(TableType.EXTERNAL_TABLE.toString());
     List<String> sortColsSql = getSortColumns(properties);
     String comment = properties.get("comment");
-    removeHiddenTableProperties(properties);
+    removeHiddenTableProperties(properties, Maps.<String, String>newHashMap());
     ArrayList<String> colsSql = Lists.newArrayList();
     ArrayList<String> partitionColsSql = Lists.newArrayList();
     boolean isHbaseTable = table instanceof HBaseTable;
@@ -231,10 +244,8 @@ public class ToSqlUtils {
       }
     }
     RowFormat rowFormat = RowFormat.fromStorageDescriptor(msTable.getSd());
-    HdfsFileFormat format = HdfsFileFormat.fromHdfsInputFormatClass(
-        msTable.getSd().getInputFormat());
-    HdfsCompression compression = HdfsCompression.fromHdfsInputFormatClass(
-        msTable.getSd().getInputFormat());
+    HdfsFileFormat format = null;
+    HdfsCompression compression = null;
     String location = isHbaseTable ? null : msTable.getSd().getLocation();
     Map<String, String> serdeParameters = msTable.getSd().getSerdeInfo().getParameters();
 
@@ -270,6 +281,10 @@ public class ToSqlUtils {
         // We shouldn't output the columns for external tables
         colsSql = null;
       }
+    } else if (table instanceof HdfsTable) {
+      String inputFormat = msTable.getSd().getInputFormat();
+      format = HdfsFileFormat.fromHdfsInputFormatClass(inputFormat);
+      compression = HdfsCompression.fromHdfsInputFormatClass(inputFormat);
     }
     HdfsUri tableLocation = location == null ? null : new HdfsUri(location);
     return getCreateTableSql(table.getDb().getName(), table.getName(), comment, colsSql,
@@ -391,7 +406,7 @@ public class ToSqlUtils {
     return sb.toString();
   }
 
-  public static String getCreateViewSql(View view) {
+  public static String getCreateViewSql(FeView view) {
     StringBuffer sb = new StringBuffer();
     sb.append("CREATE VIEW ");
     // Use toSql() to ensure that the table name and query statement are normalized

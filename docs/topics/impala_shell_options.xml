@@ -106,6 +106,35 @@ under the License.
             <row>
               <entry>
                 <p>
+                  -b or
+                </p>
+                <p>
+                  --kerberos_host_fqdn
+                </p>
+              </entry>
+              <entry>
+                <p>
+                  kerberos_host_fqdn=
+                </p>
+                <p>
+                  <varname>load-balancer-hostname</varname>
+                </p>
+              </entry>
+              <entry>
+                <p>
+                  If set, the setting overrides the expected hostname of the
+                  Impala daemon's Kerberos service principal.
+                    <cmdname>impala-shell</cmdname> will check that the server's
+                  principal matches this hostname. This may be used when
+                    <codeph>impalad</codeph> is configured to be accessed via a
+                  load-balancer, but it is desired for impala-shell to talk to a
+                  specific <codeph>impalad</codeph> directly.
+                </p>
+              </entry>
+            </row>
+            <row>
+              <entry>
+                <p>
                   --print_header
                 </p>
               </entry>
@@ -316,6 +345,10 @@ under the License.
                   is not enabled on the instance of <codeph>impalad</codeph> to which you are connecting, errors
                   are displayed.
                 </p>
+                <p>
+                  See <keyword keyref="kerberos"/> for the steps to set up and
+                  use Kerberos authentication in Impala.
+                </p>
               </entry>
             </row>
             <row>
@@ -404,27 +437,6 @@ under the License.
               <entry>
                 <p>
                   Continues on query failure.
-                </p>
-              </entry>
-            </row>
-            <row>
-              <entry>
-                <p>
-                  -r or --refresh_after_connect
-                </p>
-              </entry>
-              <entry rev="2.0.0">
-                <p>
-                  refresh_after_connect=true
-                </p>
-              </entry>
-              <entry>
-                <p>
-                  Updates Impala metadata upon connection. Same as running the
-                  <codeph><xref href="impala_invalidate_metadata.xml#invalidate_metadata">INVALIDATE
-                  METADATA</xref></codeph> statement after connecting. (This option was originally named when the
-                  <codeph>REFRESH</codeph> statement did the extensive metadata updates now performed by
-                  <codeph>INVALIDATE METADATA</codeph>.)
                 </p>
               </entry>
             </row>
@@ -547,6 +559,15 @@ under the License.
                 or in an interactive shell session.
                 Within a SQL statement, you substitute the value by using the notation <codeph>${var:<varname>variable_name</varname>}</codeph>.
                 This feature is available in <keyword keyref="impala25_full"/> and higher.
+              </entry>
+            </row>
+            <row rev="2.3.0 IMPALA-2143">
+              <entry>--auth_creds_ok_in_clear</entry>
+              <entry>N/A</entry>
+              <entry>
+                Allows LDAP authentication to be used with an insecure connection to the shell.
+                WARNING: This will allow authentication credentials to be sent unencrypted,
+                and hence may be vulnerable to an attack.
               </entry>
             </row>
           </tbody>

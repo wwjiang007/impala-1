@@ -524,7 +524,9 @@ struct FloatVal : public AnyVal {
   }
 
   bool operator==(const FloatVal& other) const {
-    return is_null == other.is_null && val == other.val;
+    if (is_null && other.is_null) return true;
+    if (is_null || other.is_null) return false;
+    return val == other.val;
   }
   bool operator!=(const FloatVal& other) const { return !(*this == other); }
 };
@@ -599,7 +601,9 @@ struct StringVal : public AnyVal {
 
   /// Construct a StringVal from NULL-terminated c-string. Note: this does not make a
   /// copy of ptr so the underlying string must exist as long as this StringVal does.
-  StringVal(const char* ptr) : len(strlen(ptr)), ptr((uint8_t*)ptr) {}
+  StringVal(const char* ptr)
+    : len(strlen(ptr)),
+      ptr(const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(ptr))) {}
 
   /// Creates a StringVal, allocating a new buffer with 'len'. This should
   /// be used to return StringVal objects in UDF/UDAs that need to allocate new

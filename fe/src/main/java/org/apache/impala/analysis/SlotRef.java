@@ -22,7 +22,7 @@ import java.util.List;
 import java.util.Set;
 
 import org.apache.impala.analysis.Path.PathType;
-import org.apache.impala.catalog.Table;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.TableLoadingException;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
@@ -114,7 +114,7 @@ public class SlotRef extends Expr {
     }
 
     numDistinctValues_ = desc_.getStats().getNumDistinctValues();
-    Table rootTable = resolvedPath.getRootTable();
+    FeTable rootTable = resolvedPath.getRootTable();
     if (rootTable != null && rootTable.getNumRows() > 0) {
       // The NDV cannot exceed the #rows in the table.
       numDistinctValues_ = Math.min(numDistinctValues_, rootTable.getNumRows());
@@ -151,26 +151,6 @@ public class SlotRef extends Expr {
     if (label_ != null) return label_;
     if (rawPath_ != null) return ToSqlUtils.getPathSql(rawPath_);
     return "<slot " + Integer.toString(desc_.getId().asInt()) + ">";
-  }
-
-  /**
-   * Checks if this slotRef refers to an array "pos" pseudo-column.
-   *
-   * Note: checking whether the column is null distinguishes between top-level columns
-   * and nested types. This check more specifically looks just for a reference to the
-   * "pos" field of an array type.
-   */
-  public boolean isArrayPosRef() {
-    TupleDescriptor parent = getDesc().getParent();
-    if (parent == null) return false;
-    Type parentType = parent.getType();
-    if (parentType instanceof CollectionStructType) {
-      if (((CollectionStructType)parentType).isArrayStruct() &&
-          getDesc().getLabel().equals(Path.ARRAY_POS_FIELD_NAME)) {
-        return true;
-      }
-    }
-    return false;
   }
 
   @Override

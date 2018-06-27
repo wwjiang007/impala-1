@@ -34,7 +34,6 @@
 #include "gen-cpp/Frontend_types.h"
 #include "rpc/thrift-server.h"
 #include "common/status.h"
-#include "service/frontend.h"
 #include "service/query-options.h"
 #include "util/condition-variable.h"
 #include "util/metrics.h"
@@ -43,8 +42,6 @@
 #include "util/simple-logger.h"
 #include "util/thread-pool.h"
 #include "util/time.h"
-#include "runtime/coordinator.h"
-#include "runtime/runtime-state.h"
 #include "runtime/timestamp-value.h"
 #include "runtime/types.h"
 #include "statestore/statestore-subscriber.h"
@@ -72,6 +69,7 @@ class TQueryOptions;
 class TGetExecSummaryResp;
 class TGetExecSummaryReq;
 class ClientRequestState;
+class QuerySchedule;
 
 /// An ImpalaServer contains both frontend and backend functionality;
 /// it implements ImpalaService (Beeswax), ImpalaHiveServer2Service (HiveServer2)
@@ -114,11 +112,6 @@ class ClientRequestState;
 /// 6. ClientRequestState::expiration_data_lock_
 /// 7. Coordinator::exec_summary_lock
 ///
-/// Coordinator::lock_ should not be acquired at the same time as the
-/// ImpalaServer/SessionState/ClientRequestState locks. Aside from
-/// Coordinator::exec_summary_lock_ the Coordinator's lock ordering is independent of
-/// the above lock ordering.
-///
 /// The following locks are not held in conjunction with other locks:
 /// * query_log_lock_
 /// * session_timeout_lock_
@@ -145,8 +138,13 @@ class ImpalaServer : public ImpalaServiceIf,
   ~ImpalaServer();
 
   /// Initializes and starts RPC services and other subsystems (like audit logging).
-  /// Returns an error if starting any services failed. If the port is <= 0, their
-  ///respective service will not be started.
+  /// Returns an error if starting any services failed.
+  ///
+  /// Different port values have special behaviour. A port > 0 explicitly specifies
+  /// the port the server run on. A port value of 0 means to choose an arbitrary
+  /// ephemeral port in tests and to not start the service in a daemon. A port < 0
+  /// always means to not start the service. The port values can be obtained after
+  /// Start() by calling GetThriftBackendPort(), GetBeeswaxPort() or GetHS2Port().
   Status Start(int32_t thrift_be_port, int32_t beeswax_port, int32_t hs2_port);
 
   /// Blocks until the server shuts down (by calling Shutdown()).
@@ -284,7 +282,10 @@ class ImpalaServer : public ImpalaServiceIf,
   /// Prepares the given query context by populating fields required for evaluating
   /// certain expressions, such as now(), pid(), etc. Should be called before handing
   /// the query context to the frontend for query compilation.
-  static void PrepareQueryContext(TQueryCtx* query_ctx);
+  void PrepareQueryContext(TQueryCtx* query_ctx);
+
+  /// Static helper for PrepareQueryContext() that is used from expr-benchmark.
+  static void PrepareQueryContext(const TNetworkAddress& backend_addr, TQueryCtx* query_ctx);
 
   /// SessionHandlerIf methods
 
@@ -355,6 +356,22 @@ class ImpalaServer : public ImpalaServiceIf,
 
   /// Returns true if this is an executor, false otherwise.
   bool IsExecutor();
+
+  /// Returns the port that the thrift backend server is listening on. Valid to call after
+  /// the server has started successfully.
+  int GetThriftBackendPort();
+
+  /// Returns the network address that the thrift backend server is listening on. Valid
+  /// to call after the server has started successfully.
+  TNetworkAddress GetThriftBackendAddress();
+
+  /// Returns the port that the Beeswax server is listening on. Valid to call after
+  /// the server has started successfully.
+  int GetBeeswaxPort();
+
+  /// Returns the port that the Beeswax server is listening on. Valid to call after
+  /// the server has started successfully.
+  int GetHS2Port();
 
   typedef boost::unordered_map<std::string, TBackendDescriptor> BackendDescriptorMap;
   const BackendDescriptorMap& GetKnownBackends();
@@ -428,7 +445,9 @@ class ImpalaServer : public ImpalaServiceIf,
     /// For HS2 only, the protocol version this session is expecting.
     apache::hive::service::cli::thrift::TProtocolVersion::type hs2_version;
 
-    /// Inflight queries belonging to this session
+    /// Inflight queries belonging to this session. It represents the set of queries that
+    /// are either queued or have started executing. Used primarily to identify queries
+    /// that need to be closed if the session closes or expires.
     boost::unordered_set<TUniqueId> inflight_queries;
 
     /// Total number of queries run as part of this session.
@@ -471,6 +490,7 @@ class ImpalaServer : public ImpalaServiceIf,
   friend class ChildQuery;
   friend class ImpalaHttpHandler;
   friend struct SessionState;
+  friend class ImpalaServerTest;
 
   boost::scoped_ptr<ImpalaHttpHandler> http_handler_;
 
@@ -487,16 +507,14 @@ class ImpalaServer : public ImpalaServiceIf,
   /// Updates the number of databases / tables metrics from the FE catalog
   Status UpdateCatalogMetrics() WARN_UNUSED_RESULT;
 
-  /// Starts asynchronous execution of query. Creates ClientRequestState (returned
-  /// in exec_state), registers it and calls Coordinator::Execute().
-  /// If it returns with an error status, exec_state will be NULL and nothing
-  /// will have been registered in client_request_state_map_.
-  /// session_state is a ptr to the session running this query and must have
-  /// been checked out.
-  /// query_session_state is a snapshot of session state that changes when the
-  /// query was run. (e.g. default database).
-  Status Execute(TQueryCtx* query_ctx,
-      std::shared_ptr<SessionState> session_state,
+  /// Depending on the query type, this either submits the query to the admission
+  /// controller for performing async admission control or starts asynchronous execution
+  /// of query. Creates ClientRequestState (returned in exec_state), registers it and
+  /// calls ClientRequestState::Execute(). If it returns with an error status, exec_state
+  /// will be NULL and nothing will have been registered in client_request_state_map_.
+  /// session_state is a ptr to the session running this query and must have been checked
+  /// out.
+  Status Execute(TQueryCtx* query_ctx, std::shared_ptr<SessionState> session_state,
       std::shared_ptr<ClientRequestState>* exec_state) WARN_UNUSED_RESULT;
 
   /// Implements Execute() logic, but doesn't unregister query on error.
@@ -709,9 +727,9 @@ class ImpalaServer : public ImpalaServiceIf,
     // The most recent time this query was actively being processed, in Unix milliseconds.
     int64_t last_active_time_ms;
 
-    /// Request pool to which the request was submitted for admission, or an empty string
-    /// if this request doesn't have a pool.
-    std::string request_pool;
+    /// Resource pool to which the request was submitted for admission, or an empty
+    /// string if this request doesn't go through admission control.
+    std::string resource_pool;
 
     /// Initialise from an exec_state. If copy_profile is true, print the query
     /// profile to a string and copy that into this.profile (which is expensive),
@@ -792,11 +810,11 @@ class ImpalaServer : public ImpalaServiceIf,
   void CancelFromThreadPool(uint32_t thread_id,
       const CancellationWork& cancellation_work);
 
-  /// Helper method to add any pool query options to the query_ctx. Must be called before
-  /// ExecuteInternal() at which point the TQueryCtx is const and cannot be mutated.
-  /// override_options_mask indicates which query options can be overridden by the pool
-  /// default query options.
-  void AddPoolQueryOptions(TQueryCtx* query_ctx,
+  /// Helper method to add the pool name and query options to the query_ctx. Must be
+  /// called before ExecuteInternal() at which point the TQueryCtx is const and cannot
+  /// be mutated. override_options_mask indicates which query options can be overridden
+  /// by the pool default query options.
+  void AddPoolConfiguration(TQueryCtx* query_ctx,
       const QueryOptionsMask& override_options_mask);
 
   /// Register timeout value upon opening a new session. This will wake up
@@ -819,6 +837,18 @@ class ImpalaServer : public ImpalaServiceIf,
 
   /// Expire 'crs' and cancel it with status 'status'.
   void ExpireQuery(ClientRequestState* crs, const Status& status);
+
+  typedef boost::unordered_map<std::string, boost::unordered_set<std::string>>
+      AuthorizedProxyMap;
+  /// Populates authorized proxy config into the given map.
+  /// For example:
+  /// - authorized_proxy_config: foo=abc,def;bar=ghi
+  /// - authorized_proxy_config_delimiter: ,
+  /// - authorized_proxy_map: {foo:[abc, def], bar=s[ghi]}
+  static Status PopulateAuthorizedProxyConfig(
+      const std::string& authorized_proxy_config,
+      const std::string& authorized_proxy_config_delimiter,
+      AuthorizedProxyMap* authorized_proxy_map);
 
   /// Guards query_log_ and query_log_index_
   boost::mutex query_log_lock_;
@@ -960,7 +990,8 @@ class ImpalaServer : public ImpalaServiceIf,
   /// Protects query_locations_. Not held in conjunction with other locks.
   boost::mutex query_locations_lock_;
 
-  /// A map from backend to the list of queries currently running there.
+  /// A map from backend to the list of queries currently running or scheduled to run
+  /// there.
   typedef boost::unordered_map<TNetworkAddress, boost::unordered_set<TUniqueId>>
       QueryLocations;
   QueryLocations query_locations_;
@@ -1019,12 +1050,14 @@ class ImpalaServer : public ImpalaServiceIf,
   /// update. Updated with each catalog topic heartbeat from the statestore.
   int64_t min_subscriber_catalog_topic_version_;
 
-  /// Map of short usernames of authorized proxy users to the set of user(s) they are
+  /// Map of short usernames of authorized proxy users to the set of users they are
   /// allowed to delegate to. Populated by parsing the --authorized_proxy_users_config
   /// flag.
-  typedef boost::unordered_map<std::string, boost::unordered_set<std::string>>
-      ProxyUserMap;
-  ProxyUserMap authorized_proxy_user_config_;
+  AuthorizedProxyMap authorized_proxy_user_config_;
+  /// Map of short usernames of authorized proxy users to the set of groups they are
+  /// allowed to delegate to. Populated by parsing the --authorized_proxy_groups_config
+  /// flag.
+  AuthorizedProxyMap authorized_proxy_group_config_;
 
   /// Guards queries_by_timestamp_. See "Locking" in the class comment for lock
   /// acquisition order.

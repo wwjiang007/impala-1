@@ -78,14 +78,29 @@ enum TImpalaQueryOptions {
   DEFAULT_ORDER_BY_LIMIT, // Removed
 
   // DEBUG ONLY:
-  // If set to
-  //   "[<backend number>:]<node id>:<TExecNodePhase>:<TDebugAction>",
-  // the exec node with the given id will perform the specified action in the given
-  // phase. If the optional backend number (starting from 0) is specified, only that
-  // backend instance will perform the debug action, otherwise all backends will behave
-  // in that way.
-  // If the string doesn't have the required format or if any of its components is
-  // invalid, the option is ignored.
+  // Accepted formats:
+  // 1. ExecNode actions
+  //  "[<instance idx>:]<node id>:<TExecNodePhase>:<TDebugAction>",
+  //  the exec node with the given id will perform the specified action in the given
+  //  phase. If the optional backend number (starting from 0) is specified, only that
+  //  backend instance will perform the debug action, otherwise all backends will behave
+  //  in that way.
+  //  If the string doesn't have the required format or if any of its components is
+  //  invalid, the option is ignored.
+  //
+  // 2. Global actions
+  //  "<global label>:<command>@<param0>@<param1>@...<paramN>",
+  //  global labels are marked in the code with DEBUG_ACTION*() macros.
+  //  Available global actions:
+  //  - SLEEP@<ms> will sleep for the 'ms' milliseconds.
+  //  - JITTER@<ms>[@<probability>] will sleep for a random amount of time between 0
+  //    and 'ms' milliseconds with the given probability. If <probability> is omitted,
+  //    it is 1.0.
+  //  - FAIL[@<probability>] returns an INTERNAL_ERROR status with the given
+  //    probability. If <probability> is omitted, it is 1.0.
+  //
+  // Only a single ExecNode action is allowed, but multiple global actions can be
+  // specified. To specify multiple actions, separate them with "|".
   DEBUG_ACTION,
 
   ABORT_ON_DEFAULT_LIMIT_EXCEEDED, // Removed
@@ -283,6 +298,34 @@ enum TImpalaQueryOptions {
   // not include time spent in planning, scheduling or admission control. A value of 0
   // means no time limit.
   EXEC_TIME_LIMIT_S,
+
+  // When a query has both grouping and distinct exprs, impala can optionally include the
+  // distinct exprs in the hash exchange of the first aggregation phase to spread the data
+  // among more nodes. However, this plan requires another hash exchange on the grouping
+  // exprs in the second phase which is not required when omitting the distinct exprs in
+  // the first phase. Shuffling by both is better if the grouping exprs have low NDVs.
+  SHUFFLE_DISTINCT_EXPRS,
+
+  // This only has an effect if memory-estimate-based admission control is enabled, i.e.
+  // max_mem_resources is set for the pool and, *contrary to best practices*, MEM_LIMIT
+  // is not set. In that case, then min(MAX_MEM_ESTIMATE_FOR_ADMISSION,
+  // planner memory estimate) is used for admission control purposes. This provides a
+  // workaround if the planner's memory estimate is too high and prevents a runnable
+  // query from being admitted. 0 or -1 means this has no effect. Defaults to 0.
+  MAX_MEM_ESTIMATE_FOR_ADMISSION,
+
+  // Admission control will reject queries when the number of reserved threads per backend
+  // for the query exceeds this number. 0 or -1 means this has no effect.
+  THREAD_RESERVATION_LIMIT,
+
+  // Admission control will reject queries when the total number of reserved threads
+  // across all backends for the query exceeds this number. 0 or -1 means this has no
+  // effect.
+  THREAD_RESERVATION_AGGREGATE_LIMIT,
+
+  // Overrides the -kudu_read_mode flag to set the consistency level for Kudu scans.
+  // Possible values are DEFAULT, READ_LATEST, and READ_AT_SNAPSHOT.
+  KUDU_READ_MODE,
 }
 
 // The summary of a DML statement.

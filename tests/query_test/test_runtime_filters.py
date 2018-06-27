@@ -22,11 +22,17 @@ import time
 
 from tests.common.environ import specific_build_type_timeout
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfLocal
+from tests.common.skip import SkipIfLocal, SkipIfIsilon
 
 WAIT_TIME_MS = specific_build_type_timeout(60000, slow_build_timeout=100000)
 
+# Some of the queries in runtime_filters consume a lot of memory, leading to
+# significant memory reservations in parallel tests.
+# Skipping Isilon due to IMPALA-6998. TODO: Remove when there's a holistic revamp of
+# what tests to run for non-HDFS platforms
+@pytest.mark.execute_serially
 @SkipIfLocal.multiple_impalad
+@SkipIfIsilon.jira(reason="IMPALA-6998")
 class TestRuntimeFilters(ImpalaTestSuite):
   @classmethod
   def get_workload(cls):
@@ -48,8 +54,8 @@ class TestRuntimeFilters(ImpalaTestSuite):
     mode"""
     now = time.time()
     self.run_test_case('QueryTest/runtime_filters_wait', vector)
-    duration = time.time() - now
-    assert duration < WAIT_TIME_MS, \
+    duration_s = time.time() - now
+    assert duration_s < (WAIT_TIME_MS / 1000), \
         "Query took too long (%ss, possibly waiting for missing filters?)" % str(duration)
 
   def test_file_filtering(self, vector):
@@ -85,8 +91,8 @@ class TestBloomFilters(ImpalaTestSuite):
     mode"""
     now = time.time()
     self.run_test_case('QueryTest/bloom_filters_wait', vector)
-    duration = time.time() - now
-    assert duration < 60, \
+    duration_s = time.time() - now
+    assert duration_s < (WAIT_TIME_MS / 1000), \
         "Query took too long (%ss, possibly waiting for missing filters?)" % str(duration)
 
 

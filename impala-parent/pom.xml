@@ -42,7 +42,7 @@ under the License.
     <hbase.version>${env.IMPALA_HBASE_VERSION}</hbase.version>
     <parquet.version>${env.IMPALA_PARQUET_VERSION}</parquet.version>
     <kite.version>${env.IMPALA_KITE_VERSION}</kite.version>
-    <thrift.version>${env.IMPALA_THRIFT_JAVA_VERSION}</thrift.version>
+    <thrift.version>0.9.3</thrift.version>
     <impala.extdatasrc.api.version>1.0-SNAPSHOT</impala.extdatasrc.api.version>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <kudu.version>${env.KUDU_JAVA_VERSION}</kudu.version>
@@ -51,7 +51,7 @@ under the License.
     <junit.version>4.12</junit.version>
     <!-- Beware compatibility requirements with Thrift and
          KMS; see IMPALA-4210. -->
-    <httpcomponents.core.version>4.2.5</httpcomponents.core.version>
+    <httpcomponents.core.version>4.4.9</httpcomponents.core.version>
     <yarn-extras.version>${project.version}</yarn-extras.version>
     <eclipse.output.directory>eclipse-classes</eclipse.output.directory>
     <guava.version>11.0.2</guava.version>
@@ -60,17 +60,16 @@ under the License.
 
   <repositories>
     <repository>
-       <id>apache.snapshots</id>
-       <name>Apache Development Snapshot Repository</name>
-        <url>https://repository.apache.org/content/repositories/snapshots/</url>
-        <releases>
-            <enabled>false</enabled>
-        </releases>
-        <snapshots>
-            <enabled>true</enabled>
-        </snapshots>
+      <id>apache.snapshots</id>
+      <name>Apache Development Snapshot Repository</name>
+      <url>https://repository.apache.org/content/repositories/snapshots/</url>
+      <releases>
+        <enabled>false</enabled>
+      </releases>
+      <snapshots>
+        <enabled>true</enabled>
+      </snapshots>
     </repository>
-
     <repository>
       <id>cdh.rcs.releases.repo</id>
       <url>https://repository.cloudera.com/content/groups/cdh-releases-rcs</url>
@@ -88,32 +87,11 @@ under the License.
       </snapshots>
     </repository>
     <repository>
-      <id>cdh.snapshots.repo</id>
-      <url>https://repository.cloudera.com/content/repositories/snapshots</url>
-      <name>CDH Snapshots Repository</name>
-      <snapshots>
-        <enabled>true</enabled>
-      </snapshots>
-    </repository>
-    <repository>
       <id>cloudera.thirdparty.repo</id>
       <url>https://repository.cloudera.com/content/repositories/third-party</url>
       <name>Cloudera Third Party Repository</name>
       <snapshots>
         <enabled>false</enabled>
-      </snapshots>
-    </repository>
-
-    <!-- This is needed for java-cup. TODO add the plugin to our maven repo -->
-    <repository>
-      <id>sonatype-nexus-snapshots</id>
-      <name>Sonatype Nexus Snapshots</name>
-      <url>https://oss.sonatype.org/content/repositories/snapshots</url>
-      <releases>
-        <enabled>false</enabled>
-      </releases>
-      <snapshots>
-        <enabled>true</enabled>
       </snapshots>
     </repository>
   </repositories>
@@ -135,19 +113,47 @@ under the License.
         <enabled>true</enabled>
       </snapshots>
     </pluginRepository>
-
-    <!-- This is needed for the cup maven plugin. TODO add the plugin to our maven repo -->
-    <pluginRepository>
-      <id>sonatype-nexus-snapshots</id>
-      <name>Sonatype Nexus Snapshots</name>
-      <url>https://oss.sonatype.org/content/repositories/snapshots</url>
-      <releases>
-        <enabled>false</enabled>
-      </releases>
-      <snapshots>
-        <enabled>true</enabled>
-      </snapshots>
-    </pluginRepository>
   </pluginRepositories>
+
+  <profiles>
+    <profile>
+      <id>impala-mini-cluster-profile-2</id>
+      <activation>
+        <property>
+          <name>env.IMPALA_MINICLUSTER_PROFILE</name>
+          <value>2</value>
+        </property>
+      </activation>
+      <repositories>
+        <repository>
+          <id>cdh.snapshots.repo</id>
+          <url>https://repository.cloudera.com/content/repositories/snapshots</url>
+          <name>CDH Snapshots Repository</name>
+          <snapshots>
+            <enabled>true</enabled>
+          </snapshots>
+        </repository>
+      </repositories>
+    </profile>
+    <profile>
+      <id>impala-mini-cluster-profile-3</id>
+      <activation>
+        <property>
+          <name>env.IMPALA_MINICLUSTER_PROFILE</name>
+          <value>3</value>
+        </property>
+      </activation>
+      <repositories>
+        <repository>
+          <id>impala.cdh.repo</id>
+          <url>https://${env.CDH_DOWNLOAD_HOST}/build/cdh_components/${env.CDH_BUILD_NUMBER}/maven</url>
+          <name>Impala CDH Repository</name>
+          <snapshots>
+            <enabled>true</enabled>
+          </snapshots>
+        </repository>
+      </repositories>
+    </profile>
+  </profiles>
 
 </project>

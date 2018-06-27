@@ -136,7 +136,8 @@ IntVal ValidateMem(FunctionContext* context) {
 }
 
 StringVal TimeToString(FunctionContext* context, const TimestampVal& time) {
-  ptime t(*(date*)&time.date);
+  ptime t(*const_cast<date*>(reinterpret_cast<const date*>(&time.date)));
+  // ptime t(*(date*)&time.date); is this conversion correct?
   t += nanoseconds(time.time_of_day);
   stringstream ss;
   ss << to_iso_extended_string(t.date()) << " " << to_simple_string(t.time_of_day());
@@ -247,6 +248,31 @@ TEST(UdfTest, TestDecimalVal) {
   // nulls
   EXPECT_EQ(null1.is_null, null2.is_null);
   EXPECT_NE(null1.is_null, d1.is_null);
+}
+
+TEST(UdfTest, TestFloatVal) {
+  FloatVal f1(1.0);
+  FloatVal f2(1.0);
+
+  // 1.0 == 1.0
+  EXPECT_EQ(f1, f2);
+
+  // convert to nulls
+  f1.is_null = true;
+  f2.is_null = true;
+  // nulls
+  EXPECT_EQ(f1, f2);
+
+  // change the value contained in one of the nulls
+  f1.val = 0.0;
+  // nulls
+  EXPECT_EQ(f1, f2);
+
+  // convert to non-nulls
+  f1.is_null = false;
+  f2.is_null = false;
+  // 0.0 != 1.0
+  EXPECT_NE(f1, f2);
 }
 
 TEST(UdfTest, TestVarArgs) {

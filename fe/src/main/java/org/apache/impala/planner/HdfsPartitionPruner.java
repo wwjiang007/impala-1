@@ -39,8 +39,9 @@ import org.apache.impala.analysis.NullLiteral;
 import org.apache.impala.analysis.SlotId;
 import org.apache.impala.analysis.SlotRef;
 import org.apache.impala.analysis.TupleDescriptor;
-import org.apache.impala.catalog.HdfsPartition;
-import org.apache.impala.catalog.HdfsTable;
+import org.apache.impala.catalog.FeFsPartition;
+import org.apache.impala.catalog.FeFsTable;
+import org.apache.impala.catalog.PrunablePartition;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.rewrite.BetweenToCompoundRule;
@@ -49,7 +50,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Preconditions;
+import com.google.common.base.Predicate;
 import com.google.common.base.Predicates;
+import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 
@@ -77,7 +80,7 @@ public class HdfsPartitionPruner {
   // Partition batch size used during partition pruning.
   private final static int PARTITION_PRUNING_BATCH_SIZE = 1024;
 
-  private final HdfsTable tbl_;
+  private final FeFsTable tbl_;
   private final List<SlotId> partitionSlots_;
 
   // For converting BetweenPredicates to CompoundPredicates so they can be
@@ -86,8 +89,8 @@ public class HdfsPartitionPruner {
       new ExprRewriter(BetweenToCompoundRule.INSTANCE);
 
   public HdfsPartitionPruner(TupleDescriptor tupleDesc) {
-    Preconditions.checkState(tupleDesc.getTable() instanceof HdfsTable);
-    tbl_ = (HdfsTable)tupleDesc.getTable();
+    Preconditions.checkState(tupleDesc.getTable() instanceof FeFsTable);
+    tbl_ = (FeFsTable)tupleDesc.getTable();
     partitionSlots_ = tupleDesc.getPartitionSlots();
 
   }
@@ -97,7 +100,7 @@ public class HdfsPartitionPruner {
    * that conjuncts used for filtering will be removed from the list 'conjuncts'.
    * If 'allowEmpty' is False, empty partitions are not returned.
    */
-  public List<HdfsPartition> prunePartitions(
+  public List<? extends FeFsPartition> prunePartitions(
       Analyzer analyzer, List<Expr> conjuncts, boolean allowEmpty)
       throws ImpalaException {
     // Start with creating a collection of partition filters for the applicable conjuncts.
@@ -154,12 +157,16 @@ public class HdfsPartitionPruner {
     evalPartitionFiltersInBe(partitionFilters, matchingPartitionIds, analyzer);
 
     // Populate the list of valid, non-empty partitions to process
-    List<HdfsPartition> results = Lists.newArrayList();
-    Map<Long, HdfsPartition> partitionMap = tbl_.getPartitionMap();
-    for (Long id: matchingPartitionIds) {
-      HdfsPartition partition = partitionMap.get(id);
-      Preconditions.checkNotNull(partition);
-      if (partition.hasFileDescriptors() || allowEmpty) results.add(partition);
+    List<? extends FeFsPartition> results = tbl_.loadPartitions(
+        matchingPartitionIds);
+    if (!allowEmpty) {
+      results = Lists.newArrayList(Iterables.filter(results,
+          new Predicate<FeFsPartition>() {
+            @Override
+            public boolean apply(FeFsPartition partition) {
+              return partition.hasFileDescriptors();
+            }
+          }));
     }
     return results;
   }
@@ -269,17 +276,15 @@ public class HdfsPartitionPruner {
     }
     if (op == Operator.DISTINCT_FROM) {
       // Case: SlotRef IS DISTINCT FROM Literal
+      matchingIds.addAll(tbl_.getPartitionIds());
       if (literal instanceof NullLiteral) {
-        matchingIds.addAll(tbl_.getPartitionIds());
         Set<Long> nullIds = tbl_.getNullPartitionIds(partitionPos);
         matchingIds.removeAll(nullIds);
-        return matchingIds;
       } else {
-        matchingIds.addAll(tbl_.getPartitionIds());
         HashSet<Long> ids = partitionValueMap.get(literal);
         if (ids != null) matchingIds.removeAll(ids);
-        return matchingIds;
       }
+      return matchingIds;
     }
     if (op == Operator.NE) {
       // Case: SlotRef != Literal
@@ -443,16 +448,16 @@ public class HdfsPartitionPruner {
    */
   private void evalPartitionFiltersInBe(List<HdfsPartitionFilter> filters,
       HashSet<Long> matchingPartitionIds, Analyzer analyzer) throws ImpalaException {
-    Map<Long, HdfsPartition> partitionMap = tbl_.getPartitionMap();
+    Map<Long, ? extends PrunablePartition> partitionMap = tbl_.getPartitionMap();
     // Set of partition ids that pass a filter
     HashSet<Long> matchingIds = Sets.newHashSet();
     // Batch of partitions
-    ArrayList<HdfsPartition> partitionBatch = Lists.newArrayList();
+    ArrayList<PrunablePartition> partitionBatch = Lists.newArrayList();
     // Identify the partitions that pass all filters.
     for (HdfsPartitionFilter filter: filters) {
       // Iterate through the currently valid partitions
       for (Long id: matchingPartitionIds) {
-        HdfsPartition p = partitionMap.get(id);
+        PrunablePartition p = partitionMap.get(id);
         Preconditions.checkState(
             p.getPartitionValues().size() == tbl_.getNumClusteringCols());
         // Add the partition to the current batch

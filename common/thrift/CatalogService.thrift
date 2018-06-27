@@ -129,6 +129,12 @@ struct TDdlExecRequest {
 
   // True if SYNC_DDL is set in query options
   22: required bool sync_ddl
+
+  // Parameters for COMMENT ON
+  23: optional JniCatalog.TCommentOnParams comment_on_params
+
+  // Parameters for ALTER DATABASE
+  24: optional JniCatalog.TAlterDbParams alter_db_params
 }
 
 // Response from executing a TDdlExecRequest

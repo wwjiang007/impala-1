@@ -93,8 +93,18 @@ class BaseImpalaService(object):
 
   def get_metric_value(self, metric_name, default_value=None):
     """Returns the value of the the given metric name from the Impala debug webpage"""
+    return self.get_metric_values([metric_name], [default_value])[0]
+
+  def get_metric_values(self, metric_names, default_values=None):
+    """Returns the value of the given metrics from the Impala debug webpage. If
+    default_values is provided and a metric is not present, the default value
+    is returned instead."""
+    if default_values is None:
+      default_values = [None for m in metric_names]
+    assert len(metric_names) == len(default_values)
     metrics = json.loads(self.read_debug_webpage('jsonmetrics?json'))
-    return metrics.get(metric_name, default_value)
+    return [metrics.get(metric_name, default_value)
+            for metric_name, default_value in zip(metric_names, default_values)]
 
   def wait_for_metric_value(self, metric_name, expected_value, timeout=10, interval=1):
     start_time = time()
@@ -123,6 +133,35 @@ class BaseImpalaService(object):
                json.dumps(self.read_debug_webpage('queries?json')),
                json.dumps(self.read_debug_webpage('threadz?json')),
                json.dumps(self.read_debug_webpage('rpcz?json')))
+
+  def get_catalog_object_dump(self, object_type, object_name):
+    """ Gets the web-page for the given 'object_type' and 'object_name'."""
+    return self.read_debug_webpage('catalog_object?object_type=%s&object_name=%s' %\
+        (object_type, object_name))
+
+  def get_catalog_objects(self, excludes=['_impala_builtins']):
+    """ Returns a dictionary containing all catalog objects. Each entry's key is the fully
+        qualified object name and the value is a tuple of the form (type, version).
+        Does not return databases listed in the 'excludes' list."""
+    catalog = self.get_debug_webpage_json('catalog')
+    objects = {}
+    for db_desc in catalog["databases"]:
+      db_name = db_desc["name"]
+      if db_name in excludes:
+        continue
+      db = self.get_catalog_object_dump('DATABASE', db_name)
+      objects[db_name] = ('DATABASE', self.extract_catalog_object_version(db))
+      for table_desc in db_desc["tables"]:
+        table_name = table_desc["fqtn"]
+        table = self.get_catalog_object_dump('TABLE', table_name)
+        objects[table_name] = ('TABLE', self.extract_catalog_object_version(table))
+    return objects
+
+  def extract_catalog_object_version(self, thrift_txt):
+    """ Extracts and returns the version of the catalog object's 'thrift_txt' representation."""
+    result = re.search(r'catalog_version \(i64\) = (\d+)', thrift_txt)
+    assert result, 'Unable to find catalog version in object: ' + thrift_txt
+    return int(result.group(1))
 
 # Allows for interacting with an Impalad instance to perform operations such as creating
 # new connections or accessing the debug webpage.
@@ -250,10 +289,6 @@ class ImpaladService(BaseImpalaService):
     hs2_client = TCLIService.Client(protocol)
     return hs2_client
 
-  def get_catalog_object_dump(self, object_type, object_name):
-    return self.read_debug_webpage('catalog_objects?object_type=%s&object_name=%s' %\
-        (object_type, object_name))
-
 
 # Allows for interacting with the StateStore service to perform operations such as
 # accessing the debug webpage.
@@ -273,6 +308,16 @@ class CatalogdService(BaseImpalaService):
     super(CatalogdService, self).__init__(hostname, webserver_port)
     self.service_port = service_port
 
-  def get_catalog_object_dump(self, object_type, object_name):
-    return self.read_debug_webpage('catalog_objects?object_type=%s&object_name=%s' %\
-        (object_type, object_name))
+  def get_catalog_version(self, timeout=10, interval=1):
+    """ Gets catalogd's latest catalog version. Retry for 'timeout'
+        seconds, sleeping 'interval' seconds between tries. If the
+        version cannot be obtained, this method fails."""
+    start_time = time()
+    while (time() - start_time < timeout):
+      try:
+        info = self.get_debug_webpage_json('catalog')
+        if "version" in info: return info['version']
+      except Exception:
+        LOG.info('Catalogd version not yet available.')
+      sleep(interval)
+    assert False, 'Catalog version not ready in expected time.'

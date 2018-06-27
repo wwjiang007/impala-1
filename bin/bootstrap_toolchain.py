@@ -35,6 +35,7 @@
 #
 #     python bootstrap_toolchain.py
 import logging
+import multiprocessing.pool
 import os
 import random
 import re
@@ -45,7 +46,7 @@ import sys
 import tempfile
 import time
 
-HOST = "https://native-toolchain.s3.amazonaws.com/build"
+TOOLCHAIN_HOST = "https://native-toolchain.s3.amazonaws.com/build"
 
 OS_MAPPING = {
   "centos6" : "ec2-package-centos-6",
@@ -155,7 +156,7 @@ def download_package(destination, package, compiler, platform_release=None):
   if package.url is None:
     url_path = "/{toolchain_build_id}/{product}/{version}-{compiler}/{file_name}".format(
         **format_params)
-    download_path = HOST + url_path
+    download_path = TOOLCHAIN_HOST + url_path
   else:
     download_path = package.url
 
@@ -350,22 +351,16 @@ extern "C" void %s() {
 
 def execute_many(f, args):
   """
-  Executes f(a) for a in args. If possible, uses a threadpool
-  to execute in parallel. The pool uses the number of CPUs
-  in the system as the default size.
+  Executes f(a) for a in args using a threadpool to execute in parallel.
+  The pool uses the smaller of 4 and the number of CPUs in the system
+  as the pool size.
   """
-  pool = None
-  try:
-    import multiprocessing.pool
-    pool = multiprocessing.pool.ThreadPool(processes=min(multiprocessing.cpu_count(), 4))
-    return pool.map(f, args, 1)
-  except ImportError:
-    # multiprocessing was introduced in Python 2.6.
-    # For older Pythons (CentOS 5), degrade to single-threaded execution:
-    return [ f(a) for a in args ]
+  pool = multiprocessing.pool.ThreadPool(processes=min(multiprocessing.cpu_count(), 4))
+  return pool.map(f, args, 1)
 
-def download_cdh_components(toolchain_root, cdh_components):
-  """Downloads and unpacks the CDH components into $CDH_COMPONENTS_HOME if not found."""
+def download_cdh_components(toolchain_root, cdh_components, url_prefix):
+  """Downloads and unpacks the CDH components for a given URL prefix into
+  $CDH_COMPONENTS_HOME if not found."""
   cdh_components_home = os.environ.get("CDH_COMPONENTS_HOME")
   if not cdh_components_home:
     logging.error("Impala environment not set up correctly, make sure "
@@ -376,9 +371,6 @@ def download_cdh_components(toolchain_root, cdh_components):
   if not os.path.exists(cdh_components_home):
     os.makedirs(cdh_components_home)
 
-  # The URL prefix of where CDH components live in S3.
-  download_path_prefix = HOST + "/cdh_components/"
-
   def download(component):
     pkg_directory = package_directory(cdh_components_home, component.name,
         component.version)
@@ -388,7 +380,7 @@ def download_cdh_components(toolchain_root, cdh_components):
     # Download the package if it doesn't exist
     file_name = "{0}-{1}.tar.gz".format(component.name, component.version)
     if component.url is None:
-      download_path = download_path_prefix + file_name
+      download_path = url_prefix + file_name
     else:
       download_path = component.url
     wget_and_unpack_package(download_path, file_name, cdh_components_home, False)
@@ -400,9 +392,15 @@ if __name__ == "__main__":
   By checking $IMPALA_HOME is present, we assume that IMPALA_{LIB}_VERSION will be present
   as well. Will create the directory specified by $IMPALA_TOOLCHAIN if it doesn't exist
   yet. Each of the packages specified in `packages` is downloaded and extracted into
-  $IMPALA_TOOLCHAIN. If $DOWNLOAD_CDH_COMPONENTS is true, this function will also download
-  the CDH components (i.e. hadoop, hbase, hive, llama, llama-minikidc and sentry) into the
-  directory specified by $CDH_COMPONENTS_HOME.
+  $IMPALA_TOOLCHAIN. If $DOWNLOAD_CDH_COMPONENTS is true, the presence of
+  $CDH_DOWNLOAD_HOST and $CDH_BUILD_NUMBER will be checked and this function will also
+  download the following CDH components into the directory specified by
+  $CDH_COMPONENTS_HOME.
+  - hadoop (downloaded from $CDH_DOWNLOAD_HOST for a given $CDH_BUILD_NUMBER)
+  - hbase (downloaded from $CDH_DOWNLOAD_HOST for a given $CDH_BUILD_NUMBER)
+  - hive (downloaded from $CDH_DOWNLOAD_HOST for a given $CDH_BUILD_NUMBER)
+  - sentry (downloaded from $CDH_DOWNLOAD_HOST for a given $CDH_BUILD_NUMBER)
+  - llama-minikdc (downloaded from $TOOLCHAIN_HOST)
   """
   logging.basicConfig(level=logging.INFO,
       format='%(asctime)s %(threadName)s %(levelname)s: %(message)s')
@@ -427,14 +425,33 @@ if __name__ == "__main__":
   # LLVM and Kudu are the largest packages. Sort them first so that
   # their download starts as soon as possible.
   packages = map(Package, ["llvm", "kudu",
-      "avro", "binutils", "boost", "breakpad", "bzip2", "cmake", "crcutil",
+      "avro", "binutils", "boost", "breakpad", "bzip2", "cctz", "cmake", "crcutil",
       "flatbuffers", "gcc", "gflags", "glog", "gperftools", "gtest", "libev",
-      "lz4", "openldap", "openssl", "protobuf",
+      "lz4", "openldap", "openssl", "orc", "protobuf",
       "rapidjson", "re2", "snappy", "thrift", "tpc-h", "tpc-ds", "zlib"])
-  packages.insert(0, Package("llvm", "3.9.1-asserts"))
+  packages.insert(0, Package("llvm", "5.0.1-asserts"))
   bootstrap(toolchain_root, packages)
 
   # Download the CDH components if necessary.
-  if os.getenv("DOWNLOAD_CDH_COMPONENTS", "false") == "true":
-    cdh_components = map(Package, ["hadoop", "hbase", "hive", "llama-minikdc", "sentry"])
-    download_cdh_components(toolchain_root, cdh_components)
+  if not os.getenv("DOWNLOAD_CDH_COMPONENTS", "false") == "true": sys.exit(0)
+
+  if "CDH_DOWNLOAD_HOST" not in os.environ or "CDH_BUILD_NUMBER" not in os.environ:
+    logging.error("Impala environment not set up correctly, make sure "
+                  "impala-config.sh is sourced.")
+    sys.exit(1)
+
+  cdh_host = os.environ.get("CDH_DOWNLOAD_HOST")
+  cdh_build_number = os.environ.get("CDH_BUILD_NUMBER")
+
+  cdh_components = map(Package, ["hadoop", "hbase", "hive", "sentry"])
+  download_path_prefix= \
+      "https://{0}/build/cdh_components/{1}/tarballs/".format(cdh_host,
+                                                              cdh_build_number)
+  download_cdh_components(toolchain_root, cdh_components, download_path_prefix)
+
+
+  # llama-minikdc is used for testing and not something that Impala needs to be built
+  # against. It does not get updated very frequently unlike the other CDH components.
+  cdh_components = [Package("llama-minikdc")]
+  download_path_prefix = "{0}/cdh_components/".format(TOOLCHAIN_HOST)
+  download_cdh_components(toolchain_root, cdh_components, download_path_prefix)

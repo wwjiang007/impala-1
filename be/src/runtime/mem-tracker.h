@@ -107,7 +107,6 @@ class MemTracker {
   /// destruction to prevent other threads from getting a reference to the MemTracker
   /// via its parent. Only used to deregister the query-level MemTracker from the
   /// global hierarchy.
-  /// TODO: IMPALA-3200: this is also used by BufferedBlockMgr, which will be deleted.
   void CloseAndUnregisterFromParent();
 
   /// Include counters from a ReservationTracker in logs and other diagnostics.
@@ -234,6 +233,12 @@ class MemTracker {
       }
     }
   }
+
+  /// Transfer 'bytes' of consumption from this tracker to 'dst', updating
+  /// all ancestors up to the first shared ancestor. Must not be used if
+  /// 'dst' has a limit, or an ancestor with a limit, that is not a common
+  /// ancestor with the tracker, because this does not check memory limits.
+  void TransferTo(MemTracker* dst, int64_t bytes);
 
   /// Returns true if a valid limit of this tracker or one of its ancestors is
   /// exceeded.

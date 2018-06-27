@@ -70,7 +70,9 @@ class CmdStatus:
   ERROR = False
 
 class ImpalaPrettyTable(prettytable.PrettyTable):
-  """Patched version of PrettyTable that TODO"""
+  """Patched version of PrettyTable with different unicode handling - instead of throwing
+  exceptions when a character can't be converted to unicode, it is replaced with a
+  placeholder character."""
   def _unicode(self, value):
     if not isinstance(value, basestring):
       value = str(value)
@@ -105,6 +107,7 @@ class ImpalaShell(object, cmd.Cmd):
 
   # If not connected to an impalad, the server version is unknown.
   UNKNOWN_SERVER_VERSION = "Not Connected"
+  PROMPT_FORMAT = "[{host}:{port}] {db}> "
   DISCONNECTED_PROMPT = "[Not connected] > "
   UNKNOWN_WEBSERVER = "0.0.0.0"
   # Message to display in shell when cancelling a query
@@ -139,12 +142,14 @@ class ImpalaShell(object, cmd.Cmd):
     self.is_alive = True
 
     self.impalad = None
+    self.kerberos_host_fqdn = options.kerberos_host_fqdn
     self.use_kerberos = options.use_kerberos
     self.kerberos_service_name = options.kerberos_service_name
     self.use_ssl = options.ssl
     self.ca_cert = options.ca_cert
     self.user = options.user
     self.ldap_password = options.ldap_password
+    self.ldap_password_cmd = options.ldap_password_cmd
     self.use_ldap = options.use_ldap
 
     self.verbose = options.verbose
@@ -310,11 +315,15 @@ class ImpalaShell(object, cmd.Cmd):
     command = self.orig_cmd
     self.orig_cmd = None
     if not command:
-      print_to_stderr("Unexpected error: Failed to execute query due to command "\
+      print_to_stderr("Unexpected error: Failed to execute query due to command "
                       "is missing")
       sys.exit(1)
-    return self.imp_client.create_beeswax_query("%s %s" % (command, args),
-                                                 self.set_query_options)
+    # In order to deduce the correct cmd, parseline stripped the leading comment.
+    # To preserve the original query, the leading comment (if exists) will be
+    # prepended when constructing the query sent to the Impala front-end.
+    return self.imp_client.create_beeswax_query("%s%s %s" % (self.leading_comment or "",
+                                                command, args),
+                                                self.set_query_options)
 
   def do_shell(self, args):
     """Run a command on the shell
@@ -391,12 +400,13 @@ class ImpalaShell(object, cmd.Cmd):
     # Strip any comments to make a statement such as the following be considered as
     # ending with a delimiter:
     # select 1 + 1; -- this is a comment
-    line = sqlparse.format(line, strip_comments=True).rstrip()
+    line = sqlparse.format(line, strip_comments=True).encode('utf-8').rstrip()
     if line.endswith(ImpalaShell.CMD_DELIM):
       try:
         # Look for an open quotation in the entire command, and not just the
         # current line.
-        if self.partial_cmd: line = '%s %s' % (self.partial_cmd, line)
+        if self.partial_cmd:
+          line = sqlparse.format('%s %s' % (self.partial_cmd, line), strip_comments=True)
         self._shlex_split(line)
         return True
       # If the command ends with a delimiter, check if it has an open quotation.
@@ -414,8 +424,8 @@ class ImpalaShell(object, cmd.Cmd):
     # Iterate through the line and switch the state if a single or double quote is found
     # and ignore escaped single and double quotes if the line is considered open (meaning
     # a previous single or double quote has not been closed yet)
-      state_closed = True;
-      opener = None;
+      state_closed = True
+      opener = None
       for i, char in enumerate(line):
         if state_closed and (char in ['\'', '\"']):
           state_closed = False
@@ -423,7 +433,7 @@ class ImpalaShell(object, cmd.Cmd):
         elif not state_closed and opener == char:
           if line[i - 1] != '\\':
             state_closed = True
-            opener = None;
+            opener = None
 
       return state_closed
 
@@ -485,7 +495,7 @@ class ImpalaShell(object, cmd.Cmd):
     return completed_cmd
 
   def _new_impala_client(self):
-    return ImpalaClient(self.impalad, self.use_kerberos,
+    return ImpalaClient(self.impalad, self.kerberos_host_fqdn, self.use_kerberos,
                         self.kerberos_service_name, self.use_ssl,
                         self.ca_cert, self.user, self.ldap_password,
                         self.use_ldap)
@@ -579,7 +589,7 @@ class ImpalaShell(object, cmd.Cmd):
       # is necessary to find a proper function and here is a right place
       # because the lowering command in front of the finding can avoid a
       # side effect.
-      command, arg, line = self.parseline(line)
+      command, arg, line, leading_comment = self.parseline(line)
       if not line:
         return self.emptyline()
       if command is None:
@@ -593,6 +603,7 @@ class ImpalaShell(object, cmd.Cmd):
         try:
           func = getattr(self, 'do_' + command.lower())
           self.orig_cmd = command
+          self.leading_comment = leading_comment
         except AttributeError:
           return self.default(line)
         return func(arg)
@@ -772,7 +783,8 @@ class ImpalaShell(object, cmd.Cmd):
     if self.imp_client.connected:
       self._print_if_verbose('Connected to %s:%s' % self.impalad)
       self._print_if_verbose('Server version: %s' % self.server_version)
-      self.prompt = "[%s:%s] > " % self.impalad
+      self.prompt = ImpalaShell.PROMPT_FORMAT.format(
+        host=self.impalad[0], port=self.impalad[1], db=ImpalaShell.DEFAULT_DB)
       self._validate_database()
     try:
       self.imp_client.build_default_query_options_dict()
@@ -818,6 +830,11 @@ class ImpalaShell(object, cmd.Cmd):
         print_to_stderr("Socket error %s: %s" % (code, e))
         self.prompt = self.DISCONNECTED_PROMPT
     except Exception, e:
+      if self.ldap_password_cmd and \
+          self.ldap_password and \
+          self.ldap_password.endswith('\n'):
+        print_to_stderr("Warning: LDAP password contains a trailing newline. "
+                      "Did you use 'echo' instead of 'echo -n'?")
       print_to_stderr("Error connecting: %s, %s" % (type(e).__name__, e))
       # A secure connection may still be open. So we explicitly close it.
       self.imp_client.close_connection()
@@ -1121,7 +1138,8 @@ class ImpalaShell(object, cmd.Cmd):
     query = self._create_beeswax_query(args)
     # Set posix=True and add "'" to escaped quotes
     # to deal with escaped quotes in string literals
-    lexer = shlex.shlex(query.query.lstrip(), posix=True)
+    lexer = shlex.shlex(sqlparse.format(query.query.lstrip(), strip_comments=True)
+                        .encode('utf-8'), posix=True)
     lexer.escapedquotes += "'"
     # Because the WITH clause may precede DML or SELECT queries,
     # just checking the first token is insufficient.
@@ -1134,7 +1152,16 @@ class ImpalaShell(object, cmd.Cmd):
     """Executes a USE... query"""
     query = self._create_beeswax_query(args)
     if self._execute_stmt(query) is CmdStatus.SUCCESS:
-      self.current_db = args
+      self.current_db = args.strip('`').strip()
+      self.prompt = ImpalaShell.PROMPT_FORMAT.format(host=self.impalad[0],
+                                                     port=self.impalad[1],
+                                                     db=self.current_db)
+    elif args.strip('`') == self.current_db:
+      # args == current_db means -d option was passed but the "use [db]" operation failed.
+      # We need to set the current_db to None so that it does not show a database, which
+      # may not exist.
+      self.current_db = None
+      return CmdStatus.ERROR
     else:
       return CmdStatus.ERROR
 
@@ -1262,17 +1289,78 @@ class ImpalaShell(object, cmd.Cmd):
 
   def parseline(self, line):
     """Parse the line into a command name and a string containing
-    the arguments.  Returns a tuple containing (command, args, line).
+    the arguments.  Returns a tuple containing (command, args, line, leading comment).
     'command' and 'args' may be None if the line couldn't be parsed.
     'line' in return tuple is the rewritten original line, with leading
     and trailing space removed and special characters transformed into
-    their aliases.
+    their aliases. If the line contains a leading comment, the leading
+    comment will be removed in order to deduce a 'command' correctly.
+    The 'command' is used to determine which 'do_<command>' function to invoke.
+    The 'do_<command>' implementation can decide whether to retain or ignore the
+    leading comment.
+
+    Examples:
+
+    > /*comment*/ help connect;
+    line: help connect
+    args: connect
+    command: help
+    leading comment: /*comment*/
+
+    > /*comment*/ ? connect;
+    line: help connect
+    args: connect
+    command: help
+    leading comment: /*comment*/
+
+    > /*first comment*/ select /*second comment*/ 1;
+    line: select /*second comment*/ 1
+    args: /*second comment*/ 1
+    command: select
+    leading comment: /*first comment*/
     """
-    line = line.strip()
+    leading_comment, line = ImpalaShell.strip_leading_comment(line.strip())
+    line = line.encode('utf-8')
     if line and line[0] == '@':
       line = 'rerun ' + line[1:]
-    return super(ImpalaShell, self).parseline(line)
+    return super(ImpalaShell, self).parseline(line) + (leading_comment,)
 
+  @staticmethod
+  def strip_leading_comment(sql):
+    """
+    Filter a leading comment in the SQL statement. This function returns a tuple
+    containing (leading comment, line without the leading comment).
+    """
+    class StripLeadingCommentFilter:
+      def __init__(self):
+        self.comment = None
+
+      def _process(self, tlist):
+        token = tlist.token_first()
+        if self._is_comment(token):
+          self.comment = token.value
+          tidx = tlist.token_index(token)
+          tlist.tokens.pop(tidx)
+
+      def _is_comment(self, token):
+        if isinstance(token, sqlparse.sql.Comment):
+          return True
+        for comment in sqlparse.tokens.Comment:
+          if token.ttype == comment:
+            return True
+        return False
+
+      def process(self, stack, stmt):
+        [self.process(stack, sgroup) for sgroup in stmt.get_sublists()]
+        self._process(stmt)
+
+    stack = sqlparse.engine.FilterStack()
+    stack.enable_grouping()
+    strip_leading_comment_filter = StripLeadingCommentFilter()
+    stack.stmtprocess.append(strip_leading_comment_filter)
+    stack.postprocess.append(sqlparse.filters.SerializerUnicode())
+    stripped_line = ''.join(stack.run(sql, 'utf-8'))
+    return strip_leading_comment_filter.comment, stripped_line
 
   def _replace_history_delimiters(self, src_delim, tgt_delim):
     """Replaces source_delim with target_delim for all items in history.

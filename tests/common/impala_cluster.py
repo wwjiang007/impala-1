@@ -18,6 +18,7 @@
 # Basic object model of an Impala cluster (set of Impala processes).
 #
 import logging
+import os
 import psutil
 import socket
 from getpass import getuser
@@ -29,11 +30,15 @@ from tests.common.impala_service import (
     CatalogdService,
     ImpaladService,
     StateStoredService)
-from tests.util.shell_util import exec_process_async, exec_process
+from tests.util.shell_util import exec_process, exec_process_async
 
 logging.basicConfig(level=logging.ERROR, format='%(threadName)s: %(message)s')
 LOG = logging.getLogger('impala_cluster')
 LOG.setLevel(level=logging.DEBUG)
+
+IMPALA_HOME = os.environ['IMPALA_HOME']
+CATALOGD_PATH = os.path.join(IMPALA_HOME, 'bin/start-catalogd.sh')
+IMPALAD_PATH = os.path.join(IMPALA_HOME, 'bin/start-impalad.sh -build_type=latest')
 
 # Represents a set of Impala processes. Each Impala process must be created with
 # a basic set of command line options (beeswax_port, webserver_port, etc)
@@ -89,6 +94,20 @@ class ImpalaCluster(object):
     LOG.info("Cluster: " + str(self.impalads))
     return choice([impalad for impalad in self.impalads if impalad != other_impalad])
 
+  def num_responsive_coordinators(self):
+    """Find the number of impalad coordinators that can evaluate a test query."""
+    n = 0
+    for impalad in self.impalads:
+      try:
+        client = impalad.service.create_beeswax_client()
+        result = client.execute("select 1")
+        assert result.success
+        ++n
+      except Exception as e: print e
+      finally:
+        client.close()
+    return n
+
   def __build_impala_process_lists(self):
     """
     Gets all the running Impala procs (with start arguments) on the machine.
@@ -109,12 +128,19 @@ class ImpalaCluster(object):
           if "uid not found" in str(e):
             continue
           raise
-        if process.name == 'impalad' and len(process.cmdline) >= 1:
-          impalads.append(ImpaladProcess(process.cmdline))
-        elif process.name == 'statestored' and len(process.cmdline) >= 1:
-          statestored.append(StateStoreProcess(process.cmdline))
-        elif process.name == 'catalogd' and len(process.cmdline) >= 1:
-          catalogd = CatalogdProcess(process.cmdline)
+        # IMPALA-6889: When a process shuts down and becomes a zombie its cmdline becomes
+        # empty for a brief moment, before it gets reaped by its parent (see man proc). We
+        # copy the cmdline to prevent it from changing between the following checks and
+        # the construction of the *Process objects.
+        cmdline = process.cmdline
+        if len(cmdline) == 0:
+          continue
+        if process.name == 'impalad':
+          impalads.append(ImpaladProcess(cmdline))
+        elif process.name == 'statestored':
+          statestored.append(StateStoreProcess(cmdline))
+        elif process.name == 'catalogd':
+          catalogd = CatalogdProcess(cmdline)
       except psutil.NoSuchProcess, e:
         # A process from get_pid_list() no longer exists, continue.
         LOG.info(e)
@@ -149,14 +175,11 @@ class Process(object):
 
   def start(self):
     LOG.info("Starting process: %s" % ' '.join(self.cmd))
-    self.process = exec_process_async(' '.join(self.cmd))
-
-  def wait(self):
-    """Wait until the current process has exited, and returns
-    (return code, stdout, stderr)"""
-    LOG.info("Waiting for process: %s" % ' '.join(self.cmd))
-    stdout, stderr = self.process.communicate()
-    return self.process.returncode, stdout, stderr
+    # Use os.system() to start 'cmd' in the background via a shell so its parent will be
+    # init after the shell exits. Otherwise, the parent of 'cmd' will be py.test and we
+    # cannot cleanly kill it until py.test exits. In theory, Popen(shell=True) should
+    # achieve the same thing but it doesn't work on some platforms for some reasons.
+    os.system(' '.join(self.cmd) + ' &')
 
   def kill(self, signal=SIGKILL):
     """
@@ -169,7 +192,6 @@ class Process(object):
       assert 0, "No processes %s found" % self.cmd
     LOG.info('Killing: %s (PID: %d) with signal %s'  % (' '.join(self.cmd), pid, signal))
     exec_process("kill -%d %d" % (signal, pid))
-
     return pid
 
   def restart(self):
@@ -222,7 +244,9 @@ class ImpaladProcess(BaseImpalaProcess):
 
   def start(self, wait_until_ready=True):
     """Starts the impalad and waits until the service is ready to accept connections."""
-    super(ImpaladProcess, self).start()
+    restart_cmd = [IMPALAD_PATH] + self.cmd[1:] + ['&']
+    LOG.info("Starting Impalad process: %s" % ' '.join(restart_cmd))
+    os.system(' '.join(restart_cmd))
     if wait_until_ready:
       self.service.wait_for_metric_value('impala-server.ready',
                                          expected_value=1, timeout=30)
@@ -245,3 +269,12 @@ class CatalogdProcess(BaseImpalaProcess):
 
   def __get_port(self, default=None):
     return int(self._get_arg_value('catalog_service_port', default))
+
+  def start(self, wait_until_ready=True):
+    """Starts catalogd and waits until the service is ready to accept connections."""
+    restart_cmd = [CATALOGD_PATH] + self.cmd[1:] + ["&"]
+    LOG.info("Starting Catalogd process: %s" % ' '.join(restart_cmd))
+    os.system(' '.join(restart_cmd))
+    if wait_until_ready:
+      self.service.wait_for_metric_value('statestore-subscriber.connected',
+                                         expected_value=1, timeout=30)

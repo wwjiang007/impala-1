@@ -40,7 +40,7 @@ class ObjectPool;
 /// single thread per process that will convert an amount (i.e. bytes) counter to a
 /// corresponding rate based counter.  This thread wakes up at fixed intervals and updates
 /// all of the rate counters.
-/// Thread-safe.
+/// All methods are thread-safe unless otherwise mentioned.
 class RuntimeProfile { // NOLINT: This struct is not packed, but there are not so many
                        // of them that it makes a performance difference
  public:
@@ -116,7 +116,7 @@ class RuntimeProfile { // NOLINT: This struct is not packed, but there are not s
   static RuntimeProfile* CreateFromThrift(ObjectPool* pool,
       const TRuntimeProfileTree& profiles);
 
-  /// Adds a child profile.  This is thread safe.
+  /// Adds a child profile.
   /// Checks if 'child' is already added by searching for its name in the
   /// child map, and only adds it if the name doesn't exist.
   /// 'indent' indicates whether the child will be printed w/ extra indentation
@@ -136,13 +136,9 @@ class RuntimeProfile { // NOLINT: This struct is not packed, but there are not s
   RuntimeProfile* CreateChild(
       const std::string& name, bool indent = true, bool prepend = false);
 
-  /// Sorts all children according to a custom comparator. Does not
+  /// Sorts all children according to descending total time. Does not
   /// invalidate pointers to profiles.
-  template <class Compare>
-  void SortChildren(const Compare& cmp) {
-    boost::lock_guard<SpinLock> l(children_lock_);
-    std::sort(children_.begin(), children_.end(), cmp);
-  }
+  void SortChildrenByTotalTime();
 
   /// Updates the AveragedCounter counters in this profile with the counters from the
   /// 'src' profile. If a counter is present in 'src' but missing in this profile, a new
@@ -201,6 +197,10 @@ class RuntimeProfile { // NOLINT: This struct is not packed, but there are not s
   /// that name.
   Counter* GetCounter(const std::string& name);
 
+  /// Gets the summary stats counter with 'name'. Returns NULL if there is no summary
+  /// stats counter with that name.
+  SummaryStatsCounter* GetSummaryStatsCounter(const std::string& name);
+
   /// Adds all counters with 'name' that are registered either in this or
   /// in any of the child profiles to 'counters'.
   void GetCounters(const std::string& name, std::vector<Counter*>* counters);
@@ -234,7 +234,8 @@ class RuntimeProfile { // NOLINT: This struct is not packed, but there are not s
   /// then no error occurred).
   void AddCodegenMsg(bool codegen_enabled, const Status& codegen_status,
       const std::string& extra_label = "") {
-    AddCodegenMsg(codegen_enabled, codegen_status.GetDetail(), extra_label);
+    const string& err_msg = codegen_status.ok() ? "" : codegen_status.msg().msg();
+    AddCodegenMsg(codegen_enabled, err_msg, extra_label);
   }
 
   /// Creates and returns a new EventSequence (owned by the runtime

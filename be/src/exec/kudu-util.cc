@@ -21,9 +21,11 @@
 #include <string>
 #include <sstream>
 
+#include <boost/algorithm/string.hpp>
 #include <kudu/client/callbacks.h>
 #include <kudu/client/schema.h>
 #include <kudu/common/partial_row.h>
+#include <kudu/util/monotime.h>
 
 #include "common/logging.h"
 #include "common/names.h"
@@ -32,6 +34,7 @@
 #include "runtime/timestamp-value.h"
 #include "runtime/timestamp-value.inline.h"
 
+using boost::algorithm::iequals;
 using kudu::client::KuduSchema;
 using kudu::client::KuduClient;
 using kudu::client::KuduClientBuilder;
@@ -41,9 +44,12 @@ using kudu::client::KuduValue;
 using DataType = kudu::client::KuduColumnSchema::DataType;
 
 DECLARE_bool(disable_kudu);
-DECLARE_int32(kudu_operation_timeout_ms);
+DECLARE_int32(kudu_client_rpc_timeout_ms);
 
 namespace impala {
+
+const string MODE_READ_LATEST = "READ_LATEST";
+const string MODE_READ_AT_SNAPSHOT = "READ_AT_SNAPSHOT";
 
 bool KuduClientIsSupported() {
   // The value below means the client is actually a stubbed client. This should mean
@@ -69,6 +75,10 @@ Status CreateKuduClient(const vector<string>& master_addrs,
     kudu::client::sp::shared_ptr<KuduClient>* client) {
   kudu::client::KuduClientBuilder b;
   for (const string& address: master_addrs) b.add_master_server_addr(address);
+  if (FLAGS_kudu_client_rpc_timeout_ms > 0) {
+    b.default_rpc_timeout(
+        kudu::MonoDelta::FromMilliseconds(FLAGS_kudu_client_rpc_timeout_ms));
+  }
   KUDU_RETURN_IF_ERROR(b.Build(client), "Unable to create Kudu client");
   return Status::OK();
 }
@@ -278,6 +288,19 @@ Status CreateKuduValue(const ColumnType& col_type, void* value, KuduValue** out)
     }
     default:
       return Status(TErrorCode::IMPALA_KUDU_TYPE_MISSING, TypeToString(type));
+  }
+  return Status::OK();
+}
+
+Status StringToKuduReadMode(
+    const std::string& mode, kudu::client::KuduScanner::ReadMode* out) {
+  if (iequals(mode, MODE_READ_LATEST)) {
+    *out = kudu::client::KuduScanner::READ_LATEST;
+  } else if (iequals(mode, MODE_READ_AT_SNAPSHOT)) {
+    *out = kudu::client::KuduScanner::READ_AT_SNAPSHOT;
+  } else {
+    return Status(Substitute("Invalid kudu_read_mode '$0'. Valid values are READ_LATEST "
+        "and READ_AT_SNAPSHOT.", mode));
   }
   return Status::OK();
 }

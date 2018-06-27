@@ -22,11 +22,12 @@ import org.apache.impala.thrift.TCatalogObjectType;
 /**
  * Interface that all catalog objects implement.
  */
-public interface CatalogObject {
+public interface CatalogObject extends HasName {
   // Returns the TCatalogObject type of this Catalog object.
   public TCatalogObjectType getCatalogObjectType();
 
   // Returns the unqualified object name.
+  @Override
   public String getName();
 
   // Returns the unique name of this catalog object.

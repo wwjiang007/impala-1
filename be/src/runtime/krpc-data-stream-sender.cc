@@ -25,6 +25,8 @@
 #include <thrift/protocol/TDebugProtocol.h>
 
 #include "common/logging.h"
+#include "codegen/codegen-anyval.h"
+#include "codegen/llvm-codegen.h"
 #include "exec/kudu-util.h"
 #include "exprs/scalar-expr.h"
 #include "exprs/scalar-expr-evaluator.h"
@@ -60,6 +62,10 @@ using kudu::MonoDelta;
 DECLARE_int32(rpc_retry_interval_ms);
 
 namespace impala {
+
+const char* KrpcDataStreamSender::HASH_ROW_SYMBOL =
+    "KrpcDataStreamSender7HashRowEPNS_8TupleRowE";
+const char* KrpcDataStreamSender::LLVM_CLASS_NAME = "class.impala::KrpcDataStreamSender";
 
 // A datastream sender may send row batches to multiple destinations. There is one
 // channel for each destination.
@@ -142,8 +148,6 @@ class KrpcDataStreamSender::Channel : public CacheLineAligned {
   // This function blocks until the EOS RPC is complete.
   Status FlushAndSendEos(RuntimeState* state);
 
-  int64_t num_data_bytes_sent() const { return num_data_bytes_sent_; }
-
   // The type for a RPC worker function.
   typedef boost::function<Status()> DoRpcFn;
 
@@ -159,9 +163,6 @@ class KrpcDataStreamSender::Channel : public CacheLineAligned {
   const TNetworkAddress address_;
   const TUniqueId fragment_instance_id_;
   const PlanNodeId dest_node_id_;
-
-  // Number of bytes of all serialized row batches sent successfully.
-  int64_t num_data_bytes_sent_ = 0;
 
   // The row batch for accumulating rows copied from AddRow().
   // Only used if the partitioning scheme is "KUDU" or "HASH_PARTITIONED".
@@ -210,6 +211,9 @@ class KrpcDataStreamSender::Channel : public CacheLineAligned {
 
   // The pointer to the current serialized row batch being sent.
   const OutboundRowBatch* rpc_in_flight_batch_ = nullptr;
+
+  // The monotonic time in nanoseconds of when current RPC started.
+  int64_t rpc_start_time_ns_ = 0;
 
   // True if there is an in-flight RPC.
   bool rpc_in_flight_ = false;
@@ -311,12 +315,14 @@ void KrpcDataStreamSender::Channel::MarkDone(const Status& status) {
   rpc_in_flight_ = false;
   rpc_in_flight_batch_ = nullptr;
   rpc_done_cv_.notify_one();
+  rpc_start_time_ns_ = 0;
 }
 
 Status KrpcDataStreamSender::Channel::WaitForRpc(std::unique_lock<SpinLock>* lock) {
   DCHECK(lock != nullptr);
   DCHECK(lock->owns_lock());
 
+  SCOPED_TIMER(parent_->profile()->inactive_timer());
   SCOPED_TIMER(parent_->state_->total_network_send_timer());
 
   // Wait for in-flight RPCs to complete unless the parent sender is closed or cancelled.
@@ -333,7 +339,7 @@ Status KrpcDataStreamSender::Channel::WaitForRpc(std::unique_lock<SpinLock>* loc
   DCHECK(!rpc_in_flight_);
   if (UNLIKELY(!rpc_status_.ok())) {
     LOG(ERROR) << "channel send to " << TNetworkAddressToString(address_) << " failed: "
-               << "(fragment_instance_id=" << fragment_instance_id_ << "): "
+               << "(fragment_instance_id=" << PrintId(fragment_instance_id_) << "): "
                << rpc_status_.GetDetail();
     return rpc_status_;
   }
@@ -379,17 +385,20 @@ void KrpcDataStreamSender::Channel::HandleFailedRPC(const DoRpcFn& rpc_fn,
 }
 
 void KrpcDataStreamSender::Channel::TransmitDataCompleteCb() {
+  DCHECK_NE(rpc_start_time_ns_, 0);
+  int64_t total_time = MonotonicNanos() - rpc_start_time_ns_;
   std::unique_lock<SpinLock> l(lock_);
   DCHECK(rpc_in_flight_);
   const kudu::Status controller_status = rpc_controller_.status();
   if (LIKELY(controller_status.ok())) {
+    DCHECK(rpc_in_flight_batch_ != nullptr);
+    COUNTER_ADD(parent_->bytes_sent_counter_,
+        RowBatch::GetSerializedSize(*rpc_in_flight_batch_));
+    int64_t network_time = total_time - resp_.receiver_latency_ns();
+    COUNTER_ADD(&parent_->total_network_timer_, network_time);
     Status rpc_status = Status::OK();
     int32_t status_code = resp_.status().status_code();
-    if (LIKELY(status_code == TErrorCode::OK)) {
-      DCHECK(rpc_in_flight_batch_ != nullptr);
-      num_data_bytes_sent_ += RowBatch::GetSerializedSize(*rpc_in_flight_batch_);
-      VLOG_ROW << "incremented #data_bytes_sent=" << num_data_bytes_sent_;
-    } else if (status_code == TErrorCode::DATASTREAM_RECVR_CLOSED) {
+    if (status_code == TErrorCode::DATASTREAM_RECVR_CLOSED) {
       remote_recvr_closed_ = true;
     } else {
       rpc_status = Status(resp_.status());
@@ -429,6 +438,7 @@ Status KrpcDataStreamSender::Channel::DoTransmitDataRpc() {
   req.set_tuple_offsets_sidecar_idx(sidecar_idx);
 
   // Add 'tuple_data_' as sidecar.
+  rpc_start_time_ns_ = MonotonicNanos();
   KUDU_RETURN_IF_ERROR(rpc_controller_.AddOutboundSidecar(
       RpcSidecar::FromSlice(rpc_in_flight_batch_->TupleDataAsSlice()), &sidecar_idx),
       "Unable to add tuple data to sidecar");
@@ -445,8 +455,8 @@ Status KrpcDataStreamSender::Channel::DoTransmitDataRpc() {
 
 Status KrpcDataStreamSender::Channel::TransmitData(
     const OutboundRowBatch* outbound_batch) {
-  VLOG_ROW << "Channel::TransmitData() fragment_instance_id=" << fragment_instance_id_
-           << " dest_node=" << dest_node_id_
+  VLOG_ROW << "Channel::TransmitData() fragment_instance_id="
+           << PrintId(fragment_instance_id_) << " dest_node=" << dest_node_id_
            << " #rows=" << outbound_batch->header()->num_rows();
   std::unique_lock<SpinLock> l(lock_);
   RETURN_IF_ERROR(WaitForRpc(&l));
@@ -525,8 +535,8 @@ Status KrpcDataStreamSender::Channel::DoEndDataStreamRpc() {
 }
 
 Status KrpcDataStreamSender::Channel::FlushAndSendEos(RuntimeState* state) {
-  VLOG_RPC << "Channel::FlushAndSendEos() fragment_instance_id=" << fragment_instance_id_
-           << " dest_node=" << dest_node_id_
+  VLOG_RPC << "Channel::FlushAndSendEos() fragment_instance_id="
+           << PrintId(fragment_instance_id_) << " dest_node=" << dest_node_id_
            << " #rows= " << batch_->num_rows();
 
   // We can return an error here and not go on to send the EOS RPC because the error that
@@ -540,7 +550,7 @@ Status KrpcDataStreamSender::Channel::FlushAndSendEos(RuntimeState* state) {
     DCHECK(rpc_status_.ok());
     if (UNLIKELY(remote_recvr_closed_)) return Status::OK();
     VLOG_RPC << "calling EndDataStream() to terminate channel. fragment_instance_id="
-             << fragment_instance_id_;
+             << PrintId(fragment_instance_id_);
     rpc_in_flight_ = true;
     COUNTER_ADD(parent_->eos_sent_counter_, 1);
     RETURN_IF_ERROR(DoEndDataStreamRpc());
@@ -572,6 +582,7 @@ KrpcDataStreamSender::KrpcDataStreamSender(int sender_id, const RowDescriptor* r
     sender_id_(sender_id),
     partition_type_(sink.output_partition.type),
     per_channel_buffer_size_(per_channel_buffer_size),
+    total_network_timer_(TUnit::TIME_NS, 0),
     dest_node_id_(sink.dest_node_id),
     next_unknown_partition_(0) {
   DCHECK_GT(destinations.size(), 0);
@@ -590,7 +601,6 @@ KrpcDataStreamSender::KrpcDataStreamSender(int sender_id, const RowDescriptor* r
   if (partition_type_ == TPartitionType::UNPARTITIONED ||
       partition_type_ == TPartitionType::RANDOM) {
     // Randomize the order we open/transmit to channels to avoid thundering herd problems.
-    srand(reinterpret_cast<uint64_t>(this));
     random_shuffle(channels_.begin(), channels_.end());
   }
 }
@@ -605,6 +615,7 @@ KrpcDataStreamSender::~KrpcDataStreamSender() {
 
 Status KrpcDataStreamSender::Init(const vector<TExpr>& thrift_output_exprs,
     const TDataSink& tsink, RuntimeState* state) {
+  SCOPED_TIMER(profile_->total_time_counter());
   DCHECK(tsink.__isset.stream_sink);
   if (partition_type_ == TPartitionType::HASH_PARTITIONED ||
       partition_type_ == TPartitionType::KUDU) {
@@ -625,33 +636,230 @@ Status KrpcDataStreamSender::Prepare(
   serialize_batch_timer_ = ADD_TIMER(profile(), "SerializeBatchTime");
   rpc_retry_counter_ = ADD_COUNTER(profile(), "RpcRetry", TUnit::UNIT);
   rpc_failure_counter_ = ADD_COUNTER(profile(), "RpcFailure", TUnit::UNIT);
-  bytes_sent_counter_ = ADD_COUNTER(profile(), "BytesSent", TUnit::BYTES);
+  bytes_sent_counter_ = ADD_COUNTER(profile(), "TotalBytesSent", TUnit::BYTES);
+  bytes_sent_time_series_counter_ =
+      ADD_TIME_SERIES_COUNTER(profile(), "BytesSent", bytes_sent_counter_);
+  network_throughput_counter_ =
+      profile()->AddDerivedCounter("NetworkThroughput", TUnit::BYTES_PER_SECOND,
+          bind<int64_t>(&RuntimeProfile::UnitsPerSecond, bytes_sent_counter_,
+              &total_network_timer_));
   eos_sent_counter_ = ADD_COUNTER(profile(), "EosSent", TUnit::UNIT);
   uncompressed_bytes_counter_ =
       ADD_COUNTER(profile(), "UncompressedRowBatchSize", TUnit::BYTES);
-  total_sent_rows_counter_= ADD_COUNTER(profile(), "RowsReturned", TUnit::UNIT);
-  overall_throughput_ =
-      profile()->AddDerivedCounter("OverallThroughput", TUnit::BYTES_PER_SECOND,
-           bind<int64_t>(&RuntimeProfile::UnitsPerSecond, bytes_sent_counter_,
-                         profile()->total_time_counter()));
+  total_sent_rows_counter_= ADD_COUNTER(profile(), "RowsSent", TUnit::UNIT);
   for (int i = 0; i < channels_.size(); ++i) {
     RETURN_IF_ERROR(channels_[i]->Init(state));
   }
+  state->CheckAndAddCodegenDisabledMessage(profile());
   return Status::OK();
 }
 
 Status KrpcDataStreamSender::Open(RuntimeState* state) {
+  SCOPED_TIMER(profile_->total_time_counter());
   return ScalarExprEvaluator::Open(partition_expr_evals_, state);
 }
 
+//
+// An example of generated code with int type.
+//
+// define i64 @KrpcDataStreamSenderHashRow(%"class.impala::KrpcDataStreamSender"* %this,
+//                                         %"class.impala::TupleRow"* %row) #46 {
+// entry:
+//   %0 = alloca i32
+//   %1 = call %"class.impala::ScalarExprEvaluator"*
+//       @_ZN6impala20KrpcDataStreamSender25GetPartitionExprEvaluatorEi(
+//           %"class.impala::KrpcDataStreamSender"* %this, i32 0)
+//   %partition_val = call i64 @GetSlotRef(
+//       %"class.impala::ScalarExprEvaluator"* %1, %"class.impala::TupleRow"* %row)
+//   %is_null = trunc i64 %partition_val to i1
+//   br i1 %is_null, label %is_null_block, label %not_null_block
+//
+// is_null_block:                                ; preds = %entry
+//   br label %hash_val_block
+//
+// not_null_block:                               ; preds = %entry
+//   %2 = ashr i64 %partition_val, 32
+//   %3 = trunc i64 %2 to i32
+//   store i32 %3, i32* %0
+//   %native_ptr = bitcast i32* %0 to i8*
+//   br label %hash_val_block
+//
+// hash_val_block:                               ; preds = %not_null_block, %is_null_block
+//   %val_ptr_phi = phi i8* [ %native_ptr, %not_null_block ], [ null, %is_null_block ]
+//   %hash_val = call i64
+//       @_ZN6impala8RawValue20GetHashValueFastHashEPKvRKNS_10ColumnTypeEm(
+//           i8* %val_ptr_phi, %"struct.impala::ColumnType"* @expr_type_arg,
+//               i64 7403188670037225271)
+//   ret i64 %hash_val
+// }
+Status KrpcDataStreamSender::CodegenHashRow(LlvmCodeGen* codegen, llvm::Function** fn) {
+  llvm::LLVMContext& context = codegen->context();
+  LlvmBuilder builder(context);
+
+  LlvmCodeGen::FnPrototype prototype(
+      codegen, "KrpcDataStreamSenderHashRow", codegen->i64_type());
+  prototype.AddArgument(
+      LlvmCodeGen::NamedVariable("this", codegen->GetNamedPtrType(LLVM_CLASS_NAME)));
+  prototype.AddArgument(
+      LlvmCodeGen::NamedVariable("row", codegen->GetStructPtrType<TupleRow>()));
+
+  llvm::Value* args[2];
+  llvm::Function* hash_row_fn = prototype.GeneratePrototype(&builder, args);
+  llvm::Value* this_arg = args[0];
+  llvm::Value* row_arg = args[1];
+
+  // Store the initial seed to hash_val
+  llvm::Value* hash_val = codegen->GetI64Constant(EXCHANGE_HASH_SEED);
+
+  // Unroll the loop and codegen each of the partition expressions
+  for (int i = 0; i < partition_exprs_.size(); ++i) {
+    llvm::Function* compute_fn;
+    RETURN_IF_ERROR(partition_exprs_[i]->GetCodegendComputeFn(codegen, &compute_fn));
+
+    // Load the expression evaluator for the i-th partition expression
+    llvm::Function* get_expr_eval_fn =
+        codegen->GetFunction(IRFunction::KRPC_DSS_GET_PART_EXPR_EVAL, false);
+    DCHECK(get_expr_eval_fn != nullptr);
+    llvm::Value* expr_eval_arg =
+        builder.CreateCall(get_expr_eval_fn, {this_arg, codegen->GetI32Constant(i)});
+
+    // Compute the value against the i-th partition expression
+    llvm::Value* compute_fn_args[] = {expr_eval_arg, row_arg};
+    CodegenAnyVal partition_val = CodegenAnyVal::CreateCallWrapped(codegen, &builder,
+        partition_exprs_[i]->type(), compute_fn, compute_fn_args, "partition_val");
+
+    llvm::BasicBlock* is_null_block =
+        llvm::BasicBlock::Create(context, "is_null_block", hash_row_fn);
+    llvm::BasicBlock* not_null_block =
+        llvm::BasicBlock::Create(context, "not_null_block", hash_row_fn);
+    llvm::BasicBlock* hash_val_block =
+        llvm::BasicBlock::Create(context, "hash_val_block", hash_row_fn);
+
+    // Check if 'partition_val' is NULL
+    llvm::Value* val_is_null = partition_val.GetIsNull();
+    builder.CreateCondBr(val_is_null, is_null_block, not_null_block);
+
+    // Set the pointer to NULL in case 'partition_val' evaluates to NULL
+    builder.SetInsertPoint(is_null_block);
+    llvm::Value* null_ptr = codegen->null_ptr_value();
+    builder.CreateBr(hash_val_block);
+
+    // Saves 'partition_val' on the stack and passes a pointer to it to the hash function
+    builder.SetInsertPoint(not_null_block);
+    llvm::Value* native_ptr = partition_val.ToNativePtr();
+    native_ptr = builder.CreatePointerCast(native_ptr, codegen->ptr_type(), "native_ptr");
+    builder.CreateBr(hash_val_block);
+
+    // Picks the input value to hash function
+    builder.SetInsertPoint(hash_val_block);
+    llvm::PHINode* val_ptr_phi = builder.CreatePHI(codegen->ptr_type(), 2, "val_ptr_phi");
+    val_ptr_phi->addIncoming(native_ptr, not_null_block);
+    val_ptr_phi->addIncoming(null_ptr, is_null_block);
+
+    // Creates a global constant of the partition expression's ColumnType. It has to be a
+    // constant for constant propagation and dead code elimination in 'get_hash_value_fn'
+    llvm::Type* col_type = codegen->GetStructType<ColumnType>();
+    llvm::Constant* expr_type_arg = codegen->ConstantToGVPtr(
+        col_type, partition_exprs_[i]->type().ToIR(codegen), "expr_type_arg");
+
+    // Update 'hash_val' with the new 'partition-val'
+    llvm::Value* get_hash_value_args[] = {val_ptr_phi, expr_type_arg, hash_val};
+    llvm::Function* get_hash_value_fn =
+        codegen->GetFunction(IRFunction::RAW_VALUE_GET_HASH_VALUE_FAST_HASH, false);
+    DCHECK(get_hash_value_fn != nullptr);
+    hash_val = builder.CreateCall(get_hash_value_fn, get_hash_value_args, "hash_val");
+  }
+
+  builder.CreateRet(hash_val);
+  *fn = codegen->FinalizeFunction(hash_row_fn);
+  if (*fn == nullptr) {
+    return Status("Codegen'd KrpcDataStreamSenderHashRow() fails verification. See log");
+  }
+
+  return Status::OK();
+}
+
+string KrpcDataStreamSender::PartitionTypeName() const {
+  switch (partition_type_) {
+  case TPartitionType::UNPARTITIONED:
+    return "Unpartitioned";
+  case TPartitionType::HASH_PARTITIONED:
+    return "Hash Partitioned";
+  case TPartitionType::RANDOM:
+    return "Random Partitioned";
+  case TPartitionType::KUDU:
+    return "Kudu Partitioned";
+  default:
+    DCHECK(false) << partition_type_;
+    return "";
+  }
+}
+
+void KrpcDataStreamSender::Codegen(LlvmCodeGen* codegen) {
+  const string sender_name = PartitionTypeName() + " Sender";
+  if (partition_type_ != TPartitionType::HASH_PARTITIONED) {
+    const string& msg = Substitute("not $0",
+        partition_type_ == TPartitionType::KUDU ? "supported" : "needed");
+    profile()->AddCodegenMsg(false, msg, sender_name);
+    return;
+  }
+
+  llvm::Function* hash_row_fn;
+  Status codegen_status = CodegenHashRow(codegen, &hash_row_fn);
+  if (codegen_status.ok()) {
+    llvm::Function* hash_and_add_rows_fn =
+        codegen->GetFunction(IRFunction::KRPC_DSS_HASH_AND_ADD_ROWS, true);
+    DCHECK(hash_and_add_rows_fn != nullptr);
+
+    int num_replaced;
+    // Replace GetNumChannels() with a constant.
+    num_replaced = codegen->ReplaceCallSitesWithValue(hash_and_add_rows_fn,
+        codegen->GetI32Constant(GetNumChannels()), "GetNumChannels");
+    DCHECK_EQ(num_replaced, 1);
+
+    // Replace HashRow() with the handcrafted IR function.
+    num_replaced = codegen->ReplaceCallSites(hash_and_add_rows_fn,
+        hash_row_fn, HASH_ROW_SYMBOL);
+    DCHECK_EQ(num_replaced, 1);
+
+    hash_and_add_rows_fn = codegen->FinalizeFunction(hash_and_add_rows_fn);
+    if (hash_and_add_rows_fn == nullptr) {
+      codegen_status =
+          Status("Codegen'd HashAndAddRows() failed verification. See log");
+    } else {
+      codegen->AddFunctionToJit(hash_and_add_rows_fn,
+          reinterpret_cast<void**>(&hash_and_add_rows_fn_));
+    }
+  }
+  profile()->AddCodegenMsg(codegen_status.ok(), codegen_status, sender_name);
+}
+
+Status KrpcDataStreamSender::AddRowToChannel(const int channel_id, TupleRow* row) {
+  return channels_[channel_id]->AddRow(row);
+}
+
+uint64_t KrpcDataStreamSender::HashRow(TupleRow* row) {
+  uint64_t hash_val = EXCHANGE_HASH_SEED;
+  for (ScalarExprEvaluator* eval : partition_expr_evals_) {
+    void* partition_val = eval->GetValue(row);
+    // We can't use the crc hash function here because it does not result in
+    // uncorrelated hashes with different seeds. Instead we use FastHash.
+    // TODO: fix crc hash/GetHashValue()
+    hash_val = RawValue::GetHashValueFastHash(
+        partition_val, eval->root().type(), hash_val);
+  }
+  return hash_val;
+}
+
 Status KrpcDataStreamSender::Send(RuntimeState* state, RowBatch* batch) {
+  SCOPED_TIMER(profile()->total_time_counter());
   DCHECK(!closed_);
   DCHECK(!flushed_);
 
   if (batch->num_rows() == 0) return Status::OK();
   if (partition_type_ == TPartitionType::UNPARTITIONED) {
     OutboundRowBatch* outbound_batch = &outbound_batches_[next_batch_idx_];
-    RETURN_IF_ERROR(SerializeBatch(batch, outbound_batch));
+    RETURN_IF_ERROR(SerializeBatch(batch, outbound_batch, channels_.size()));
     // TransmitData() will block if there are still in-flight rpcs (and those will
     // reference the previously written serialized batch).
     for (int i = 0; i < channels_.size(); ++i) {
@@ -693,40 +901,10 @@ Status KrpcDataStreamSender::Send(RuntimeState* state, RowBatch* batch) {
     }
   } else {
     DCHECK_EQ(partition_type_, TPartitionType::HASH_PARTITIONED);
-    // hash-partition batch's rows across channels
-    // TODO: encapsulate this in an Expr as we've done for Kudu above and remove this case
-    // once we have codegen here.
-    int num_channels = channels_.size();
-    const int num_partition_exprs = partition_exprs_.size();
-    const int num_rows = batch->num_rows();
-    const int hash_batch_size = RowBatch::HASH_BATCH_SIZE;
-    int channel_ids[hash_batch_size];
-
-    // Break the loop into two parts break the data dependency between computing
-    // the hash and calling AddRow()
-    // To keep stack allocation small a RowBatch::HASH_BATCH is used
-    for (int batch_start = 0; batch_start < num_rows; batch_start += hash_batch_size) {
-      int batch_window_size = min(num_rows - batch_start, hash_batch_size);
-      for (int i = 0; i < batch_window_size; ++i) {
-        TupleRow* row = batch->GetRow(i + batch_start);
-        uint64_t hash_val = EXCHANGE_HASH_SEED;
-        for (int j = 0; j < num_partition_exprs; ++j) {
-          ScalarExprEvaluator* eval = partition_expr_evals_[j];
-          void* partition_val = eval->GetValue(row);
-          // We can't use the crc hash function here because it does not result in
-          // uncorrelated hashes with different seeds. Instead we use FastHash.
-          // TODO: fix crc hash/GetHashValue()
-          DCHECK(&(eval->root()) == partition_exprs_[j]);
-          hash_val = RawValue::GetHashValueFastHash(
-              partition_val, partition_exprs_[j]->type(), hash_val);
-        }
-        channel_ids[i] = hash_val % num_channels;
-      }
-
-      for (int i = 0; i < batch_window_size; ++i) {
-        TupleRow* row = batch->GetRow(i + batch_start);
-        RETURN_IF_ERROR(channels_[channel_ids[i]]->AddRow(row));
-      }
+    if (hash_and_add_rows_fn_ != nullptr) {
+      RETURN_IF_ERROR(hash_and_add_rows_fn_(this, batch));
+    } else {
+      RETURN_IF_ERROR(HashAndAddRows(batch));
     }
   }
   COUNTER_ADD(total_sent_rows_counter_, batch->num_rows());
@@ -736,6 +914,7 @@ Status KrpcDataStreamSender::Send(RuntimeState* state, RowBatch* batch) {
 }
 
 Status KrpcDataStreamSender::FlushFinal(RuntimeState* state) {
+  SCOPED_TIMER(profile()->total_time_counter());
   DCHECK(!flushed_);
   DCHECK(!closed_);
   flushed_ = true;
@@ -749,39 +928,31 @@ Status KrpcDataStreamSender::FlushFinal(RuntimeState* state) {
 }
 
 void KrpcDataStreamSender::Close(RuntimeState* state) {
+  SCOPED_TIMER(profile()->total_time_counter());
   if (closed_) return;
   for (int i = 0; i < channels_.size(); ++i) {
     channels_[i]->Teardown(state);
   }
   ScalarExprEvaluator::Close(partition_expr_evals_, state);
   ScalarExpr::Close(partition_exprs_);
+  profile()->StopPeriodicCounters();
   DataSink::Close(state);
-  closed_ = true;
 }
 
 Status KrpcDataStreamSender::SerializeBatch(
     RowBatch* src, OutboundRowBatch* dest, int num_receivers) {
   VLOG_ROW << "serializing " << src->num_rows() << " rows";
   {
-    SCOPED_TIMER(profile_->total_time_counter());
     SCOPED_TIMER(serialize_batch_timer_);
     RETURN_IF_ERROR(src->Serialize(dest));
-    int64_t bytes = RowBatch::GetSerializedSize(*dest);
     int64_t uncompressed_bytes = RowBatch::GetDeserializedSize(*dest);
-    COUNTER_ADD(bytes_sent_counter_, bytes * num_receivers);
     COUNTER_ADD(uncompressed_bytes_counter_, uncompressed_bytes * num_receivers);
   }
   return Status::OK();
 }
 
 int64_t KrpcDataStreamSender::GetNumDataBytesSent() const {
-  // TODO: do we need synchronization here or are reads & writes to 8-byte ints
-  // atomic?
-  int64_t result = 0;
-  for (int i = 0; i < channels_.size(); ++i) {
-    result += channels_[i]->num_data_bytes_sent();
-  }
-  return result;
+  return bytes_sent_counter_->value();
 }
 
 } // namespace impala

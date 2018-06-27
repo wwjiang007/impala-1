@@ -85,10 +85,7 @@ DEFINE_int64(tcmalloc_max_total_thread_cache_bytes, 0, "(Advanced) Bound on the 
 DEFINE_bool(abort_on_config_error, true, "Abort Impala startup if there are improper "
     "configs or running on unsupported hardware.");
 
-DEFINE_bool(disable_mem_pools, false, "Set to true to disable memory pooling. "
-    "This can be used to help diagnose memory corruption issues.");
-
-DEFINE_bool(compact_catalog_topic, false, "If true, catalog updates sent via the "
+DEFINE_bool(compact_catalog_topic, true, "If true, catalog updates sent via the "
     "statestore are compacted before transmission. This saves network bandwidth at the"
     " cost of a small quantity of CPU time. Enable this option in cluster with large"
     " catalogs. It must be enabled on both the catalog service, and all Impala demons.");
@@ -148,6 +145,8 @@ DEFINE_bool(thread_creation_fault_injection, false, "A fault injection option th
 DEFINE_int32(stress_catalog_init_delay_ms, 0, "A stress option that injects extra delay"
     " in milliseconds when initializing an impalad's local catalog replica. Delay <= 0"
     " inject no delay.");
+DEFINE_int32(stress_disk_read_delay_ms, 0, "A stress option that injects extra delay"
+    " in milliseconds when the I/O manager is reading from disk.");
 #endif
 
 // Used for testing the path where the Kudu client is stubbed.
@@ -159,6 +158,13 @@ DEFINE_bool(disable_kudu, false, "If true, Kudu features will be disabled.");
 DEFINE_int32(kudu_operation_timeout_ms, 3 * 60 * 1000, "Timeout (milliseconds) set for "
     "all Kudu operations. This must be a positive value, and there is no way to disable "
     "timeouts.");
+
+// Timeout (ms) for Kudu rpcs set in the BE on the KuduClient.
+DEFINE_int32(kudu_client_rpc_timeout_ms, 0, "(Advanced) Timeout (milliseconds) set for "
+    "individual Kudu client rpcs. An operation may consist of several rpcs, so this is "
+    "expected to be less than kudu_operation_timeout_ms. This must be a positive value "
+    "or it will be ignored and Kudu's default of 10s will be used. There is no way to "
+    "disable timeouts.");
 
 DEFINE_int64(inc_stats_size_limit_bytes, 200 * (1LL<<20), "Maximum size of "
     "incremental stats the catalog is allowed to serialize per table. "
@@ -226,6 +232,7 @@ REMOVED_FLAG(enable_partitioned_aggregation);
 REMOVED_FLAG(enable_partitioned_hash_join);
 REMOVED_FLAG(enable_phj_probe_side_filtering);
 REMOVED_FLAG(enable_rm);
+REMOVED_FLAG(kerberos_reinit_interval);
 REMOVED_FLAG(llama_addresses);
 REMOVED_FLAG(llama_callback_port);
 REMOVED_FLAG(llama_host);
@@ -234,6 +241,7 @@ REMOVED_FLAG(llama_port);
 REMOVED_FLAG(llama_registration_timeout_secs);
 REMOVED_FLAG(llama_registration_wait_secs);
 REMOVED_FLAG(local_nodemanager_url);
+REMOVED_FLAG(max_free_io_buffers);
 REMOVED_FLAG(resource_broker_cnxn_attempts);
 REMOVED_FLAG(resource_broker_cnxn_retry_interval_ms);
 REMOVED_FLAG(resource_broker_recv_timeout);
@@ -243,6 +251,10 @@ REMOVED_FLAG(rm_default_cpu_vcores);
 REMOVED_FLAG(rm_default_memory);
 REMOVED_FLAG(rpc_cnxn_attempts);
 REMOVED_FLAG(rpc_cnxn_retry_interval_ms);
+REMOVED_FLAG(skip_lzo_version_check);
 REMOVED_FLAG(staging_cgroup);
 REMOVED_FLAG(suppress_unknown_disk_id_warnings);
 REMOVED_FLAG(use_statestore);
+REMOVED_FLAG(use_kudu_kinit);
+REMOVED_FLAG(disable_admission_control);
+REMOVED_FLAG(disable_mem_pools);

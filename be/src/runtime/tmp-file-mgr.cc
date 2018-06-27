@@ -38,11 +38,11 @@
 
 #include "common/names.h"
 
-DEFINE_bool(disk_spill_encryption, false,
+DEFINE_bool(disk_spill_encryption, true,
     "Set this to encrypt and perform an integrity "
     "check on all data spilled to disk during a query");
 DEFINE_string(scratch_dirs, "/tmp", "Writable scratch directories");
-DEFINE_bool(allow_multiple_scratch_dirs_per_device, false,
+DEFINE_bool(allow_multiple_scratch_dirs_per_device, true,
     "If false and --scratch_dirs contains multiple directories on the same device, "
     "then only the first writable directory is used");
 
@@ -150,7 +150,7 @@ Status TmpFileMgr::InitCustom(const vector<string>& tmp_dirs, bool one_dir_per_d
   return Status::OK();
 }
 
-Status TmpFileMgr::NewFile(
+void TmpFileMgr::NewFile(
     FileGroup* file_group, DeviceId device_id, unique_ptr<File>* new_file) {
   DCHECK(initialized_);
   DCHECK_GE(device_id, 0);
@@ -164,7 +164,6 @@ Status TmpFileMgr::NewFile(
   new_file_path /= file_name.str();
 
   new_file->reset(new File(file_group, device_id, new_file_path.string()));
-  return Status::OK();
 }
 
 string TmpFileMgr::GetTmpDirPath(DeviceId device_id) const {
@@ -197,11 +196,10 @@ TmpFileMgr::File::File(FileGroup* file_group, DeviceId device_id, const string& 
   DCHECK(file_group != nullptr);
 }
 
-Status TmpFileMgr::File::AllocateSpace(int64_t num_bytes, int64_t* offset) {
+void TmpFileMgr::File::AllocateSpace(int64_t num_bytes, int64_t* offset) {
   DCHECK_GT(num_bytes, 0);
   *offset = bytes_allocated_;
   bytes_allocated_ += num_bytes;
-  return Status::OK();
 }
 
 int TmpFileMgr::File::AssignDiskQueue() const {
@@ -243,7 +241,7 @@ TmpFileMgr::FileGroup::FileGroup(TmpFileMgr* tmp_file_mgr, DiskIoMgr* io_mgr,
     next_allocation_index_(0),
     free_ranges_(64) {
   DCHECK(tmp_file_mgr != nullptr);
-  io_ctx_ = io_mgr_->RegisterContext(nullptr);
+  io_ctx_ = io_mgr_->RegisterContext();
 }
 
 TmpFileMgr::FileGroup::~FileGroup() {
@@ -258,17 +256,10 @@ Status TmpFileMgr::FileGroup::CreateFiles() {
   // Initialize the tmp files and the initial file to use.
   for (int i = 0; i < tmp_devices.size(); ++i) {
     TmpFileMgr::DeviceId device_id = tmp_devices[i];
-    // It is possible for a device to be blacklisted after it was returned by
-    // ActiveTmpDevices(), handle this gracefully by skipping devices if NewFile()
-    // fails.
     unique_ptr<TmpFileMgr::File> tmp_file;
-    Status status = tmp_file_mgr_->NewFile(this, device_id, &tmp_file);
-    if (status.ok()) {
-      tmp_files_.emplace_back(std::move(tmp_file));
-      ++files_allocated;
-    } else {
-      scratch_errors_.push_back(std::move(status));
-    }
+    tmp_file_mgr_->NewFile(this, device_id, &tmp_file);
+    tmp_files_.emplace_back(std::move(tmp_file));
+    ++files_allocated;
   }
   DCHECK_EQ(tmp_files_.size(), files_allocated);
   if (tmp_files_.size() == 0) {
@@ -321,18 +312,10 @@ Status TmpFileMgr::FileGroup::AllocateSpace(
     *tmp_file = tmp_files_[next_allocation_index_].get();
     next_allocation_index_ = (next_allocation_index_ + 1) % tmp_files_.size();
     if ((*tmp_file)->is_blacklisted()) continue;
-    Status status = (*tmp_file)->AllocateSpace(scratch_range_bytes, file_offset);
-    if (status.ok()) {
-      scratch_space_bytes_used_counter_->Add(scratch_range_bytes);
-      current_bytes_allocated_ += num_bytes;
-      return Status::OK();
-    }
-    // Log error and try other files if there was a problem. Problematic files will be
-    // blacklisted so we will not repeatedly log the same error.
-    LOG(WARNING) << "Error while allocating range in scratch file '"
-                 << (*tmp_file)->path() << "': " << status.msg().msg()
-                 << ". Will try another scratch file.";
-    scratch_errors_.push_back(status);
+    (*tmp_file)->AllocateSpace(scratch_range_bytes, file_offset);
+    scratch_space_bytes_used_counter_->Add(scratch_range_bytes);
+    current_bytes_allocated_ += num_bytes;
+    return Status::OK();
   }
   Status err_status(TErrorCode::SCRATCH_ALLOCATION_FAILED,
       join(tmp_file_mgr_->tmp_dirs_, ","), GetBackendString());
@@ -363,7 +346,7 @@ Status TmpFileMgr::FileGroup::Write(
   WriteRange::WriteDoneCallback callback = [this, tmp_handle_ptr](
       const Status& write_status) { WriteComplete(tmp_handle_ptr, write_status); };
   RETURN_IF_ERROR(
-      tmp_handle->Write(io_mgr_, io_ctx_.get(), tmp_file, file_offset, buffer, callback));
+      tmp_handle->Write(io_ctx_.get(), tmp_file, file_offset, buffer, callback));
   write_counter_->Add(1);
   bytes_written_counter_->Add(buffer.len());
   *handle = move(tmp_handle);
@@ -396,7 +379,9 @@ Status TmpFileMgr::FileGroup::ReadAsync(WriteHandle* handle, MemRange buffer) {
       BufferOpts::ReadInto(buffer.data(), buffer.len()));
   read_counter_->Add(1);
   bytes_read_counter_->Add(buffer.len());
-  RETURN_IF_ERROR(io_mgr_->AddScanRange(io_ctx_.get(), handle->read_range_, true));
+  bool needs_buffers;
+  RETURN_IF_ERROR(io_ctx_->StartScanRange(handle->read_range_, &needs_buffers));
+  DCHECK(!needs_buffers) << "Already provided a buffer";
   return Status::OK();
 }
 
@@ -426,7 +411,7 @@ Status TmpFileMgr::FileGroup::WaitForAsyncRead(WriteHandle* handle, MemRange buf
   }
 exit:
   // Always return the buffer before exiting to avoid leaking it.
-  if (io_mgr_buffer != nullptr) io_mgr_->ReturnBuffer(move(io_mgr_buffer));
+  if (io_mgr_buffer != nullptr) handle->read_range_->ReturnBuffer(move(io_mgr_buffer));
   handle->read_range_ = nullptr;
   return status;
 }
@@ -491,7 +476,7 @@ Status TmpFileMgr::FileGroup::RecoverWriteError(
   // Choose another file to try. Blacklisting ensures we don't retry the same file.
   // If this fails, the status will include all the errors in 'scratch_errors_'.
   RETURN_IF_ERROR(AllocateSpace(handle->len(), &tmp_file, &file_offset));
-  return handle->RetryWrite(io_mgr_, io_ctx_.get(), tmp_file, file_offset);
+  return handle->RetryWrite(io_ctx_.get(), tmp_file, file_offset);
 }
 
 string TmpFileMgr::FileGroup::DebugString() {
@@ -522,12 +507,21 @@ TmpFileMgr::WriteHandle::WriteHandle(
     is_cancelled_(false),
     write_in_flight_(false) {}
 
+TmpFileMgr::WriteHandle::~WriteHandle() {
+  DCHECK(!write_in_flight_);
+  DCHECK(read_range_ == nullptr);
+}
+
 string TmpFileMgr::WriteHandle::TmpFilePath() const {
   if (file_ == nullptr) return "";
   return file_->path();
 }
 
-Status TmpFileMgr::WriteHandle::Write(DiskIoMgr* io_mgr, RequestContext* io_ctx,
+int64_t TmpFileMgr::WriteHandle::len() const {
+  return write_range_->len();
+}
+
+Status TmpFileMgr::WriteHandle::Write(RequestContext* io_ctx,
     File* file, int64_t offset, MemRange buffer,
     WriteRange::WriteDoneCallback callback) {
   DCHECK(!write_in_flight_);
@@ -541,7 +535,7 @@ Status TmpFileMgr::WriteHandle::Write(DiskIoMgr* io_mgr, RequestContext* io_ctx,
       new WriteRange(file->path(), offset, file->AssignDiskQueue(), callback));
   write_range_->SetData(buffer.data(), buffer.len());
   write_in_flight_ = true;
-  Status status = io_mgr->AddWriteRange(io_ctx, write_range_.get());
+  Status status = io_ctx->AddWriteRange(write_range_.get());
   if (!status.ok()) {
     // The write will not be in flight if we returned with an error.
     write_in_flight_ = false;
@@ -555,11 +549,11 @@ Status TmpFileMgr::WriteHandle::Write(DiskIoMgr* io_mgr, RequestContext* io_ctx,
 }
 
 Status TmpFileMgr::WriteHandle::RetryWrite(
-    DiskIoMgr* io_mgr, RequestContext* io_ctx, File* file, int64_t offset) {
+    RequestContext* io_ctx, File* file, int64_t offset) {
   DCHECK(write_in_flight_);
   file_ = file;
   write_range_->SetRange(file->path(), offset, file->AssignDiskQueue());
-  Status status = io_mgr->AddWriteRange(io_ctx, write_range_.get());
+  Status status = io_ctx->AddWriteRange(write_range_.get());
   if (!status.ok()) {
     // The write will not be in flight if we returned with an error.
     write_in_flight_ = false;
@@ -625,15 +619,26 @@ Status TmpFileMgr::WriteHandle::EncryptAndHash(MemRange buffer) {
 
 Status TmpFileMgr::WriteHandle::CheckHashAndDecrypt(MemRange buffer) {
   DCHECK(FLAGS_disk_spill_encryption);
+  DCHECK(write_range_ != nullptr);
   SCOPED_TIMER(encryption_timer_);
 
   // GCM mode will verify the integrity by itself
   if (!key_.IsGcmMode()) {
     if (!hash_.Verify(buffer.data(), buffer.len())) {
-      return Status("Block verification failure");
+      return Status(TErrorCode::SCRATCH_READ_VERIFY_FAILED, buffer.len(),
+        write_range_->file(), GetBackendString(), write_range_->offset());
     }
   }
-  return key_.Decrypt(buffer.data(), buffer.len(), buffer.data());
+  Status decrypt_status = key_.Decrypt(buffer.data(), buffer.len(), buffer.data());
+  if (!decrypt_status.ok()) {
+    // Treat decryption failing as a verification failure, but include extra info from
+    // the decryption status.
+    Status result_status(TErrorCode::SCRATCH_READ_VERIFY_FAILED, buffer.len(),
+          write_range_->file(), GetBackendString(), write_range_->offset());
+    result_status.MergeStatus(decrypt_status);
+    return result_status;
+  }
+  return Status::OK();
 }
 
 string TmpFileMgr::WriteHandle::DebugString() {

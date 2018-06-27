@@ -169,7 +169,8 @@ class LlvmCodeGen {
   void Close();
 
   RuntimeProfile* runtime_profile() { return profile_; }
-  RuntimeProfile::Counter* codegen_timer() { return codegen_timer_; }
+  RuntimeProfile::Counter* ir_generation_timer() { return ir_generation_timer_; }
+  RuntimeProfile::ThreadCounters* llvm_thread_counters() { return llvm_thread_counters_; }
 
   /// Turns on/off optimization passes
   void EnableOptimizations(bool enable);
@@ -636,8 +637,9 @@ class LlvmCodeGen {
   Status LinkModuleFromLocalFs(const std::string& file);
 
   /// Same as 'LinkModuleFromLocalFs', but takes an hdfs file location instead and makes
-  /// sure that the same hdfs file is not linked twice.
-  Status LinkModuleFromHdfs(const std::string& hdfs_file);
+  /// sure that the same hdfs file is not linked twice. The mtime is used ensure that the
+  /// cached hdfs_file that's used is the most recent.
+  Status LinkModuleFromHdfs(const std::string& hdfs_file, const time_t mtime);
 
   /// Strip global constructors and destructors from an LLVM module. We never run them
   /// anyway (they must be explicitly invoked) so it is dead code.
@@ -687,10 +689,6 @@ class LlvmCodeGen {
   /// This function parses the bitcode of 'fn' to populate basic blocks, instructions
   /// and other data structures attached to the function object. Return error status
   /// for any error.
-  Status MaterializeFunctionHelper(llvm::Function* fn);
-
-  /// Entry point for materializing function 'fn'. Invokes MaterializeFunctionHelper()
-  /// to do the actual work. Return error status for any error.
   Status MaterializeFunction(llvm::Function* fn);
 
   /// Materialize the module owned by this codegen object. This will materialize all
@@ -753,11 +751,12 @@ class LlvmCodeGen {
   /// Time spent reading the .ir file from the file system.
   RuntimeProfile::Counter* load_module_timer_;
 
-  /// Time spent constructing the in-memory module from the ir.
+  /// Time spent creating the initial module with the cross-compiled Impala IR.
   RuntimeProfile::Counter* prepare_module_timer_;
 
-  /// Time spent doing codegen (adding IR to the module)
-  RuntimeProfile::Counter* codegen_timer_;
+  /// Time spent by ExecNodes while adding IR to the module. Update by
+  /// FragmentInstanceState during its 'CODEGEN_START' state.
+  RuntimeProfile::Counter* ir_generation_timer_;
 
   /// Time spent optimizing the module.
   RuntimeProfile::Counter* optimization_timer_;
@@ -772,6 +771,10 @@ class LlvmCodeGen {
   /// unused functions from the module.
   RuntimeProfile::Counter* num_functions_;
   RuntimeProfile::Counter* num_instructions_;
+
+  /// Aggregated llvm thread counters. Also includes the phase represented by
+  /// 'ir_generation_timer_' and hence is also updated by FragmentInstanceState.
+  RuntimeProfile::ThreadCounters* llvm_thread_counters_;
 
   /// whether or not optimizations are enabled
   bool optimizations_enabled_;

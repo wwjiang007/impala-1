@@ -21,7 +21,6 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.util.List;
 
-import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.adl.AdlFileSystem;
@@ -29,13 +28,11 @@ import org.apache.hadoop.fs.permission.FsAction;
 import org.apache.hadoop.fs.s3a.S3AFileSystem;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
 import org.apache.impala.authorization.Privilege;
-import org.apache.impala.catalog.HdfsFileFormat;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.HdfsPartition;
 import org.apache.impala.catalog.HdfsTable;
-import org.apache.impala.catalog.Table;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FileSystemUtil;
-import org.apache.impala.thrift.ImpalaInternalServiceConstants;
 import org.apache.impala.thrift.TLoadDataReq;
 import org.apache.impala.thrift.TTableName;
 import org.apache.impala.util.FsPermissionChecker;
@@ -107,7 +104,7 @@ public class LoadDataStmt extends StatementBase {
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
     dbName_ = analyzer.getTargetDbName(tableName_);
-    Table table = analyzer.getTable(tableName_, Privilege.INSERT);
+    FeTable table = analyzer.getTable(tableName_, Privilege.INSERT);
     if (!(table instanceof HdfsTable)) {
       throw new AnalysisException("LOAD DATA only supported for HDFS tables: " +
           dbName_ + "." + getTbl());
@@ -205,33 +202,18 @@ public class LoadDataStmt extends StatementBase {
           "target table (%s) because Impala does not have WRITE access to HDFS " +
           "location: ", hdfsTable.getFullName());
 
-      HdfsPartition partition;
-      String location;
       if (partitionSpec_ != null) {
-        partition = hdfsTable.getPartition(partitionSpec_.getPartitionSpecKeyValues());
-        location = partition.getLocation();
+        HdfsPartition partition = hdfsTable.getPartition(
+            partitionSpec_.getPartitionSpecKeyValues());
+        String location = partition.getLocation();
         if (!TAccessLevelUtil.impliesWriteAccess(partition.getAccessLevel())) {
           throw new AnalysisException(noWriteAccessErrorMsg + location);
         }
       } else {
-        // "default" partition
-        partition = hdfsTable.getPartitionMap().get(
-            ImpalaInternalServiceConstants.DEFAULT_PARTITION_ID);
-        location = hdfsTable.getLocation();
+        // No specific partition specified, so we need to check write access
+        // on the table as a whole.
         if (!hdfsTable.hasWriteAccess()) {
           throw new AnalysisException(noWriteAccessErrorMsg + hdfsTable.getLocation());
-        }
-      }
-      Preconditions.checkNotNull(partition);
-
-      // Verify the files being loaded are supported.
-      for (FileStatus fStatus: fs.listStatus(source)) {
-        if (fs.isDirectory(fStatus.getPath())) continue;
-        StringBuilder errorMsg = new StringBuilder();
-        HdfsFileFormat fileFormat = partition.getInputFormatDescriptor().getFileFormat();
-        if (!fileFormat.isFileCompressionTypeSupported(fStatus.getPath().toString(),
-          errorMsg)) {
-          throw new AnalysisException(errorMsg.toString());
         }
       }
     } catch (FileNotFoundException e) {

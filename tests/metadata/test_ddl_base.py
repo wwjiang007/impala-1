@@ -73,17 +73,31 @@ class TestDdlBase(ImpalaTestSuite):
     """Extracts the serde properties mapping from the output of DESCRIBE FORMATTED"""
     return self._get_properties('Storage Desc Params:', table_name)
 
-  def _get_properties(self, section_name, table_name):
-    """Extracts the table properties mapping from the output of DESCRIBE FORMATTED"""
-    result = self.client.execute("describe formatted " + table_name)
+  def _get_db_owner_properties(self, db_name):
+    """Extracts the DB properties mapping from the output of DESCRIBE FORMATTED"""
+    return self._get_properties("Owner:", db_name, True)
+
+  def _get_properties(self, section_name, name, is_db=False):
+    """Extracts the db/table properties mapping from the output of DESCRIBE FORMATTED"""
+    result = self.client.execute("describe {0} formatted {1}".format(
+      "database" if is_db else "", name))
     match = False
-    properties = dict();
+    properties = dict()
     for row in result.data:
       if section_name in row:
         match = True
       elif match:
         row = row.split('\t')
-        if (row[1] == 'NULL'):
+        if row[1] == 'NULL':
           break
         properties[row[1].rstrip()] = row[2].rstrip()
     return properties
+
+  def _get_db_comment(self, db_name):
+    """Extracts the DB comment from the output of DESCRIBE DATABASE"""
+    result = self.client.execute("describe database {0}".format(db_name))
+    return result.data[0].split('\t')[2]
+
+  def _get_table_or_view_comment(self, table_name):
+    props = self._get_tbl_properties(table_name)
+    return props["comment"] if "comment" in props else None

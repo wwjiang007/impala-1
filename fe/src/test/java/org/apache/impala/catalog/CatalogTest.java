@@ -17,7 +17,6 @@
 
 package org.apache.impala.catalog;
 
-import static org.apache.impala.thrift.ImpalaInternalServiceConstants.DEFAULT_PARTITION_ID;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
@@ -50,9 +49,9 @@ public class CatalogTest {
   private static CatalogServiceCatalog catalog_ =
       CatalogServiceTestCatalog.create();
 
-  private void checkTableCols(Db db, String tblName, int numClusteringCols,
+  public static void checkTableCols(FeDb db, String tblName, int numClusteringCols,
       String[] colNames, Type[] colTypes) throws TableLoadingException {
-    Table tbl = db.getTable(tblName);
+    FeTable tbl = db.getTable(tblName);
     assertEquals(tbl.getName(), tblName);
     assertEquals(tbl.getNumClusteringCols(), numClusteringCols);
     List<Column> cols = tbl.getColumns();
@@ -288,17 +287,21 @@ public class CatalogTest {
   public void TestPartitions() throws CatalogException {
     HdfsTable table =
         (HdfsTable) catalog_.getOrLoadTable("functional", "AllTypes");
-    Collection<HdfsPartition> partitions = table.getPartitions();
+    checkAllTypesPartitioning(table, true);
+  }
+
+  public static void checkAllTypesPartitioning(FeFsTable table,
+      boolean checkFileDescriptors) {
+    assertEquals(24, table.getPartitionIds().size());
+    assertEquals(24, table.getPartitions().size());
+    Collection<? extends FeFsPartition> partitions =
+        FeCatalogUtils.loadAllPartitions(table);
 
     // check that partition keys cover the date range 1/1/2009-12/31/2010
-    // and that we have one file per partition, plus the default partition
-    assertEquals(25, partitions.size());
+    // and that we have one file per partition.
+    assertEquals(24, partitions.size());
     Set<Long> months = Sets.newHashSet();
-    for (HdfsPartition p: partitions) {
-      if (p.getId() == DEFAULT_PARTITION_ID) {
-        continue;
-      }
-
+    for (FeFsPartition p: partitions) {
       assertEquals(2, p.getPartitionValues().size());
 
       LiteralExpr key1Expr = p.getPartitionValues().get(0);
@@ -313,7 +316,11 @@ public class CatalogTest {
 
       months.add(key1 * 100 + key2);
 
-      assertEquals(p.getFileDescriptors().size(), 1);
+      if (checkFileDescriptors) {
+        // TODO(todd): once LocalCatalog supports file descriptors,
+        // no need for this boolean anymore.
+        assertEquals(p.getFileDescriptors().size(), 1);
+      }
     }
     assertEquals(months.size(), 24);
   }

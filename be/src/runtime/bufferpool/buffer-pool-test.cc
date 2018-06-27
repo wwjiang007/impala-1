@@ -1960,7 +1960,7 @@ void BufferPoolTest::TestRandomInternalMulti(
   }
 
   AtomicInt32 stop_maintenance(0);
-  thread* maintenance_thread = new thread([this, &pool, &stop_maintenance]() {
+  thread maintenance_thread([&pool, &stop_maintenance]() {
     while (stop_maintenance.Load() == 0) {
       pool.Maintenance();
       SleepForMs(50);
@@ -1968,7 +1968,7 @@ void BufferPoolTest::TestRandomInternalMulti(
   });
   workers.join_all();
   stop_maintenance.Add(1);
-  maintenance_thread->join();
+  maintenance_thread.join();
   global_reservations_.Close();
 }
 
@@ -2122,14 +2122,16 @@ TEST_F(BufferPoolTest, DecreaseReservation) {
 
   // Unpin pages and decrease reservation while the writes are in flight.
   UnpinAll(&pool, &client, &pages);
-  ASSERT_OK(client.DecreaseReservationTo(2 * TEST_BUFFER_LEN));
+  ASSERT_OK(client.DecreaseReservationTo(
+      numeric_limits<int64_t>::max(), 2 * TEST_BUFFER_LEN));
   // Two pages must be clean to stay within reservation
   EXPECT_GE(pool.GetNumCleanPages(), 2);
   EXPECT_EQ(2 * TEST_BUFFER_LEN, client.GetReservation());
 
   // Decrease it further after the pages are evicted.
   WaitForAllWrites(&client);
-  ASSERT_OK(client.DecreaseReservationTo(TEST_BUFFER_LEN));
+  ASSERT_OK(client.DecreaseReservationTo(
+      numeric_limits<int64_t>::max(), TEST_BUFFER_LEN));
   EXPECT_GE(pool.GetNumCleanPages(), 3);
   EXPECT_EQ(TEST_BUFFER_LEN, client.GetReservation());
 
@@ -2137,10 +2139,38 @@ TEST_F(BufferPoolTest, DecreaseReservation) {
   ASSERT_OK(AllocateAndFree(&pool, &client, TEST_BUFFER_LEN));
   EXPECT_EQ(1, NumEvicted(pages));
 
-  // Check that we can decrease it to zero.
-  ASSERT_OK(client.DecreaseReservationTo(0));
+  // Check that we can decrease it to zero, with the max decrease applied.
+  const int64_t MAX_DECREASE = 123;
+  ASSERT_OK(client.DecreaseReservationTo(MAX_DECREASE, 0));
+  EXPECT_EQ(TEST_BUFFER_LEN - MAX_DECREASE, client.GetReservation());
+  ASSERT_OK(client.DecreaseReservationTo(numeric_limits<int64_t>::max(), 0));
   EXPECT_EQ(0, client.GetReservation());
 
+  // Test concurrent increases and decreases do not race. All increases go through
+  // and each decrease reduces the reservation by DECREASE_SIZE or less.
+  const int NUM_CONCURRENT_INCREASES = 50;
+  const int NUM_CONCURRENT_DECREASES = 50;
+  const int64_t INCREASE_SIZE = 13;
+  const int64_t DECREASE_SIZE = 7;
+  const int64_t START_RESERVATION = 1000;
+  const int64_t MIN_RESERVATION = 500;
+  ASSERT_TRUE(client.IncreaseReservation(START_RESERVATION));
+  thread increaser([&] {
+    for (int i = 0; i < NUM_CONCURRENT_INCREASES; ++i) {
+      ASSERT_TRUE(client.IncreaseReservation(INCREASE_SIZE));
+      SleepForMs(0);
+    }
+  });
+  for (int i = 0; i < NUM_CONCURRENT_DECREASES; ++i) {
+    ASSERT_OK(client.DecreaseReservationTo(DECREASE_SIZE, MIN_RESERVATION));
+  }
+  increaser.join();
+  // All increases and decreased should have been applied.
+  EXPECT_EQ(START_RESERVATION + INCREASE_SIZE * NUM_CONCURRENT_INCREASES
+      - DECREASE_SIZE * NUM_CONCURRENT_DECREASES, client.GetReservation());
+
+  ASSERT_OK(client.DecreaseReservationTo(numeric_limits<int64_t>::max(), 0));
+  EXPECT_EQ(0, client.GetReservation());
   DestroyAll(&pool, &client, &pages);
   pool.DeregisterClient(&client);
   global_reservations_.Close();
@@ -2171,7 +2201,7 @@ TEST_F(BufferPoolTest, ConcurrentBufferOperations) {
   // Allocate threads allocate buffers whenever able and enqueue them.
   for (int i = 0; i < ALLOCATE_THREADS; ++i) {
     allocate_threads.add_thread(new thread([&] {
-        for (int i = 0; i < NUM_ALLOCATIONS_PER_THREAD; ++i) {
+        for (int j = 0; j < NUM_ALLOCATIONS_PER_THREAD; ++j) {
           // Try to deduct reservation.
           while (true) {
             int64_t val = available_reservation.Load();
@@ -2182,7 +2212,7 @@ TEST_F(BufferPoolTest, ConcurrentBufferOperations) {
           }
           BufferHandle buffer;
           ASSERT_OK(pool.AllocateBuffer(&client, TEST_BUFFER_LEN, &buffer));
-          uint8_t first_byte = static_cast<uint8_t>(i % 256);
+          uint8_t first_byte = static_cast<uint8_t>(j % 256);
           buffer.data()[0] = first_byte;
           delete_queue.BlockingPut(pair<uint8_t, BufferHandle>(first_byte, move(buffer)));
         }

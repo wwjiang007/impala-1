@@ -295,11 +295,15 @@ static void ResolveSymbolLookup(const TSymbolLookupParams params,
 
   // Builtin functions are loaded directly from the running process
   if (params.fn_binary_type != TFunctionBinaryType::BUILTIN) {
-    // Refresh the library if necessary since we're creating a new function
-    LibCache::instance()->SetNeedsRefresh(params.location);
+    // Use the latest version of the file from the file system if specified.
+    if (params.needs_refresh) {
+      // Refresh the library if necessary.
+      LibCache::instance()->SetNeedsRefresh(params.location);
+    }
+    LibCacheEntryHandle handle;
     string dummy_local_path;
-    Status status = LibCache::instance()->GetLocalLibPath(
-        params.location, type, &dummy_local_path);
+    Status status = LibCache::instance()->GetLocalPath(
+        params.location, type, -1, &handle, &dummy_local_path);
     if (!status.ok()) {
       result->__set_result_code(TSymbolLookupResultCode::BINARY_NOT_FOUND);
       result->__set_error_msg(status.GetDetail());
@@ -310,11 +314,13 @@ static void ResolveSymbolLookup(const TSymbolLookupParams params,
   // Check if the FE-specified symbol exists as-is.
   // Set 'quiet' to true so we don't flood the log with unfound builtin symbols on
   // startup.
-  Status status =
-      LibCache::instance()->CheckSymbolExists(params.location, type, params.symbol, true);
+  time_t mtime = -1;
+  Status status = LibCache::instance()->CheckSymbolExists(
+      params.location, type, params.symbol, true, &mtime);
   if (status.ok()) {
     result->__set_result_code(TSymbolLookupResultCode::SYMBOL_FOUND);
     result->__set_symbol(params.symbol);
+    result->__set_last_modified_time(mtime);
     return;
   }
 
@@ -348,7 +354,8 @@ static void ResolveSymbolLookup(const TSymbolLookupParams params,
   }
 
   // Look up the mangled symbol
-  status = LibCache::instance()->CheckSymbolExists(params.location, type, symbol);
+  status = LibCache::instance()->CheckSymbolExists(
+      params.location, type, symbol, false, &mtime);
   if (!status.ok()) {
     result->__set_result_code(TSymbolLookupResultCode::SYMBOL_NOT_FOUND);
     stringstream ss;
@@ -379,6 +386,7 @@ static void ResolveSymbolLookup(const TSymbolLookupParams params,
   // We were able to resolve the symbol.
   result->__set_result_code(TSymbolLookupResultCode::SYMBOL_FOUND);
   result->__set_symbol(symbol);
+  result->__set_last_modified_time(mtime);
 }
 
 extern "C"
@@ -390,9 +398,11 @@ Java_org_apache_impala_service_FeSupport_NativeCacheJar(
       JniUtil::internal_exc_class(), nullptr);
 
   TCacheJarResult result;
+  LibCacheEntryHandle handle;
   string local_path;
-  Status status = LibCache::instance()->GetLocalLibPath(params.hdfs_location,
-      LibCache::TYPE_JAR, &local_path);
+  // TODO(IMPALA-6727): used for external data sources; add proper mtime.
+  Status status = LibCache::instance()->GetLocalPath(
+      params.hdfs_location, LibCache::TYPE_JAR, -1, &handle, &local_path);
   status.ToThrift(&result.status);
   if (status.ok()) result.__set_local_path(local_path);
 
@@ -551,48 +561,52 @@ namespace impala {
 
 static JNINativeMethod native_methods[] = {
   {
-      (char*)"NativeFeTestInit", (char*)"()V",
+      const_cast<char*>("NativeFeTestInit"), const_cast<char*>("()V"),
       (void*)::Java_org_apache_impala_service_FeSupport_NativeFeTestInit
   },
   {
-      (char*)"NativeEvalExprsWithoutRow", (char*)"([B[B)[B",
+      const_cast<char*>("NativeEvalExprsWithoutRow"), const_cast<char*>("([B[B)[B"),
       (void*)::Java_org_apache_impala_service_FeSupport_NativeEvalExprsWithoutRow
   },
   {
-      (char*)"NativeCacheJar", (char*)"([B)[B",
+      const_cast<char*>("NativeCacheJar"), const_cast<char*>("([B)[B"),
       (void*)::Java_org_apache_impala_service_FeSupport_NativeCacheJar
   },
   {
-      (char*)"NativeLookupSymbol", (char*)"([B)[B",
+      const_cast<char*>("NativeLookupSymbol"), const_cast<char*>("([B)[B"),
       (void*)::Java_org_apache_impala_service_FeSupport_NativeLookupSymbol
   },
   {
-      (char*)"NativePrioritizeLoad", (char*)"([B)[B",
+      const_cast<char*>("NativePrioritizeLoad"), const_cast<char*>("([B)[B"),
       (void*)::Java_org_apache_impala_service_FeSupport_NativePrioritizeLoad
   },
   {
-      (char*)"NativeParseQueryOptions", (char*)"(Ljava/lang/String;[B)[B",
+      const_cast<char*>("NativeParseQueryOptions"),
+      const_cast<char*>("(Ljava/lang/String;[B)[B"),
       (void*)::Java_org_apache_impala_service_FeSupport_NativeParseQueryOptions
   },
   {
-      (char*)"NativeAddPendingTopicItem", (char*)"(JLjava/lang/String;J[BZ)Z",
+      const_cast<char*>("NativeAddPendingTopicItem"),
+      const_cast<char*>("(JLjava/lang/String;J[BZ)Z"),
       (void*)::Java_org_apache_impala_service_FeSupport_NativeAddPendingTopicItem
   },
   {
-      (char*)"NativeGetNextCatalogObjectUpdate",
-      (char*)"(J)Lorg/apache/impala/common/Pair;",
+      const_cast<char*>("NativeGetNextCatalogObjectUpdate"),
+      const_cast<char*>("(J)Lorg/apache/impala/common/Pair;"),
       (void*)::Java_org_apache_impala_service_FeSupport_NativeGetNextCatalogObjectUpdate
   },
   {
-      (char*)"NativeLibCacheSetNeedsRefresh", (char*)"(Ljava/lang/String;)Z",
+      const_cast<char*>("NativeLibCacheSetNeedsRefresh"),
+      const_cast<char*>("(Ljava/lang/String;)Z"),
       (void*)::Java_org_apache_impala_service_FeSupport_NativeLibCacheSetNeedsRefresh
   },
   {
-      (char*)"NativeLibCacheRemoveEntry", (char*)"(Ljava/lang/String;)Z",
+      const_cast<char*>("NativeLibCacheRemoveEntry"),
+      const_cast<char*>("(Ljava/lang/String;)Z"),
       (void*)::Java_org_apache_impala_service_FeSupport_NativeLibCacheRemoveEntry
   },
   {
-    (char*)"MinLogSpaceForBloomFilter", (char*)"(JD)I",
+    const_cast<char*>("MinLogSpaceForBloomFilter"), const_cast<char*>("(JD)I"),
     (void*)::Java_org_apache_impala_service_FeSupport_MinLogSpaceForBloomFilter
   },
 };

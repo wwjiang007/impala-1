@@ -33,7 +33,5 @@ add_library(Scheduling STATIC
 )
 add_dependencies(Scheduling gen-deps)
 
-ADD_BE_TEST(scheduler-test)
-ADD_BE_TEST(backend-config-test)
-# TODO: Add BE test
-# ADD_BE_TEST(admission-controller-test)
+ADD_BE_LSAN_TEST(scheduler-test)
+ADD_BE_LSAN_TEST(backend-config-test)

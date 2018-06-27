@@ -22,6 +22,7 @@ import pytest
 import shutil
 import tempfile
 import json
+import grp
 from time import sleep, time
 from getpass import getuser
 from ImpalaService import ImpalaHiveServer2Service
@@ -174,10 +175,42 @@ class TestAuthorization(CustomClusterTestSuite):
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args("--server_name=server1\
       --authorization_policy_file=%s\
-      --authorized_proxy_user_config=hue=%s\
+      --authorized_proxy_user_config=foo=bar;hue=%s\
       --abort_on_failed_audit_event=false\
       --audit_event_log_dir=%s" % (AUTH_POLICY_FILE, getuser(), AUDIT_LOG_DIR))
-  def test_impersonation(self):
+  def test_user_impersonation(self):
+    """End-to-end user impersonation + authorization test"""
+    self.__test_impersonation()
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args("--server_name=server1\
+        --authorization_policy_file=%s\
+        --authorized_proxy_user_config=hue=bar\
+        --authorized_proxy_group_config=foo=bar;hue=%s\
+        --abort_on_failed_audit_event=false\
+        --audit_event_log_dir=%s" % (AUTH_POLICY_FILE,
+                                     grp.getgrgid(os.getgid()).gr_name,
+                                     AUDIT_LOG_DIR))
+  def test_group_impersonation(self):
+    """End-to-end group impersonation + authorization test"""
+    self.__test_impersonation()
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args("--server_name=server1\
+        --authorization_policy_file=%s\
+        --authorized_proxy_user_config=foo=bar\
+        --authorized_proxy_group_config=foo=bar\
+        --abort_on_failed_audit_event=false\
+        --audit_event_log_dir=%s" % (AUTH_POLICY_FILE, AUDIT_LOG_DIR))
+  def test_no_matching_user_and_group_impersonation(self):
+    open_session_req = TCLIService.TOpenSessionReq()
+    open_session_req.username = 'hue'
+    open_session_req.configuration = dict()
+    open_session_req.configuration['impala.doas.user'] = 'abc'
+    resp = self.hs2_client.OpenSession(open_session_req)
+    assert 'User \'hue\' is not authorized to delegate to \'abc\'' in str(resp)
+
+  def __test_impersonation(self):
     """End-to-end impersonation + authorization test. Expects authorization to be
     configured before running this test"""
     # TODO: To reuse the HS2 utility code from the TestHS2 test suite we need to import
@@ -321,7 +354,6 @@ class TestAuthorization(CustomClusterTestSuite):
 
     if has_access:
       TestHS2.check_response(exec_summary_resp)
-      assert exec_summary_resp.summary.nodes is not None
     else:
       assert "User %s is not authorized to access the runtime profile or "\
           "execution summary." % (getuser()) in str(exec_summary_resp)

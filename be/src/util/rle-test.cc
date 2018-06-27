@@ -145,7 +145,7 @@ TEST(BitArray, TestValues) {
   }
 }
 
-/// Get many values from a batch RLE decoder.
+/// Get many values from a batch RLE decoder using its low level functions.
 template <typename T>
 static bool GetRleValues(RleBatchDecoder<T>* decoder, int num_vals, T* vals) {
   int decoded = 0;
@@ -173,6 +173,12 @@ static bool GetRleValues(RleBatchDecoder<T>* decoder, int num_vals, T* vals) {
   return true;
 }
 
+/// Get many values from a batch RLE decoder using its GetValues() function.
+template <typename T>
+static bool GetRleValuesBatched(RleBatchDecoder<T>* decoder, int num_vals, T* vals) {
+  return num_vals == decoder->GetValues(num_vals, vals);
+}
+
 // Validates encoding of values by encoding and decoding them.  If
 // expected_encoding != NULL, also validates that the encoded buffer is
 // exactly 'expected_encoding'.
@@ -198,23 +204,30 @@ void ValidateRle(const vector<int>& values, int bit_width,
   }
 
   // Verify read
-  RleBatchDecoder<uint64_t> decoder(buffer, len, bit_width);
-  RleBatchDecoder<uint64_t> decoder2(buffer, len, bit_width);
+  RleBatchDecoder<uint64_t> per_value_decoder(buffer, len, bit_width);
+  RleBatchDecoder<uint64_t> per_run_decoder(buffer, len, bit_width);
+  RleBatchDecoder<uint64_t> batch_decoder(buffer, len, bit_width);
   // Ensure it returns the same results after Reset().
   for (int trial = 0; trial < 2; ++trial) {
     for (int i = 0; i < values.size(); ++i) {
       uint64_t val;
-      EXPECT_TRUE(decoder.GetSingleValue(&val));
+      EXPECT_TRUE(per_value_decoder.GetSingleValue(&val));
       EXPECT_EQ(values[i], val) << i;
     }
-    // Unpack everything at once from the second batch decoder.
-    vector<uint64_t> decoded_values(values.size());
-    EXPECT_TRUE(GetRleValues(&decoder2, values.size(), decoded_values.data()));
+    // Unpack everything at once from the other decoders.
+    vector<uint64_t> decoded_values1(values.size());
+    vector<uint64_t> decoded_values2(values.size());
+    EXPECT_TRUE(GetRleValues(
+        &per_run_decoder, decoded_values1.size(), decoded_values1.data()));
+    EXPECT_TRUE(GetRleValuesBatched(
+        &batch_decoder, decoded_values2.size(), decoded_values2.data()));
     for (int i = 0; i < values.size(); ++i) {
-      EXPECT_EQ(values[i], decoded_values[i]) << i;
+      EXPECT_EQ(values[i], decoded_values1[i]) << i;
+      EXPECT_EQ(values[i], decoded_values2[i]) << i;
     }
-    decoder.Reset(buffer, len, bit_width);
-    decoder2.Reset(buffer, len, bit_width);
+    per_value_decoder.Reset(buffer, len, bit_width);
+    per_run_decoder.Reset(buffer, len, bit_width);
+    batch_decoder.Reset(buffer, len, bit_width);
   }
 }
 
@@ -468,6 +481,45 @@ TEST(Rle, ZeroLiteralOrRepeatCount) {
   for (int i = 0; i < 10; ++i) {
     EXPECT_EQ(0, decoder.NextNumLiterals());
     EXPECT_EQ(0, decoder.NextNumRepeats());
+  }
+}
+
+// Regression test for handing of repeat counts >= 2^31: IMPALA-6946.
+TEST(Rle, RepeatCountOverflow) {
+  const int BUFFER_LEN = 1024;
+  uint8_t buffer[BUFFER_LEN];
+
+  for (bool literal_run : {true, false}) {
+    memset(buffer, 0, BUFFER_LEN);
+    LOG(INFO) << "Testing negative " << (literal_run ? "literal" : "repeated");
+    BitWriter writer(buffer, BUFFER_LEN);
+    // Literal runs have lowest bit 1. Repeated runs have lowest bit 0. All other bits
+    // are 1.
+    const uint32_t REPEATED_RUN_HEADER = 0xfffffffe;
+    const uint32_t LITERAL_RUN_HEADER = 0xffffffff;
+    writer.PutUleb128Int(literal_run ? LITERAL_RUN_HEADER : REPEATED_RUN_HEADER);
+    writer.Flush();
+
+    RleBatchDecoder<uint64_t> decoder(buffer, BUFFER_LEN, 1);
+    // Repeated run length fits in an int32_t.
+    if (literal_run) {
+      EXPECT_EQ(0, decoder.NextNumRepeats()) << "Not a repeated run";
+      // Literal run length would overflow int32_t - should gracefully fail decoding.
+      EXPECT_EQ(0, decoder.NextNumLiterals());
+    } else {
+      EXPECT_EQ(0x7fffffff, decoder.NextNumRepeats());
+      EXPECT_EQ(0, decoder.NextNumLiterals()) << "Not a literal run";
+    }
+
+    // IMPALA-6946: reading back run lengths that don't fit in int32_t hit various
+    // DCHECKs.
+    uint64_t val;
+    if (literal_run) {
+      EXPECT_EQ(0, decoder.GetValues(1, &val)) << "Decoding failed above.";
+    } else {
+      EXPECT_EQ(1, decoder.GetValues(1, &val));
+      EXPECT_EQ(0, val) << "Buffer was initialized with all zeroes";
+    }
   }
 }
 

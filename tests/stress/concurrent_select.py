@@ -62,17 +62,19 @@ import sys
 import threading
 import traceback
 from Queue import Empty   # Must be before Queue below
+from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser, Namespace
 from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime
 from multiprocessing import Lock, Process, Queue, Value
-from random import choice, random, randrange
+from random import choice, random, randrange, shuffle
 from sys import exit, maxint
 from tempfile import gettempdir
 from textwrap import dedent
 from threading import current_thread, Thread
 from time import sleep, time
 
+import tests.comparison.cli_options as cli_options
 import tests.util.test_file_parser as test_file_parser
 from tests.comparison.cluster import Timeout
 from tests.comparison.db_types import Int, TinyInt, SmallInt, BigInt
@@ -84,20 +86,102 @@ from tests.util.thrift_util import op_handle_to_query_id
 
 LOG = logging.getLogger(os.path.splitext(os.path.basename(__file__))[0])
 
-# Used to short circuit a binary search of the min mem limit. Values will be considered
-# equal if they are within this ratio or absolute amount of each other.
-MEM_LIMIT_EQ_THRESHOLD_PC = 0.975
-MEM_LIMIT_EQ_THRESHOLD_MB = 50
+# IMPALA-6715: Every so often the stress test or the TPC workload directories get
+# changed, and the stress test loses the ability to run the full set of queries. Set
+# these constants and assert that when a workload is used, all the queries we expect to
+# use are there.
+EXPECTED_TPCDS_QUERIES_COUNT = 71
+EXPECTED_TPCH_NESTED_QUERIES_COUNT = 22
+EXPECTED_TPCH_QUERIES_COUNT = 22
 
 # Regex to extract the estimated memory from an explain plan.
+# The unit prefixes can be found in
+# fe/src/main/java/org/apache/impala/common/PrintUtils.java
 MEM_ESTIMATE_PATTERN = re.compile(
-    r"Per-Host Resource Estimates: Memory=(\d+.?\d*)(T|G|M|K)?B")
+    r"Per-Host Resource Estimates: Memory=(\d+.?\d*)(P|T|G|M|K)?B")
 
 PROFILES_DIR = "profiles"
 RESULT_HASHES_DIR = "result_hashes"
 
 # The version of the file format containing the collected query runtime info.
 RUNTIME_INFO_FILE_VERSION = 3
+
+
+class StressArgConverter(object):
+  def __init__(self, args):
+    """
+    Convert arguments as returned from from argparse parse_args() into internal forms.
+
+    The purpose of this object is to do any conversions needed from the type given by
+    parge_args() into internal forms. For example, if a commandline option takes in a
+    complicated string that needs to be converted into a list or dictionary, this is the
+    place to do it. Access works the same as on the object returned by parse_args(),
+    i.e., object.option_attribute.
+
+    In most cases, simple arguments needn't be converted, because argparse handles the
+    type conversion already, and in most cases, type conversion (e.g., "8" <str> to 8
+    <int>) is all that's needed. If a property getter below doesn't exist, it means the
+    argument value is just passed along unconverted.
+
+    Params:
+      args: argparse.Namespace object (from argparse.ArgumentParser().parse_args())
+    """
+    assert isinstance(args, Namespace), "expected Namespace, got " + str(type(args))
+    self._args = args
+    self._common_query_options = None
+
+  def __getattr__(self, attr):
+    # This "proxies through" all the attributes from the Namespace object that are not
+    # defined in this object via property getters below.
+    return getattr(self._args, attr)
+
+  @property
+  def common_query_options(self):
+    # Memoize this, as the integrity checking of --common-query-options need only
+    # happen once.
+    if self._common_query_options is not None:
+      return self._common_query_options
+    # The stress test sets these, so callers cannot override them.
+    IGNORE_QUERY_OPTIONS = frozenset([
+        'ABORT_ON_ERROR',
+        'MEM_LIMIT',
+    ])
+    common_query_options = {}
+    if self._args.common_query_options is not None:
+      for query_option_and_value in self._args.common_query_options:
+        try:
+          query_option, value = query_option_and_value.split('=')
+        except ValueError:
+          LOG.error(
+              "Could not parse --common-query-options: '{common_query_options}'".format(
+                  common_query_options=self._args.common_query_options))
+          exit(1)
+        query_option = query_option.upper()
+        if query_option in common_query_options:
+          LOG.error(
+              "Query option '{query_option}' already defined in --common-query-options: "
+              "'{common_query_options}'".format(
+                  query_option=query_option,
+                  common_query_options=self._args.common_query_options))
+          exit(1)
+        elif query_option in IGNORE_QUERY_OPTIONS:
+          LOG.warn(
+              "Ignoring '{query_option}' in common query options: '{opt}': "
+              "The stress test algorithm needs control of this option.".format(
+                  query_option=query_option, opt=self._args.common_query_options))
+        else:
+          common_query_options[query_option] = value
+          LOG.debug("Common query option '{query_option}' set to '{value}'".format(
+              query_option=query_option, value=value))
+    self._common_query_options = common_query_options
+    return self._common_query_options
+
+  @property
+  def runtime_info_path(self):
+    runtime_info_path = self._args.runtime_info_path
+    if "{cm_host}" in runtime_info_path:
+      runtime_info_path = runtime_info_path.format(cm_host=self._args.cm_host)
+    return runtime_info_path
 
 
 def create_and_start_daemon_thread(fn, name):
@@ -159,7 +243,9 @@ def print_crash_info_if_exists(impala, start_time):
 class QueryReport(object):
   """Holds information about a single query run."""
 
-  def __init__(self):
+  def __init__(self, query):
+    self.query = query
+
     self.result_hash = None
     self.runtime_secs = None
     self.mem_was_spilled = False
@@ -169,6 +255,32 @@ class QueryReport(object):
     self.was_cancelled = False
     self.profile = None
     self.query_id = None
+
+  def write_query_profile(self, directory, prefix=None):
+    """
+    Write out the query profile bound to this object to a given directory.
+
+    The file name is generated and will contain the query ID. Use the optional prefix
+    parameter to set a prefix on the filename.
+
+    Example return:
+      tpcds_300_decimal_parquet_q21_00000001_a38c8331_profile.txt
+
+    Parameters:
+      directory (str): Directory to write profile.
+      prefix (str): Prefix for filename.
+    """
+    if not (self.profile and self.query_id):
+      return
+    if prefix is not None:
+      file_name = prefix + '_'
+    else:
+      file_name = ''
+    file_name += self.query.logical_query_id + '_'
+    file_name += self.query_id.replace(":", "_") + "_profile.txt"
+    profile_log_path = os.path.join(directory, file_name)
+    with open(profile_log_path, "w") as profile_log:
+      profile_log.write(self.profile)
 
 
 class MemBroker(object):
@@ -622,14 +734,18 @@ class StressRunner(object):
             continue
           increment(self._num_successive_errors)
           increment(self._num_other_errors)
-          self._write_query_profile(report)
-          raise Exception("Query {0} failed: {1}".format(report.query_id, error_msg))
+          self._write_query_profile(report, PROFILES_DIR, prefix='error')
+          raise Exception("Query {query} ID {id} failed: {mesg}".format(
+              query=query.logical_query_id,
+              id=report.query_id,
+              mesg=error_msg))
         if (
             report.mem_limit_exceeded and
             not self._mem_broker.was_overcommitted(reservation_id)
         ):
           increment(self._num_successive_errors)
-          self._write_query_profile(report)
+          self._write_query_profile(
+              report, PROFILES_DIR, prefix='unexpected_mem_exceeded')
           raise Exception("Unexpected mem limit exceeded; mem was not overcommitted. "
                           "Query ID: {0}".format(report.query_id))
         if (
@@ -639,18 +755,19 @@ class StressRunner(object):
         ):
           increment(self._num_successive_errors)
           increment(self._num_result_mismatches)
-          self._write_query_profile(report)
+          self._write_query_profile(report, PROFILES_DIR, prefix='incorrect_results')
           raise Exception(dedent("""\
                                  Result hash mismatch; expected {expected}, got {actual}
                                  Query ID: {id}
                                  Query: {query}""".format(expected=query.result_hash,
                                                           actual=report.result_hash,
                                                           id=report.query_id,
-                                                          query=query.sql)))
+                                                          query=query.logical_query_id)))
         if report.timed_out and not should_cancel:
-          self._write_query_profile(report)
+          self._write_query_profile(report, PROFILES_DIR, prefix='timed_out')
           raise Exception(
-              "Query unexpectedly timed out. Query ID: {0}".format(report.query_id))
+              "Query {query} unexpectedly timed out. Query ID: {id}".format(
+                  query=query.logical_query_id, id=report.query_id))
         self._num_successive_errors.value = 0
 
   def _print_status_header(self):
@@ -696,13 +813,10 @@ class StressRunner(object):
     if report.timed_out:
       increment(self._num_queries_timedout)
 
-  def _write_query_profile(self, report):
-    if not (report.profile and report.query_id):
-      return
-    file_name = report.query_id.replace(":", "_") + "_profile.txt"
-    profile_log_path = os.path.join(self.results_dir, PROFILES_DIR, file_name)
-    with open(profile_log_path, "w") as profile_log:
-      profile_log.write(report.profile)
+  def _write_query_profile(self, report, subdir, prefix=None):
+    report.write_query_profile(
+        os.path.join(self.results_dir, subdir),
+        prefix)
 
   def _check_successive_errors(self):
     if (self._num_successive_errors.value >= self.num_successive_errors_needed_to_abort):
@@ -797,6 +911,8 @@ class Query(object):
     self.result_hash = None
     self.required_mem_mb_with_spilling = None
     self.required_mem_mb_without_spilling = None
+    self.solo_runtime_profile_with_spilling = None
+    self.solo_runtime_profile_without_spilling = None
     self.solo_runtime_secs_with_spilling = None
     self.solo_runtime_secs_without_spilling = None
     # Query options to set before running the query.
@@ -807,6 +923,8 @@ class Query(object):
     # Type of query. Can have the following values: SELECT, COMPUTE_STATS, INSERT, UPDATE,
     # UPSERT, DELETE.
     self.query_type = QueryType.SELECT
+
+    self._logical_query_id = None
 
   def __repr__(self):
     return dedent("""
@@ -821,6 +939,32 @@ class Query(object):
         SQL: %(sql)s>
         Population order: %(population_order)r>
         """.strip() % self.__dict__)
+
+  @property
+  def logical_query_id(self):
+    """
+    Return a meanginful unique str identifier for the query.
+
+    Example: "tpcds_300_decimal_parquet_q21"
+    """
+    if self._logical_query_id is None:
+      self._logical_query_id = '{0}_{1}'.format(self.db_name, self.name)
+    return self._logical_query_id
+
+  def write_runtime_info_profiles(self, directory):
+    """Write profiles for spilling and non-spilling into directory (str)."""
+    profiles_to_write = [
+        (self.logical_query_id + "_profile_with_spilling.txt",
+         self.solo_runtime_profile_with_spilling),
+        (self.logical_query_id + "_profile_without_spilling.txt",
+         self.solo_runtime_profile_without_spilling),
+    ]
+    for filename, profile in profiles_to_write:
+      if profile is None:
+        LOG.debug("No profile recorded for {0}".format(filename))
+        continue
+      with open(os.path.join(directory, filename), "w") as fh:
+        fh.write(profile)
 
 
 class QueryRunner(object):
@@ -846,7 +990,7 @@ class QueryRunner(object):
       self.impalad_conn = None
 
   def run_query(self, query, timeout_secs, mem_limit_mb, run_set_up=False,
-                should_cancel=False):
+                should_cancel=False, retain_profile=False):
     """Run a query and return an execution report. If 'run_set_up' is True, set up sql
     will be executed before the main query. This should be the case during the binary
     search phase of the stress test.
@@ -858,7 +1002,7 @@ class QueryRunner(object):
       raise Exception("connect() must first be called")
 
     timeout_unix_time = time() + timeout_secs
-    report = QueryReport()
+    report = QueryReport(query)
     try:
       with self.impalad_conn.cursor() as cursor:
         start_time = time()
@@ -904,7 +1048,8 @@ class QueryRunner(object):
           if query.query_type == QueryType.SELECT:
             try:
               report.result_hash = self._hash_result(cursor, timeout_unix_time, query)
-              if query.result_hash and report.result_hash != query.result_hash:
+              if retain_profile or \
+                 query.result_hash and report.result_hash != query.result_hash:
                 fetch_and_set_profile(cursor, report)
             except QueryTimeout:
               self._cancel(cursor, report)
@@ -994,7 +1139,7 @@ class QueryRunner(object):
     def hash_result_impl():
       result_log = None
       try:
-        file_name = query_id.replace(":", "_")
+        file_name = '_'.join([query.logical_query_id, query_id.replace(":", "_")])
         if query.result_hash is None:
           file_name += "_initial"
         file_name += "_results.txt"
@@ -1059,17 +1204,16 @@ class QueryRunner(object):
     return hash_thread.result
 
 
-def load_tpc_queries(workload, load_in_kudu=False):
-  """Returns a list of TPC queries. 'workload' should either be 'tpch' or 'tpcds'.
-  If 'load_in_kudu' is True, it loads only queries specified for the Kudu storage
-  engine.
-  """
+def load_tpc_queries(workload):
+  """Returns a list of TPC queries. 'workload' should either be 'tpch' or 'tpcds'."""
   LOG.info("Loading %s queries", workload)
   queries = list()
   query_dir = os.path.join(
       os.path.dirname(__file__), "..", "..", "testdata", "workloads", workload, "queries")
-  engine = 'kudu-' if load_in_kudu else ''
-  file_name_pattern = re.compile(r"%s-%s(q\d+).test$" % (workload, engine))
+  # IMPALA-6715 and others from the past: This pattern enforces the queries we actually
+  # find. Both workload directories contain other queries that are not part of the TPC
+  # spec.
+  file_name_pattern = re.compile(r"^{0}-(q.*).test$".format(workload))
   for query_file in os.listdir(query_dir):
     match = file_name_pattern.search(query_file)
     if not match:
@@ -1099,8 +1243,7 @@ def load_queries_from_test_file(file_path, db_name=None):
 
 
 def load_random_queries_and_populate_runtime_info(
-    query_generator, model_translator, tables, db_name, impala, use_kerberos, query_count,
-    query_timeout_secs, results_dir
+    query_generator, model_translator, tables, impala, converted_args
 ):
   """Returns a list of random queries. Each query will also have its runtime info
   populated. The runtime info population also serves to validate the query.
@@ -1113,16 +1256,13 @@ def load_random_queries_and_populate_runtime_info(
       sql = model_translator.write_query(query_model)
       query = Query()
       query.sql = sql
-      query.db_name = db_name
+      query.db_name = converted_args.random_db
       yield query
   return populate_runtime_info_for_random_queries(
-      impala, use_kerberos, generate_candidates(), query_count, query_timeout_secs,
-      results_dir)
+      impala, generate_candidates(), converted_args)
 
 
-def populate_runtime_info_for_random_queries(
-    impala, use_kerberos, candidate_queries, query_count, query_timeout_secs, results_dir
-):
+def populate_runtime_info_for_random_queries(impala, candidate_queries, converted_args):
   """Returns a list of random queries. Each query will also have its runtime info
   populated. The runtime info population also serves to validate the query.
   """
@@ -1133,7 +1273,8 @@ def populate_runtime_info_for_random_queries(
   for query in candidate_queries:
     try:
       populate_runtime_info(
-          query, impala, use_kerberos, results_dir, timeout_secs=query_timeout_secs)
+          query, impala, converted_args,
+          timeout_secs=converted_args.random_query_timeout_seconds)
       queries.append(query)
     except Exception as e:
       # Ignore any non-fatal errors. These could be query timeouts or bad queries (
@@ -1143,34 +1284,37 @@ def populate_runtime_info_for_random_queries(
       LOG.warn(
           "Error running query (the test will continue)\n%s\n%s",
           e, query.sql, exc_info=True)
-    if len(queries) == query_count:
+    if len(queries) == converted_args.random_query_count:
       break
   return queries
 
 
-def populate_runtime_info(
-    query, impala, use_kerberos, results_dir,
-    timeout_secs=maxint, samples=1, max_conflicting_samples=0
-):
+def populate_runtime_info(query, impala, converted_args, timeout_secs=maxint):
   """Runs the given query by itself repeatedly until the minimum memory is determined
   with and without spilling. Potentially all fields in the Query class (except
   'sql') will be populated by this method. 'required_mem_mb_without_spilling' and
   the corresponding runtime field may still be None if the query could not be run
   without spilling.
 
-  'samples' and 'max_conflicting_samples' control the reliability of the collected
-  information. The problem is that memory spilling or usage may differ (by a large
-  amount) from run to run due to races during execution. The parameters provide a way
-  to express "X out of Y runs must have resulted in the same outcome". Increasing the
-  number of samples and decreasing the tolerance (max conflicts) increases confidence
-  but also increases the time to collect the data.
+  converted_args.samples and converted_args.max_conflicting_samples control the
+  reliability of the collected information. The problem is that memory spilling or usage
+  may differ (by a large amount) from run to run due to races during execution. The
+  parameters provide a way to express "X out of Y runs must have resulted in the same
+  outcome". Increasing the number of samples and decreasing the tolerance (max conflicts)
+  increases confidence but also increases the time to collect the data.
   """
   LOG.info("Collecting runtime info for query %s: \n%s", query.name, query.sql)
+  samples = converted_args.samples
+  max_conflicting_samples = converted_args.max_conflicting_samples
+  results_dir = converted_args.results_dir
+  mem_limit_eq_threshold_mb = converted_args.mem_limit_eq_threshold_mb
+  mem_limit_eq_threshold_percent = converted_args.mem_limit_eq_threshold_percent
   runner = QueryRunner()
   runner.check_if_mem_was_spilled = True
+  runner.common_query_options = converted_args.common_query_options
   runner.impalad = impala.impalads[0]
   runner.results_dir = results_dir
-  runner.use_kerberos = use_kerberos
+  runner.use_kerberos = converted_args.use_kerberos
   runner.connect()
   limit_exceeded_mem = 0
   non_spill_mem = None
@@ -1181,6 +1325,8 @@ def populate_runtime_info(
 
   old_required_mem_mb_without_spilling = query.required_mem_mb_without_spilling
   old_required_mem_mb_with_spilling = query.required_mem_mb_with_spilling
+
+  profile_error_prefix = query.logical_query_id + "_binsearch_error"
 
   # TODO: This method is complicated enough now that breaking it out into a class may be
   # helpful to understand the structure.
@@ -1194,30 +1340,42 @@ def populate_runtime_info(
       ):
         query.required_mem_mb_with_spilling = required_mem
         query.solo_runtime_secs_with_spilling = report.runtime_secs
+        query.solo_runtime_profile_with_spilling = report.profile
     elif (
         query.required_mem_mb_without_spilling is None or
         required_mem < query.required_mem_mb_without_spilling
     ):
       query.required_mem_mb_without_spilling = required_mem
       query.solo_runtime_secs_without_spilling = report.runtime_secs
+      query.solo_runtime_profile_without_spilling = report.profile
 
   def get_report(desired_outcome=None):
     reports_by_outcome = defaultdict(list)
     leading_outcome = None
     for remaining_samples in xrange(samples - 1, -1, -1):
-      report = runner.run_query(query, timeout_secs, mem_limit, run_set_up=True)
+      report = runner.run_query(query, timeout_secs, mem_limit,
+                                run_set_up=True, retain_profile=True)
       if report.timed_out:
-        raise QueryTimeout()
+        report.write_query_profile(
+            os.path.join(results_dir, PROFILES_DIR), profile_error_prefix)
+        raise QueryTimeout(
+            "query {0} timed out during binary search".format(query.logical_query_id))
       if report.non_mem_limit_error:
-        raise report.non_mem_limit_error
+        report.write_query_profile(
+            os.path.join(results_dir, PROFILES_DIR), profile_error_prefix)
+        raise Exception(
+            "query {0} errored during binary search: {1}".format(
+                query.logical_query_id, str(report.non_mem_limit_error)))
       LOG.debug("Spilled: %s" % report.mem_was_spilled)
       if not report.mem_limit_exceeded:
         if query.result_hash is None:
           query.result_hash = report.result_hash
         elif query.result_hash != report.result_hash:
+          report.write_query_profile(
+              os.path.join(results_dir, PROFILES_DIR), profile_error_prefix)
           raise Exception(
-              "Result hash mismatch; expected %s, got %s" %
-              (query.result_hash, report.result_hash))
+              "Result hash mismatch for query %s; expected %s, got %s" %
+              (query.logical_query_id, query.result_hash, report.result_hash))
 
       if report.mem_limit_exceeded:
         outcome = "EXCEEDED"
@@ -1251,6 +1409,7 @@ def populate_runtime_info(
     LOG.info("Finding a starting point for binary search")
     mem_limit = min(mem_estimate, impala.min_impalad_mem_mb) or impala.min_impalad_mem_mb
     while True:
+      LOG.info("Next mem_limit: {0}".format(mem_limit))
       report = get_report()
       if not report or report.mem_limit_exceeded:
         if report and report.mem_limit_exceeded:
@@ -1277,8 +1436,9 @@ def populate_runtime_info(
       old_required_mem_mb_without_spilling = None
     else:
       mem_limit = (lower_bound + upper_bound) / 2
-    should_break = mem_limit / float(upper_bound) > MEM_LIMIT_EQ_THRESHOLD_PC or \
-        upper_bound - mem_limit < MEM_LIMIT_EQ_THRESHOLD_MB
+    LOG.info("Next mem_limit: {0}".format(mem_limit))
+    should_break = mem_limit / float(upper_bound) > 1 - mem_limit_eq_threshold_percent \
+        or upper_bound - mem_limit < mem_limit_eq_threshold_mb
     report = get_report(desired_outcome=("NOT_SPILLED" if spill_mem else None))
     if not report:
       lower_bound = mem_limit
@@ -1313,8 +1473,9 @@ def populate_runtime_info(
       old_required_mem_mb_with_spilling = None
     else:
       mem_limit = (lower_bound + upper_bound) / 2
-    should_break = mem_limit / float(upper_bound) > MEM_LIMIT_EQ_THRESHOLD_PC \
-        or upper_bound - mem_limit < MEM_LIMIT_EQ_THRESHOLD_MB
+    LOG.info("Next mem_limit: {0}".format(mem_limit))
+    should_break = mem_limit / float(upper_bound) > 1 - mem_limit_eq_threshold_percent \
+        or upper_bound - mem_limit < mem_limit_eq_threshold_mb
     report = get_report(desired_outcome="SPILLED")
     if not report or report.mem_limit_exceeded:
       lower_bound = mem_limit
@@ -1323,8 +1484,16 @@ def populate_runtime_info(
       upper_bound = mem_limit
     if should_break:
       if not query.required_mem_mb_with_spilling:
+        if upper_bound - mem_limit < mem_limit_eq_threshold_mb:
+          # IMPALA-6604: A fair amount of queries go down this path.
+          LOG.info(
+              "Unable to find a memory limit with spilling within the threshold of {0} "
+              "MB. Using the same memory limit for both.".format(
+                  mem_limit_eq_threshold_mb))
         query.required_mem_mb_with_spilling = query.required_mem_mb_without_spilling
         query.solo_runtime_secs_with_spilling = query.solo_runtime_secs_without_spilling
+        query.solo_runtime_profile_with_spilling = \
+            query.solo_runtime_profile_without_spilling
       break
   LOG.info("Minimum memory is %s MB" % query.required_mem_mb_with_spilling)
   if (
@@ -1340,6 +1509,7 @@ def populate_runtime_info(
         " the absolute minimum memory.")
     query.required_mem_mb_with_spilling = query.required_mem_mb_without_spilling
     query.solo_runtime_secs_with_spilling = query.solo_runtime_secs_without_spilling
+    query.solo_runtime_profile_with_spilling = query.solo_runtime_profile_without_spilling
   LOG.debug("Query after populating runtime info: %s", query)
 
 
@@ -1352,8 +1522,8 @@ def match_memory_estimate(explain_lines):
     explain_lines: list of str
 
   Returns:
-    2-tuple str of memory limit in decimal string and units (one of 'T', 'G', 'M', 'K',
-    '' bytes)
+    2-tuple str of memory limit in decimal string and units (one of 'P', 'T', 'G', 'M',
+    'K', '' bytes)
 
   Raises:
     Exception if no match found
@@ -1411,9 +1581,12 @@ def save_runtime_info(path, query, impala):
     class JsonEncoder(json.JSONEncoder):
       def default(self, obj):
         data = dict(obj.__dict__)
-        # Queries are stored by sql, so remove the duplicate data.
-        if "sql" in data:
-          del data["sql"]
+        # Queries are stored by sql, so remove the duplicate data. Also don't store
+        # profiles as JSON values, but instead separately.
+        for k in ("sql", "solo_runtime_profile_with_spilling",
+                  "solo_runtime_profile_without_spilling"):
+          if k in data:
+            del data[k]
         return data
     json.dump(
         store, file, cls=JsonEncoder, sort_keys=True, indent=2, separators=(',', ': '))
@@ -1681,8 +1854,9 @@ def reset_databases(cursor):
                   " exist in '{1}' database.".format(table_name, cursor.db_name))
 
 
-def populate_all_queries(queries, impala, args, runtime_info_path,
-                         queries_with_runtime_info_by_db_sql_and_options):
+def populate_all_queries(
+    queries, impala, converted_args, queries_with_runtime_info_by_db_sql_and_options
+):
   """Populate runtime info for all queries, ordered by the population_order property."""
   result = []
   queries_by_order = {}
@@ -1702,10 +1876,10 @@ def populate_all_queries(queries, impala, args, runtime_info_path,
         result.append(queries_with_runtime_info_by_db_sql_and_options[
             query.db_name][query.sql][str(sorted(query.options.items()))])
       else:
-        populate_runtime_info(
-            query, impala, args.use_kerberos, args.results_dir,
-            samples=args.samples, max_conflicting_samples=args.max_conflicting_samples)
-        save_runtime_info(runtime_info_path, query, impala)
+        populate_runtime_info(query, impala, converted_args)
+        save_runtime_info(converted_args.runtime_info_path, query, impala)
+        query.write_runtime_info_profiles(
+            os.path.join(converted_args.results_dir, PROFILES_DIR))
         result.append(query)
   return result
 
@@ -1736,10 +1910,6 @@ def print_version(cluster):
 
 
 def main():
-  from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
-  from random import shuffle
-  import tests.comparison.cli_options as cli_options
-
   parser = ArgumentParser(
       epilog=dedent("""
       Before running this script a CM cluster must be setup and any needed data
@@ -1770,6 +1940,16 @@ def main():
       ' determine the mem limit that avoids spilling with samples=5 and'
       ' max-conflicting-samples=1, then 4/5 queries must not spill at a particular mem'
       ' limit.')
+  parser.add_argument(
+      "--mem-limit-eq-threshold-percent", default=0.025,
+      type=float, help='Used when collecting "runtime info". If the difference between'
+      ' two memory limits is less than this percentage, we consider the two limits to'
+      ' be equal and stop the memory binary search.')
+  parser.add_argument(
+      "--mem-limit-eq-threshold-mb", default=50,
+      type=int, help='Used when collecting "runtime info". If the difference between'
+      ' two memory limits is less than this value in MB, we consider the two limits to'
+      ' be equal and stop the memory binary search.')
   parser.add_argument(
       "--results-dir", default=gettempdir(),
       help="Directory under which the profiles and result_hashes directories are created."
@@ -1882,6 +2062,7 @@ def main():
       "or set valid values. Example: --common-query-options "
       "DISABLE_CODEGEN=true RUNTIME_FILTER_MODE=1")
   args = parser.parse_args()
+  converted_args = StressArgConverter(args)
 
   cli_options.configure_logging(
       args.log_level, debug_log_file=args.debug_log_file, log_thread_name=True,
@@ -1896,40 +2077,6 @@ def main():
     raise Exception(
         "At least one of --tpcds-db, --tpch-db, --tpch-kudu-db,"
         "--tpcds-kudu-db, --tpch-nested-db, --random-db, --query-file-path is required")
-
-  # The stress test sets these, so callers cannot override them.
-  IGNORE_QUERY_OPTIONS = frozenset([
-      'ABORT_ON_ERROR',
-      'MEM_LIMIT',
-  ])
-
-  common_query_options = {}
-  if args.common_query_options is not None:
-    for query_option_and_value in args.common_query_options:
-      try:
-        query_option, value = query_option_and_value.split('=')
-      except ValueError:
-        LOG.error(
-            "Could not parse --common-query-options: '{common_query_options}'".format(
-                common_query_options=args.common_query_options))
-        exit(1)
-      query_option = query_option.upper()
-      if query_option in common_query_options:
-        LOG.error(
-            "Query option '{query_option}' already defined in --common-query-options: "
-            "'{common_query_options}'".format(
-                query_option=query_option,
-                common_query_options=args.common_query_options))
-        exit(1)
-      elif query_option in IGNORE_QUERY_OPTIONS:
-        LOG.warn(
-            "Ignoring '{query_option}' in common query options: '{opt}': "
-            "The stress test algorithm needs control of this option.".format(
-                query_option=query_option, opt=args.common_query_options))
-      else:
-        common_query_options[query_option] = value
-        LOG.debug("Common query option '{query_option}' set to '{value}'".format(
-            query_option=query_option, value=value))
 
   os.mkdir(os.path.join(args.results_dir, RESULT_HASHES_DIR))
   os.mkdir(os.path.join(args.results_dir, PROFILES_DIR))
@@ -1947,11 +2094,8 @@ def main():
     raise Exception("Queries are currently running on the cluster")
   impala.min_impalad_mem_mb = min(impala.find_impalad_mem_mb_limit())
 
-  runtime_info_path = args.runtime_info_path
-  if "{cm_host}" in runtime_info_path:
-    runtime_info_path = runtime_info_path.format(cm_host=args.cm_host)
   queries_with_runtime_info_by_db_sql_and_options = load_runtime_info(
-      runtime_info_path, impala)
+      converted_args.runtime_info_path, impala)
 
   # Start loading the test queries.
   queries = list()
@@ -1960,6 +2104,7 @@ def main():
   # the TPC queries are expected to always complete successfully.
   if args.tpcds_db:
     tpcds_queries = load_tpc_queries("tpcds")
+    assert len(tpcds_queries) == EXPECTED_TPCDS_QUERIES_COUNT
     for query in tpcds_queries:
       query.db_name = args.tpcds_db
     queries.extend(tpcds_queries)
@@ -1968,6 +2113,7 @@ def main():
         queries.extend(generate_compute_stats_queries(cursor))
   if args.tpch_db:
     tpch_queries = load_tpc_queries("tpch")
+    assert len(tpch_queries) == EXPECTED_TPCH_QUERIES_COUNT
     for query in tpch_queries:
       query.db_name = args.tpch_db
     queries.extend(tpch_queries)
@@ -1976,6 +2122,7 @@ def main():
         queries.extend(generate_compute_stats_queries(cursor))
   if args.tpch_nested_db:
     tpch_nested_queries = load_tpc_queries("tpch_nested")
+    assert len(tpch_nested_queries) == EXPECTED_TPCH_NESTED_QUERIES_COUNT
     for query in tpch_nested_queries:
       query.db_name = args.tpch_nested_db
     queries.extend(tpch_nested_queries)
@@ -1983,7 +2130,8 @@ def main():
       with impala.cursor(db_name=args.tpch_nested_db) as cursor:
         queries.extend(generate_compute_stats_queries(cursor))
   if args.tpch_kudu_db:
-    tpch_kudu_queries = load_tpc_queries("tpch", load_in_kudu=True)
+    tpch_kudu_queries = load_tpc_queries("tpch")
+    assert len(tpch_kudu_queries) == EXPECTED_TPCH_QUERIES_COUNT
     for query in tpch_kudu_queries:
       query.db_name = args.tpch_kudu_db
     queries.extend(tpch_kudu_queries)
@@ -1995,7 +2143,8 @@ def main():
         prepare_database(cursor)
         queries.extend(generate_DML_queries(cursor, args.dml_mod_values))
   if args.tpcds_kudu_db:
-    tpcds_kudu_queries = load_tpc_queries("tpcds", load_in_kudu=True)
+    tpcds_kudu_queries = load_tpc_queries("tpcds")
+    assert len(tpcds_kudu_queries) == EXPECTED_TPCDS_QUERIES_COUNT
     for query in tpcds_kudu_queries:
       query.db_name = args.tpcds_kudu_db
     queries.extend(tpcds_kudu_queries)
@@ -2012,8 +2161,8 @@ def main():
       with impala.cursor(db_name=database) as cursor:
         reset_databases(cursor)
 
-  queries = populate_all_queries(queries, impala, args, runtime_info_path,
-                                 queries_with_runtime_info_by_db_sql_and_options)
+  queries = populate_all_queries(
+      queries, impala, converted_args, queries_with_runtime_info_by_db_sql_and_options)
 
   # A particular random query may either fail (due to a generator or Impala bug) or
   # take a really long time to complete. So the queries needs to be validated. Since the
@@ -2023,17 +2172,14 @@ def main():
     with impala.cursor(db_name=args.random_db) as cursor:
       tables = [cursor.describe_table(t) for t in cursor.list_table_names()]
     queries.extend(load_random_queries_and_populate_runtime_info(
-        query_generator, SqlWriter.create(), tables, args.random_db, impala,
-        args.use_kerberos, args.random_query_count, args.random_query_timeout_seconds,
-        args.results_dir))
+        query_generator, SqlWriter.create(), tables, impala, converted_args))
 
   if args.query_file_path:
     file_queries = load_queries_from_test_file(
         args.query_file_path, db_name=args.query_file_db)
     shuffle(file_queries)
     queries.extend(populate_runtime_info_for_random_queries(
-        impala, args.use_kerberos, file_queries, args.random_query_count,
-        args.random_query_timeout_seconds, args.results_dir))
+        impala, file_queries, converted_args))
 
   # Apply tweaks to the query's runtime info as requested by CLI options.
   for idx in xrange(len(queries) - 1, -1, -1):
@@ -2053,10 +2199,17 @@ def main():
 
     # Remove any queries that would use "too many" resources. This way a larger number
     # of queries will run concurrently.
-    if query.required_mem_mb_with_spilling is None \
-        or query.required_mem_mb_with_spilling / impala.min_impalad_mem_mb \
+    if query.required_mem_mb_without_spilling is not None and \
+        query.required_mem_mb_without_spilling / float(impala.min_impalad_mem_mb) \
             > args.filter_query_mem_ratio:
-      LOG.debug("Filtered query due to mem ratio option: " + query.sql)
+      LOG.debug(
+          "Filtering non-spilling query that exceeds "
+          "--filter-query-mem-ratio: " + query.sql)
+      query.required_mem_mb_without_spilling = None
+    if query.required_mem_mb_with_spilling is None \
+        or query.required_mem_mb_with_spilling / float(impala.min_impalad_mem_mb) \
+            > args.filter_query_mem_ratio:
+      LOG.debug("Filtering query that exceeds --filter-query-mem-ratio: " + query.sql)
       del queries[idx]
 
   # Remove queries that have a nested loop join in the plan.
@@ -2103,7 +2256,7 @@ def main():
   stress_runner.cancel_probability = args.cancel_probability
   stress_runner.spill_probability = args.spill_probability
   stress_runner.leak_check_interval_mins = args.mem_leak_check_interval_mins
-  stress_runner.common_query_options = common_query_options
+  stress_runner.common_query_options = converted_args.common_query_options
   stress_runner.run_queries(
       queries, impala, args.max_queries, args.mem_overcommit_pct,
       should_print_status=not args.no_status,

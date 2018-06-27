@@ -53,7 +53,8 @@ under the License.
 <script>
     $(document).ready(function() {
         $('#large-tables').DataTable({
-            "order": [[ 0, "desc" ]],
+            "columnDefs": [{"targets": 1, "render": renderSize}],
+            "order": [[ 1, "desc" ]],
             "pageLength": 10
         });
     });

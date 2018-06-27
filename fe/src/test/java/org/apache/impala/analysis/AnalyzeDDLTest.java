@@ -46,6 +46,7 @@ import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.common.FrontendTestBase;
+import org.apache.impala.common.Pair;
 import org.apache.impala.common.RuntimeEnv;
 import org.apache.impala.service.BackendConfig;
 import org.apache.impala.testutil.TestUtils;
@@ -534,6 +535,18 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalysisError("alter table functional.alltypes set tblproperties(" +
                "'sort.columns'='ID, foo')",
                "Could not find SORT BY column 'foo' in table.");
+
+    // Table is partitioned, but it has no matching partitions.
+    AnalyzesOk("alter table functional.alltypesagg partition(year=2009, month=1) " +
+        "set location 'hdfs://localhost:20500/test-warehouse/new_table'");
+    AnalyzesOk("alter table functional.alltypesagg partition(year=2009, month=1) " +
+        "set fileformat parquet");
+    AnalyzesOk("alter table functional.alltypesagg partition(year=2009, month=1) " +
+        "set tblproperties ('key'='value')");
+    AnalyzesOk("alter table functional.alltypesagg partition(year=2009, month=1) " +
+        "set serdeproperties ('key'='value')");
+    AnalyzesOk("alter table functional.alltypesagg partition(year=2009, month=1) " +
+        "set row format delimited fields terminated by '|'");
 
     {
       // Check that long_properties fail at the analysis layer
@@ -2200,12 +2213,28 @@ public class AnalyzeDDLTest extends FrontendTestBase {
           "partition 10 <= values", kw));
       AnalyzesOk(String.format("alter table functional_kudu.testtbl %s range " +
           "partition 1+1 <= values <= factorial(3)", kw));
+      AnalyzesOk(String.format("alter table functional_kudu.jointbl %s range " +
+          "partition (0, '0') < values", kw));
+      AnalyzesOk(String.format("alter table functional_kudu.jointbl %s range " +
+          "partition values <= (1, '1')", kw));
+      AnalyzesOk(String.format("alter table functional_kudu.jointbl %s range " +
+          "partition (0, '0') <= values < (1, '1')", kw));
+      AnalyzesOk(String.format("alter table functional_kudu.jointbl %s range " +
+          "partition value = (-1, 'a')", kw));
       AnalysisError(String.format("alter table functional.alltypes %s range " +
           "partition 10 < values < 20", kw), "Table functional.alltypes does not " +
           "support range partitions: RANGE PARTITION 10 < VALUES < 20");
       AnalysisError(String.format("alter table functional_kudu.testtbl %s range " +
           "partition values < isnull(null, null)", kw), "Range partition values " +
           "cannot be NULL. Range partition: 'PARTITION VALUES < isnull(NULL, NULL)'");
+      AnalysisError(String.format("alter table functional_kudu.jointbl %s range " +
+          "partition (0) < values", kw),
+          "Number of specified range partition values is different than the number of " +
+          "partitioning columns: (1 vs 2). Range partition: 'PARTITION (0) < VALUES'");
+      AnalysisError(String.format("alter table functional_kudu.jointbl %s range " +
+          "partition values < (0, 0)", kw),
+          "Range partition value 0 (type: TINYINT) is not type compatible with " +
+          "partitioning column 'test_name' (type: STRING).");
     }
 
     // ALTER TABLE ADD COLUMNS
@@ -2394,7 +2423,7 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "partition by range(a) (partition value = (1, 2), " +
         "partition value = 3, partition value = 4) stored as kudu",
         "Number of specified range partition values is different than the number of " +
-        "partitioning columns: (2 vs 1). Range partition: 'PARTITION VALUE = (1,2)'");
+        "partitioning columns: (2 vs 1). Range partition: 'PARTITION VALUE = (1, 2)'");
     // Key ranges must match the column types.
     AnalysisError("create table tab (a int, b int, c int, d int, primary key(a, b, c)) " +
         "partition by hash (a, b, c) partitions 8, range (a) " +
@@ -2481,6 +2510,18 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalysisError("create table tab (x int primary key) " +
         "partitioned by (y int) stored as kudu", "PARTITIONED BY cannot be used " +
         "in Kudu tables.");
+    // Multi-column range partitions
+    AnalyzesOk("create table tab (a bigint, b tinyint, c double, primary key(a, b)) " +
+        "partition by range(a, b) (partition (0, 0) < values <= (1, 1)) stored as kudu");
+    AnalysisError("create table tab (a bigint, b tinyint, c double, primary key(a, b)) " +
+        "partition by range(a, b) (partition values <= (1, 'b')) stored as kudu",
+        "Range partition value 'b' (type: STRING) is not type compatible with " +
+        "partitioning column 'b' (type: TINYINT)");
+    AnalysisError("create table tab (a bigint, b tinyint, c double, primary key(a, b)) " +
+        "partition by range(a, b) (partition 0 < values <= 1) stored as kudu",
+        "Number of specified range partition values is different than the number of " +
+        "partitioning columns: (1 vs 2). Range partition: 'PARTITION 0 < VALUES <= 1'");
+
 
     // Test unsupported Kudu types
     List<String> unsupportedTypes = Lists.newArrayList("VARCHAR(20)", "CHAR(20)",
@@ -3103,10 +3144,31 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "impala_udf::FunctionContext::FunctionStateScope) in: ");
 
     // Try to create a function with the same name as a builtin
-    AnalysisError("create function sin(double) RETURNS double" + udfSuffix,
-        "Function cannot have the same name as a builtin: sin");
-    AnalysisError("create function sin() RETURNS double" + udfSuffix,
-        "Function cannot have the same name as a builtin: sin");
+    AnalyzesOk("create function sin(double) RETURNS double" + udfSuffix);
+    AnalyzesOk("create function sin() RETURNS double" + udfSuffix);
+    // Try to create a function in the system database.
+    AnalysisError("create function _impala_builtins.sin(double) returns double" +
+        udfSuffix, "Cannot modify system database.");
+    AnalysisError("create function sin(double) returns double" + udfSuffix,
+        createAnalysisCtx("_impala_builtins"), "Cannot modify system database.");
+    AnalysisError("create function _impala_builtins.f(double) returns double" +
+        udfSuffix, "Cannot modify system database.");
+
+    // Try to drop a function with the same name as builtin.
+    addTestFunction("sin", Lists.newArrayList(Type.DOUBLE), false);
+    // default.sin(double) function exists.
+    AnalyzesOk("drop function sin(double)");
+    // default.cos(double) does not exist.
+    AnalysisError("drop function cos(double)", "Function does not exist: cos(DOUBLE)");
+    AnalysisError("drop function _impala_builtins.sin(double)",
+        "Cannot modify system database.");
+
+    // Try to select a function with the same name as builtin.
+    // This will call _impala_builtins.sin(1).
+    AnalyzesOk("select sin(1)");
+    AnalyzesOk("select _impala_builtins.sin(1)");
+    AnalyzesOk("select default.sin(1)");
+    AnalysisError("select functional.sin(1)", "functional.sin() unknown");
 
     // Try to create with a bad location
     AnalysisError("create function foo() RETURNS int LOCATION 'bad-location' SYMBOL='c'",
@@ -3868,5 +3930,84 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         // Ignore
       }
     }
+  }
+
+  @Test
+  public void TestCommentOnDatabase() {
+    AnalyzesOk("comment on database functional is 'comment'");
+    AnalyzesOk("comment on database functional is ''");
+    AnalyzesOk("comment on database functional is null");
+    AnalysisError("comment on database doesntexist is 'comment'",
+        "Database does not exist: doesntexist");
+    AnalysisError(String.format("comment on database functional is '%s'",
+        buildLongComment()), "Comment exceeds maximum length of 256 characters. " +
+        "The given comment has 261 characters.");
+  }
+
+  @Test
+  public void TestCommentOnTable() {
+    for (Pair<String, AnalysisContext> pair : new Pair[]{
+        new Pair<>("functional.alltypes", createAnalysisCtx()),
+        new Pair<>("alltypes", createAnalysisCtx("functional"))}) {
+      AnalyzesOk(String.format("comment on table %s is 'comment'", pair.first),
+          pair.second);
+      AnalyzesOk(String.format("comment on table %s is ''", pair.first), pair.second);
+      AnalyzesOk(String.format("comment on table %s is null", pair.first), pair.second);
+    }
+    AnalysisError("comment on table doesntexist is 'comment'",
+        "Could not resolve table reference: 'default.doesntexist'");
+    AnalysisError("comment on table functional.alltypes_view is 'comment'",
+        "COMMENT ON TABLE not allowed on a view: functional.alltypes_view");
+    AnalysisError(String.format("comment on table functional.alltypes is '%s'",
+        buildLongComment()), "Comment exceeds maximum length of 256 characters. " +
+        "The given comment has 261 characters.");
+  }
+
+  @Test
+  public void TestCommentOnView() {
+    for (Pair<String, AnalysisContext> pair : new Pair[]{
+        new Pair<>("functional.alltypes_view", createAnalysisCtx()),
+        new Pair<>("alltypes_view", createAnalysisCtx("functional"))}) {
+      AnalyzesOk(String.format("comment on view %s is 'comment'", pair.first),
+          pair.second);
+      AnalyzesOk(String.format("comment on view %s is ''", pair.first), pair.second);
+      AnalyzesOk(String.format("comment on view %s is null", pair.first), pair.second);
+    }
+    AnalysisError("comment on view doesntexist is 'comment'",
+        "Could not resolve table reference: 'default.doesntexist'");
+    AnalysisError("comment on view functional.alltypes is 'comment'",
+        "COMMENT ON VIEW not allowed on a table: functional.alltypes");
+    AnalysisError(String.format("comment on table functional.alltypes_view is '%s'",
+        buildLongComment()), "Comment exceeds maximum length of 256 characters. " +
+        "The given comment has 261 characters.");
+  }
+
+  private static String buildLongComment() {
+    StringBuilder comment = new StringBuilder();
+    for (int i = 0; i < MetaStoreUtil.CREATE_MAX_COMMENT_LENGTH + 5; i++) {
+      comment.append("a");
+    }
+    return comment.toString();
+  }
+
+  @Test
+  public void TestAlterDatabaseSetOwner() {
+    String[] ownerTypes = new String[]{"user", "role"};
+    for (String ownerType : ownerTypes) {
+      AnalyzesOk(String.format("alter database functional set owner %s foo", ownerType));
+      AnalysisError(String.format("alter database doesntexist set owner %s foo",
+          ownerType), "Database does not exist: doesntexist");
+      AnalysisError(String.format("alter database functional set owner %s %s",
+          ownerType, buildLongOwnerName()), "Owner name exceeds maximum length of 128 " +
+          "characters. The given owner name has 133 characters.");
+    }
+  }
+
+  private static String buildLongOwnerName() {
+    StringBuilder comment = new StringBuilder();
+    for (int i = 0; i < MetaStoreUtil.MAX_OWNER_LENGTH + 5; i++) {
+      comment.append("a");
+    }
+    return comment.toString();
   }
 }

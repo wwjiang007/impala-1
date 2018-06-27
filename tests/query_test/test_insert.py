@@ -20,8 +20,9 @@
 import pytest
 
 from testdata.common import widetable
+from tests.common.impala_cluster import ImpalaCluster
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfLocal
+from tests.common.skip import SkipIfEC, SkipIfLocal, SkipIfNotHdfsMinicluster
 from tests.common.test_dimensions import (
     create_exec_option_dimension,
     create_uncompressed_text_dimension)
@@ -31,6 +32,7 @@ from tests.common.test_result_verifier import (
     QueryTestResult,
     parse_result_rows)
 from tests.common.test_vector import ImpalaTestDimension
+from tests.verifiers.metric_verifier import MetricVerifier
 
 PARQUET_CODECS = ['none', 'snappy', 'gzip']
 
@@ -110,12 +112,29 @@ class TestInsertQueries(ImpalaTestSuite):
     super(TestInsertQueries, cls).setup_class()
 
   @pytest.mark.execute_serially
+  # Erasure coding doesn't respect memory limit
+  @SkipIfEC.fix_later
   def test_insert(self, vector):
     if (vector.get_value('table_format').file_format == 'parquet'):
       vector.get_value('exec_option')['COMPRESSION_CODEC'] = \
           vector.get_value('compression_codec')
     self.run_test_case('QueryTest/insert', vector,
         multiple_impalad=vector.get_value('exec_option')['sync_ddl'] == 1)
+
+  @pytest.mark.execute_serially
+  @SkipIfNotHdfsMinicluster.tuned_for_minicluster
+  def test_insert_mem_limit(self, vector):
+    if (vector.get_value('table_format').file_format == 'parquet'):
+      vector.get_value('exec_option')['COMPRESSION_CODEC'] = \
+          vector.get_value('compression_codec')
+    self.run_test_case('QueryTest/insert-mem-limit', vector,
+        multiple_impalad=vector.get_value('exec_option')['sync_ddl'] == 1)
+    # IMPALA-7023: These queries can linger and use up memory, causing subsequent
+    # tests to hit memory limits. Wait for some time to allow the query to
+    # be reclaimed.
+    verifiers = [ MetricVerifier(i.service) for i in ImpalaCluster().impalads ]
+    for v in verifiers:
+      v.wait_for_metric("impala-server.num-fragments-in-flight", 0, timeout=60)
 
   @pytest.mark.execute_serially
   def test_insert_overwrite(self, vector):

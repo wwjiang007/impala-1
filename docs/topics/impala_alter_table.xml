@@ -58,7 +58,7 @@ under the License.
 
 ALTER TABLE <varname>name</varname> ADD COLUMNS (<varname>col_spec</varname>[, <varname>col_spec</varname> ...])
 ALTER TABLE <varname>name</varname> DROP [COLUMN] <varname>column_name</varname>
-ALTER TABLE <varname>name</varname> CHANGE <varname>column_name</varname> <varname>new_name</varname> <varname>new_type</varname>
+ALTER TABLE <varname>name</varname> CHANGE <varname>column_name</varname> <varname>col_spec</varname>
 
 ALTER TABLE <varname>name</varname> REPLACE COLUMNS (<varname>col_spec</varname>[, <varname>col_spec</varname> ...])
 
@@ -86,6 +86,7 @@ ALTER TABLE <varname>name</varname> DROP [IF EXISTS] PARTITION (<varname>partiti
 
 ALTER TABLE <varname>name</varname> [PARTITION (<varname>partition_spec</varname>)]
   SET { FILEFORMAT <varname>file_format</varname>
+  | ROW FORMAT <varname>row_format</varname>
   | LOCATION '<varname>hdfs_path_of_directory</varname>'
   | TBLPROPERTIES (<varname>table_properties</varname>)
   | SERDEPROPERTIES (<varname>serde_properties</varname>) }
@@ -99,7 +100,7 @@ statsKey ::= numDVs | numNulls | avgSize | maxSize</ph>
 
 <varname>new_name</varname> ::= [<varname>new_database</varname>.]<varname>new_table_name</varname>
 
-<varname>col_spec</varname> ::= <varname>col_name</varname> <varname>type_name</varname> <ph rev="2.9.0 IMPALA-4616">[<varname>kudu_attributes</varname>]</ph>
+<varname>col_spec</varname> ::= <varname>col_name</varname> <varname>type_name</varname> <ph rev="2.9.0 IMPALA-4616"> COMMENT '<varname>column-comment</varname>' [<varname>kudu_attributes</varname>]</ph>
 
 <ph rev="2.9.0 IMPALA-4616"><varname>kudu_attributes</varname> ::= { [NOT] NULL | ENCODING <varname>codec</varname> | COMPRESSION <varname>algorithm</varname> |
   DEFAULT <varname>constant</varname> | BLOCK_SIZE <varname>number</varname> }</ph>
@@ -121,7 +122,10 @@ statsKey ::= numDVs | numNulls | avgSize | maxSize</ph>
 <varname>serde_properties</varname> ::= '<varname>name</varname>'='<varname>value</varname>'[, '<varname>name</varname>'='<varname>value</varname>' ...]
 
 <varname>file_format</varname> ::= { PARQUET | TEXTFILE | RCFILE | SEQUENCEFILE | AVRO }
-</codeblock>
+
+<varname>row_format</varname> ::= DELIMITED
+  [FIELDS TERMINATED BY '<varname>char</varname>' [ESCAPED BY '<varname>char</varname>']]
+  [LINES TERMINATED BY '<varname>char</varname>']</codeblock>
 
     <p conref="../shared/impala_common.xml#common/ddl_blurb"/>
 
@@ -458,26 +462,22 @@ ALTER TABLE <varname>table_name</varname> SET SERDEPROPERTIES ('<varname>key1</v
     </p>
 
     <p>
-      The <codeph>SERDEPROPERTIES</codeph> clause sets up metadata defining how tables are read or written, needed
-      in some cases by Hive but not used extensively by Impala. You would use this clause primarily to change the
-      delimiter in an existing text table or partition, by setting the <codeph>'serialization.format'</codeph> and
-      <codeph>'field.delim'</codeph> property values to the new delimiter character:
+      The <codeph>SERDEPROPERTIES</codeph> clause sets up metadata defining
+      how tables are read or written, needed in some cases by Hive but not used
+      extensively by Impala. You would use this clause primarily to change the
+      delimiter in an existing text table or partition, by setting the
+        <codeph>'serialization.format'</codeph> and
+        <codeph>'field.delim'</codeph> property values to the new delimiter
+      character: The <codeph>SERDEPROPERTIES</codeph> clause does not change the
+      existing data in the table. The change only affects the future insert into
+      the table.
     </p>
 
-<codeblock>-- This table begins life as pipe-separated text format.
-create table change_to_csv (s1 string, s2 string) row format delimited fields terminated by '|';
--- Then we change it to a CSV table.
-alter table change_to_csv set SERDEPROPERTIES ('serialization.format'=',', 'field.delim'=',');
-insert overwrite change_to_csv values ('stop','go'), ('yes','no');
-!hdfs dfs -cat 'hdfs://<varname>hostname</varname>:8020/<varname>data_directory</varname>/<varname>dbname</varname>.db/change_to_csv/<varname>data_file</varname>';
-stop,go
-yes,no</codeblock>
-
     <p>
-      Use the <codeph>DESCRIBE FORMATTED</codeph> statement to see the current values of these properties for an
-      existing table. See <xref href="impala_create_table.xml#create_table"/> for more details about these clauses.
-      See <xref href="impala_perf_stats.xml#perf_table_stats_manual"/> for an example of using table properties to
-      fine-tune the performance-related table statistics.
+      Use the <codeph>DESCRIBE FORMATTED</codeph> statement to see the current
+      values of these properties for an existing table. See <xref
+        href="impala_create_table.xml#create_table"/> for more details about
+      these clauses.
     </p>
 
     <p>
@@ -735,6 +735,37 @@ alter table p1 add partition (month=2, day=2);
 -- in this format for this specific partition.
 alter table p1 partition (month=2, day=2) set fileformat parquet;
 </codeblock>
+    <p><b>To change the row format with different delimiter characters:</b></p>
+    <p> Use the <codeph>SET ROW FORMAT DELIMITED</codeph> clause to ingest data
+      files that use a different delimiter character or a different line end
+      character. When specifying delimiter and line end characters with the
+        <codeph>FIELDS TERMINATED BY</codeph>, <codeph>ESCAPED BY</codeph>, and
+        <codeph>LINES TERMINATED BY</codeph> clauses, you can use the following:<ul>
+        <li>A regular ASCII character surrounded by single or double quotation
+          marks.</li>
+        <li>An octal sequence,  such as <codeph>'\054'</codeph> representing a
+          comma or <codeph>'\0'</codeph> for ASCII null (hex 00).</li>
+        <li>Special characters, such as:<ul>
+            <li><codeph>'\t'</codeph> for tab</li>
+            <li><codeph>'\n'</codeph> for newline or linefeed</li>
+            <li><codeph>'\r'</codeph> for carriage return</li>
+          </ul></li>
+        <li>An integer in the range '-127'..'128' (with quotation marks but no
+            backslash)<p>Negative values are subtracted from 256. For example,
+              <codeph>FIELDS TERMINATED BY '-2'</codeph> sets the field
+            delimiter to ASCII code 254.</p></li>
+      </ul></p>
+    <p>For more examples of text tables, see <xref
+        href="impala_txtfile.xml#txtfile"/>. </p>
+    <p> For the <codeph>ESCAPED BY</codeph> clause, choose an escape character
+      that is not used anywhere else in the file. The character following the
+      escape character is taken literally as part of a field value. </p>
+    <p>Surrounding field values with quotation marks does not help Impala to
+      parse fields with embedded delimiter characters as the quotation marks are
+      considered to be part of the column value. </p>
+    <p>If you want to use <codeph>\</codeph> as the escape character, specify
+      the clause in <cmdname>impala-shell</cmdname> as <codeph>ESCAPED BY
+        '\\'</codeph>. </p>
 
     <p>
       <b>To add or drop partitions for a table</b>, the table must already be partitioned (that is, created with a

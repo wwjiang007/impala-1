@@ -23,6 +23,7 @@ import static org.apache.hadoop.fs.CommonConfigurationKeysPublic
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.security.authentication.util.KerberosName;
 import org.apache.impala.analysis.SqlScanner;
+import org.apache.impala.catalog.HdfsFileFormat;
 import org.apache.impala.thrift.TBackendGflags;
 
 import com.google.common.base.Preconditions;
@@ -45,6 +46,7 @@ public class BackendConfig {
     Preconditions.checkNotNull(cfg);
     INSTANCE = new BackendConfig(cfg);
     SqlScanner.init(cfg.getReserved_words_version());
+    HdfsFileFormat.init(cfg.isEnable_orc_scanner());
     initAuthToLocal();
   }
 
@@ -80,6 +82,10 @@ public class BackendConfig {
   public double getMaxFilterErrorRate() { return backendCfg_.max_filter_error_rate; }
 
   public long getMinBufferSize() { return backendCfg_.min_buffer_size; }
+
+  public boolean isAuthorizedProxyGroupEnabled() {
+    return !Strings.isNullOrEmpty(backendCfg_.authorized_proxy_group_config);
+  }
 
   // Inits the auth_to_local configuration in the static KerberosName class.
   private static void initAuthToLocal() {

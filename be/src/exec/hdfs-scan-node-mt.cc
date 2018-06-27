@@ -19,6 +19,7 @@
 
 #include <sstream>
 
+#include "exec/scanner-context.h"
 #include "runtime/runtime-state.h"
 #include "runtime/row-batch.h"
 #include "util/debug-util.h"
@@ -26,6 +27,7 @@
 
 #include "gen-cpp/PlanNodes_types.h"
 
+using namespace impala::io;
 using std::stringstream;
 
 namespace impala {
@@ -46,6 +48,7 @@ Status HdfsScanNodeMt::Prepare(RuntimeState* state) {
   // because the scanner of the corresponding file format does implement GetNext().
   for (const auto& files: per_type_files_) {
     if (!files.second.empty() && files.first != THdfsFileFormat::PARQUET
+        && files.first != THdfsFileFormat::ORC
         && files.first != THdfsFileFormat::TEXT) {
       stringstream msg;
       msg << "Unsupported file format with HdfsScanNodeMt: " << files.first;
@@ -76,9 +79,9 @@ Status HdfsScanNodeMt::GetNext(RuntimeState* state, RowBatch* row_batch, bool* e
       scanner_->Close(row_batch);
       scanner_.reset();
     }
-    RETURN_IF_ERROR(
-        runtime_state_->io_mgr()->GetNextRange(reader_context_.get(), &scan_range_));
-    if (scan_range_ == NULL) {
+    int64_t scanner_reservation = buffer_pool_client()->GetReservation();
+    RETURN_IF_ERROR(StartNextScanRange(&scanner_reservation, &scan_range_));
+    if (scan_range_ == nullptr) {
       *eos = true;
       StopAndFinalizeCounters();
       return Status::OK();
@@ -87,9 +90,9 @@ Status HdfsScanNodeMt::GetNext(RuntimeState* state, RowBatch* row_batch, bool* e
         static_cast<ScanRangeMetadata*>(scan_range_->meta_data());
     int64_t partition_id = metadata->partition_id;
     HdfsPartitionDescriptor* partition = hdfs_table_->GetPartition(partition_id);
-    scanner_ctx_.reset(new ScannerContext(
-        runtime_state_, this, partition, scan_range_, filter_ctxs(),
-        expr_results_pool()));
+    scanner_ctx_.reset(new ScannerContext(runtime_state_, this, buffer_pool_client(),
+        scanner_reservation, partition, filter_ctxs(), expr_results_pool()));
+    scanner_ctx_->AddStream(scan_range_, scanner_reservation);
     Status status = CreateAndOpenScanner(partition, scanner_ctx_.get(), &scanner_);
     if (!status.ok()) {
       DCHECK(scanner_ == NULL);

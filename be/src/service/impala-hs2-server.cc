@@ -34,6 +34,7 @@
 #include "common/logging.h"
 #include "common/version.h"
 #include "rpc/thrift-util.h"
+#include "runtime/coordinator.h"
 #include "runtime/raw-value.h"
 #include "runtime/exec-env.h"
 #include "service/hs2-util.h"
@@ -85,18 +86,6 @@ DECLARE_int32(idle_session_timeout);
 namespace impala {
 
 const string IMPALA_RESULT_CACHING_OPT = "impala.resultset.cache.size";
-
-// Helper function to translate between Beeswax and HiveServer2 type
-static TOperationState::type QueryStateToTOperationState(
-    const beeswax::QueryState::type& query_state) {
-  switch (query_state) {
-    case beeswax::QueryState::CREATED: return TOperationState::INITIALIZED_STATE;
-    case beeswax::QueryState::RUNNING: return TOperationState::RUNNING_STATE;
-    case beeswax::QueryState::FINISHED: return TOperationState::FINISHED_STATE;
-    case beeswax::QueryState::EXCEPTION: return TOperationState::ERROR_STATE;
-    default: return TOperationState::UKNOWN_STATE;
-  }
-}
 
 void ImpalaServer::ExecuteMetadataOp(const THandleIdentifier& session_handle,
     TMetadataOpRequest* request, TOperationHandle* handle, thrift::TStatus* status) {
@@ -161,7 +150,7 @@ void ImpalaServer::ExecuteMetadataOp(const THandleIdentifier& session_handle,
     return;
   }
 
-  request_state->UpdateNonErrorQueryState(beeswax::QueryState::FINISHED);
+  request_state->UpdateNonErrorOperationState(TOperationState::FINISHED_STATE);
 
   Status inflight_status = SetQueryInflight(session, request_state);
   if (!inflight_status.ok()) {
@@ -267,7 +256,7 @@ Status ImpalaServer::TExecuteStatementReqToTQueryContext(
   }
   // Only query options not set in the session or confOverlay can be overridden by the
   // pool options.
-  AddPoolQueryOptions(query_ctx, ~set_query_options_mask);
+  AddPoolConfiguration(query_ctx, ~set_query_options_mask);
   VLOG_QUERY << "TClientRequest.queryOptions: "
              << ThriftDebugString(query_ctx->client_request.query_options);
   return Status::OK();
@@ -349,8 +338,8 @@ void ImpalaServer::OpenSession(TOpenSessionResp& return_val,
   TQueryOptionsToMap(state->QueryOptions(), &return_val.configuration);
 
   // OpenSession() should return the coordinator's HTTP server address.
-  const string& http_addr = lexical_cast<string>(
-      MakeNetworkAddress(FLAGS_hostname, FLAGS_webserver_port));
+  const string& http_addr = TNetworkAddressToString(MakeNetworkAddress(
+      FLAGS_hostname, FLAGS_webserver_port));
   return_val.configuration.insert(make_pair("http_addr", http_addr));
 
   // Put the session state in session_state_map_
@@ -458,6 +447,10 @@ void ImpalaServer::ExecuteStatement(TExecuteStatementResp& return_val,
   status = Execute(&query_ctx, session, &request_state);
   HS2_RETURN_IF_ERROR(return_val, status, SQLSTATE_GENERAL_ERROR);
 
+  // Start thread to wait for results to become available.
+  status = request_state->WaitAsync();
+  if (!status.ok()) goto return_error;
+
   // Optionally enable result caching on the ClientRequestState.
   if (cache_num_rows > 0) {
     status = request_state->SetResultCache(
@@ -466,10 +459,6 @@ void ImpalaServer::ExecuteStatement(TExecuteStatementResp& return_val,
         cache_num_rows);
     if (!status.ok()) goto return_error;
   }
-  request_state->UpdateNonErrorQueryState(beeswax::QueryState::RUNNING);
-  // Start thread to wait for results to become available.
-  status = request_state->WaitAsync();
-  if (!status.ok()) goto return_error;
   // Once the query is running do a final check for session closure and add it to the
   // set of in-flight queries.
   status = SetQueryInflight(session, request_state);
@@ -651,8 +640,7 @@ void ImpalaServer::GetOperationStatus(TGetOperationStatusResp& return_val,
 
   {
     lock_guard<mutex> l(*request_state->lock());
-    TOperationState::type operation_state = QueryStateToTOperationState(
-        request_state->query_state());
+    TOperationState::type operation_state = request_state->operation_state();
     return_val.__set_operationState(operation_state);
     if (operation_state == TOperationState::ERROR_STATE) {
       DCHECK(!request_state->query_status().ok());
@@ -814,15 +802,16 @@ void ImpalaServer::GetLog(TGetLogResp& return_val, const TGetLogReq& request) {
                       SQLSTATE_GENERAL_ERROR);
 
   stringstream ss;
-  if (request_state->coord() != NULL) {
+  Coordinator* coord = request_state->GetCoordinator();
+  if (coord != nullptr) {
     // Report progress
-    ss << request_state->coord()->progress().ToString() << "\n";
+    ss << coord->progress().ToString() << "\n";
   }
   // Report analysis errors
   ss << join(request_state->GetAnalysisWarnings(), "\n");
-  if (request_state->coord() != NULL) {
+  if (coord != nullptr) {
     // Report execution errors
-    ss << request_state->coord()->GetErrorLog();
+    ss << coord->GetErrorLog();
   }
   return_val.log = ss.str();
   return_val.status.__set_statusCode(thrift::TStatusCode::SUCCESS_STATUS);

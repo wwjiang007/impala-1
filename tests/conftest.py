@@ -120,6 +120,10 @@ def pytest_addoption(parser):
                    default=False, help="Run all tests with KRPC disabled. This assumes "
                    "that the test cluster has been started with --disable_krpc.")
 
+  parser.addoption("--shard_tests", default=None,
+                   help="If set to N/M (e.g., 3/5), will split the tests into "
+                   "M partitions and run the Nth partition. 1-indexed.")
+
 
 def pytest_assertrepr_compare(op, left, right):
   """
@@ -340,7 +344,8 @@ def conn(request):
        - get_conn_timeout(): The timeout, in seconds, to use for this connection.
      The returned connection will have a 'db_name' property.
 
-     See the 'unique_database' fixture above if you want to use Impala's custom python
+     DEPRECATED:
+     See the 'unique_database' fixture above to use Impala's custom python
      API instead of DB-API.
   """
   db_name = __call_cls_method_if_exists(request.cls, "get_db_name")
@@ -376,6 +381,10 @@ def __unique_conn(db_name=None, timeout=DEFAULT_CONN_TIMEOUT):
      # The database no longer exists and the conn is closed.
 
      The returned connection will have a 'db_name' property.
+
+     DEPRECATED:
+     See the 'unique_database' fixture above to use Impala's custom python
+     API instead of DB-API.
   """
   if not db_name:
     db_name = choice(ascii_lowercase) + "".join(sample(ascii_lowercase + digits, 5))
@@ -403,6 +412,10 @@ def __auto_closed_conn(db_name=None, timeout=DEFAULT_CONN_TIMEOUT):
      The connection will be closed upon exiting the block.
 
      The returned connection will have a 'db_name' property.
+
+     DEPRECATED:
+     See the 'unique_database' fixture above to use Impala's custom python
+     API instead of DB-API.
   """
   default_impalad = pytest.config.option.impalad.split(',')[0]
   impalad_host = default_impalad.split(':')[0]
@@ -427,6 +440,10 @@ def cursor(conn):
 
      The returned cursor will have a 'conn' property. The 'conn' will have a 'db_name'
      property.
+
+     DEPRECATED:
+     See the 'unique_database' fixture above to use Impala's custom python
+     API instead of DB-API.
   """
   with __auto_closed_cursor(conn) as cur:
     yield cur
@@ -439,6 +456,10 @@ def cls_cursor(conn):
 
      The returned cursor will have a 'conn' property. The 'conn' will have a 'db_name'
      property.
+
+     DEPRECATED:
+     See the 'unique_database' fixture above to use Impala's custom python
+     API instead of DB-API.
   """
   with __auto_closed_cursor(conn) as cur:
     yield cur
@@ -452,6 +473,10 @@ def unique_cursor():
 
      The returned cursor will have a 'conn' property. The 'conn' will have a 'db_name'
      property.
+
+     DEPRECATED:
+     See the 'unique_database' fixture above to use Impala's custom python
+     API instead of DB-API.
   """
   with __unique_conn() as conn:
     with __auto_closed_cursor(conn) as cur:
@@ -501,3 +526,34 @@ def validate_pytest_config():
     if any(pytest.config.option.impalad.startswith(loc) for loc in local_prefixes):
       logging.error("--testing_remote_cluster can not be used with a local impalad")
       pytest.exit("Invalid pytest config option: --testing_remote_cluster")
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(items, config, session):
+  """Hook to handle --shard_tests command line option.
+
+  If set, this "deselects" a subset of tests, by hashing
+  their id into buckets.
+  """
+  if not config.option.shard_tests:
+    return
+
+  num_items = len(items)
+  this_shard, num_shards = map(int, config.option.shard_tests.split("/"))
+  assert 0 <= this_shard <= num_shards
+  if this_shard == num_shards:
+    this_shard = 0
+
+  items_selected, items_deselected = [], []
+  for i in items:
+    if hash(i.nodeid) % num_shards == this_shard:
+      items_selected.append(i)
+    else:
+      items_deselected.append(i)
+  config.hook.pytest_deselected(items=items_deselected)
+
+  # We must modify the items list in place for it to take effect.
+  items[:] = items_selected
+
+  logging.info("pytest shard selection enabled %s. Of %d items, selected %d items by hash.",
+      config.option.shard_tests, num_items, len(items))

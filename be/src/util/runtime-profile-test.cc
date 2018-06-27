@@ -16,7 +16,9 @@
 // under the License.
 
 #include <stdlib.h>
+#include <algorithm>
 #include <iostream>
+
 #include <boost/bind.hpp>
 
 #include "common/object-pool.h"
@@ -220,6 +222,76 @@ TEST(CountersTest, MergeAndUpdate) {
 
   // make sure we can print
   profile2->PrettyPrint(&dummy);
+}
+
+// Regression test for IMPALA-6694 - child order isn't preserved if a child
+// is prepended between updates.
+TEST(CountersTest, MergeAndUpdateChildOrder) {
+  ObjectPool pool;
+  // Add Child2 first.
+  RuntimeProfile* profile1 = RuntimeProfile::Create(&pool, "Parent");
+  RuntimeProfile* p1_child2 = RuntimeProfile::Create(&pool, "Child2");
+  profile1->AddChild(p1_child2);
+  TRuntimeProfileTree tprofile1_v1, tprofile1_v2, tprofile1_v3;
+  profile1->ToThrift(&tprofile1_v1);
+
+  // Update averaged and deserialized profiles from the serialized profile.
+  RuntimeProfile* averaged_profile = RuntimeProfile::Create(&pool, "merged", true);
+  RuntimeProfile* deserialized_profile = RuntimeProfile::Create(&pool, "Parent");
+  averaged_profile->UpdateAverage(profile1);
+  deserialized_profile->Update(tprofile1_v1);
+
+  std::vector<RuntimeProfile*> tmp_children;
+  averaged_profile->GetChildren(&tmp_children);
+  EXPECT_EQ(1, tmp_children.size());
+  EXPECT_EQ("Child2", tmp_children[0]->name());
+  deserialized_profile->GetChildren(&tmp_children);
+  EXPECT_EQ(1, tmp_children.size());
+  EXPECT_EQ("Child2", tmp_children[0]->name());
+
+  // Prepend Child1 and update profiles.
+  RuntimeProfile* p1_child1 = RuntimeProfile::Create(&pool, "Child1");
+  profile1->PrependChild(p1_child1);
+  profile1->ToThrift(&tprofile1_v2);
+  averaged_profile->UpdateAverage(profile1);
+  deserialized_profile->Update(tprofile1_v2);
+
+  averaged_profile->GetChildren(&tmp_children);
+  EXPECT_EQ(2, tmp_children.size());
+  EXPECT_EQ("Child1", tmp_children[0]->name());
+  EXPECT_EQ("Child2", tmp_children[1]->name());
+  deserialized_profile->GetChildren(&tmp_children);
+  EXPECT_EQ(2, tmp_children.size());
+  EXPECT_EQ("Child1", tmp_children[0]->name());
+  EXPECT_EQ("Child2", tmp_children[1]->name());
+
+  // Test that changes in order of children is handled gracefully by preserving the
+  // order from the previous update. Sorting puts the children in descending total time
+  // order.
+  p1_child1->total_time_counter()->Set(1);
+  p1_child2->total_time_counter()->Set(2);
+  profile1->SortChildrenByTotalTime();
+  profile1->GetChildren(&tmp_children);
+  EXPECT_EQ("Child2", tmp_children[0]->name());
+  EXPECT_EQ("Child1", tmp_children[1]->name());
+  profile1->ToThrift(&tprofile1_v3);
+  averaged_profile->UpdateAverage(profile1);
+  deserialized_profile->Update(tprofile1_v2);
+
+  // The previous order of children that were already present is preserved.
+  averaged_profile->GetChildren(&tmp_children);
+  EXPECT_EQ(2, tmp_children.size());
+  EXPECT_EQ("Child1", tmp_children[0]->name());
+  EXPECT_EQ("Child2", tmp_children[1]->name());
+  deserialized_profile->GetChildren(&tmp_children);
+  EXPECT_EQ(2, tmp_children.size());
+  EXPECT_EQ("Child1", tmp_children[0]->name());
+  EXPECT_EQ("Child2", tmp_children[1]->name());
+
+  // Make sure we can print the profiles.
+  stringstream dummy;
+  averaged_profile->PrettyPrint(&dummy);
+  deserialized_profile->PrettyPrint(&dummy);
 }
 
 TEST(CountersTest, HighWaterMarkCounters) {
@@ -539,6 +611,38 @@ TEST(CountersTest, EventSequences) {
     EXPECT_TRUE(ev.first > last_string);
     last_string = ev.first;
   }
+}
+
+TEST(CountersTest, UpdateEmptyEventSequence) {
+  // IMPALA-6824: This test makes sure that adding events to an empty event sequence does
+  // not crash.
+  ObjectPool pool;
+
+  // Create the profile to send in the update and add some events.
+  RuntimeProfile* profile = RuntimeProfile::Create(&pool, "Profile");
+  RuntimeProfile::EventSequence* seq = profile->AddEventSequence("event sequence");
+  seq->Start();
+  // Sleep for 10ms to make sure the events are logged at a time > 0.
+  SleepForMs(10);
+  seq->MarkEvent("aaaa");
+  seq->MarkEvent("bbbb");
+
+  vector<RuntimeProfile::EventSequence::Event> events;
+  seq->GetEvents(&events);
+  EXPECT_EQ(2, events.size());
+
+  TRuntimeProfileTree thrift_profile;
+  profile->ToThrift(&thrift_profile);
+
+  // Create the profile that will be updated and add the empty event sequence to it.
+  RuntimeProfile* updated_profile = RuntimeProfile::Create(&pool, "Updated Profile");
+  seq = updated_profile->AddEventSequence("event sequence");
+  updated_profile->Update(thrift_profile);
+
+  // Verify that the events have been updated successfully.
+  events.clear();
+  seq->GetEvents(&events);
+  EXPECT_EQ(2, events.size());
 }
 
 void ValidateSampler(const StreamingSampler<int, 10>& sampler, int expected_num,

@@ -18,18 +18,21 @@
 package org.apache.impala.analysis;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import java.lang.reflect.Field;
 import java.util.List;
 
+import org.apache.impala.analysis.AnalysisContext.AnalysisResult;
 import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.PrimitiveType;
 import org.apache.impala.catalog.ScalarType;
 import org.apache.impala.catalog.Table;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
+import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.RuntimeEnv;
 import org.junit.Assert;
 import org.junit.Test;
@@ -2647,6 +2650,26 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     // Regression test for IMPALA-1128, union of decimal and an int type that converts
     // to the identical decimal.
     AnalyzesOk("select cast(1 as bigint) union select cast(1 as decimal(19, 0))");
+
+    AnalysisContext decimalV1Ctx = createAnalysisCtx();
+    decimalV1Ctx.getQueryOptions().setDecimal_v2(false);
+    AnalysisContext decimalV2Ctx = createAnalysisCtx();
+    decimalV2Ctx.getQueryOptions().setDecimal_v2(true);
+
+    // IMPALA-6518: union of two incompatible decimal columns. There is no implicit cast
+    // if decimal_v2 is enabled.
+    String query = "select cast(123 as decimal(38, 0)) " +
+        "union all select cast(0.789 as decimal(38, 38))";
+    AnalyzesOk(query, decimalV1Ctx);
+    AnalysisError(query, decimalV2Ctx, "Incompatible return types 'DECIMAL(38,0)' and " +
+        "'DECIMAL(38,38)' of exprs 'CAST(123 AS DECIMAL(38,0))' and " +
+        "'CAST(0.789 AS DECIMAL(38,38))'.");
+
+    query = "select cast(123 as double) " +
+        "union all select cast(0.456 as float)" +
+        "union all select cast(0.789 as decimal(38, 38))";
+    AnalyzesOk(query, decimalV1Ctx);
+    AnalyzesOk(query, decimalV2Ctx);
   }
 
   @Test
@@ -2657,11 +2680,12 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalyzesOk("values(1.0, 2, NULL) union all values(1, 2.0, 3)");
     AnalyzesOk("insert overwrite table functional.alltypes " +
         "partition (year=2009, month=10)" +
-        "values(1, true, 1, 1, 1, 1, 1.0, 1.0, 'a', 'a', cast(0 as timestamp))");
+        "values(1, true, 1, 1, 1, 1, cast(1.0 as float), cast(1.0 as double), " +
+        "'a', 'a', cast(0 as timestamp))");
     AnalyzesOk("insert overwrite table functional.alltypes " +
         "partition (year, month) " +
-        "values(1, true, 1, 1, 1, 1, 1.0, 1.0, 'a', 'a', cast(0 as timestamp)," +
-        "2009, 10)");
+        "values(1, true, 1, 1, 1, 1, cast(1.0 as float), cast(1.0 as double), " +
+        "'a', 'a', cast(0 as timestamp), 2009, 10)");
     // Values stmt with multiple rows.
     AnalyzesOk("values((1, 2, 3), (4, 5, 6))");
     AnalyzesOk("select * from (values('a', 'b', 'c')) as t");
@@ -2670,15 +2694,21 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalyzesOk("insert overwrite table functional.alltypes " +
         "partition (year=2009, month=10) " +
         "values(" +
-        "(1, true, 1, 1, 1, 1, 1.0, 1.0, 'a', 'a', cast(0 as timestamp))," +
-        "(2, false, 2, 2, NULL, 2, 2.0, 2.0, 'b', 'b', cast(0 as timestamp))," +
-        "(3, true, 3, 3, 3, 3, 3.0, 3.0, 'c', 'c', cast(0 as timestamp)))");
+        "(1, true, 1, 1, 1, 1, cast(1.0 as float), cast(1.0 as double), " +
+        "'a', 'a', cast(0 as timestamp))," +
+        "(2, false, 2, 2, NULL, 2, cast(2.0 as float), cast(2.0 as double), " +
+        "'b', 'b', cast(0 as timestamp))," +
+        "(3, true, 3, 3, 3, 3, cast(3.0 as float), cast(3.0 as double), " +
+        "'c', 'c', cast(0 as timestamp)))");
     AnalyzesOk("insert overwrite table functional.alltypes " +
         "partition (year, month) " +
         "values(" +
-        "(1, true, 1, 1, 1, 1, 1.0, 1.0, 'a', 'a', cast(0 as timestamp), 2009, 10)," +
-        "(2, false, 2, 2, NULL, 2, 2.0, 2.0, 'b', 'b', cast(0 as timestamp), 2009, 2)," +
-        "(3, true, 3, 3, 3, 3, 3.0, 3.0, 'c', 'c', cast(0 as timestamp), 2009, 3))");
+        "(1, true, 1, 1, 1, 1, cast(1.0 as float), cast(1.0 as double), " +
+        "'a', 'a', cast(0 as timestamp), 2009, 10)," +
+        "(2, false, 2, 2, NULL, 2, cast(2.0 as float), cast(2.0 as double), " +
+        "'b', 'b', cast(0 as timestamp), 2009, 2)," +
+        "(3, true, 3, 3, 3, 3, cast(3.0 as float), cast(3.0 as double), " +
+        "'c', 'c', cast(0 as timestamp), 2009, 3))");
 
     // Test multiple aliases. Values() is like union, the column labels are 'x' and 'y'.
     AnalyzesOk("values((1 as x, 'a' as y), (2 as k, 'b' as j))");
@@ -3198,7 +3228,59 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
       AnalysisError("insert into functional_kudu.testtbl(zip) values(1)",
           "All primary key columns must be specified for INSERTing into Kudu tables. " +
           "Missing columns are: id");
+      // Mixed column name case, on both primary key and non-primary key cols.
+      AnalyzesOk("insert into functional_kudu.alltypes (ID, BOOL_COL) values (0, true)");
     }
+
+    addTestDb("d", null);
+    addTestTable("create table d.dec1 (c decimal(38,37)) location '/'");
+    addTestTable("create table d.dec2 (c decimal(38,1)) location '/'");
+    addTestTable("create table d.dbl (c double) location '/'");
+    addTestTable("create table d.flt (c float) location '/'");
+
+    AnalysisContext decimalV1Ctx = createAnalysisCtx("d");
+    decimalV1Ctx.getQueryOptions().setDecimal_v2(false);
+    AnalysisContext decimalV2Ctx = createAnalysisCtx("d");
+    decimalV2Ctx.getQueryOptions().setDecimal_v2(true);
+
+    AnalyzesOk("insert into d.dec1 select cast(1 as decimal(38, 0))", decimalV1Ctx);
+    AnalysisError("insert into d.dec1 select cast(1 as decimal(38, 0))", decimalV2Ctx,
+        "Target table 'd.dec1' is incompatible with source expressions.\n" +
+        "Expression 'CAST(1 AS DECIMAL(38,0))' (type: DECIMAL(38,0)) is not " +
+        "compatible with column 'c' (type: DECIMAL(38,37))");
+
+    AnalysisError("insert into d.dec2 select cast(11.1 as decimal(38, 20));",
+        decimalV1Ctx, "Possible loss of precision for target table 'd.dec2'.\n" +
+        "Expression 'CAST(11.1 AS DECIMAL(38,20))' (type: DECIMAL(38,20)) would need " +
+        "to be cast to DECIMAL(38,1) for column 'c'");
+    AnalysisError("insert into d.dec2 select cast(11.1 as decimal(38, 20));",
+        decimalV2Ctx, "Target table 'd.dec2' is incompatible with source expressions.\n" +
+        "Expression 'CAST(11.1 AS DECIMAL(38,20))' (type: DECIMAL(38,20)) is not " +
+        "compatible with column 'c' (type: DECIMAL(38,1))");
+
+    AnalysisError("insert into d.dec1 select cast(1 as double)", decimalV1Ctx,
+        "Possible loss of precision for target table 'd.dec1'.\n" +
+        "Expression 'CAST(1 AS DOUBLE)' (type: DOUBLE) would need to be cast to " +
+        "DECIMAL(38,37) for column 'c'");
+    AnalysisError("insert into d.dec1 select cast(1 as double)", decimalV2Ctx,
+        "Possible loss of precision for target table 'd.dec1'.\n" +
+        "Expression 'CAST(1 AS DOUBLE)' (type: DOUBLE) would need to be cast to " +
+        "DECIMAL(38,37) for column 'c'");
+
+    AnalysisError("insert into d.dec1 select cast(1 as float)", decimalV1Ctx,
+        "Possible loss of precision for target table 'd.dec1'.\n" +
+            "Expression 'CAST(1 AS FLOAT)' (type: FLOAT) would need to be cast to " +
+            "DECIMAL(38,37) for column 'c'");
+    AnalysisError("insert into d.dec1 select cast(1 as float)", decimalV2Ctx,
+        "Possible loss of precision for target table 'd.dec1'.\n" +
+            "Expression 'CAST(1 AS FLOAT)' (type: FLOAT) would need to be cast to " +
+            "DECIMAL(38,37) for column 'c'");
+
+    AnalyzesOk("insert into d.dbl select cast(1 as decimal(20, 10))", decimalV1Ctx);
+    AnalyzesOk("insert into d.dbl select cast(1 as decimal(20, 10))", decimalV2Ctx);
+
+    AnalyzesOk("insert into d.flt select cast(1 as decimal(20, 10))", decimalV1Ctx);
+    AnalyzesOk("insert into d.flt select cast(1 as decimal(20, 10))", decimalV2Ctx);
   }
 
   /**
@@ -3322,6 +3404,13 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "select * from functional.alltypes",
         "Target table 'functional.alltypessmall' has fewer columns (13) than the " +
         "SELECT / VALUES clause and PARTITION clause return (15)");
+
+    // Mixed column name case in the partition clause.
+    AnalyzesOk("insert " + qualifier + " table functional.alltypessmall " +
+        "partition (YEAR, month)" +
+        "select id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, " +
+        "float_col, double_col, date_string_col, string_col, timestamp_col, year, " +
+        "month from functional.alltypes");
   }
 
   /**
@@ -3510,6 +3599,12 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "from functional.alltypes",
         "Non-constant expressions are not supported as static partition-key values " +
         "in 'month=int_col'.");
+    // Mixed column case in the partition clause.
+    AnalyzesOk("insert " + qualifier + " table functional.alltypessmall " +
+        "partition (year=2009, MONTH=4)" +
+        "select id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, " +
+        "float_col, double_col, date_string_col, string_col, timestamp_col " +
+        "from functional.alltypes");
 
     if (qualifier.contains("OVERWRITE")) {
       AnalysisError("insert " + qualifier + " table functional_hbase.alltypessmall " +
@@ -3640,6 +3735,10 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalyzesOk("insert " + qualifier + " table functional.alltypes() " +
         "partition(year, month) select 1,2 from functional.alltypes");
 
+    // Mixed column case in permutation, both partition and non-partition cols.
+    AnalyzesOk("insert " + qualifier + " table functional.alltypes (ID, YEAR, month)" +
+        "values (0, 0, 0)");
+
     if (!qualifier.contains("OVERWRITE")) {
       // Simple permutation
       AnalyzesOk("insert " + qualifier + " table functional_hbase.alltypesagg" +
@@ -3661,6 +3760,11 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
           "float_col, double_col, date_string_col, string_col, timestamp_col from " +
           "functional.alltypesnopart",
           "Row-key column 'id' must be explicitly mentioned in column permutation.");
+      // Mixed column case on both row-key and non-row-key cols.
+      AnalyzesOk("insert " + qualifier + " table functional_hbase.alltypesagg" +
+          "(ID, bool_col, tinyint_col, smallint_col, INT_COL, bigint_col, " +
+          "float_col, double_col, date_string_col, string_col, timestamp_col) " +
+          "select * from functional.alltypesnopart");
     }
   }
 
@@ -3673,7 +3777,7 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
    */
   @Test
   public void TestClone() {
-    testNumberOfMembers(QueryStmt.class, 9);
+    testNumberOfMembers(QueryStmt.class, 11);
     testNumberOfMembers(UnionStmt.class, 9);
     testNumberOfMembers(ValuesStmt.class, 0);
 
@@ -3702,5 +3806,59 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
   public void TestSetQueryOption() {
     AnalyzesOk("set foo=true");
     AnalyzesOk("set");
+  }
+
+  @Test
+  public void TestFunctionPaths() throws ImpalaException {
+    // The statement here does not matter since we just need to get a dummy analyzer
+    // to be able to call FuntionName.analyze(Analyzer, boolean) method.
+    Analyzer dummyAnalyzer = ((StatementBase) AnalyzesOk("select 1")).getAnalyzer();
+    FunctionName fnName = new FunctionName(null, "sin");
+    fnName.analyze(dummyAnalyzer, false);
+    assertFalse(fnName.isBuiltin());
+
+    fnName = new FunctionName(null, "f");
+    fnName.analyze(dummyAnalyzer, false);
+    assertFalse(fnName.isBuiltin());
+
+    fnName = new FunctionName("db", "sin");
+    fnName.analyze(dummyAnalyzer, false);
+    assertFalse(fnName.isBuiltin());
+
+    fnName = new FunctionName("db", "f");
+    fnName.analyze(dummyAnalyzer, false);
+    assertFalse(fnName.isBuiltin());
+
+    fnName = new FunctionName("_impala_builtins", "sin");
+    fnName.analyze(dummyAnalyzer, false);
+    assertTrue(fnName.isBuiltin());
+
+    fnName = new FunctionName("_impala_builtins", "f");
+    fnName.analyze(dummyAnalyzer, false);
+    assertFalse(fnName.isBuiltin());
+
+    fnName = new FunctionName(null, "sin");
+    fnName.analyze(dummyAnalyzer, true);
+    assertTrue(fnName.isBuiltin());
+
+    fnName = new FunctionName(null, "f");
+    fnName.analyze(dummyAnalyzer, true);
+    assertFalse(fnName.isBuiltin());
+
+    fnName = new FunctionName("db", "sin");
+    fnName.analyze(dummyAnalyzer, false);
+    assertFalse(fnName.isBuiltin());
+
+    fnName = new FunctionName("db", "f");
+    fnName.analyze(dummyAnalyzer, true);
+    assertFalse(fnName.isBuiltin());
+
+    fnName = new FunctionName("_impala_builtins", "sin");
+    fnName.analyze(dummyAnalyzer, false);
+    assertTrue(fnName.isBuiltin());
+
+    fnName = new FunctionName("_impala_builtins", "f");
+    fnName.analyze(dummyAnalyzer, false);
+    assertFalse(fnName.isBuiltin());
   }
 }

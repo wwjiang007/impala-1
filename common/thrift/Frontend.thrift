@@ -166,6 +166,9 @@ struct TDescribeTableParams {
 
   // Set when describing a path to a nested collection.
   3: optional Types.TColumnType result_struct
+
+  // Session state for the user who initiated this request.
+  4: optional ImpalaInternalService.TSessionState session
 }
 
 // Results of a call to describeDb() and describeTable()
@@ -366,9 +369,9 @@ struct TPlanExecInfo {
   // it is unpartitioned.
   1: required list<Planner.TPlanFragment> fragments
 
-  // A map from scan node ids to a list of scan range locations.
+  // A map from scan node ids to a scan range specification.
   // The node ids refer to scan nodes in fragments[].plan
-  2: optional map<Types.TPlanNodeId, list<Planner.TScanRangeLocationList>>
+  2: optional map<Types.TPlanNodeId, Planner.TScanRangeSpec>
       per_node_scan_ranges
 }
 
@@ -405,8 +408,13 @@ struct TQueryExecRequest {
   9: optional i64 per_host_mem_estimate
 
   // Maximum possible (in the case all fragments are scheduled on all hosts with
-  // max DOP) minimum reservation required per host, in bytes.
-  10: optional i64 max_per_host_min_reservation;
+  // max DOP) minimum memory reservation required per host, in bytes.
+  10: optional i64 max_per_host_min_mem_reservation;
+
+  // Maximum possible (in the case all fragments are scheduled on all hosts with
+  // max DOP) required threads per host, i.e. the number of threads that this query
+  // needs to execute successfully. Does not include "optional" threads.
+  11: optional i64 max_per_host_thread_reservation;
 }
 
 enum TCatalogOpType {
@@ -634,7 +642,13 @@ struct TSymbolLookupParams {
   6: optional Types.TColumnType ret_arg_type
 
   // Determines the signature of the mangled symbol
-  7: required TSymbolType symbol_type;
+  7: required TSymbolType symbol_type
+
+  // Does the lookup require the backend lib-cache entry be refreshed?
+  // If so, the file system is checked for a newer version of the file
+  // referenced by 'location'. If not, the entry in the lib-cache is used
+  // if present, otherwise the file is read from file-system.
+  8: required bool needs_refresh
 }
 
 enum TSymbolLookupResultCode {
@@ -652,6 +666,9 @@ struct TSymbolLookupResult {
 
   // The error message if the symbol found not be found.
   3: optional string error_msg
+
+  // Last modified time in backend lib-cache entry for the file referenced by 'location'.
+  4: optional i64 last_modified_time
 }
 
 // Sent from the impalad BE to FE with the results of each CatalogUpdate heartbeat.
@@ -801,6 +818,16 @@ struct TGetHadoopConfigResponse {
 
 struct TGetAllHadoopConfigsResponse {
   1: optional map<string, string> configs;
+}
+
+struct TGetHadoopGroupsRequest {
+  // The user name to get the groups from.
+  1: required string user
+}
+
+struct TGetHadoopGroupsResponse {
+  // The list of groups that the user belongs to.
+  1: required list<string> groups
 }
 
 // For creating a test descriptor table. The tuples and their memory layout are computed

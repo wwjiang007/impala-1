@@ -14,8 +14,7 @@ explain select id from alltypes;
 '     table: rows=unavailable size=unavailable'
 '     partitions: 0/12 rows=unavailable'
 '     columns: unavailable'
-'   extrapolated-rows=unavailable'
-'   mem-estimate=16.00MB mem-reservation=0B'
+row_regex:.* extrapolated-rows=unavailable.*
 '   tuple-ids=0 row-size=4B cardinality=unavailable'
 ---- TYPES
 STRING
@@ -34,17 +33,17 @@ show table stats alltypes
 YEAR, MONTH, #ROWS, EXTRAP #ROWS, #FILES, SIZE, BYTES CACHED, CACHE REPLICATION, FORMAT, INCREMENTAL STATS, LOCATION
 ---- RESULTS
 '2009','1',-1,308,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=1'
-'2009','2',-1,288,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=2'
-'2009','3',-1,308,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=3'
+'2009','2',-1,289,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=2'
+'2009','3',-1,307,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=3'
 '2009','4',-1,302,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=4'
-'2009','5',-1,308,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=5'
+'2009','5',-1,307,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=5'
 '2009','6',-1,302,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=6'
-'2009','7',-1,308,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=7'
-'2009','8',-1,308,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=8'
+'2009','7',-1,307,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=7'
+'2009','8',-1,307,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=8'
 '2009','9',-1,302,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=9'
-'2009','10',-1,308,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=10'
+'2009','10',-1,307,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=10'
 '2009','11',-1,302,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=11'
-'2009','12',-1,308,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=12'
+'2009','12',-1,307,1,regex:.*B,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/$DATABASE.db/alltypes/year=2009/month=12'
 'Total','',3650,3650,12,regex:.*B,'0B','','','',''
 ---- TYPES
 STRING,STRING,BIGINT,BIGINT,BIGINT,STRING,STRING,STRING,STRING,STRING,STRING
@@ -53,14 +52,14 @@ STRING,STRING,BIGINT,BIGINT,BIGINT,STRING,STRING,STRING,STRING,STRING,STRING
 # Stats are available now.
 explain select id from alltypes;
 ---- RESULTS: VERIFY_IS_EQUAL
-'Max Per-Host Resource Reservation: Memory=0B'
-'Per-Host Resource Estimates: Memory=16.00MB'
+row_regex:.*Max Per-Host Resource Reservation: Memory=.*
+row_regex:.*Per-Host Resource Estimates: Memory=.*
 'Codegen disabled by planner'
 ''
 'F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1'
-'|  Per-Host Resources: mem-estimate=16.00MB mem-reservation=0B'
+row_regex:.*Per-Host Resources: mem-estimate=.* mem-reservation=.*
 'PLAN-ROOT SINK'
-'|  mem-estimate=0B mem-reservation=0B'
+row_regex:.*mem-estimate=.* mem-reservation=.*
 '|'
 '00:SCAN HDFS [$DATABASE.alltypes]'
 row_regex:.*partitions=12/12 files=12 size=.*
@@ -68,8 +67,8 @@ row_regex:.*partitions=12/12 files=12 size=.*
 row_regex:.*table: rows=3650 size=.*
 '     partitions: 0/12 rows=unavailable'
 '     columns: all'
-'   extrapolated-rows=3650'
-'   mem-estimate=16.00MB mem-reservation=0B'
+row_regex:.* extrapolated-rows=3650.*
+row_regex:.*mem-estimate=.* mem-reservation=.*
 '   tuple-ids=0 row-size=4B cardinality=3650'
 ---- TYPES
 STRING
@@ -78,14 +77,14 @@ STRING
 # Select a subset of partitions.
 explain select id from alltypes where month in (1, 2, 3);
 ---- RESULTS: VERIFY_IS_EQUAL
-'Max Per-Host Resource Reservation: Memory=0B'
-'Per-Host Resource Estimates: Memory=16.00MB'
+row_regex:.*Max Per-Host Resource Reservation: Memory=.*
+row_regex:.*Per-Host Resource Estimates: Memory=.*
 'Codegen disabled by planner'
 ''
 'F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1'
-'|  Per-Host Resources: mem-estimate=16.00MB mem-reservation=0B'
+row_regex:.*mem-estimate=.* mem-reservation=.*
 'PLAN-ROOT SINK'
-'|  mem-estimate=0B mem-reservation=0B'
+row_regex:.*mem-estimate=.* mem-reservation=.*
 '|'
 '00:SCAN HDFS [$DATABASE.alltypes]'
 row_regex:.*partitions=3/12 files=3 size=.*
@@ -93,8 +92,8 @@ row_regex:.*partitions=3/12 files=3 size=.*
 row_regex:.*table: rows=3650 size=.*
 '     partitions: 0/3 rows=unavailable'
 '     columns: all'
-'   extrapolated-rows=904'
-'   mem-estimate=16.00MB mem-reservation=0B'
+row_regex:.* extrapolated-rows=904.*
+row_regex:.*mem-estimate=.* mem-reservation=.*
 '   tuple-ids=0 row-size=4B cardinality=904'
 ---- TYPES
 STRING
@@ -105,13 +104,13 @@ insert into alltypes partition(year, month)
 select * from functional_parquet.alltypes where year = 2009;
 explain select id from alltypes;
 ---- RESULTS: VERIFY_IS_EQUAL
-'Max Per-Host Resource Reservation: Memory=0B'
-'Per-Host Resource Estimates: Memory=16.00MB'
+row_regex:.*Max Per-Host Resource Reservation: Memory=.*
+row_regex:.*Per-Host Resource Estimates: Memory=.*
 ''
 'F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1'
-'|  Per-Host Resources: mem-estimate=16.00MB mem-reservation=0B'
+row_regex:.*Per-Host Resources: mem-estimate=.* mem-reservation=.*
 'PLAN-ROOT SINK'
-'|  mem-estimate=0B mem-reservation=0B'
+row_regex:.*mem-estimate=.* mem-reservation=.*
 '|'
 '00:SCAN HDFS [$DATABASE.alltypes]'
 row_regex:.*partitions=12/12 files=24 size=.*
@@ -119,8 +118,8 @@ row_regex:.*partitions=12/12 files=24 size=.*
 row_regex:.*table: rows=3650 size=.*
 '     partitions: 0/12 rows=unavailable'
 '     columns: all'
-'   extrapolated-rows=7300'
-'   mem-estimate=16.00MB mem-reservation=0B'
+row_regex:.* extrapolated-rows=7300.*
+row_regex:.*mem-estimate=.* mem-reservation=.*
 '   tuple-ids=0 row-size=4B cardinality=7300'
 ---- TYPES
 STRING
@@ -131,14 +130,14 @@ insert into alltypes partition(year, month)
 select * from functional_parquet.alltypes where year = 2010;
 explain select id from alltypes where year = 2010;
 ---- RESULTS: VERIFY_IS_EQUAL
-'Max Per-Host Resource Reservation: Memory=0B'
-'Per-Host Resource Estimates: Memory=16.00MB'
+row_regex:.*Max Per-Host Resource Reservation: Memory=.*
+row_regex:.*Per-Host Resource Estimates: Memory=16.00MB'
 'Codegen disabled by planner'
 ''
 'F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1'
-'|  Per-Host Resources: mem-estimate=16.00MB mem-reservation=0B'
+row_regex:.*Per-Host Resources: mem-estimate=.* mem-reservation=.*
 'PLAN-ROOT SINK'
-'|  mem-estimate=0B mem-reservation=0B'
+row_regex:.*mem-estimate=.* mem-reservation=.*
 '|'
 '00:SCAN HDFS [$DATABASE.alltypes]'
 row_regex:.*partitions=12/24 files=12 size=.*
@@ -146,8 +145,8 @@ row_regex:.*partitions=12/24 files=12 size=.*
 row_regex:.*table: rows=3650 size=.*
 '     partitions: 0/12 rows=unavailable'
 '     columns: all'
-'   extrapolated-rows=3651'
-'   mem-estimate=16.00MB mem-reservation=0B'
+row_regex:.* extrapolated-rows=3651.*
+row_regex:.*mem-estimate=.* mem-reservation=.*
 '   tuple-ids=0 row-size=4B cardinality=3651'
 ---- TYPES
 STRING
@@ -157,14 +156,14 @@ STRING
 compute stats alltypes;
 explain select id from alltypes where year = 2010;
 ---- RESULTS: VERIFY_IS_EQUAL
-'Max Per-Host Resource Reservation: Memory=0B'
-'Per-Host Resource Estimates: Memory=16.00MB'
+row_regex:.*Max Per-Host Resource Reservation: Memory=.*
+row_regex:.*Per-Host Resource Estimates: Memory=16.00MB'
 'Codegen disabled by planner'
 ''
 'F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1'
-'|  Per-Host Resources: mem-estimate=16.00MB mem-reservation=0B'
+row_regex:.*Per-Host Resources: mem-estimate=.* mem-reservation=.*
 'PLAN-ROOT SINK'
-'|  mem-estimate=0B mem-reservation=0B'
+row_regex:.*mem-estimate=.* mem-reservation=.*
 '|'
 '00:SCAN HDFS [$DATABASE.alltypes]'
 row_regex:.*partitions=12/24 files=12 size=.*
@@ -172,8 +171,8 @@ row_regex:.*partitions=12/24 files=12 size=.*
 row_regex:.*table: rows=10950 size=.*
 '     partitions: 0/12 rows=unavailable'
 '     columns: all'
-'   extrapolated-rows=3651'
-'   mem-estimate=16.00MB mem-reservation=0B'
+row_regex:.* extrapolated-rows=3651
+row_regex:.*mem-estimate=.* mem-reservation=.*
 '   tuple-ids=0 row-size=4B cardinality=3651'
 ---- TYPES
 STRING
@@ -187,8 +186,7 @@ explain select id from alltypes;
 '     table: rows=unavailable size=unavailable'
 '     partitions: 0/24 rows=unavailable'
 '     columns: unavailable'
-'   extrapolated-rows=unavailable'
-'   mem-estimate=16.00MB mem-reservation=0B'
+row_regex:.* extrapolated-rows=unavailable.*
 '   tuple-ids=0 row-size=4B cardinality=unavailable'
 ---- TYPES
 STRING

@@ -36,9 +36,9 @@
 #include "runtime/client-cache.h"
 #include "runtime/coordinator.h"
 #include "runtime/data-stream-mgr.h"
-#include "runtime/io/disk-io-mgr.h"
 #include "runtime/hbase-table-factory.h"
 #include "runtime/hdfs-fs-cache.h"
+#include "runtime/io/disk-io-mgr.h"
 #include "runtime/krpc-data-stream-mgr.h"
 #include "runtime/lib-cache.h"
 #include "runtime/mem-tracker.h"
@@ -50,6 +50,7 @@
 #include "scheduling/scheduler.h"
 #include "service/data-stream-service.h"
 #include "service/frontend.h"
+#include "service/impala-server.h"
 #include "statestore/statestore-subscriber.h"
 #include "util/debug-util.h"
 #include "util/default-path-handlers.h"
@@ -79,9 +80,12 @@ DEFINE_int32(state_store_subscriber_port, 23000,
     "port where StatestoreSubscriberService should be exported");
 DEFINE_int32(num_hdfs_worker_threads, 16,
     "(Advanced) The number of threads in the global HDFS operation pool");
-DEFINE_bool(disable_admission_control, false, "Disables admission control.");
 DEFINE_bool(use_krpc, true, "If true, use KRPC for the DataStream subsystem. "
     "Otherwise use Thrift RPC.");
+
+DEFINE_bool_hidden(use_local_catalog, false,
+  "Use experimental implementation of a local catalog. If this is set, "
+  "the catalog service is not used and does not need to be started.");
 
 DECLARE_int32(state_store_port);
 DECLARE_int32(num_threads_per_core);
@@ -125,11 +129,11 @@ struct ExecEnv::KuduClientPtr {
 ExecEnv* ExecEnv::exec_env_ = nullptr;
 
 ExecEnv::ExecEnv()
-  : ExecEnv(FLAGS_hostname, FLAGS_be_port, FLAGS_krpc_port,
+  : ExecEnv(FLAGS_be_port, FLAGS_krpc_port,
         FLAGS_state_store_subscriber_port, FLAGS_webserver_port,
         FLAGS_state_store_host, FLAGS_state_store_port) {}
 
-ExecEnv::ExecEnv(const string& hostname, int backend_port, int krpc_port,
+ExecEnv::ExecEnv(int backend_port, int krpc_port,
     int subscriber_port, int webserver_port, const string& statestore_host,
     int statestore_port)
   : obj_pool_(new ObjectPool),
@@ -153,7 +157,7 @@ ExecEnv::ExecEnv(const string& hostname, int backend_port, int krpc_port,
     query_exec_mgr_(new QueryExecMgr()),
     rpc_metrics_(metrics_->GetOrCreateChildGroup("rpc")),
     enable_webserver_(FLAGS_enable_webserver && webserver_port > 0),
-    backend_address_(MakeNetworkAddress(hostname, backend_port)) {
+    configured_backend_address_(MakeNetworkAddress(FLAGS_hostname, backend_port)) {
 
   if (FLAGS_use_krpc) {
     VLOG_QUERY << "Using KRPC.";
@@ -167,12 +171,13 @@ ExecEnv::ExecEnv(const string& hostname, int backend_port, int krpc_port,
 
   request_pool_service_.reset(new RequestPoolService(metrics_.get()));
 
-  TNetworkAddress subscriber_address = MakeNetworkAddress(hostname, subscriber_port);
+  TNetworkAddress subscriber_address =
+      MakeNetworkAddress(FLAGS_hostname, subscriber_port);
   TNetworkAddress statestore_address =
       MakeNetworkAddress(statestore_host, statestore_port);
 
   statestore_subscriber_.reset(new StatestoreSubscriber(
-      Substitute("impalad@$0", TNetworkAddressToString(backend_address_)),
+      Substitute("impalad@$0", TNetworkAddressToString(configured_backend_address_)),
       subscriber_address, statestore_address, metrics_.get()));
 
   if (FLAGS_is_coordinator) {
@@ -185,12 +190,8 @@ ExecEnv::ExecEnv(const string& hostname, int backend_port, int krpc_port,
         request_pool_service_.get()));
   }
 
-  if (FLAGS_disable_admission_control) {
-    LOG(INFO) << "Admission control is disabled.";
-  } else {
-    admission_controller_.reset(new AdmissionController(statestore_subscriber_.get(),
-        request_pool_service_.get(), metrics_.get(), backend_address_));
-  }
+  admission_controller_.reset(new AdmissionController(statestore_subscriber_.get(),
+      request_pool_service_.get(), metrics_.get(), configured_backend_address_));
   exec_env_ = this;
 }
 
@@ -277,7 +278,7 @@ Status ExecEnv::Init() {
       metrics_.get(), true, buffer_reservation_.get(), buffer_pool_.get()));
 
   // Resolve hostname to IP address.
-  RETURN_IF_ERROR(HostnameToIpAddr(backend_address_.hostname, &ip_address_));
+  RETURN_IF_ERROR(HostnameToIpAddr(FLAGS_hostname, &ip_address_));
 
   mem_tracker_.reset(
       new MemTracker(AggregateMemoryMetrics::TOTAL_USED, bytes_limit, "Process"));
@@ -349,10 +350,7 @@ Status ExecEnv::Init() {
   LOG(INFO) << "Buffer pool limit: "
             << PrettyPrinter::Print(buffer_pool_limit, TUnit::BYTES);
 
-  RETURN_IF_ERROR(disk_io_mgr_->Init(mem_tracker_.get()));
-
-  mem_tracker_->AddGcFunction(
-      [this](int64_t bytes_to_free) { disk_io_mgr_->GcIoBuffers(bytes_to_free); });
+  RETURN_IF_ERROR(disk_io_mgr_->Init());
 
   // Start services in order to ensure that dependencies between them are met
   if (enable_webserver_) {
@@ -363,9 +361,10 @@ Status ExecEnv::Init() {
   }
 
   if (scheduler_ != nullptr) {
-    RETURN_IF_ERROR(scheduler_->Init(backend_address_, krpc_address_, ip_address_));
+    RETURN_IF_ERROR(scheduler_->Init(
+          configured_backend_address_, krpc_address_, ip_address_));
   }
-  if (admission_controller_ != nullptr) RETURN_IF_ERROR(admission_controller_->Init());
+  RETURN_IF_ERROR(admission_controller_->Init());
 
   // Get the fs.defaultFS value set in core-site.xml and assign it to configured_defaultFs
   TGetHadoopConfigRequest config_request;
@@ -416,6 +415,11 @@ void ExecEnv::InitBufferPool(int64_t min_buffer_size, int64_t capacity,
   buffer_pool_.reset(new BufferPool(min_buffer_size, capacity, clean_pages_limit));
   buffer_reservation_.reset(new ReservationTracker());
   buffer_reservation_->InitRootTracker(nullptr, capacity);
+}
+
+TNetworkAddress ExecEnv::GetThriftBackendAddress() const {
+  DCHECK(impala_server_ != nullptr);
+  return impala_server_->GetThriftBackendAddress();
 }
 
 Status ExecEnv::GetKuduClient(

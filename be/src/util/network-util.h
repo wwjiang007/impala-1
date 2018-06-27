@@ -73,12 +73,8 @@ std::string TNetworkAddressToString(const TNetworkAddress& address);
 Status TNetworkAddressToSockaddr(const TNetworkAddress& address,
     kudu::Sockaddr* sockaddr);
 
-/// Prints a hostport as ipaddress:port
-std::ostream& operator<<(std::ostream& out, const TNetworkAddress& hostport);
-
 /// Returns a ephemeral port that is currently unused. Returns -1 on an error or if
-/// a free ephemeral port can't be found after 100 tries. If 'used_ports' is non-NULL,
-/// does not select those ports and adds the selected port to 'used_ports'.
-int FindUnusedEphemeralPort(std::vector<int>* used_ports);
+/// a free ephemeral port can't be found after 100 tries.
+int FindUnusedEphemeralPort();
 
 } // namespace impala

@@ -24,6 +24,7 @@
 
 #include "catalog/catalog-util.h"
 #include "gen-cpp/beeswax_types.h"
+#include "runtime/coordinator.h"
 #include "runtime/exec-env.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/query-state.h"
@@ -31,6 +32,7 @@
 #include "runtime/timestamp-value.inline.h"
 #include "service/impala-server.h"
 #include "service/client-request-state.h"
+#include "service/frontend.h"
 #include "thrift/protocol/TDebugProtocol.h"
 #include "util/coding-util.h"
 #include "util/logging-support.h"
@@ -42,6 +44,7 @@
 
 #include "common/names.h"
 
+using namespace apache::hive::service::cli::thrift;
 using namespace apache::thrift;
 using namespace beeswax;
 using namespace impala;
@@ -195,7 +198,7 @@ void ImpalaHttpHandler::CloseSessionHandler(const Webserver::ArgumentMap& args,
     return;
   }
   stringstream ss;
-  ss << "Session " << unique_id << " closed successfully";
+  ss << "Session " << PrintId(unique_id) << " closed successfully";
   Value message(ss.str().c_str(), document->GetAllocator());
   document->AddMember("contents", message, document->GetAllocator());
 }
@@ -247,7 +250,7 @@ void ImpalaHttpHandler::InflightQueryIdsHandler(const Webserver::ArgumentMap& ar
   stringstream ss;
   server_->client_request_state_map_.DoFuncForAllEntries(
       [&](const std::shared_ptr<ClientRequestState>& request_state) {
-          ss << request_state->query_id() << "\n";
+          ss << PrintId(request_state->query_id()) << "\n";
       });
   document->AddMember(Webserver::ENABLE_RAW_JSON_KEY, true, document->GetAllocator());
   Value query_ids(ss.str().c_str(), document->GetAllocator());
@@ -265,12 +268,12 @@ void ImpalaHttpHandler::QueryMemoryHandler(const Webserver::ArgumentMap& args,
   }
   QueryState::ScopedRef qs(unique_id);
   string mem_usage_text;
-  // Only in-flight queries have a MemTracker to get usage from.
+  // Only queries that have started execution have a MemTracker to get usage from.
   if (qs.get() != nullptr) {
     mem_usage_text = qs->query_mem_tracker()->LogUsage(MemTracker::UNLIMITED_DEPTH);
   } else {
-    mem_usage_text =
-        "The query is finished, current memory consumption is not available.";
+    mem_usage_text = "The query has either finished or has not started execution yet, "
+                     "current memory consumption is not available.";
   }
 
   Value mem_usage(mem_usage_text.c_str(), document->GetAllocator());
@@ -358,7 +361,7 @@ void ImpalaHttpHandler::QueryStateToJson(const ImpalaServer::QueryStateRecord& r
   Value val_waiting_time(waiting_time_str.c_str(), document->GetAllocator());
   value->AddMember("waiting_time", val_waiting_time, document->GetAllocator());
 
-  Value resource_pool(record.request_pool.c_str(), document->GetAllocator());
+  Value resource_pool(record.resource_pool.c_str(), document->GetAllocator());
   value->AddMember("resource_pool", resource_pool, document->GetAllocator());
 }
 
@@ -416,7 +419,7 @@ void ImpalaHttpHandler::QueryStateHandler(const Webserver::ArgumentMap& args,
     for (const ImpalaServer::QueryLocations::value_type& location:
          server_->query_locations_) {
       Value location_json(kObjectType);
-      Value location_name(lexical_cast<string>(location.first).c_str(),
+      Value location_name(TNetworkAddressToString(location.first).c_str(),
           document->GetAllocator());
       location_json.AddMember("location", location_name, document->GetAllocator());
       location_json.AddMember("count", static_cast<uint64_t>(location.second.size()),
@@ -437,8 +440,7 @@ void ImpalaHttpHandler::SessionsHandler(const Webserver::ArgumentMap& args,
            server_->session_state_map_) {
     shared_ptr<ImpalaServer::SessionState> state = session.second;
     Value session_json(kObjectType);
-    Value type(PrintTSessionType(state->session_type).c_str(),
-        document->GetAllocator());
+    Value type(PrintThriftEnum(state->session_type).c_str(), document->GetAllocator());
     session_json.AddMember("type", type, document->GetAllocator());
 
     session_json.AddMember("inflight_queries",
@@ -456,7 +458,7 @@ void ImpalaHttpHandler::SessionsHandler(const Webserver::ArgumentMap& args,
     Value session_id(PrintId(session.first).c_str(), document->GetAllocator());
     session_json.AddMember("session_id", session_id, document->GetAllocator());
 
-    Value network_address(lexical_cast<string>(state->network_address).c_str(),
+    Value network_address(TNetworkAddressToString(state->network_address).c_str(),
         document->GetAllocator());
     session_json.AddMember("network_address", network_address, document->GetAllocator());
 
@@ -703,9 +705,11 @@ void ImpalaHttpHandler::QueryBackendsHandler(
   }
 
   shared_ptr<ClientRequestState> request_state = server_->GetClientRequestState(query_id);
-  if (request_state.get() == nullptr || request_state->coord() == nullptr) return;
+  if (request_state.get() == nullptr || request_state->GetCoordinator() == nullptr) {
+    return;
+  }
 
-  request_state->coord()->BackendsToJson(document);
+  request_state->GetCoordinator()->BackendsToJson(document);
 }
 
 void ImpalaHttpHandler::QueryFInstancesHandler(
@@ -722,9 +726,11 @@ void ImpalaHttpHandler::QueryFInstancesHandler(
   }
 
   shared_ptr<ClientRequestState> request_state = server_->GetClientRequestState(query_id);
-  if (request_state.get() == nullptr || request_state->coord() == nullptr) return;
+  if (request_state.get() == nullptr || request_state->GetCoordinator() == nullptr) {
+    return;
+  }
 
-  request_state->coord()->FInstanceStatsToJson(document);
+  request_state->GetCoordinator()->FInstanceStatsToJson(document);
 }
 
 void ImpalaHttpHandler::QuerySummaryHandler(bool include_json_plan, bool include_summary,
@@ -751,29 +757,24 @@ void ImpalaHttpHandler::QuerySummaryHandler(bool include_json_plan, bool include
   {
     shared_ptr<ClientRequestState> request_state =
         server_->GetClientRequestState(query_id);
-    if (request_state != NULL) {
+    if (request_state != nullptr) {
       found = true;
       // If the query plan isn't generated, avoid waiting for the request
       // state lock to be acquired, since it could potentially be an expensive
       // call, if the table Catalog metadata loading is in progress. Instead
       // update the caller that the plan information is unavailable.
-      if (request_state->query_state() == beeswax::QueryState::CREATED) {
+      if (request_state->operation_state() == TOperationState::INITIALIZED_STATE) {
         document->AddMember(
             "plan_metadata_unavailable", "true", document->GetAllocator());
         return;
       }
       lock_guard<mutex> l(*request_state->lock());
-      if (request_state->coord() == NULL) {
-        const string& err = Substitute("Invalid query id: $0", PrintId(query_id));
-        Value json_error(err.c_str(), document->GetAllocator());
-        document->AddMember("error", json_error, document->GetAllocator());
-        return;
-      }
       query_status = request_state->query_status();
       stmt = request_state->sql_stmt();
       plan = request_state->exec_request().query_exec_request.query_plan;
-      if (include_json_plan || include_summary) {
-        request_state->coord()->GetTExecSummary(&summary);
+      if ((include_json_plan || include_summary)
+          && request_state->GetCoordinator() != nullptr) {
+        request_state->GetCoordinator()->GetTExecSummary(&summary);
       }
       if (include_json_plan) {
         for (const TPlanExecInfo& plan_exec_info:

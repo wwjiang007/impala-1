@@ -25,6 +25,7 @@
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <boost/lexical_cast.hpp>
 #include <boost/regex.hpp>
+#include <boost/scoped_ptr.hpp>
 #include <boost/unordered_map.hpp>
 
 #include "testutil/gtest-util.h"
@@ -67,6 +68,7 @@
 DECLARE_bool(abort_on_config_error);
 DECLARE_bool(disable_optimization_passes);
 DECLARE_bool(use_utc_for_unix_timestamp_conversions);
+DECLARE_string(hdfs_zone_info_zip);
 
 namespace posix_time = boost::posix_time;
 using boost::bad_lexical_cast;
@@ -135,23 +137,30 @@ string StringToOctalLiteral(const string& s) {
 // and no special permissions are needed. This is not thread-safe.
 class ScopedTimeZoneOverride {
  public:
-  ScopedTimeZoneOverride(string time_zone) {
-    original_time_zone_ = getenv("TZ");
-    setenv("TZ", time_zone.c_str(), /*overwrite*/ true);
+  ScopedTimeZoneOverride(const char* tz_name)
+      : original_tz_name_(getenv("TZ")),
+        new_tz_name_(tz_name),
+        new_tz_(TimezoneDatabase::FindTimezone(new_tz_name_)) {
+    EXPECT_NE(nullptr, new_tz_) << "Could not find " << new_tz_name_ << " time zone.";
+    setenv("TZ", new_tz_name_, true);
     tzset();
   }
 
   ~ScopedTimeZoneOverride() {
-    if (original_time_zone_ == NULL) {
+    if (original_tz_name_ == nullptr) {
       unsetenv("TZ");
     } else {
-      setenv("TZ", original_time_zone_, /*overwrite*/ true);
+      setenv("TZ", original_tz_name_, true);
     }
     tzset();
   }
 
+  const Timezone& GetTimezone() const { return *new_tz_; }
+
  private:
-  char* original_time_zone_;
+  const char* const original_tz_name_;
+  const char* const new_tz_name_;
+  const Timezone* new_tz_;
 };
 
 // Enable FLAGS_use_local_tz_for_unix_timestamp_conversions for the duration of the scope.
@@ -168,6 +177,9 @@ class ScopedLocalUnixTimestampConversionOverride {
 
 class ExprTest : public testing::Test {
  protected:
+  // Pool for objects to be destroyed during test teardown.
+  ObjectPool pool_;
+
   // Maps from enum value of primitive integer type to the minimum value that is
   // outside of the next smaller-resolution type. For example the value for type
   // TYPE_SMALLINT is numeric_limits<int8_t>::max()+1. There is a GREATEST test in
@@ -213,7 +225,8 @@ class ExprTest : public testing::Test {
     default_decimal_str_ = "1.23";
     default_bool_val_ = false;
     default_string_val_ = "abc";
-    default_timestamp_val_ = TimestampValue::FromUnixTime(1293872461);
+    default_timestamp_val_ = TimestampValue::FromUnixTime(1293872461,
+        TimezoneDatabase::GetUtcTimezone());
     default_type_strs_[TYPE_TINYINT] =
         lexical_cast<string>(min_int_values_[TYPE_TINYINT]);
     default_type_strs_[TYPE_SMALLINT] =
@@ -237,6 +250,8 @@ class ExprTest : public testing::Test {
     default_type_strs_[TYPE_TIMESTAMP] = default_timestamp_str_;
     default_type_strs_[TYPE_DECIMAL] = default_decimal_str_;
   }
+
+  virtual void TearDown() { pool_.Clear(); }
 
   string GetValue(const string& expr, const ColumnType& expr_type,
       bool expect_error = false) {
@@ -264,6 +279,10 @@ class ExprTest : public testing::Test {
   void TestStringValue(const string& expr, const string& expected_result) {
     EXPECT_EQ(expected_result, GetValue(expr, TYPE_STRING)) << expr;
   }
+
+  // Tests that DST of the given timezone ends at 3am
+  void TestAusDSTEndingForEastTimeZone(const string& time_zone);
+  void TestAusDSTEndingForCentralTimeZone(const string& time_zone);
 
   void TestCharValue(const string& expr, const string& expected_result,
                      const ColumnType& type) {
@@ -1019,7 +1038,7 @@ class ExprTest : public testing::Test {
   template<class T>
   bool ParseString(const string& str, T* val);
 
-  // Create a Literal expression out of 'str'.
+  // Create a Literal expression out of 'str'. Adds the returned literal to pool_.
   Literal* CreateLiteral(const ColumnType& type, const string& str);
 
   // Helper function for LiteralConstruction test. Creates a Literal expression
@@ -1047,6 +1066,15 @@ class ExprTest : public testing::Test {
       TestIsNull("cast(" + stmt + " as timestamp)", TYPE_TIMESTAMP);
     }
   }
+
+  // Wrapper around UdfTestHarness::CreateTestContext() that stores the context in
+  // 'pool_' to be automatically cleaned up.
+  FunctionContext* CreateUdfTestContext(const FunctionContext::TypeDesc& return_type,
+      const std::vector<FunctionContext::TypeDesc>& arg_types,
+      RuntimeState* state = nullptr, MemPool* pool = nullptr) {
+    return pool_.Add(
+        UdfTestHarness::CreateTestContext(return_type, arg_types, state, pool));
+  }
 };
 
 template<>
@@ -1056,22 +1084,22 @@ TimestampValue ExprTest::CreateTestTimestamp(const string& val) {
 
 template<>
 TimestampValue ExprTest::CreateTestTimestamp(float val) {
-  return TimestampValue::FromSubsecondUnixTime(val);
+  return TimestampValue::FromSubsecondUnixTime(val, TimezoneDatabase::GetUtcTimezone());
 }
 
 template<>
 TimestampValue ExprTest::CreateTestTimestamp(double val) {
-  return TimestampValue::FromSubsecondUnixTime(val);
+  return TimestampValue::FromSubsecondUnixTime(val, TimezoneDatabase::GetUtcTimezone());
 }
 
 template<>
 TimestampValue ExprTest::CreateTestTimestamp(int val) {
-  return TimestampValue::FromUnixTime(val);
+  return TimestampValue::FromUnixTime(val, TimezoneDatabase::GetUtcTimezone());
 }
 
 template<>
 TimestampValue ExprTest::CreateTestTimestamp(int64_t val) {
-  return TimestampValue::FromUnixTime(val);
+  return TimestampValue::FromUnixTime(val, TimezoneDatabase::GetUtcTimezone());
 }
 
 // Test casting 'stmt' to each of the native types.  The result should be 'val'
@@ -1178,51 +1206,51 @@ Literal* ExprTest::CreateLiteral(const ColumnType& type, const string& str) {
     case TYPE_BOOLEAN: {
       bool v = false;
       EXPECT_TRUE(ParseString<bool>(str, &v));
-      return new Literal(type, v);
+      return pool_.Add(new Literal(type, v));
     }
     case TYPE_TINYINT: {
       int8_t v = 0;
       EXPECT_TRUE(ParseString<int8_t>(str, &v));
-      return new Literal(type, v);
+      return pool_.Add(new Literal(type, v));
     }
     case TYPE_SMALLINT: {
       int16_t v = 0;
       EXPECT_TRUE(ParseString<int16_t>(str, &v));
-      return new Literal(type, v);
+      return pool_.Add(new Literal(type, v));
     }
     case TYPE_INT: {
       int32_t v = 0;
       EXPECT_TRUE(ParseString<int32_t>(str, &v));
-      return new Literal(type, v);
+      return pool_.Add(new Literal(type, v));
     }
     case TYPE_BIGINT: {
       int64_t v = 0;
       EXPECT_TRUE(ParseString<int64_t>(str, &v));
-      return new Literal(type, v);
+      return pool_.Add(new Literal(type, v));
     }
     case TYPE_FLOAT: {
       float v = 0;
       EXPECT_TRUE(ParseString<float>(str, &v));
-      return new Literal(type, v);
+      return pool_.Add(new Literal(type, v));
     }
     case TYPE_DOUBLE: {
       double v = 0;
       EXPECT_TRUE(ParseString<double>(str, &v));
-      return new Literal(type, v);
+      return pool_.Add(new Literal(type, v));
     }
     case TYPE_STRING:
     case TYPE_VARCHAR:
     case TYPE_CHAR:
-      return new Literal(type, str);
+      return pool_.Add(new Literal(type, str));
     case TYPE_TIMESTAMP: {
       TimestampValue v;
       EXPECT_TRUE(ParseString<TimestampValue>(str, &v));
-      return new Literal(type, v);
+      return pool_.Add(new Literal(type, v));
     }
     case TYPE_DECIMAL: {
       double v = 0;
       EXPECT_TRUE(ParseString<double>(str, &v));
-      return new Literal(type, v);
+      return pool_.Add(new Literal(type, v));
     }
     default:
       DCHECK(false) << "Invalid type: " << type.DebugString();
@@ -1234,6 +1262,7 @@ template <typename T>
 void ExprTest::TestSingleLiteralConstruction(
     const ColumnType& type, const T& value, const string& string_val) {
   ObjectPool pool;
+
   RuntimeState state(TQueryCtx(), ExecEnv::GetInstance());
   MemTracker tracker;
   MemPool mem_pool(&tracker);
@@ -3073,7 +3102,6 @@ TEST_F(ExprTest, CastExprs) {
   TestTimestampValue("cast('1:05:1' as timestamp)", TimestampValue::Parse("01:05:01"));
   TestTimestampValue("cast('        2001-01-9 1:05:1        ' as timestamp)",
       TimestampValue::Parse("2001-01-09 01:05:01"));
-  TestIsNull("cast('2001-1-21     11:2:3' as timestamp)", TYPE_TIMESTAMP);
   TestIsNull("cast('2001-6' as timestamp)", TYPE_TIMESTAMP);
   TestIsNull("cast('01-1-21' as timestamp)", TYPE_TIMESTAMP);
   TestIsNull("cast('2001-1-21 12:5:3 AM' as timestamp)", TYPE_TIMESTAMP);
@@ -3154,14 +3182,41 @@ TEST_F(ExprTest, CastExprs) {
   TestTimestampValue("cast('  \t\r\n      2001-1-9    \t\r\n    ' as timestamp)",
       TimestampValue::Parse("2001-01-09"));
 
+  // IMPALA-6995: whitespace-only strings should return NULL.
+  TestIsNull("cast(' ' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('\n' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('\t' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('  \t\r\n' as timestamp)", TYPE_TIMESTAMP);
+
+  // Test valid multi-space and 'T' separators between date and time
+  // components
+  TestTimestampValue("cast('2001-01-09   01:05:01' as timestamp)",
+      TimestampValue::Parse("2001-01-09 01:05:01"));
+  TestTimestampValue("cast('2001-01-09T01:05:01' as timestamp)",
+      TimestampValue::Parse("2001-01-09 01:05:01"));
+  TestTimestampValue("cast('2001-01-09   01:05:01.123456789101112' as timestamp)",
+      TimestampValue::Parse("2001-01-09 01:05:01.123456789"));
+  TestTimestampValue("cast('2001-01-09T01:05:01.123456789101112' as timestamp)",
+      TimestampValue::Parse("2001-01-09 01:05:01.123456789"));
+  TestTimestampValue("cast('  \t\r\n 2001-01-09   01:05:01   \t\r\n ' as timestamp)",
+      TimestampValue::Parse("2001-01-09 01:05:01"));
+  TestTimestampValue("cast('  \t\r\n 2001-01-09T01:05:01   \t\r\n ' as timestamp)",
+      TimestampValue::Parse("2001-01-09 01:05:01"));
+  TestTimestampValue(
+      "cast('  \t\r\n 2001-01-09   01:05:01.12345678910   \t\r\n ' as timestamp)",
+      TimestampValue::Parse("2001-01-09 01:05:01.123456789"));
+  TestTimestampValue(
+      "cast('  \t\r\n 2001-01-09T01:05:01.12345678910   \t\r\n ' as timestamp)",
+      TimestampValue::Parse("2001-01-09 01:05:01.123456789"));
+
+  // Test invalid variations of the 'T' separator
+  TestIsNull("cast('2001-01-09TTTTT01:05:01' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('2001-01-09t01:05:01' as timestamp)", TYPE_TIMESTAMP);
+
   // Test invalid whitespace locations in strings to be casted to timestamp
-  TestIsNull(
-      "cast(' \t\r\n  2001-01-09      01:05:01  \t\r\n ' as timestamp)", TYPE_TIMESTAMP);
-  TestIsNull("cast('2001-01-09   01:05:01' as timestamp)", TYPE_TIMESTAMP);
   TestIsNull("cast('2001-01-09\t01:05:01' as timestamp)", TYPE_TIMESTAMP);
   TestIsNull("cast('2001-01-09\r01:05:01' as timestamp)", TYPE_TIMESTAMP);
   TestIsNull("cast('2001-01-09\n01:05:01' as timestamp)", TYPE_TIMESTAMP);
-  TestIsNull("cast('2001-1-9    1:5:1' as timestamp)", TYPE_TIMESTAMP);
   TestIsNull("cast('2001-1-9\t1:5:1' as timestamp)", TYPE_TIMESTAMP);
   TestIsNull("cast('2001-1-9\r1:5:1' as timestamp)", TYPE_TIMESTAMP);
   TestIsNull("cast('2001-1-9\n1:5:1' as timestamp)", TYPE_TIMESTAMP);
@@ -3796,7 +3851,7 @@ TEST_F(ExprTest, StringFunctions) {
   FunctionContext::TypeDesc str_desc;
   str_desc.type = FunctionContext::Type::TYPE_STRING;
   std::vector<FunctionContext::TypeDesc> v(3, str_desc);
-  auto context = UdfTestHarness::CreateTestContext(str_desc, v, nullptr, &pool);
+  FunctionContext* context = CreateUdfTestContext(str_desc, v, nullptr, &pool);
 
   StringVal giga(static_cast<uint8_t*>(giga_buf->data()), StringVal::MAX_LENGTH);
   StringVal a("A");
@@ -3833,7 +3888,7 @@ TEST_F(ExprTest, StringFunctions) {
   EXPECT_TRUE(r4.is_null);
   // Re-create context to clear the error from failed allocation.
   UdfTestHarness::CloseContext(context);
-  context = UdfTestHarness::CreateTestContext(str_desc, v, nullptr, &pool);
+  context = CreateUdfTestContext(str_desc, v, nullptr, &pool);
 
   // Similar test for second overflow.  This tests overflowing on re-allocation.
   (*short_buf)[4095] = 'Z';
@@ -3842,7 +3897,7 @@ TEST_F(ExprTest, StringFunctions) {
   EXPECT_TRUE(r5.is_null);
   // Re-create context to clear the error from failed allocation.
   UdfTestHarness::CloseContext(context);
-  context = UdfTestHarness::CreateTestContext(str_desc, v, nullptr, &pool);
+  context = CreateUdfTestContext(str_desc, v, nullptr, &pool);
 
   // Finally, test expanding to exactly MAX_LENGTH
   // There are 4 Zs in giga4 (not including the trailing one, as we truncate that)
@@ -5224,12 +5279,12 @@ TEST_F(ExprTest, MathFunctions) {
   TestValue("abs(-9223372036854775807)", TYPE_BIGINT,  9223372036854775807);
   TestValue("abs(9223372036854775807)", TYPE_BIGINT,  9223372036854775807);
   TestIsNull("abs(-9223372036854775808)", TYPE_BIGINT);
-  TestValue("sign(0.0)", TYPE_FLOAT, 0.0f);
-  TestValue("sign(-0.0)", TYPE_FLOAT, 0.0f);
-  TestValue("sign(+0.0)", TYPE_FLOAT, 0.0f);
-  TestValue("sign(10.0)", TYPE_FLOAT, 1.0f);
-  TestValue("sign(-10.0)", TYPE_FLOAT, -1.0f);
-  TestIsNull("sign(NULL)", TYPE_FLOAT);
+  TestValue("sign(0.0)", TYPE_DOUBLE, 0.0f);
+  TestValue("sign(-0.0)", TYPE_DOUBLE, 0.0f);
+  TestValue("sign(+0.0)", TYPE_DOUBLE, 0.0f);
+  TestValue("sign(10.0)", TYPE_DOUBLE, 1.0f);
+  TestValue("sign(-10.0)", TYPE_DOUBLE, -1.0f);
+  TestIsNull("sign(NULL)", TYPE_DOUBLE);
 
   // It is important to calculate the expected values
   // using math functions, and not simply use constants.
@@ -5493,7 +5548,7 @@ TEST_F(ExprTest, MathFunctions) {
   // NULL arguments. In some cases the NULL can match multiple overloads so the result
   // type depends on the order in which function overloads are considered.
   TestIsNull("abs(NULL)", TYPE_SMALLINT);
-  TestIsNull("sign(NULL)", TYPE_FLOAT);
+  TestIsNull("sign(NULL)", TYPE_DOUBLE);
   TestIsNull("exp(NULL)", TYPE_DOUBLE);
   TestIsNull("ln(NULL)", TYPE_DOUBLE);
   TestIsNull("log10(NULL)", TYPE_DOUBLE);
@@ -5546,25 +5601,25 @@ TEST_F(ExprTest, MathFunctions) {
 }
 
 TEST_F(ExprTest, MathRoundingFunctions) {
-  TestValue("ceil(cast(0.1 as double))", TYPE_BIGINT, 1);
-  TestValue("ceil(cast(-10.05 as double))", TYPE_BIGINT, -10);
-  TestValue("ceil(cast(23.6 as double))", TYPE_BIGINT, 24);
-  TestValue("ceiling(cast(0.1 as double))", TYPE_BIGINT, 1);
-  TestValue("ceiling(cast(-10.05 as double))", TYPE_BIGINT, -10);
-  TestValue("floor(cast(0.1 as double))", TYPE_BIGINT, 0);
-  TestValue("floor(cast(-10.007 as double))", TYPE_BIGINT, -11);
-  TestValue("dfloor(cast(123.456 as double))", TYPE_BIGINT, 123);
-  TestValue("truncate(cast(0.1 as double))", TYPE_BIGINT, 0);
-  TestValue("truncate(cast(-10.007 as double))", TYPE_BIGINT, -10);
-  TestValue("dtrunc(cast(10.99 as double))", TYPE_BIGINT, 10);
+  TestValue("ceil(cast(0.1 as double))", TYPE_DOUBLE, 1);
+  TestValue("ceil(cast(-10.05 as double))", TYPE_DOUBLE, -10);
+  TestValue("ceil(cast(23.6 as double))", TYPE_DOUBLE, 24);
+  TestValue("ceiling(cast(0.1 as double))", TYPE_DOUBLE, 1);
+  TestValue("ceiling(cast(-10.05 as double))", TYPE_DOUBLE, -10);
+  TestValue("floor(cast(0.1 as double))", TYPE_DOUBLE, 0);
+  TestValue("floor(cast(-10.007 as double))", TYPE_DOUBLE, -11);
+  TestValue("dfloor(cast(123.456 as double))", TYPE_DOUBLE, 123);
+  TestValue("truncate(cast(0.1 as double))", TYPE_DOUBLE, 0);
+  TestValue("truncate(cast(-10.007 as double))", TYPE_DOUBLE, -10);
+  TestValue("dtrunc(cast(10.99 as double))", TYPE_DOUBLE, 10);
 
-  TestValue("round(cast(1.499999 as double))", TYPE_BIGINT, 1);
-  TestValue("round(cast(1.5 as double))", TYPE_BIGINT, 2);
-  TestValue("round(cast(1.500001 as double))", TYPE_BIGINT, 2);
-  TestValue("round(cast(-1.499999 as double))", TYPE_BIGINT, -1);
-  TestValue("round(cast(-1.5 as double))", TYPE_BIGINT, -2);
-  TestValue("round(cast(-1.500001 as double))", TYPE_BIGINT, -2);
-  TestValue("dround(cast(2.500001 as double))", TYPE_BIGINT, 3);
+  TestValue("round(cast(1.499999 as double))", TYPE_DOUBLE, 1);
+  TestValue("round(cast(1.5 as double))", TYPE_DOUBLE, 2);
+  TestValue("round(cast(1.500001 as double))", TYPE_DOUBLE, 2);
+  TestValue("round(cast(-1.499999 as double))", TYPE_DOUBLE, -1);
+  TestValue("round(cast(-1.5 as double))", TYPE_DOUBLE, -2);
+  TestValue("round(cast(-1.500001 as double))", TYPE_DOUBLE, -2);
+  TestValue("dround(cast(2.500001 as double))", TYPE_DOUBLE, 3);
 
   TestValue("round(cast(3.14159265 as double), 0)", TYPE_DOUBLE, 3.0);
   TestValue("round(cast(3.14159265 as double), 1)", TYPE_DOUBLE, 3.1);
@@ -5578,14 +5633,24 @@ TEST_F(ExprTest, MathRoundingFunctions) {
   TestValue("round(cast(-3.14159265 as double), 3)", TYPE_DOUBLE, -3.142);
   TestValue("round(cast(-3.14159265 as double), 4)", TYPE_DOUBLE, -3.1416);
   TestValue("round(cast(-3.14159265 as double), 5)", TYPE_DOUBLE, -3.14159);
+  TestValue("round(cast(3.1415926535897932384626433 as double), 19)",
+      TYPE_DOUBLE, 3.141592653589793);
+  TestValue("round(cast(3.1415926535897932384626433 as double), 20)",
+      TYPE_DOUBLE, 3.141592653589794);
   TestValue("dround(cast(3.14159265 as double), 5)", TYPE_DOUBLE, 3.14159);
+  TestValue("round(cast(5.55 as double), 1)", TYPE_DOUBLE, 5.6);
+  TestValue("round(cast(-5.55 as double), 1)", TYPE_DOUBLE, -5.6);
+  TestValue("round(cast(555.555 as double), -1)", TYPE_DOUBLE, 560);
+  TestValue("round(cast(-555.555 as double), -1)", TYPE_DOUBLE, -560);
+  TestValue("round(cast(555.555 as double), -2)", TYPE_DOUBLE, 600);
+  TestValue("round(cast(-555.555 as double), -2)", TYPE_DOUBLE, -600);
 
   // NULL arguments.
-  TestIsNull("ceil(cast(NULL as double))", TYPE_BIGINT);
-  TestIsNull("ceiling(cast(NULL as double))", TYPE_BIGINT);
-  TestIsNull("floor(cast(NULL as double))", TYPE_BIGINT);
-  TestIsNull("truncate(cast(NULL as double))", TYPE_BIGINT);
-  TestIsNull("round(cast(NULL as double))", TYPE_BIGINT);
+  TestIsNull("ceil(cast(NULL as double))", TYPE_DOUBLE);
+  TestIsNull("ceiling(cast(NULL as double))", TYPE_DOUBLE);
+  TestIsNull("floor(cast(NULL as double))", TYPE_DOUBLE);
+  TestIsNull("truncate(cast(NULL as double))", TYPE_DOUBLE);
+  TestIsNull("round(cast(NULL as double))", TYPE_DOUBLE);
   TestIsNull("round(cast(NULL as double), 1)", TYPE_DOUBLE);
   TestIsNull("round(cast(3.14159265 as double), NULL)", TYPE_DOUBLE);
   TestIsNull("round(cast(NULL as double), NULL)", TYPE_DOUBLE);
@@ -5672,6 +5737,49 @@ TEST_F(ExprTest, MoscowTimezoneConversion) {
 
 #pragma pop_macro("MSC_TO_UTC")
 #pragma pop_macro("UTC_TO_MSC")
+}
+
+void ExprTest::TestAusDSTEndingForEastTimeZone(const string& time_zone) {
+  // Timestamps between 02:00:00 and 02:59:59 inclusive on the ending day of DST are
+  // ambiguous, hence excpecting NULL for timestamps in that range. Expect a UTC adjusted
+  // timestamp otherwise.
+  TestStringValue("cast(to_utc_timestamp('2018-04-01 01:59:59', '" + time_zone + "') "
+      "as string)", "2018-03-31 14:59:59");
+  TestStringValue("cast(to_utc_timestamp('2018-04-01 02:00:00', '" + time_zone + "') "
+      "as string)", "NULL");
+  TestStringValue("cast(to_utc_timestamp('2018-04-01 02:59:59', '" + time_zone + "') "
+      "as string)", "NULL");
+  TestStringValue("cast(to_utc_timestamp('2018-04-01 03:00:00', '" + time_zone + "') "
+      "as string)", "2018-03-31 17:00:00");
+}
+
+void ExprTest::TestAusDSTEndingForCentralTimeZone(const string& time_zone) {
+  TestStringValue("cast(to_utc_timestamp('2018-04-01 01:59:59', '" + time_zone + "') "
+      "as string)", "2018-03-31 15:29:59");
+  TestStringValue("cast(to_utc_timestamp('2018-04-01 02:00:00', '" + time_zone + "') "
+      "as string)", "NULL");
+  TestStringValue("cast(to_utc_timestamp('2018-04-01 02:59:59', '" + time_zone + "') "
+      "as string)", "NULL");
+  TestStringValue("cast(to_utc_timestamp('2018-04-01 03:00:00', '" + time_zone + "') "
+      "as string)", "2018-03-31 17:30:00");
+}
+
+// IMPALA-6699: Fix DST end time for Australian time-zones
+TEST_F(ExprTest, AusDSTEndingTests) {
+  TestAusDSTEndingForEastTimeZone("AET");
+  TestAusDSTEndingForEastTimeZone("Australia/ACT");
+  TestAusDSTEndingForCentralTimeZone("Australia/Adelaide");
+  TestAusDSTEndingForCentralTimeZone("Australia/Broken_Hill");
+  TestAusDSTEndingForEastTimeZone("Australia/Canberra");
+  TestAusDSTEndingForEastTimeZone("Australia/Currie");
+  TestAusDSTEndingForEastTimeZone("Australia/Hobart");
+  TestAusDSTEndingForEastTimeZone("Australia/Melbourne");
+  TestAusDSTEndingForEastTimeZone("Australia/NSW");
+  TestAusDSTEndingForCentralTimeZone("Australia/South");
+  TestAusDSTEndingForEastTimeZone("Australia/Sydney");
+  TestAusDSTEndingForEastTimeZone("Australia/Tasmania");
+  TestAusDSTEndingForEastTimeZone("Australia/Victoria");
+  TestAusDSTEndingForCentralTimeZone("Australia/Yancowinna");
 }
 
 TEST_F(ExprTest, TimestampFunctions) {
@@ -6272,7 +6380,7 @@ TEST_F(ExprTest, TimestampFunctions) {
 
   // These return NULL because timezone conversion makes the value out
   // of range.
-  TestIsNull("to_utc_timestamp(CAST(\"1400-01-01 05:00:00\" as TIMESTAMP), \"AEST\")",
+  TestIsNull("to_utc_timestamp(CAST(\"1400-01-01 05:00:00\" as TIMESTAMP), \"AET\")",
       TYPE_TIMESTAMP);
   TestIsNull("from_utc_timestamp(CAST(\"1400-01-01 05:00:00\" as TIMESTAMP), \"PST\")",
       TYPE_TIMESTAMP);
@@ -6282,8 +6390,8 @@ TEST_F(ExprTest, TimestampFunctions) {
       TYPE_TIMESTAMP);
 
   // With support of date strings this generates a date and 0 time.
-  TestStringValue(
-      "cast(cast('1999-01-10' as timestamp) as string)", "1999-01-10 00:00:00");
+  TestStringValue("cast(cast('1999-01-10' as timestamp) as string)",
+      "1999-01-10 00:00:00");
 
   // Test functions with unknown expected value.
   TestValidTimestampValue("now()");
@@ -6315,33 +6423,51 @@ TEST_F(ExprTest, TimestampFunctions) {
         static_cast<int64_t>(mktime(&after)));
   }
 
-  // Test that the other current time functions are also reasonable.
-  TimestampValue timestamp_result;
-  TimestampValue start_time = TimestampValue::FromUnixTimeMicros(UnixMicros());
-  timestamp_result = ConvertValue<TimestampValue>(GetValue("now()", TYPE_TIMESTAMP));
-  EXPECT_BETWEEN(start_time, timestamp_result,
-      TimestampValue::FromUnixTimeMicros(UnixMicros()));
-  timestamp_result = ConvertValue<TimestampValue>(GetValue("current_timestamp()",
-      TYPE_TIMESTAMP));
-  EXPECT_BETWEEN(start_time, timestamp_result,
-      TimestampValue::FromUnixTimeMicros(UnixMicros()));
+  // Test that now() and current_timestamp() are reasonable.
+  {
+    ScopedTimeZoneOverride time_zone("PST8PDT");
+    const Timezone& local_tz = time_zone.GetTimezone();
+
+    const TimestampValue start_time =
+        TimestampValue::FromUnixTimeMicros(UnixMicros(), local_tz);
+    TimestampValue timestamp_result =
+        ConvertValue<TimestampValue>(GetValue("now()", TYPE_TIMESTAMP));
+    EXPECT_BETWEEN(start_time, timestamp_result,
+        TimestampValue::FromUnixTimeMicros(UnixMicros(), local_tz));
+    timestamp_result = ConvertValue<TimestampValue>(GetValue("current_timestamp()",
+        TYPE_TIMESTAMP));
+    EXPECT_BETWEEN(start_time, timestamp_result,
+        TimestampValue::FromUnixTimeMicros(UnixMicros(), local_tz));
+  }
+
+  // Test that utc_timestamp() is reasonable.
   const TimestampValue utc_start_time =
       TimestampValue::UtcFromUnixTimeMicros(UnixMicros());
-  timestamp_result = ConvertValue<TimestampValue>(GetValue("utc_timestamp()",
-      TYPE_TIMESTAMP));
+  TimestampValue timestamp_result =
+      ConvertValue<TimestampValue>(GetValue("utc_timestamp()", TYPE_TIMESTAMP));
   EXPECT_BETWEEN(utc_start_time, timestamp_result,
       TimestampValue::UtcFromUnixTimeMicros(UnixMicros()));
-  // UNIX_TIMESTAMP() has second precision so the comparison start time is shifted back
-  // a second to ensure an earlier value.
-  unix_start_time =
-      (posix_time::microsec_clock::local_time() - from_time_t(0)).total_seconds();
-  timestamp_result = ConvertValue<TimestampValue>(GetValue(
-      "cast(unix_timestamp() as timestamp)", TYPE_TIMESTAMP));
-  EXPECT_BETWEEN(TimestampValue::FromUnixTime(unix_start_time - 1), timestamp_result,
-      TimestampValue::FromUnixTimeMicros(UnixMicros()));
+
+  // Test cast(unix_timestamp() as timestamp).
+  {
+    ScopedTimeZoneOverride time_zone("PST8PDT");
+    const Timezone& local_tz = time_zone.GetTimezone();
+
+    // UNIX_TIMESTAMP() has second precision so the comparison start time is shifted back
+    // a second to ensure an earlier value.
+    unix_start_time =
+        (posix_time::microsec_clock::local_time() - from_time_t(0)).total_seconds();
+    timestamp_result = ConvertValue<TimestampValue>(GetValue(
+        "cast(unix_timestamp() as timestamp)", TYPE_TIMESTAMP));
+    EXPECT_BETWEEN(TimestampValue::FromUnixTime(unix_start_time - 1, local_tz),
+        timestamp_result,
+        TimestampValue::FromUnixTimeMicros(UnixMicros(), local_tz));
+  }
 
   // Test that UTC and local time represent the same point in time
   {
+    ScopedTimeZoneOverride time_zone_override("PST8PDT");
+
     const string stmt = "select now(), utc_timestamp()";
     vector<FieldSchema> result_types;
     Status status = executor_->Exec(stmt, &result_types);
@@ -6360,8 +6486,9 @@ TEST_F(ExprTest, TimestampFunctions) {
     DCHECK(result_cols.size() == 2);
     const TimestampValue local_time = ConvertValue<TimestampValue>(result_cols[0]);
     const TimestampValue utc_timestamp = ConvertValue<TimestampValue>(result_cols[1]);
+
     TimestampValue utc_converted_to_local(utc_timestamp);
-    utc_converted_to_local.UtcToLocal();
+    utc_converted_to_local.UtcToLocal(time_zone_override.GetTimezone());
     EXPECT_EQ(utc_converted_to_local, local_time);
   }
 
@@ -6654,73 +6781,73 @@ TEST_F(ExprTest, TimestampFunctions) {
       "cast(trunc(cast('2012-09-10 07:59:59' as timestamp), 'XXYYZZ') as string)");
 
   // Extract as a regular function
-  TestValue("extract(cast('2006-05-12 18:27:28.12345' as timestamp), 'YEAR')",
-            TYPE_INT, 2006);
-  TestValue("extract('2006-05-12 18:27:28.12345', 'YEAR')", TYPE_INT, 2006);
-  TestValue("extract(cast('2006-05-12 18:27:28.12345' as timestamp), 'MoNTH')",
-            TYPE_INT, 5);
-  TestValue("extract(cast('2006-05-12 18:27:28.12345' as timestamp), 'DaY')",
-            TYPE_INT, 12);
-  TestValue("extract(cast('2006-05-12 06:27:28.12345' as timestamp), 'hour')",
-            TYPE_INT, 6);
-  TestValue("extract(cast('2006-05-12 18:27:28.12345' as timestamp), 'MINUTE')",
-            TYPE_INT, 27);
-  TestValue("extract(cast('2006-05-12 18:27:28.12345' as timestamp), 'SECOND')",
-            TYPE_INT, 28);
-  TestValue("extract(cast('2006-05-12 18:27:28.12345' as timestamp), 'MILLISECOND')",
-            TYPE_INT, 123);
-  TestValue("extract(cast('2006-05-13 01:27:28.12345' as timestamp), 'EPOCH')",
-            TYPE_INT, 1147483648);
-  TestNonOkStatus("extract(cast('2006-05-13 01:27:28.12345' as timestamp), 'foo')");
-  TestNonOkStatus("extract(cast('2006-05-13 01:27:28.12345' as timestamp), NULL)");
-  TestIsNull("extract(NULL, 'EPOCH')", TYPE_INT);
+  TestValue("extract(cast('2006-05-12 18:27:28.123456789' as timestamp), 'YEAR')",
+            TYPE_BIGINT, 2006);
+  TestValue("extract('2006-05-12 18:27:28.123456789', 'YEAR')", TYPE_BIGINT, 2006);
+  TestValue("extract(cast('2006-05-12 18:27:28.123456789' as timestamp), 'MoNTH')",
+            TYPE_BIGINT, 5);
+  TestValue("extract(cast('2006-05-12 18:27:28.123456789' as timestamp), 'DaY')",
+            TYPE_BIGINT, 12);
+  TestValue("extract(cast('2006-05-12 06:27:28.123456789' as timestamp), 'hour')",
+            TYPE_BIGINT, 6);
+  TestValue("extract(cast('2006-05-12 18:27:28.123456789' as timestamp), 'MINUTE')",
+            TYPE_BIGINT, 27);
+  TestValue("extract(cast('2006-05-12 18:27:28.123456789' as timestamp), 'SECOND')",
+            TYPE_BIGINT, 28);
+  TestValue("extract(cast('2006-05-12 18:27:28.123456789' as timestamp), 'MILLISECOND')",
+            TYPE_BIGINT, 28123);
+  TestValue("extract(cast('2006-05-13 01:27:28.123456789' as timestamp), 'EPOCH')",
+            TYPE_BIGINT, 1147483648);
+  TestNonOkStatus("extract(cast('2006-05-13 01:27:28.123456789' as timestamp), 'foo')");
+  TestNonOkStatus("extract(cast('2006-05-13 01:27:28.123456789' as timestamp), NULL)");
+  TestIsNull("extract(NULL, 'EPOCH')", TYPE_BIGINT);
   TestNonOkStatus("extract(NULL, NULL)");
 
   // Extract using FROM keyword
-  TestValue("extract(YEAR from cast('2006-05-12 18:27:28.12345' as timestamp))",
-            TYPE_INT, 2006);
-  TestValue("extract(QUARTER from cast('2006-05-12 18:27:28.12345' as timestamp))",
-            TYPE_INT, 2);
-  TestValue("extract(MoNTH from cast('2006-05-12 18:27:28.12345' as timestamp))",
-            TYPE_INT, 5);
-  TestValue("extract(DaY from cast('2006-05-12 18:27:28.12345' as timestamp))",
-            TYPE_INT, 12);
-  TestValue("extract(hour from cast('2006-05-12 06:27:28.12345' as timestamp))",
-            TYPE_INT, 6);
-  TestValue("extract(MINUTE from cast('2006-05-12 18:27:28.12345' as timestamp))",
-            TYPE_INT, 27);
-  TestValue("extract(SECOND from cast('2006-05-12 18:27:28.12345' as timestamp))",
-            TYPE_INT, 28);
-  TestValue("extract(MILLISECOND from cast('2006-05-12 18:27:28.12345' as timestamp))",
-            TYPE_INT, 123);
-  TestValue("extract(EPOCH from cast('2006-05-13 01:27:28.12345' as timestamp))",
-            TYPE_INT, 1147483648);
-  TestNonOkStatus("extract(foo from cast('2006-05-13 01:27:28.12345' as timestamp))");
-  TestNonOkStatus("extract(NULL from cast('2006-05-13 01:27:28.12345' as timestamp))");
-  TestIsNull("extract(EPOCH from NULL)", TYPE_INT);
+  TestValue("extract(YEAR from cast('2006-05-12 18:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 2006);
+  TestValue("extract(QUARTER from cast('2006-05-12 18:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 2);
+  TestValue("extract(MoNTH from cast('2006-05-12 18:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 5);
+  TestValue("extract(DaY from cast('2006-05-12 18:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 12);
+  TestValue("extract(hour from cast('2006-05-12 06:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 6);
+  TestValue("extract(MINUTE from cast('2006-05-12 18:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 27);
+  TestValue("extract(SECOND from cast('2006-05-12 18:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 28);
+  TestValue("extract(MILLISECOND from cast('2006-05-12 18:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 28123);
+  TestValue("extract(EPOCH from cast('2006-05-13 01:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 1147483648);
+  TestNonOkStatus("extract(foo from cast('2006-05-13 01:27:28.123456789' as timestamp))");
+  TestNonOkStatus("extract(NULL from cast('2006-05-13 01:27:28.123456789' as timestamp))");
+  TestIsNull("extract(EPOCH from NULL)", TYPE_BIGINT);
 
   // Date_part, same as extract function but with arguments swapped
-  TestValue("date_part('YEAR', cast('2006-05-12 18:27:28.12345' as timestamp))",
-            TYPE_INT, 2006);
-  TestValue("date_part('QUARTER', cast('2006-05-12 18:27:28.12345' as timestamp))",
-            TYPE_INT, 2);
-  TestValue("date_part('MoNTH', cast('2006-05-12 18:27:28.12345' as timestamp))",
-            TYPE_INT, 5);
-  TestValue("date_part('DaY', cast('2006-05-12 18:27:28.12345' as timestamp))",
-            TYPE_INT, 12);
-  TestValue("date_part('hour', cast('2006-05-12 06:27:28.12345' as timestamp))",
-            TYPE_INT, 6);
-  TestValue("date_part('MINUTE', cast('2006-05-12 18:27:28.12345' as timestamp))",
-            TYPE_INT, 27);
-  TestValue("date_part('SECOND', cast('2006-05-12 18:27:28.12345' as timestamp))",
-            TYPE_INT, 28);
-  TestValue("date_part('MILLISECOND', cast('2006-05-12 18:27:28.12345' as timestamp))",
-            TYPE_INT, 123);
-  TestValue("date_part('EPOCH', cast('2006-05-13 01:27:28.12345' as timestamp))",
-            TYPE_INT, 1147483648);
-  TestNonOkStatus("date_part('foo', cast('2006-05-13 01:27:28.12345' as timestamp))");
-  TestNonOkStatus("date_part(NULL, cast('2006-05-13 01:27:28.12345' as timestamp))");
-  TestIsNull("date_part('EPOCH', NULL)", TYPE_INT);
+  TestValue("date_part('YEAR', cast('2006-05-12 18:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 2006);
+  TestValue("date_part('QUARTER', cast('2006-05-12 18:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 2);
+  TestValue("date_part('MoNTH', cast('2006-05-12 18:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 5);
+  TestValue("date_part('DaY', cast('2006-05-12 18:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 12);
+  TestValue("date_part('hour', cast('2006-05-12 06:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 6);
+  TestValue("date_part('MINUTE', cast('2006-05-12 18:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 27);
+  TestValue("date_part('SECOND', cast('2006-05-12 18:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 28);
+  TestValue("date_part('MILLISECOND', cast('2006-05-12 18:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 28123);
+  TestValue("date_part('EPOCH', cast('2006-05-13 01:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 1147483648);
+  TestNonOkStatus("date_part('foo', cast('2006-05-13 01:27:28.123456789' as timestamp))");
+  TestNonOkStatus("date_part(NULL, cast('2006-05-13 01:27:28.123456789' as timestamp))");
+  TestIsNull("date_part('EPOCH', NULL)", TYPE_BIGINT);
   TestNonOkStatus("date_part(NULL, NULL)");
 
   // Test with timezone offset
@@ -6884,8 +7011,10 @@ TEST_F(ExprTest, ConditionalFunctions) {
   TestValue("if(FALSE, cast(5.5 as double), cast(8.8 as double))", TYPE_DOUBLE, 8.8);
   TestStringValue("if(TRUE, 'abc', 'defgh')", "abc");
   TestStringValue("if(FALSE, 'abc', 'defgh')", "defgh");
-  TimestampValue then_val = TimestampValue::FromUnixTime(1293872461);
-  TimestampValue else_val = TimestampValue::FromUnixTime(929387245);
+  TimestampValue then_val = TimestampValue::FromUnixTime(1293872461,
+      TimezoneDatabase::GetUtcTimezone());
+  TimestampValue else_val = TimestampValue::FromUnixTime(929387245,
+      TimezoneDatabase::GetUtcTimezone());
   TestTimestampValue("if(TRUE, cast('2011-01-01 09:01:01' as timestamp), "
       "cast('1999-06-14 19:07:25' as timestamp))", then_val);
   TestTimestampValue("if(FALSE, cast('2011-01-01 09:01:01' as timestamp), "
@@ -6902,8 +7031,10 @@ TEST_F(ExprTest, ConditionalFunctions) {
   TestValue("nvl2(NULL, cast(5.5 as double), cast(8.8 as double))", TYPE_DOUBLE, 8.8);
   TestStringValue("nvl2('some string', 'abc', 'defgh')", "abc");
   TestStringValue("nvl2(NULL, 'abc', 'defgh')", "defgh");
-  TimestampValue first_val = TimestampValue::FromUnixTime(1293872461);
-  TimestampValue second_val = TimestampValue::FromUnixTime(929387245);
+  TimestampValue first_val = TimestampValue::FromUnixTime(1293872461,
+      TimezoneDatabase::GetUtcTimezone());
+  TimestampValue second_val = TimestampValue::FromUnixTime(929387245,
+      TimezoneDatabase::GetUtcTimezone());
   TestTimestampValue("nvl2(FALSE, cast('2011-01-01 09:01:01' as timestamp), "
       "cast('1999-06-14 19:07:25' as timestamp))", first_val);
   TestTimestampValue("nvl2(NULL, cast('2011-01-01 09:01:01' as timestamp), "
@@ -6929,7 +7060,8 @@ TEST_F(ExprTest, ConditionalFunctions) {
   TestStringValue("nullif('abc', NULL)", "abc");
   TestIsNull("nullif(cast('2011-01-01 09:01:01' as timestamp), "
       "cast('2011-01-01 09:01:01' as timestamp))", TYPE_TIMESTAMP);
-  TimestampValue testlhs = TimestampValue::FromUnixTime(1293872461);
+  TimestampValue testlhs = TimestampValue::FromUnixTime(1293872461,
+      TimezoneDatabase::GetUtcTimezone());
   TestTimestampValue("nullif(cast('2011-01-01 09:01:01' as timestamp), "
       "cast('1999-06-14 19:07:25' as timestamp))", testlhs);
   TestIsNull("nullif(NULL, "
@@ -6992,8 +7124,10 @@ TEST_F(ExprTest, ConditionalFunctions) {
   TestStringValue("coalesce(NULL, 'abc', NULL)", "abc");
   TestStringValue("coalesce('defgh', NULL, 'abc', NULL)", "defgh");
   TestStringValue("coalesce(NULL, NULL, NULL, 'abc', NULL, NULL)", "abc");
-  TimestampValue ats = TimestampValue::FromUnixTime(1293872461);
-  TimestampValue bts = TimestampValue::FromUnixTime(929387245);
+  TimestampValue ats = TimestampValue::FromUnixTime(1293872461,
+      TimezoneDatabase::GetUtcTimezone());
+  TimestampValue bts = TimestampValue::FromUnixTime(929387245,
+      TimezoneDatabase::GetUtcTimezone());
   TestTimestampValue("coalesce(cast('2011-01-01 09:01:01' as timestamp))", ats);
   TestTimestampValue("coalesce(NULL, cast('2011-01-01 09:01:01' as timestamp),"
       "NULL)", ats);
@@ -7287,8 +7421,6 @@ void ValidateLayout(const vector<ScalarExpr*>& exprs, int expected_byte_size,
 }
 
 TEST_F(ExprTest, ResultsLayoutTest) {
-  ObjectPool pool;
-
   vector<ScalarExpr*> exprs;
   map<int, set<int>> expected_offsets;
 
@@ -7329,9 +7461,9 @@ TEST_F(ExprTest, ResultsLayoutTest) {
     // With one expr, all offsets should be 0.
     expected_offsets[t.GetByteSize()] = set<int>({0});
     if (t.type != TYPE_TIMESTAMP) {
-      exprs.push_back(pool.Add(CreateLiteral(t, "0")));
+      exprs.push_back(CreateLiteral(t, "0"));
     } else {
-      exprs.push_back(pool.Add(CreateLiteral(t, "2016-11-09")));
+      exprs.push_back(CreateLiteral(t, "2016-11-09"));
     }
     if (t.IsVarLenStringType()) {
       ValidateLayout(exprs, 16, 0, expected_offsets);
@@ -7347,28 +7479,27 @@ TEST_F(ExprTest, ResultsLayoutTest) {
 
   // Test layout adding a bunch of exprs.  This is designed to trigger padding.
   // The expected result is computed along the way
-  exprs.push_back(pool.Add(CreateLiteral(TYPE_BOOLEAN, "0")));
-  exprs.push_back(pool.Add(CreateLiteral(TYPE_TINYINT, "0")));
-  exprs.push_back(pool.Add(CreateLiteral(ColumnType::CreateCharType(1), "0")));
+  exprs.push_back(CreateLiteral(TYPE_BOOLEAN, "0"));
+  exprs.push_back(CreateLiteral(TYPE_TINYINT, "0"));
+  exprs.push_back(CreateLiteral(ColumnType::CreateCharType(1), "0"));
   expected_offsets[1].insert(expected_byte_size);
   expected_offsets[1].insert(expected_byte_size + 1);
   expected_offsets[1].insert(expected_byte_size + 2);
   expected_byte_size += 3 * 1 + 1;  // 1 byte of padding
 
-  exprs.push_back(pool.Add(CreateLiteral(TYPE_SMALLINT, "0")));
+  exprs.push_back(CreateLiteral(TYPE_SMALLINT, "0"));
   expected_offsets[2].insert(expected_byte_size);
   expected_byte_size += 2; // No padding before CHAR
 
-  exprs.push_back(pool.Add(CreateLiteral(ColumnType::CreateCharType(3), "0")));
+  exprs.push_back(CreateLiteral(ColumnType::CreateCharType(3), "0"));
   expected_offsets[3].insert(expected_byte_size);
   expected_byte_size += 3 + 3; // 3 byte of padding
   ASSERT_EQ(expected_byte_size % 4, 0);
 
-  exprs.push_back(pool.Add(CreateLiteral(TYPE_INT, "0")));
-  exprs.push_back(pool.Add(CreateLiteral(TYPE_FLOAT, "0")));
-  exprs.push_back(pool.Add(CreateLiteral(TYPE_FLOAT, "0")));
-  exprs.push_back(pool.Add(
-      CreateLiteral(ColumnType::CreateDecimalType(9, 0), "0")));
+  exprs.push_back(CreateLiteral(TYPE_INT, "0"));
+  exprs.push_back(CreateLiteral(TYPE_FLOAT, "0"));
+  exprs.push_back(CreateLiteral(TYPE_FLOAT, "0"));
+  exprs.push_back(CreateLiteral(ColumnType::CreateDecimalType(9, 0), "0"));
   expected_offsets[4].insert(expected_byte_size);
   expected_offsets[4].insert(expected_byte_size + 4);
   expected_offsets[4].insert(expected_byte_size + 8);
@@ -7376,12 +7507,11 @@ TEST_F(ExprTest, ResultsLayoutTest) {
   expected_byte_size += 4 * 4 + 4;  // 4 bytes of padding
   ASSERT_EQ(expected_byte_size % 8, 0);
 
-  exprs.push_back(pool.Add(CreateLiteral(TYPE_BIGINT, "0")));
-  exprs.push_back(pool.Add(CreateLiteral(TYPE_BIGINT, "0")));
-  exprs.push_back(pool.Add(CreateLiteral(TYPE_BIGINT, "0")));
-  exprs.push_back(pool.Add(CreateLiteral(TYPE_DOUBLE, "0")));
-  exprs.push_back(pool.Add(
-      CreateLiteral(ColumnType::CreateDecimalType(18, 0), "0")));
+  exprs.push_back(CreateLiteral(TYPE_BIGINT, "0"));
+  exprs.push_back(CreateLiteral(TYPE_BIGINT, "0"));
+  exprs.push_back(CreateLiteral(TYPE_BIGINT, "0"));
+  exprs.push_back(CreateLiteral(TYPE_DOUBLE, "0"));
+  exprs.push_back(CreateLiteral(ColumnType::CreateDecimalType(18, 0), "0"));
   expected_offsets[8].insert(expected_byte_size);
   expected_offsets[8].insert(expected_byte_size + 8);
   expected_offsets[8].insert(expected_byte_size + 16);
@@ -7390,20 +7520,18 @@ TEST_F(ExprTest, ResultsLayoutTest) {
   expected_byte_size += 5 * 8;      // No more padding
   ASSERT_EQ(expected_byte_size % 8, 0);
 
-  exprs.push_back(pool.Add(CreateLiteral(TYPE_TIMESTAMP, "2016-11-09")));
-  exprs.push_back(pool.Add(CreateLiteral(TYPE_TIMESTAMP, "2016-11-09")));
-  exprs.push_back(pool.Add(
-      CreateLiteral(ColumnType::CreateDecimalType(20, 0), "0")));
+  exprs.push_back(CreateLiteral(TYPE_TIMESTAMP, "2016-11-09"));
+  exprs.push_back(CreateLiteral(TYPE_TIMESTAMP, "2016-11-09"));
+  exprs.push_back(CreateLiteral(ColumnType::CreateDecimalType(20, 0), "0"));
   expected_offsets[16].insert(expected_byte_size);
   expected_offsets[16].insert(expected_byte_size + 16);
   expected_offsets[16].insert(expected_byte_size + 32);
   expected_byte_size += 3 * 16;
   ASSERT_EQ(expected_byte_size % 8, 0);
 
-  exprs.push_back(pool.Add(CreateLiteral(TYPE_STRING, "0")));
-  exprs.push_back(pool.Add(CreateLiteral(TYPE_STRING, "0")));
-  exprs.push_back(pool.Add(
-      CreateLiteral(ColumnType::CreateVarcharType(1), "0")));
+  exprs.push_back(CreateLiteral(TYPE_STRING, "0"));
+  exprs.push_back(CreateLiteral(TYPE_STRING, "0"));
+  exprs.push_back(CreateLiteral(ColumnType::CreateVarcharType(1), "0"));
   expected_offsets[0].insert(expected_byte_size);
   expected_offsets[0].insert(expected_byte_size + 16);
   expected_offsets[0].insert(expected_byte_size + 32);
@@ -7451,8 +7579,8 @@ TEST_F(ExprTest, DecimalFunctions) {
   TestValue("scale(round(cast(\"123.456\" as decimal(6, 3)), -2))", TYPE_INT, 0);
   TestValue("precision(round(123.456, -2))", TYPE_INT, 4);
 
-  TestValue("scale(truncate(123.456, 10))", TYPE_INT, 10);
-  TestValue("precision(truncate(cast(\"123.456\" as decimal(6, 3)), 10))", TYPE_INT, 13);
+  TestValue("scale(truncate(123.456, 10))", TYPE_INT, 3);
+  TestValue("precision(truncate(cast(\"123.456\" as decimal(6, 3)), 10))", TYPE_INT, 6);
 
   TestValue("scale(round(123.456, -10))", TYPE_INT, 0);
   TestValue("precision(round(cast(\"123.456\" as decimal(6, 3)), -10))", TYPE_INT, 4);
@@ -7783,8 +7911,8 @@ TEST_F(ExprTest, DecimalFunctions) {
       ColumnType::CreateDecimalType(6, 3));
   TestDecimalValue("round(cast('3.1615' as decimal(6,4)), 4)", Decimal4Value(31615),
       ColumnType::CreateDecimalType(6, 4));
-  TestDecimalValue("round(cast('-3.1615' as decimal(6,4)), 5)", Decimal4Value(-316150),
-      ColumnType::CreateDecimalType(7, 5));
+  TestDecimalValue("round(cast('-3.1615' as decimal(6,4)), 5)", Decimal4Value(-31615),
+      ColumnType::CreateDecimalType(6, 4));
   TestDecimalValue("round(cast('175.0' as decimal(6,1)), 0)", Decimal4Value(175),
       ColumnType::CreateDecimalType(6, 0));
   TestDecimalValue("round(cast('-175.0' as decimal(6,1)), -1)", Decimal4Value(-180),
@@ -7810,8 +7938,8 @@ TEST_F(ExprTest, DecimalFunctions) {
       ColumnType::CreateDecimalType(16, 3));
   TestDecimalValue("round(cast('-3.1615' as decimal(16,4)), 4)", Decimal8Value(-31615),
       ColumnType::CreateDecimalType(16, 4));
-  TestDecimalValue("round(cast('3.1615' as decimal(16,4)), 5)", Decimal8Value(316150),
-      ColumnType::CreateDecimalType(17, 5));
+  TestDecimalValue("round(cast('3.1615' as decimal(16,4)), 5)", Decimal8Value(31615),
+      ColumnType::CreateDecimalType(16, 4));
   TestDecimalValue("round(cast('-999.951' as decimal(16,3)), 1)", Decimal8Value(-10000),
       ColumnType::CreateDecimalType(15, 1));
 
@@ -7873,8 +8001,8 @@ TEST_F(ExprTest, DecimalFunctions) {
       ColumnType::CreateDecimalType(5, 3));
   TestDecimalValue("truncate(cast('-3.1615' as decimal(6,4)), 4)", Decimal4Value(-31615),
       ColumnType::CreateDecimalType(6, 4));
-  TestDecimalValue("truncate(cast('3.1615' as decimal(6,4)), 5)", Decimal4Value(316150),
-      ColumnType::CreateDecimalType(7, 5));
+  TestDecimalValue("truncate(cast('3.1615' as decimal(6,4)), 5)", Decimal4Value(31615),
+      ColumnType::CreateDecimalType(6, 4));
   TestDecimalValue("truncate(cast('175.0' as decimal(6,1)), 0)", Decimal4Value(175),
       ColumnType::CreateDecimalType(5, 0));
   TestDecimalValue("truncate(cast('-175.0' as decimal(6,1)), -1)", Decimal4Value(-170),
@@ -7897,7 +8025,7 @@ TEST_F(ExprTest, DecimalFunctions) {
   TestDecimalValue("truncate(cast('3.1615' as decimal(16,4)), 4)",
       Decimal8Value(31615), ColumnType::CreateDecimalType(16, 4));
   TestDecimalValue("truncate(cast('-3.1615' as decimal(16,4)), 5)",
-      Decimal8Value(-316150), ColumnType::CreateDecimalType(17, 5));
+      Decimal8Value(-31615), ColumnType::CreateDecimalType(16, 4));
   TestDecimalValue("truncate(cast('-175.0' as decimal(15,1)), 0)", Decimal8Value(-175),
       ColumnType::CreateDecimalType(14, 0));
   TestDecimalValue("truncate(cast('175.0' as decimal(15,1)), -1)", Decimal8Value(170),
@@ -7920,7 +8048,7 @@ TEST_F(ExprTest, DecimalFunctions) {
   TestDecimalValue("truncate(cast('-3.1615' as decimal(32,4)), 4)",
       Decimal16Value(-31615), ColumnType::CreateDecimalType(32, 4));
   TestDecimalValue("truncate(cast('3.1615' as decimal(32,4)), 5)",
-      Decimal16Value(316150), ColumnType::CreateDecimalType(33, 5));
+      Decimal16Value(31615), ColumnType::CreateDecimalType(32, 4));
   TestDecimalValue("truncate(cast('-175.0' as decimal(35,1)), 0)",
       Decimal16Value(-175), ColumnType::CreateDecimalType(34, 0));
   TestDecimalValue("truncate(cast('175.0' as decimal(35,1)), -1)",
@@ -8579,9 +8707,15 @@ TEST_F(ExprTest, DateTruncTest) {
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   InitCommonRuntime(argc, argv, true, TestInfo::BE_TEST);
-  ABORT_IF_ERROR(TimezoneDatabase::Initialize());
   InitFeSupport(false);
   ABORT_IF_ERROR(impala::LlvmCodeGen::InitializeLlvm());
+
+  // The host running this test might have an out-of-date tzdata package installed.
+  // To avoid tzdata related issues, we will load time-zone db from the testdata
+  // directory.
+  FLAGS_hdfs_zone_info_zip = Substitute("file://$0/testdata/tzdb/2017c.zip",
+      getenv("IMPALA_HOME"));
+  ABORT_IF_ERROR(TimezoneDatabase::Initialize());
 
   // Disable llvm optimization passes if the env var is no set to true. Running without
   // the optimizations makes the tests run much faster.
@@ -8599,11 +8733,12 @@ int main(int argc, char** argv) {
   FLAGS_abort_on_config_error = false;
   VLOG_CONNECTION << "creating test env";
   VLOG_CONNECTION << "starting backends";
-  InProcessStatestore* ips = InProcessStatestore::StartWithEphemeralPorts();
-  InProcessImpalaServer* impala_server =
-      InProcessImpalaServer::StartWithEphemeralPorts(FLAGS_hostname, ips->port());
-  executor_ = new ImpaladQueryExecutor(impala_server->hostname(),
-      impala_server->beeswax_port());
+  InProcessStatestore* ips;
+  ABORT_IF_ERROR(InProcessStatestore::StartWithEphemeralPorts(&ips));
+  InProcessImpalaServer* impala_server;
+  ABORT_IF_ERROR(InProcessImpalaServer::StartWithEphemeralPorts(
+      FLAGS_hostname, ips->port(), &impala_server));
+  executor_ = new ImpaladQueryExecutor(FLAGS_hostname, impala_server->GetBeeswaxPort());
   ABORT_IF_ERROR(executor_->Setup());
 
   // Disable FE expr rewrites to make sure the Exprs get executed exactly as specified

@@ -76,6 +76,7 @@ endfunction()
 # set_dep_root(PACKAGE) ->
 #   PACKAGE_ROOT set to $ENV{IMPALA_TOOLCHAIN}/PACKAGE-$ENV{IMPALA_PACKAGE_VERSION}
 set_dep_root(AVRO)
+set_dep_root(ORC)
 set_dep_root(BOOST)
 set_dep_root(BREAKPAD)
 set_dep_root(BZIP2)
@@ -97,6 +98,7 @@ set_dep_root(RAPIDJSON)
 set_dep_root(SNAPPY)
 set_dep_root(THRIFT)
 set_dep_root(ZLIB)
+set_dep_root(CCTZ)
 
 # The boost-cmake project hasn't been maintained for years. Let's make sure we
 # don't accidentally use it if it can be found.
@@ -155,7 +157,7 @@ message(STATUS "Boost libraries: " ${Boost_LIBRARIES})
 # platform that this build might ultimately be deployed on. If no suitable OpenSSL is
 # found, use the toolchain version - but beware that Impala will then fail to start if
 # deployed on a system with a lower version.
-find_package(OpenSSL 1.0.0 QUIET)
+find_package(OpenSSL 1.0.1 QUIET)
 if (NOT ${OPENSSL_FOUND})
   set_dep_root(OPENSSL)
   set(OPENSSL_FOUND ON)
@@ -272,6 +274,14 @@ message(STATUS "RapidJson include dir: " ${RAPIDJSON_INCLUDE_DIR})
 find_package(Avro REQUIRED)
 IMPALA_ADD_THIRDPARTY_LIB(avro ${AVRO_INCLUDE_DIR} ${AVRO_STATIC_LIB} "")
 
+# find ORC headers and libs
+find_package(Orc REQUIRED)
+IMPALA_ADD_THIRDPARTY_LIB(orc ${ORC_INCLUDE_DIR} ${ORC_STATIC_LIB} "")
+
+# find CCTZ headers and libs
+find_package(Cctz REQUIRED)
+IMPALA_ADD_THIRDPARTY_LIB(cctz ${CCTZ_INCLUDE_DIR} ${CCTZ_STATIC_LIB} "")
+
 # find protobuf headers, libs and compiler
 find_package(Protobuf REQUIRED)
 IMPALA_ADD_THIRDPARTY_LIB(protobuf ${PROTOBUF_INCLUDE_DIR} ${PROTOBUF_STATIC_LIBRARY}
@@ -365,7 +375,7 @@ add_subdirectory(impala-parent)
 add_subdirectory(ext-data-source)
 
 # Build target for all generated files which most backend code depends on
-add_custom_target(gen-deps ALL DEPENDS thrift-deps proto-deps)
+add_custom_target(gen-deps ALL DEPENDS thrift-deps proto-deps fb-deps)
 
 add_custom_target(tarballs ALL DEPENDS shell_tarball)
 

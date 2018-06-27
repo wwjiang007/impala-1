@@ -355,6 +355,14 @@ error_codes = (
 
   ("ROW_BATCH_TOO_LARGE", 116,
    "Row batch cannot be serialized: size of $0 bytes exceeds supported limit of $1"),
+
+  ("LIB_VERSION_MISMATCH", 117,
+   "The library $0 last modified time $1 does not match the expected last "
+   "modified time $2. Run 'refresh functions <db name>'."),
+
+  ("SCRATCH_READ_VERIFY_FAILED", 118, "Error reading $0 bytes from scratch file '$1' "
+   "on backend $2 at offset $3: verification of read data failed."),
+
 )
 
 import sys

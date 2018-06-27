@@ -26,8 +26,8 @@ import java.util.List;
 
 import org.apache.impala.authorization.Privilege;
 import org.apache.impala.catalog.Column;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.KuduTable;
-import org.apache.impala.catalog.Table;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.Pair;
@@ -148,7 +148,7 @@ public abstract class ModifyStmt extends StatementBase {
     }
 
     Preconditions.checkNotNull(targetTableRef_);
-    Table dstTbl = targetTableRef_.getTable();
+    FeTable dstTbl = targetTableRef_.getTable();
     // Only Kudu tables can be updated
     if (!(dstTbl instanceof KuduTable)) {
       throw new AnalysisException(
@@ -283,8 +283,8 @@ public abstract class ModifyStmt extends StatementBase {
             format("Duplicate value assignment to column: '%s'", lhsSlotRef.toSql()));
       }
 
-      rhsExpr = checkTypeCompatibility(
-          targetTableRef_.getDesc().getTable().getFullName(), c, rhsExpr);
+      rhsExpr = checkTypeCompatibility(targetTableRef_.getDesc().getTable().getFullName(),
+          c, rhsExpr, analyzer.isDecimalV2());
       uniqueSlots.add(lhsSlotRef.getSlotId());
       selectList.add(new SelectListItem(rhsExpr, null));
       referencedColumns.add(colIndexMap.get(c.getName()));

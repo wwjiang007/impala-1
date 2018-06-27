@@ -82,7 +82,14 @@ public class HashJoinNode extends JoinNode {
           throw new InternalException("Cannot compare " +
               t0.toSql() + " to " + t1.toSql() + " in join predicate.");
         }
-        Type compatibleType = Type.getAssignmentCompatibleType(t0, t1, false);
+        Type compatibleType = Type.getAssignmentCompatibleType(
+            t0, t1, false, analyzer.isDecimalV2());
+        if (compatibleType.isInvalid()) {
+          throw new InternalException(String.format(
+              "Unable create a hash join with equi-join predicate %s " +
+              "because the operands cannot be cast without loss of precision. " +
+              "Operand types: %s = %s.", eqPred.toSql(), t0.toSql(), t1.toSql()));
+        }
         Preconditions.checkState(compatibleType.isDecimal() ||
             compatibleType.isStringType());
         try {
@@ -236,11 +243,11 @@ public class HashJoinNode extends JoinNode {
     // to serve as input and output buffers while repartitioning.
     long maxRowBufferSize =
         computeMaxSpillableBufferSize(bufferSize, queryOptions.getMax_row_size());
-    long perInstanceMinBufferBytes =
+    long perInstanceMinMemReservation =
         bufferSize * (minBuffers - 2) + maxRowBufferSize * 2;
     nodeResourceProfile_ = new ResourceProfileBuilder()
         .setMemEstimateBytes(perInstanceMemEstimate)
-        .setMinReservationBytes(perInstanceMinBufferBytes)
+        .setMinMemReservationBytes(perInstanceMinMemReservation)
         .setSpillableBufferBytes(bufferSize)
         .setMaxRowBufferBytes(maxRowBufferSize).build();
   }

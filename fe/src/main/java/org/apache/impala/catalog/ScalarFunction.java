@@ -32,8 +32,11 @@ import org.apache.impala.hive.executor.UdfExecutor.JavaUdfDataType;
 import org.apache.impala.thrift.TFunction;
 import org.apache.impala.thrift.TFunctionBinaryType;
 import org.apache.impala.thrift.TScalarFunction;
+import org.apache.impala.thrift.TSymbolLookupParams;
 import org.apache.impala.thrift.TSymbolType;
+
 import com.google.common.base.Preconditions;
+import com.google.common.base.Throwables;
 import com.google.common.collect.Lists;
 
 /**
@@ -70,7 +73,7 @@ public class ScalarFunction extends Function {
       String prepareFnSymbol, String closeFnSymbol, boolean userVisible) {
     Preconditions.checkNotNull(symbol);
     ScalarFunction fn = new ScalarFunction(
-        new FunctionName(Catalog.BUILTINS_DB, name), argTypes, retType, hasVarArgs);
+        new FunctionName(ImpaladCatalog.BUILTINS_DB, name), argTypes, retType, hasVarArgs);
     fn.setBinaryType(TFunctionBinaryType.BUILTIN);
     fn.setUserVisible(userVisible);
     fn.setIsPersistent(true);
@@ -219,7 +222,7 @@ public class ScalarFunction extends Function {
       ArrayList<Type> argTypes, boolean hasVarArgs, Type retType,
       boolean userVisible) {
     ScalarFunction fn = new ScalarFunction(
-        new FunctionName(Catalog.BUILTINS_DB, name), argTypes, retType, hasVarArgs);
+        new FunctionName(ImpaladCatalog.BUILTINS_DB, name), argTypes, retType, hasVarArgs);
     fn.setBinaryType(TFunctionBinaryType.BUILTIN);
     fn.setUserVisible(userVisible);
     fn.setIsPersistent(true);
@@ -228,8 +231,9 @@ public class ScalarFunction extends Function {
           fn.hasVarArgs(), fn.getArgs());
     } catch (AnalysisException e) {
       // This should never happen
-      Preconditions.checkState(false, "Builtin symbol '" + symbol + "'" + argTypes
-          + " not found!" + e.getStackTrace());
+      Preconditions.checkState(false, "Builtin symbol '" + symbol + "'" +
+          argTypes + " not found: " +
+          Throwables.getStackTraceAsString(e));
       throw new RuntimeException("Builtin symbol not found!", e);
     }
     return fn;
@@ -255,6 +259,12 @@ public class ScalarFunction extends Function {
   public void setCloseFnSymbol(String s) { closeFnSymbol_ = s; }
 
   public String getSymbolName() { return symbolName_; }
+
+  @Override
+  protected TSymbolLookupParams getLookupParams() {
+    return buildLookupParams(
+        getSymbolName(), TSymbolType.UDF_EVALUATE, null, hasVarArgs(), false, getArgs());
+  }
 
   @Override
   public String toSql(boolean ifNotExists) {

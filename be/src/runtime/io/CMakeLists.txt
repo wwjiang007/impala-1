@@ -24,6 +24,9 @@ set(EXECUTABLE_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/runtime/io")
 add_library(Io
   disk-io-mgr.cc
   disk-io-mgr-stress.cc
+  local-file-system.cc
+  local-file-system-with-fault-injection.cc
+  error-converter.cc
   request-context.cc
   scan-range.cc
 )
@@ -33,4 +36,4 @@ add_dependencies(Io gen-deps)
 add_executable(disk-io-mgr-stress-test disk-io-mgr-stress-test.cc)
 target_link_libraries(disk-io-mgr-stress-test ${IMPALA_TEST_LINK_LIBS})
 
-ADD_BE_TEST(disk-io-mgr-test)
+ADD_BE_LSAN_TEST(disk-io-mgr-test)

@@ -112,7 +112,7 @@ class StatestoreSubscriber {
   /// Must be called before Start(), in which case it will return
   /// Status::OK. Otherwise an error will be returned.
   Status AddTopic(const Statestore::TopicId& topic_id, bool is_transient,
-      const UpdateCallback& callback);
+      bool populate_min_subscriber_topic_version, const UpdateCallback& callback);
 
   /// Registers this subscriber with the statestore, and starts the
   /// heartbeat service, as well as a thread to check for failure and
@@ -121,14 +121,14 @@ class StatestoreSubscriber {
   /// Returns OK unless some error occurred, like a failure to connect.
   Status Start();
 
+  /// Return the port that the subscriber is listening on.
+  int heartbeat_port() const { return heartbeat_address_.port; }
+
   const std::string& id() const { return subscriber_id_; }
 
  private:
   /// Unique, but opaque, identifier for this subscriber.
   const std::string subscriber_id_;
-
-  /// Address that the heartbeat service should be started on.
-  TNetworkAddress heartbeat_address_;
 
   /// Address of the statestore
   TNetworkAddress statestore_address_;
@@ -187,6 +187,10 @@ class StatestoreSubscriber {
   /// comments.
   boost::shared_mutex lock_;
 
+  /// Address that the heartbeat service should be started on. Initialised in constructor,
+  /// updated in Start() with the actual port if the wildcard port 0 was specified.
+  TNetworkAddress heartbeat_address_;
+
   /// Set to true after Register(...) is successful, after which no
   /// more topics may be subscribed to.
   bool is_registered_;
@@ -211,6 +215,10 @@ class StatestoreSubscriber {
     /// Whether the subscriber considers this topic to be "transient", that is any updates
     /// it makes will be deleted upon failure or disconnection.
     bool is_transient = false;
+
+    /// Whether this subscriber needs the min_subscriber_topic_version field to be filled
+    /// in on updates.
+    bool populate_min_subscriber_topic_version = false;
 
     /// The last version of the topic this subscriber processed.
     /// -1 if no updates have been processed yet.

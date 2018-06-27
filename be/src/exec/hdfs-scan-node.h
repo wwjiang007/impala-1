@@ -27,9 +27,9 @@
 #include <boost/scoped_ptr.hpp>
 #include <boost/thread/mutex.hpp>
 
+#include "common/atomic.h"
 #include "exec/filter-context.h"
 #include "exec/hdfs-scan-node-base.h"
-#include "runtime/io/disk-io-mgr.h"
 #include "util/counting-barrier.h"
 #include "util/thread.h"
 
@@ -39,6 +39,7 @@ class DescriptorTbl;
 class ObjectPool;
 class RuntimeState;
 class RowBatch;
+class ThreadResourcePool;
 class TPlanNode;
 
 /// Legacy ScanNode implementation used in the non-multi-threaded execution mode
@@ -58,8 +59,16 @@ class TPlanNode;
 /// 5. The scanner finishes the scan range and informs the scan node so it can track
 ///    end of stream.
 ///
-/// TODO: This class allocates a bunch of small utility objects that should be
-/// recycled.
+/// Buffer management:
+/// ------------------
+/// The different scanner threads all allocate I/O buffers from the node's Buffer Pool
+/// client. The scan node ensures that enough reservation is available to start a
+/// scanner thread before launching each one with, after which the scanner thread must
+/// stay within the reservation handed off to it. Scanner threads can try to increase
+/// their reservation if desired (e.g. for scanning columnar formats like Parquet), but
+/// must be able to make progress within the initial reservation handed off from the scan
+/// node.
+///
 /// TODO: Remove this class once the fragment-based multi-threaded execution is
 /// fully functional.
 class HdfsScanNode : public HdfsScanNodeBase {
@@ -100,12 +109,7 @@ class HdfsScanNode : public HdfsScanNodeBase {
 
  private:
   /// Released when initial ranges are issued in the first call to GetNext().
-  CountingBarrier ranges_issued_barrier_;
-
-  /// The estimated memory required to start up a new scanner thread. If the memory
-  /// left (due to limits) is less than this value, we won't start up optional
-  /// scanner threads.
-  int64_t scanner_thread_bytes_required_;
+  CountingBarrier ranges_issued_barrier_{1};
 
   /// Thread group for all scanner worker threads
   ThreadGroup scanner_threads_;
@@ -130,16 +134,16 @@ class HdfsScanNode : public HdfsScanNodeBase {
   /// are finished, an error/cancellation occurred, or the limit was reached.
   /// Setting this to true triggers the scanner threads to clean up.
   /// This should not be explicitly set. Instead, call SetDone().
-  bool done_;
+  bool done_ = false;
 
   /// Set to true if all ranges have started. Some of the ranges may still be in flight
   /// being processed by scanner threads, but no new ScannerThreads should be started.
-  bool all_ranges_started_;
+  bool all_ranges_started_ = false;
 
   /// The id of the callback added to the thread resource manager when thread token
   /// is available. Used to remove the callback before this scan node is destroyed.
   /// -1 if no callback is registered.
-  int thread_avail_cb_id_;
+  int thread_avail_cb_id_ = -1;
 
   /// Maximum number of scanner threads. Set to 'NUM_SCANNER_THREADS' if that query
   /// option is set. Otherwise, it's set to the number of cpu cores. Scanner threads
@@ -147,34 +151,62 @@ class HdfsScanNode : public HdfsScanNodeBase {
   /// the number of cores.
   int max_num_scanner_threads_;
 
+  // MemTracker for queued row batches. Initialized in Prepare(). Owned by RuntimeState.
+  MemTracker* row_batches_mem_tracker_ = nullptr;
+
+  // Number of times scanner threads were not created because of reservation increase
+  // being denied.
+  RuntimeProfile::Counter* scanner_thread_reservations_denied_counter_ = nullptr;
+
+  /// The number of row batches enqueued into the row batch queue.
+  RuntimeProfile::Counter* row_batches_enqueued_ = nullptr;
+
+  /// The total bytes of row batches enqueued into the row batch queue.
+  RuntimeProfile::Counter* row_batch_bytes_enqueued_ = nullptr;
+
   /// The wait time for fetching a row batch from the row batch queue.
-  RuntimeProfile::Counter* row_batches_get_timer_;
+  RuntimeProfile::Counter* row_batches_get_timer_ = nullptr;
 
   /// The wait time for enqueuing a row batch into the row batch queue.
-  RuntimeProfile::Counter* row_batches_put_timer_;
+  RuntimeProfile::Counter* row_batches_put_timer_ = nullptr;
+
+  /// Maximum capacity of the row batch queue.
+  RuntimeProfile::HighWaterMarkCounter* row_batches_max_capacity_ = nullptr;
+
+  /// Peak memory consumption of the materialized batch queue. Updated in Close().
+  RuntimeProfile::Counter* row_batches_peak_mem_consumption_ = nullptr;
 
   /// Tries to spin up as many scanner threads as the quota allows. Called explicitly
   /// (e.g., when adding new ranges) or when threads are available for this scan node.
-  void ThreadTokenAvailableCb(ThreadResourceMgr::ResourcePool* pool);
+  void ThreadTokenAvailableCb(ThreadResourcePool* pool);
 
   /// Main function for scanner thread. This thread pulls the next range to be
   /// processed from the IoMgr and then processes the entire range end to end.
   /// This thread terminates when all scan ranges are complete or an error occurred.
-  void ScannerThread();
+  /// 'first_thread' is true if this was the first scanner thread to start and
+  /// it acquired a "required" thread token from ThreadResourceMgr. The first thread
+  /// will continue running until 'done_' is true or an error is encountered. Other
+  /// threads may terminate early if the optional tokens in
+  /// runtime_state_->resource_pool() are exceeded.
+  /// The caller must have reserved 'scanner_thread_reservation' bytes of memory for
+  /// this thread. Before returning, this function releases the reservation with
+  /// ReturnReservationFromScannerThread().
+  void ScannerThread(bool first_thread, int64_t scanner_thread_reservation);
 
   /// Process the entire scan range with a new scanner object. Executed in scanner
   /// thread. 'filter_ctxs' is a clone of the class-wide filter_ctxs_, used to filter rows
-  /// in this split.
+  /// in this split. 'scanner_thread_reservation' is an in/out argument that tracks the
+  /// total reservation from 'buffer_pool_client_' that is allotted for this thread's
+  /// use.
   Status ProcessSplit(const std::vector<FilterContext>& filter_ctxs,
-      MemPool* expr_results_pool, io::ScanRange* scan_range) WARN_UNUSED_RESULT;
+      MemPool* expr_results_pool, io::ScanRange* scan_range,
+      int64_t* scanner_thread_reservation) WARN_UNUSED_RESULT;
 
-  /// Returns true if there is enough memory (against the mem tracker limits) to
-  /// have a scanner thread.
-  /// If new_thread is true, the calculation is for starting a new scanner thread.
-  /// If false, it determines whether there's adequate memory for the existing
-  /// set of scanner threads.
-  /// lock_ must be taken before calling this.
-  bool EnoughMemoryForScannerThread(bool new_thread);
+  /// Called by scanner thread to return some or all of its reservation that is not
+  /// needed. Always holds onto at least the minimum reservation to avoid violating the
+  /// invariants of ExecNode::buffer_pool_client_. 'lock_' must be held via 'lock'.
+  void ReturnReservationFromScannerThread(const boost::unique_lock<boost::mutex>& lock,
+      int64_t bytes);
 
   /// Checks for eos conditions and returns batches from materialized_row_batches_.
   Status GetNextInternal(RuntimeState* state, RowBatch* row_batch, bool* eos)

@@ -31,6 +31,7 @@ import org.apache.hadoop.ipc.RemoteException;
 import org.apache.log4j.Logger;
 
 import org.apache.impala.analysis.TableName;
+import org.apache.impala.catalog.FeFsPartition;
 import org.apache.impala.catalog.HdfsPartition;
 import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.common.ImpalaException;
@@ -133,8 +134,17 @@ public class HdfsCachingUtil {
     if (LOG.isTraceEnabled()) {
       LOG.trace("Uncaching table: " + table.getDbName() + "." + table.getTableName());
     }
-    Long id = getCacheDirectiveId(table.getParameters());
-    if (id == null) return;
+    Map<String, String> parameters = table.getParameters();
+    if (parameters == null) {
+      LOG.warn("removePartitionCacheDirective(): table " + table.getTableName() +
+          "has a null parameter map.");
+    }
+    Long id = getCacheDirectiveId(parameters);
+    if (id == null) {
+      LOG.warn("removePartitionCacheDirective(): table " + table.getTableName() +
+          "doesn't have a cache directive id.");
+      return;
+    }
     HdfsCachingUtil.removeDirective(id);
     table.getParameters().remove(CACHE_DIR_ID_PROP_NAME);
     table.getParameters().remove(CACHE_DIR_REPLICATION_PROP_NAME);
@@ -145,11 +155,20 @@ public class HdfsCachingUtil {
    * data. Also updates the partition's metadata to remove the cache directive ID.
    * No-op if the table is not cached.
    */
-  public static void removePartitionCacheDirective(HdfsPartition part)
+  public static void removePartitionCacheDirective(FeFsPartition part)
       throws ImpalaException {
     Preconditions.checkNotNull(part);
-    Long id = getCacheDirectiveId(part.getParameters());
-    if (id == null) return;
+    Map<String, String> parameters = part.getParameters();
+    if (parameters == null) {
+      LOG.warn("removePartitionCacheDirective(): partition " + part.getPartitionName() +
+          "has a null parameter map.");
+    }
+    Long id = getCacheDirectiveId(parameters);
+    if (id == null) {
+      LOG.warn("removePartitionCacheDirective(): partition " + part.getPartitionName() +
+          "doesn't have a cache directive id.");
+      return;
+    }
     HdfsCachingUtil.removeDirective(id);
     part.getParameters().remove(CACHE_DIR_ID_PROP_NAME);
     part.getParameters().remove(CACHE_DIR_REPLICATION_PROP_NAME);

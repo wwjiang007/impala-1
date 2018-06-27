@@ -17,6 +17,7 @@
 
 #include "common/init.h"
 
+#include <csignal>
 #include <gperftools/heap-profiler.h>
 #include <gperftools/malloc_extension.h>
 
@@ -53,6 +54,7 @@
 #include "util/test-info.h"
 #include "util/thread.h"
 #include "util/time.h"
+#include "util/zip-util.h"
 
 #include "common/names.h"
 
@@ -172,6 +174,8 @@ static void PauseMonitorLoop() {
 
 void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
     TestInfo::Mode test_mode) {
+  srand(time(NULL));
+
   CpuInfo::Init();
   DiskInfo::Init();
   MemInfo::Init();
@@ -232,6 +236,11 @@ void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
   LOG(INFO) << "Using hostname: " << FLAGS_hostname;
   impala::LogCommandLineFlags();
 
+  // When a process calls send(2) on a socket closed on the other end, linux generates
+  // SIGPIPE. MSG_NOSIGNAL can be passed to send(2) to disable it, which thrift does. But
+  // OpenSSL doesn't have place for this parameter so the signal must be disabled
+  // manually.
+  signal(SIGPIPE, SIG_IGN);
   InitThriftLogging();
 
   LOG(INFO) << CpuInfo::DebugString();
@@ -250,6 +259,7 @@ void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
   if (init_jvm) {
     ABORT_IF_ERROR(JniUtil::Init());
     InitJvmLoggingSupport();
+    ZipUtil::InitJvm();
   }
 
   if (argc == -1) {
@@ -274,3 +284,29 @@ Status impala::StartMemoryMaintenanceThread() {
   return Thread::Create("common", "memory-maintenance-thread",
       &MemoryMaintenanceThread, &memory_maintenance_thread);
 }
+
+#if defined(ADDRESS_SANITIZER)
+// Default ASAN_OPTIONS. Override by setting environment variable $ASAN_OPTIONS.
+extern "C" const char *__asan_default_options() {
+  // IMPALA-2746: backend tests don't pass with leak sanitizer enabled.
+  return "handle_segv=0 detect_leaks=0 allocator_may_return_null=1";
+}
+#endif
+
+#if defined(THREAD_SANITIZER)
+// Default TSAN_OPTIONS. Override by setting environment variable $TSAN_OPTIONS.
+extern "C" const char *__tsan_default_options() {
+  // Note that backend test should re-configure to halt_on_error=1
+  return "halt_on_error=0 history_size=7";
+}
+#endif
+
+// Default UBSAN_OPTIONS. Override by setting environment variable $UBSAN_OPTIONS.
+#if defined(UNDEFINED_SANITIZER)
+extern "C" const char *__ubsan_default_options() {
+  static const string default_options = Substitute(
+      "print_stacktrace=1 suppressions=$0/bin/ubsan-suppressions.txt",
+      getenv("IMPALA_HOME") == nullptr ? "." : getenv("IMPALA_HOME"));
+  return default_options.c_str();
+}
+#endif

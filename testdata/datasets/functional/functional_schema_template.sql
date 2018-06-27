@@ -140,6 +140,8 @@ string_col string
 timestamp_col timestamp
 ---- ROW_FORMAT
 delimited fields terminated by ','  escaped by '\\'
+---- HBASE_REGION_SPLITS
+'1','3','5','7','9'
 ---- ALTER
 ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION(year=2009, month=1);
 ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION(year=2009, month=2);
@@ -242,16 +244,16 @@ functional
 ---- BASE_TABLE_NAME
 alltypesinsert
 ---- CREATE
-CREATE TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name} LIKE {db_name}.alltypes
-STORED AS {file_format};
+CREATE TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+LIKE {db_name}{db_suffix}.alltypes STORED AS {file_format};
 ====
 ---- DATASET
 functional
 ---- BASE_TABLE_NAME
 alltypesnopart_insert
 ---- CREATE
-CREATE TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name} like {db_name}.alltypesnopart
-STORED AS {file_format};
+CREATE TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}
+LIKE {db_name}{db_suffix}.alltypesnopart STORED AS {file_format};
 ====
 ---- DATASET
 functional
@@ -515,6 +517,8 @@ string_col string
 timestamp_col timestamp
 ---- ROW_FORMAT
 delimited fields terminated by ','  escaped by '\\'
+---- HBASE_REGION_SPLITS
+'1','3','5','7','9'
 ---- ALTER
 ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION(year=2010, month=1, day=1);
 ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION(year=2010, month=1, day=2);
@@ -739,6 +743,7 @@ INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} PARTITION(p=1) SELECT i
 INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} PARTITION(p=2) SELECT id, named_struct("f1",string_col,"f2",int_col), array(1, 2, 3), map("k", cast(0 as bigint)) FROM functional.alltypestiny;
 INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} PARTITION(p=3) SELECT id, named_struct("f1",string_col,"f2",int_col), array(1, 2, 3), map("k", cast(0 as bigint)) FROM functional.alltypestiny;
 INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} PARTITION(p=4) SELECT id, named_struct("f1",string_col,"f2",int_col), array(1, 2, 3), map("k", cast(0 as bigint)) FROM functional.alltypestiny;
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} PARTITION(p=5) SELECT id, named_struct("f1",string_col,"f2",int_col), array(1, 2, 3), map("k", cast(0 as bigint)) FROM functional.alltypestiny;
 -- The order of insertions and alterations is deliberately chose to work around a Hive
 -- bug where the format of an altered partition is reverted back to the original format after
 -- an insert. So we first do the insert, and then alter the format.
@@ -746,6 +751,7 @@ USE {db_name}{db_suffix};
 ALTER TABLE {table_name} PARTITION (p=2) SET FILEFORMAT PARQUET;
 ALTER TABLE {table_name} PARTITION (p=3) SET FILEFORMAT AVRO;
 ALTER TABLE {table_name} PARTITION (p=4) SET FILEFORMAT RCFILE;
+ALTER TABLE {table_name} PARTITION (p=5) SET FILEFORMAT ORC;
 USE default;
 ====
 ---- DATASET
@@ -816,8 +822,11 @@ create table {db_name}{db_suffix}.{table_name} (
   alltypes_id int,
   primary key (test_id, test_name, test_zip, alltypes_id)
 )
-partition by range(test_id) (partition values <= 1003, partition 1003 < values <= 1007,
-partition 1007 < values) stored as kudu;
+partition by range(test_id, test_name)
+  (partition values <= (1003, 'Name3'),
+   partition (1003, 'Name3') < values <= (1007, 'Name7'),
+   partition (1007, 'Name7') < values)
+stored as kudu;
 ====
 ---- DATASET
 functional
@@ -2007,7 +2016,7 @@ functional
 ---- BASE_TABLE_NAME
 avro_unicode_nulls
 ---- CREATE_HIVE
-create external table if not exists {db_name}{db_suffix}.{table_name} like {db_name}.liketbl stored as avro LOCATION '/test-warehouse/avro_null_char';
+create external table if not exists {db_name}{db_suffix}.{table_name} like {db_name}{db_suffix}.liketbl stored as avro LOCATION '/test-warehouse/avro_null_char';
 ---- LOAD
 `hdfs dfs -mkdir -p /test-warehouse/avro_null_char && \
 hdfs dfs -put -f ${IMPALA_HOME}/testdata/avro_null_char/000000_0 /test-warehouse/avro_null_char/

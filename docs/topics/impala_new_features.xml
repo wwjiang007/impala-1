@@ -46,6 +46,36 @@ under the License.
 
   </conbody>
 
+  <!-- All 3.0.x new features go under here -->
+  <concept rev="3.0.0" id="new_features_300">
+    <title>New Features in <keyword keyref="impala30"/></title>
+    <conbody>
+      <p>
+        For the full list of issues closed in this release, including the
+        issues marked as <q>new features</q> or <q>improvements</q>, see the
+          <xref keyref="changelog_300">changelog for <keyword keyref="impala30"
+          /></xref>.
+      </p>
+    </conbody>
+  </concept>
+
+<!-- All 2.12.x new features go under here -->
+
+  <concept rev="2.12.0" id="new_features_2120">
+
+    <title>New Features in <keyword keyref="impala212_full"/></title>
+
+    <conbody>
+
+      <p>
+        For the full list of issues closed in this release, including the issues
+        marked as <q>new features</q> or <q>improvements</q>, see the
+        <xref keyref="changelog_212">changelog for <keyword keyref="impala212"/></xref>.
+      </p>
+
+    </conbody>
+  </concept>
+
 <!-- All 2.11.x new features go under here -->
 
   <concept rev="2.11.0" id="new_features_2110">
@@ -403,13 +433,6 @@ under the License.
               </p>
             </li>
           </ul>
-        </li>
-        <li>
-          <p rev="">
-            The <codeph>REFRESH</codeph> statement now updates information about HDFS block locations.
-            Therefore, you can perform a fast and efficient <codeph>REFRESH</codeph> after doing an HDFS
-            rebalancing operation instead of the more expensive <codeph>INVALIDATE METADATA</codeph> statement.
-          </p>
         </li>
         <li>
           <p rev="IMPALA-1654">
@@ -2631,9 +2654,7 @@ under the License.
         <li>
           <p>
             The documentation provides additional guidance for planning tasks. <ph audience="PDF">See
-            <xref href="impala_planning.xml#planning"/>.</ph> <ph audience="PDF">In particular, see
-            <xref href="impala_cluster_sizing.xml#cluster_sizing"/> before you purchase or repurpose hardware for a
-            cluster to run Impala.</ph>
+            <xref href="impala_planning.xml#planning"/>.</ph>
           </p>
         </li>
 

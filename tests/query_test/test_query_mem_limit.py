@@ -24,6 +24,7 @@ from copy import copy
 
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.impala_test_suite import ImpalaTestSuite
+from tests.common.skip import SkipIfEC
 from tests.common.test_dimensions import (
     ImpalaTestDimension,
     create_single_exec_option_dimension,
@@ -87,6 +88,7 @@ class TestQueryMemLimit(ImpalaTestSuite):
     cls.ImpalaTestMatrix.add_constraint(
         lambda v: v.get_value('exec_option')['batch_size'] == 0)
 
+  @SkipIfEC.oom
   @pytest.mark.execute_serially
   def test_mem_limit(self, vector):
     mem_limit = copy(vector.get_value('mem_limit'))
@@ -118,7 +120,9 @@ class TestCodegenMemLimit(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestCodegenMemLimit, cls).add_test_dimensions()
-    cls.ImpalaTestMatrix.add_dimension(create_single_exec_option_dimension())
+    # Run with num_nodes=1 to avoid races between fragments allocating memory.
+    cls.ImpalaTestMatrix.add_dimension(create_single_exec_option_dimension(
+        num_nodes=1, disable_codegen_rows_threshold=0))
     # Only run the query for parquet
     cls.ImpalaTestMatrix.add_constraint(
       lambda v: v.get_value('table_format').file_format == 'parquet')

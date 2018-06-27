@@ -185,6 +185,11 @@ select real_words(letters) from word_games;</codeblock>
           </li>
 
           <li>
+            Hive/Java UDFs must extend
+              <codeph>org.apache.hadoop.hive.ql.exec.UDF</codeph> class.
+          </li>
+
+          <li>
             Currently, Hive UDFs that accept or return the <codeph>TIMESTAMP</codeph> type are not supported.
           </li>
 
@@ -597,16 +602,10 @@ IntVal AddUdf(FunctionContext* context, const IntVal&amp; arg1, const IntVal&amp
 
           <li>
             <p>
-              Each kind of struct has a <codeph>null()</codeph> member function that returns an instance of the
-              struct with the <codeph>is_null</codeph> flag set.
-            </p>
-          </li>
-
-          <li>
-            <p>
-              Because Impala currently does not support composite or nested types, Impala cannot process UDFs that
-              accept such types as arguments or return them as result values. This limitation applies both to
-              Impala UDFs written in C++ and Java-based Hive UDFs.
+              Impala cannot process UDFs that accept composite or nested types
+              as arguments or return them as result values. This limitation
+              applies both to Impala UDFs written in C++ and Java-based Hive
+              UDFs.
             </p>
           </li>
 

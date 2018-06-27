@@ -21,7 +21,7 @@ from copy import copy
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.impala_cluster import ImpalaCluster
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfLocal
+from tests.common.skip import SkipIfNotHdfsMinicluster
 from tests.common.test_dimensions import create_single_exec_option_dimension
 from tests.common.test_vector import ImpalaTestDimension
 from tests.verifiers.metric_verifier import MetricVerifier
@@ -32,7 +32,7 @@ MEM_LIMIT_TOO_LOW_FOR_RESERVATION = ("minimum memory reservation is greater than
   "available to the query for buffer reservations")
 MEM_LIMIT_ERROR_MSGS = [MEM_LIMIT_EXCEEDED_MSG, MEM_LIMIT_TOO_LOW_FOR_RESERVATION]
 
-@SkipIfLocal.mem_usage_different
+@SkipIfNotHdfsMinicluster.tuned_for_minicluster
 class TestQueryMemLimitScaling(ImpalaTestSuite):
   """Test class to do functional validation of per query memory limits. """
   QUERY = ["select * from lineitem where l_orderkey = -1",
@@ -96,7 +96,7 @@ class TestExprMemUsage(ImpalaTestSuite):
 class TestLowMemoryLimits(ImpalaTestSuite):
   '''Super class for the memory limit tests with the TPC-H and TPC-DS queries'''
 
-  def low_memory_limit_test(self, vector, tpch_query, limit, xfail_mem_limit=None):
+  def low_memory_limit_test(self, vector, tpch_query, limit):
     mem = vector.get_value('mem_limit')
     # Mem consumption can be +-30MBs, depending on how many scanner threads are
     # running. Adding this extra mem in order to reduce false negatives in the tests.
@@ -113,28 +113,27 @@ class TestLowMemoryLimits(ImpalaTestSuite):
     try:
       self.run_test_case(tpch_query, new_vector)
     except ImpalaBeeswaxException as e:
-      if not expects_error and not xfail_mem_limit: raise
+      if not expects_error: raise
       found_expected_error = False
       for error_msg in MEM_LIMIT_ERROR_MSGS:
         if error_msg in str(e): found_expected_error = True
       assert found_expected_error, str(e)
-      if not expects_error and xfail_mem_limit:
-        pytest.xfail(xfail_mem_limit)
 
 
-@SkipIfLocal.mem_usage_different
+@SkipIfNotHdfsMinicluster.tuned_for_minicluster
 class TestTpchMemLimitError(TestLowMemoryLimits):
   # The mem limits that will be used.
-  MEM_IN_MB = [20, 140, 180, 220, 275, 450, 700]
+  MEM_IN_MB = [20, 50, 80, 130, 160, 200, 400]
 
   # Different values of mem limits and minimum mem limit (in MBs) each query is expected
   # to run without problem. These were determined using the query_runtime_info.json file
-  # produced by the stress test (i.e. concurrent_select.py).
-  MIN_MEM_FOR_TPCH = { 'Q1' : 125, 'Q2' : 125, 'Q3' : 112, 'Q4' : 137, 'Q5' : 137,\
-                       'Q6' : 25, 'Q7' : 200, 'Q8' : 125, 'Q9' : 200, 'Q10' : 162,\
-                       'Q11' : 112, 'Q12' : 150, 'Q13' : 125, 'Q14' : 125, 'Q15' : 125,\
-                       'Q16' : 137, 'Q17' : 137, 'Q18' : 196, 'Q19' : 112, 'Q20' : 162,\
-                       'Q21' : 187, 'Q22' : 125}
+  # produced by the stress test (i.e. concurrent_select.py) and extracted with
+  # tests/stress/extract_min_mem.py
+  MIN_MEM_FOR_TPCH = {'Q1': 55, 'Q2': 89, 'Q3': 80, 'Q4': 70, 'Q5': 99,
+                      'Q6': 48, 'Q7': 127, 'Q8': 111, 'Q9': 189, 'Q10': 108,
+                      'Q11': 76, 'Q12': 70, 'Q13': 71, 'Q14': 57, 'Q15': 83,
+                      'Q16': 71, 'Q17': 73, 'Q18': 153, 'Q19': 54, 'Q20': 128,
+                      'Q21': 147, 'Q22': 57}
 
   @classmethod
   def get_workload(self):
@@ -177,8 +176,7 @@ class TestTpchMemLimitError(TestLowMemoryLimits):
     self.low_memory_limit_test(vector, 'tpch-q8', self.MIN_MEM_FOR_TPCH['Q8'])
 
   def test_low_mem_limit_q9(self, vector):
-    self.low_memory_limit_test(vector, 'tpch-q9', self.MIN_MEM_FOR_TPCH['Q9'],
-            xfail_mem_limit="IMPALA-3328: TPC-H Q9 memory limit test is flaky")
+    self.low_memory_limit_test(vector, 'tpch-q9', self.MIN_MEM_FOR_TPCH['Q9'])
 
   def test_low_mem_limit_q10(self, vector):
     self.low_memory_limit_test(vector, 'tpch-q10', self.MIN_MEM_FOR_TPCH['Q10'])
@@ -228,7 +226,7 @@ class TestTpchMemLimitError(TestLowMemoryLimits):
       verifier = MetricVerifier(impalad.service)
       verifier.wait_for_metric("impala-server.num-fragments-in-flight", 0)
 
-@SkipIfLocal.mem_usage_different
+@SkipIfNotHdfsMinicluster.tuned_for_minicluster
 class TestTpchPrimitivesMemLimitError(TestLowMemoryLimits):
   """
   Memory usage tests using targeted-perf queries to exercise specific operators.
@@ -274,7 +272,7 @@ class TestTpchPrimitivesMemLimitError(TestLowMemoryLimits):
     self.run_primitive_query(vector, 'primitive_orderby_all')
 
 
-@SkipIfLocal.mem_usage_different
+@SkipIfNotHdfsMinicluster.tuned_for_minicluster
 class TestTpcdsMemLimitError(TestLowMemoryLimits):
   # The mem limits that will be used.
   MEM_IN_MB = [20, 100, 116, 150]

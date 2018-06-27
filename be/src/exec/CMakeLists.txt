@@ -28,6 +28,7 @@ add_library(Exec
   analytic-eval-node.cc
   base-sequence-scanner.cc
   blocking-join-node.cc
+  cardinality-check-node.cc
   catalog-op-executor.cc
   data-sink.cc
   data-source-scan-node.cc
@@ -52,13 +53,14 @@ add_library(Exec
   hdfs-avro-scanner.cc
   hdfs-avro-table-writer.cc
   hdfs-avro-scanner-ir.cc
+  hdfs-plugin-text-scanner.cc
   hdfs-text-scanner.cc
-  hdfs-lzo-text-scanner.cc
   hdfs-text-table-writer.cc
   hdfs-sequence-table-writer.cc
   hdfs-parquet-scanner.cc
   hdfs-parquet-scanner-ir.cc
   hdfs-parquet-table-writer.cc
+  hdfs-orc-scanner.cc
   hbase-scan-node.cc
   hbase-table-scanner.cc
   incr-stats-util.cc
@@ -100,12 +102,13 @@ add_library(Exec
 
 add_dependencies(Exec gen-deps)
 
-ADD_BE_TEST(zigzag-test)
-ADD_BE_TEST(hash-table-test)
-ADD_BE_TEST(delimited-text-parser-test)
-ADD_BE_TEST(read-write-util-test)
-ADD_BE_TEST(parquet-plain-test)
-ADD_BE_TEST(parquet-version-test)
-ADD_BE_TEST(row-batch-list-test)
-ADD_BE_TEST(incr-stats-util-test)
-ADD_BE_TEST(hdfs-avro-scanner-test)
+ADD_BE_LSAN_TEST(zigzag-test)
+ADD_BE_LSAN_TEST(hash-table-test)
+ADD_BE_LSAN_TEST(delimited-text-parser-test)
+ADD_BE_LSAN_TEST(read-write-util-test)
+ADD_BE_LSAN_TEST(parquet-plain-test)
+ADD_BE_LSAN_TEST(parquet-version-test)
+ADD_BE_LSAN_TEST(row-batch-list-test)
+ADD_BE_LSAN_TEST(incr-stats-util-test)
+ADD_BE_LSAN_TEST(hdfs-avro-scanner-test)
+ADD_BE_LSAN_TEST(hdfs-parquet-scanner-test)

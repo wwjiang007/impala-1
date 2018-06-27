@@ -16,13 +16,15 @@
 // under the License.
 
 #include "exec/hdfs-scan-node-base.h"
+
+#include "exec/hdfs-plugin-text-scanner.h"
 #include "exec/base-sequence-scanner.h"
 #include "exec/hdfs-text-scanner.h"
-#include "exec/hdfs-lzo-text-scanner.h"
 #include "exec/hdfs-sequence-scanner.h"
 #include "exec/hdfs-rcfile-scanner.h"
 #include "exec/hdfs-avro-scanner.h"
 #include "exec/hdfs-parquet-scanner.h"
+#include "exec/hdfs-orc-scanner.h"
 
 #include <avro/errors.h>
 #include <avro/schema.h>
@@ -35,6 +37,7 @@
 #include "exprs/scalar-expr-evaluator.h"
 #include "exprs/scalar-expr.h"
 #include "runtime/descriptors.h"
+#include "runtime/exec-env.h"
 #include "runtime/hdfs-fs-cache.h"
 #include "runtime/io/disk-io-mgr.h"
 #include "runtime/io/request-context.h"
@@ -109,7 +112,6 @@ Status HdfsScanNodeBase::Init(const TPlanNode& tnode, RuntimeState* state) {
     RETURN_IF_ERROR(ScalarExpr::Create(tnode.hdfs_scan_node.min_max_conjuncts,
         *min_max_row_desc, state, &min_max_conjuncts_));
   }
-
   return Status::OK();
 }
 
@@ -240,13 +242,23 @@ Status HdfsScanNodeBase::Prepare(RuntimeState* state) {
   ImpaladMetrics::NUM_RANGES_PROCESSED->Increment(scan_range_params_->size());
   ImpaladMetrics::NUM_RANGES_MISSING_VOLUME_ID->Increment(num_ranges_missing_volume_id);
 
+  // Check if reservation was enough to allocate at least one buffer. The
+  // reservation calculation in HdfsScanNode.java should guarantee this.
+  // Hitting this error indicates a misconfiguration or bug.
+  int64_t min_buffer_size = ExecEnv::GetInstance()->disk_io_mgr()->min_buffer_size();
+  if (scan_range_params_->size() > 0
+      && resource_profile_.min_reservation < min_buffer_size) {
+    return Status(TErrorCode::INTERNAL_ERROR,
+      Substitute("HDFS scan min reservation $0 must be >= min buffer size $1",
+       resource_profile_.min_reservation, min_buffer_size));
+  }
   // Add per volume stats to the runtime profile
   PerVolumeStats per_volume_stats;
   stringstream str;
   UpdateHdfsSplitStats(*scan_range_params_, &per_volume_stats);
   PrintHdfsSplitStats(per_volume_stats, &str);
   runtime_profile()->AddInfoString(HDFS_SPLIT_STATS_DESC, str.str());
-  AddCodegenDisabledMessage(state);
+  state->CheckAndAddCodegenDisabledMessage(runtime_profile());
   return Status::OK();
 }
 
@@ -326,7 +338,8 @@ Status HdfsScanNodeBase::Open(RuntimeState* state) {
         partition_desc->partition_key_value_evals(), scan_node_pool_.get(), state);
   }
 
-  reader_context_ = runtime_state_->io_mgr()->RegisterContext(mem_tracker());
+  RETURN_IF_ERROR(ClaimBufferReservation(state));
+  reader_context_ = runtime_state_->io_mgr()->RegisterContext();
 
   // Initialize HdfsScanNode specific counters
   // TODO: Revisit counters and move the counters specific to multi-threaded scans
@@ -347,19 +360,19 @@ Status HdfsScanNodeBase::Open(RuntimeState* state) {
   num_scanner_threads_started_counter_ =
       ADD_COUNTER(runtime_profile(), NUM_SCANNER_THREADS_STARTED, TUnit::UNIT);
 
-  runtime_state_->io_mgr()->set_bytes_read_counter(
-      reader_context_.get(), bytes_read_counter());
-  runtime_state_->io_mgr()->set_read_timer(reader_context_.get(), read_timer());
-  runtime_state_->io_mgr()->set_open_file_timer(reader_context_.get(), open_file_timer());
-  runtime_state_->io_mgr()->set_active_read_thread_counter(
-      reader_context_.get(), &active_hdfs_read_thread_counter_);
-  runtime_state_->io_mgr()->set_disks_access_bitmap(
-      reader_context_.get(), &disks_accessed_bitmap_);
+  reader_context_->set_bytes_read_counter(bytes_read_counter());
+  reader_context_->set_read_timer(read_timer());
+  reader_context_->set_open_file_timer(open_file_timer());
+  reader_context_->set_active_read_thread_counter(&active_hdfs_read_thread_counter_);
+  reader_context_->set_disks_accessed_bitmap(&disks_accessed_bitmap_);
 
-  average_scanner_thread_concurrency_ = runtime_profile()->AddSamplingCounter(
-      AVERAGE_SCANNER_THREAD_CONCURRENCY, &active_scanner_thread_counter_);
   average_hdfs_read_thread_concurrency_ = runtime_profile()->AddSamplingCounter(
       AVERAGE_HDFS_READ_THREAD_CONCURRENCY, &active_hdfs_read_thread_counter_);
+
+  initial_range_ideal_reservation_stats_ = ADD_SUMMARY_STATS_COUNTER(runtime_profile(),
+      "InitialRangeIdealReservation", TUnit::BYTES);
+  initial_range_actual_reservation_stats_ = ADD_SUMMARY_STATS_COUNTER(runtime_profile(),
+      "InitialRangeActualReservation", TUnit::BYTES);
 
   bytes_read_local_ = ADD_COUNTER(runtime_profile(), "BytesReadLocal",
       TUnit::BYTES);
@@ -386,7 +399,7 @@ Status HdfsScanNodeBase::Open(RuntimeState* state) {
 
   int64_t total_splits = 0;
   for (const auto& fd: file_descs_) total_splits += fd.second->splits.size();
-  progress_.Init(Substitute("Splits complete (node=$0)", total_splits), total_splits);
+  progress_.Init(Substitute("Splits complete (node=$0)", id_), total_splits);
   return Status::OK();
 }
 
@@ -448,18 +461,30 @@ Status HdfsScanNodeBase::IssueInitialScanRanges(RuntimeState* state) {
     }
   }
 
-  // Issue initial ranges for all file types.
-  RETURN_IF_ERROR(HdfsParquetScanner::IssueInitialRanges(this,
-      matching_per_type_files[THdfsFileFormat::PARQUET]));
-  RETURN_IF_ERROR(HdfsTextScanner::IssueInitialRanges(this,
-      matching_per_type_files[THdfsFileFormat::TEXT]));
-  RETURN_IF_ERROR(BaseSequenceScanner::IssueInitialRanges(this,
-      matching_per_type_files[THdfsFileFormat::SEQUENCE_FILE]));
-  RETURN_IF_ERROR(BaseSequenceScanner::IssueInitialRanges(this,
-      matching_per_type_files[THdfsFileFormat::RC_FILE]));
-  RETURN_IF_ERROR(BaseSequenceScanner::IssueInitialRanges(this,
-      matching_per_type_files[THdfsFileFormat::AVRO]));
-
+  // Issue initial ranges for all file types. Only call functions for file types that
+  // actually exist - trying to add empty lists of ranges can result in spurious
+  // CANCELLED errors - see IMPALA-6564.
+  for (const auto& entry : matching_per_type_files) {
+    if (entry.second.empty()) continue;
+    switch (entry.first) {
+      case THdfsFileFormat::PARQUET:
+        RETURN_IF_ERROR(HdfsParquetScanner::IssueInitialRanges(this, entry.second));
+        break;
+      case THdfsFileFormat::TEXT:
+        RETURN_IF_ERROR(HdfsTextScanner::IssueInitialRanges(this, entry.second));
+        break;
+      case THdfsFileFormat::SEQUENCE_FILE:
+      case THdfsFileFormat::RC_FILE:
+      case THdfsFileFormat::AVRO:
+        RETURN_IF_ERROR(BaseSequenceScanner::IssueInitialRanges(this, entry.second));
+        break;
+      case THdfsFileFormat::ORC:
+        RETURN_IF_ERROR(HdfsOrcScanner::IssueInitialRanges(this, entry.second));
+        break;
+      default:
+        DCHECK(false) << "Unexpected file type " << entry.first;
+    }
+  }
   return Status::OK();
 }
 
@@ -478,6 +503,50 @@ bool HdfsScanNodeBase::FilePassesFilterPredicates(
     return false;
   }
   return true;
+}
+
+Status HdfsScanNodeBase::StartNextScanRange(int64_t* reservation,
+    ScanRange** scan_range) {
+  DiskIoMgr* io_mgr = ExecEnv::GetInstance()->disk_io_mgr();
+  bool needs_buffers;
+  RETURN_IF_ERROR(reader_context_->GetNextUnstartedRange(scan_range, &needs_buffers));
+  if (*scan_range == nullptr) return Status::OK();
+  if (needs_buffers) {
+    // Check if we should increase our reservation to read this range more efficiently.
+    // E.g. if we are scanning a large text file, we might want extra I/O buffers to
+    // improve throughput. Note that if this is a columnar format like Parquet,
+    // '*scan_range' is the small footer range only so we won't request an increase.
+    int64_t ideal_scan_range_reservation =
+        io_mgr->ComputeIdealBufferReservation((*scan_range)->len());
+    *reservation = IncreaseReservationIncrementally(*reservation, ideal_scan_range_reservation);
+    initial_range_ideal_reservation_stats_->UpdateCounter(ideal_scan_range_reservation);
+    initial_range_actual_reservation_stats_->UpdateCounter(*reservation);
+    RETURN_IF_ERROR(
+        io_mgr->AllocateBuffersForRange(buffer_pool_client(), *scan_range, *reservation));
+  }
+  return Status::OK();
+}
+
+int64_t HdfsScanNodeBase::IncreaseReservationIncrementally(int64_t curr_reservation,
+      int64_t ideal_reservation) {
+  DiskIoMgr* io_mgr = ExecEnv::GetInstance()->disk_io_mgr();
+  // Check if we could use at least one more max-sized I/O buffer for this range. Don't
+  // increase in smaller increments since we may not be able to use additional smaller
+  // buffers.
+  while (curr_reservation < ideal_reservation) {
+    // Increase to the next I/O buffer multiple or to the ideal reservation.
+    int64_t target = min(ideal_reservation,
+        BitUtil::RoundUpToPowerOf2(curr_reservation + 1, io_mgr->max_buffer_size()));
+    DCHECK_LT(curr_reservation, target);
+    bool increased = buffer_pool_client()->IncreaseReservation(target - curr_reservation);
+    VLOG_FILE << "Increasing reservation from "
+              << PrettyPrinter::PrintBytes(curr_reservation) << " to "
+              << PrettyPrinter::PrintBytes(target) << " "
+              << (increased ? "succeeded" : "failed");
+    if (!increased) break;
+    curr_reservation = target;
+  }
+  return curr_reservation;
 }
 
 ScanRange* HdfsScanNodeBase::AllocateScanRange(hdfsFS fs, const char* file,
@@ -518,7 +587,9 @@ ScanRange* HdfsScanNodeBase::AllocateScanRange(hdfsFS fs, const char* file,
 
 Status HdfsScanNodeBase::AddDiskIoRanges(
     const vector<ScanRange*>& ranges, int num_files_queued) {
-  RETURN_IF_ERROR(runtime_state_->io_mgr()->AddScanRanges(reader_context_.get(), ranges));
+  DCHECK(!progress_.done()) << "Don't call AddScanRanges() after all ranges finished.";
+  DCHECK_GT(ranges.size(), 0);
+  RETURN_IF_ERROR(reader_context_->AddScanRanges(ranges));
   num_unqueued_files_.Add(-num_files_queued);
   DCHECK_GE(num_unqueued_files_.Load(), 0);
   return Status::OK();
@@ -562,12 +633,15 @@ Status HdfsScanNodeBase::CreateAndOpenScanner(HdfsPartitionDescriptor* partition
   // Create a new scanner for this file format and compression.
   switch (partition->file_format()) {
     case THdfsFileFormat::TEXT:
-      // Lzo-compressed text files are scanned by a scanner that it is implemented as a
-      // dynamic library, so that Impala does not include GPL code.
-      if (compression == THdfsCompression::LZO) {
-        scanner->reset(HdfsLzoTextScanner::GetHdfsLzoTextScanner(this, runtime_state_));
-      } else {
+      if (HdfsTextScanner::HasBuiltinSupport(compression)) {
         scanner->reset(new HdfsTextScanner(this, runtime_state_));
+      } else {
+        // No builtin support - we must have loaded the plugin in IssueInitialRanges().
+        auto it = _THdfsCompression_VALUES_TO_NAMES.find(compression);
+        DCHECK(it != _THdfsCompression_VALUES_TO_NAMES.end())
+            << "Already issued ranges for this compression type.";
+        scanner->reset(HdfsPluginTextScanner::GetHdfsPluginTextScanner(
+            this, runtime_state_, it->second));
       }
       break;
     case THdfsFileFormat::SEQUENCE_FILE:
@@ -581,6 +655,9 @@ Status HdfsScanNodeBase::CreateAndOpenScanner(HdfsPartitionDescriptor* partition
       break;
     case THdfsFileFormat::PARQUET:
       scanner->reset(new HdfsParquetScanner(this, runtime_state_));
+      break;
+    case THdfsFileFormat::ORC:
+      scanner->reset(new HdfsOrcScanner(this, runtime_state_));
       break;
     default:
       return Status(Substitute("Unknown Hdfs file format type: $0",
@@ -787,23 +864,26 @@ void HdfsScanNodeBase::StopAndFinalizeCounters() {
           if (file_format == THdfsFileFormat::PARQUET) {
             // If a scan range stored as parquet is skipped, its compression type
             // cannot be figured out without reading the data.
-            ss << file_format << "/" << "Unknown" << "(Skipped):" << file_cnt << " ";
+            ss << PrintThriftEnum(file_format) << "/" << "Unknown" << "(Skipped):"
+               << file_cnt << " ";
           } else {
-            ss << file_format << "/" << compressions_set.GetFirstType() << "(Skipped):"
+            ss << PrintThriftEnum(file_format) << "/"
+               << PrintThriftEnum(compressions_set.GetFirstType()) << "(Skipped):"
                << file_cnt << " ";
           }
         } else if (compressions_set.Size() == 1) {
-          ss << file_format << "/" << compressions_set.GetFirstType() << ":" << file_cnt
+          ss << PrintThriftEnum(file_format) << "/"
+             << PrintThriftEnum(compressions_set.GetFirstType()) << ":" << file_cnt
              << " ";
         } else {
-          ss << file_format << "/" << "(";
+          ss << PrintThriftEnum(file_format) << "/" << "(";
           bool first = true;
           for (auto& elem : _THdfsCompression_VALUES_TO_NAMES) {
             THdfsCompression::type type = static_cast<THdfsCompression::type>(
                 elem.first);
             if (!compressions_set.HasType(type)) continue;
             if (!first) ss << ",";
-            ss << type;
+            ss << PrintThriftEnum(type);
             first = false;
           }
           ss << "):" << file_cnt << " ";
@@ -820,20 +900,14 @@ void HdfsScanNodeBase::StopAndFinalizeCounters() {
       Substitute("Codegen enabled: $0 out of $1", num_enabled, total));
 
   if (reader_context_ != nullptr) {
-    bytes_read_local_->Set(
-        runtime_state_->io_mgr()->bytes_read_local(reader_context_.get()));
-    bytes_read_short_circuit_->Set(
-        runtime_state_->io_mgr()->bytes_read_short_circuit(reader_context_.get()));
-    bytes_read_dn_cache_->Set(
-        runtime_state_->io_mgr()->bytes_read_dn_cache(reader_context_.get()));
-    num_remote_ranges_->Set(static_cast<int64_t>(
-        runtime_state_->io_mgr()->num_remote_ranges(reader_context_.get())));
-    unexpected_remote_bytes_->Set(
-        runtime_state_->io_mgr()->unexpected_remote_bytes(reader_context_.get()));
-    cached_file_handles_hit_count_->Set(
-        runtime_state_->io_mgr()->cached_file_handles_hit_count(reader_context_.get()));
+    bytes_read_local_->Set(reader_context_->bytes_read_local());
+    bytes_read_short_circuit_->Set(reader_context_->bytes_read_short_circuit());
+    bytes_read_dn_cache_->Set(reader_context_->bytes_read_dn_cache());
+    num_remote_ranges_->Set(reader_context_->num_remote_ranges());
+    unexpected_remote_bytes_->Set(reader_context_->unexpected_remote_bytes());
+    cached_file_handles_hit_count_->Set(reader_context_->cached_file_handles_hit_count());
     cached_file_handles_miss_count_->Set(
-        runtime_state_->io_mgr()->cached_file_handles_miss_count(reader_context_.get()));
+        reader_context_->cached_file_handles_miss_count());
 
     if (unexpected_remote_bytes_->value() >= UNEXPECTED_REMOTE_BYTES_WARN_THRESHOLD) {
       runtime_state_->LogError(ErrorMsg(TErrorCode::GENERAL, Substitute(

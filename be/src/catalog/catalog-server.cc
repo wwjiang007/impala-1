@@ -157,7 +157,7 @@ CatalogServer::CatalogServer(MetricGroup* metrics)
   : thrift_iface_(new CatalogServiceThriftIf(this)),
     thrift_serializer_(FLAGS_compact_catalog_topic), metrics_(metrics),
     topic_updates_ready_(false), last_sent_catalog_version_(0L),
-    catalog_objects_min_version_(0L), catalog_objects_max_version_(0L) {
+    catalog_objects_max_version_(0L) {
   topic_processing_time_metric_ = StatsMetric<double>::CreateAndRegister(metrics,
       CATALOG_SERVER_TOPIC_PROCESSING_TIMES);
 }
@@ -186,7 +186,7 @@ Status CatalogServer::Start() {
 
   StatestoreSubscriber::UpdateCallback cb =
       bind<void>(mem_fn(&CatalogServer::UpdateCatalogTopicCallback), this, _1, _2);
-  status = statestore_subscriber_->AddTopic(IMPALA_CATALOG_TOPIC, false, cb);
+  status = statestore_subscriber_->AddTopic(IMPALA_CATALOG_TOPIC, false, false, cb);
   if (!status.ok()) {
     status.AddDetail("CatalogService failed to start");
     return status;
@@ -228,10 +228,12 @@ void CatalogServer::UpdateCatalogTopicCallback(
 
   const TTopicDelta& delta = topic->second;
 
-  // If not generating a delta update and 'pending_topic_updates_' doesn't already contain
-  // the full catalog (beginning with version 0), then force GatherCatalogUpdatesThread()
-  // to reload the full catalog.
-  if (delta.from_version == 0 && catalog_objects_min_version_ != 0) {
+  // If the statestore restarts, both from_version and to_version would be 0. If catalog
+  // has sent non-empty topic udpate, pending_topic_updates_ won't be from version 0 and
+  // it should be re-collected.
+  if (delta.from_version == 0 && delta.to_version == 0 &&
+      last_sent_catalog_version_ != 0) {
+    LOG(INFO) << "Statestore restart detected. Collecting a non-delta catalog update.";
     last_sent_catalog_version_ = 0L;
   } else if (!pending_topic_updates_.empty()) {
     // Process the pending topic update.
@@ -239,6 +241,12 @@ void CatalogServer::UpdateCatalogTopicCallback(
     TTopicDelta& update = subscriber_topic_updates->back();
     update.topic_name = IMPALA_CATALOG_TOPIC;
     update.topic_entries = std::move(pending_topic_updates_);
+    // If this is the first update sent to the statestore, instruct the
+    // statestore to clear any entries it may already have for the catalog
+    // update topic. This is to guarantee that upon catalog restart, the
+    // statestore entries of the catalog update topic are in sync with the
+    // catalog objects stored in the catalog (see IMPALA-6948).
+    update.__set_clear_topic_entries((last_sent_catalog_version_ == 0));
 
     VLOG(1) << "A catalog update with " << update.topic_entries.size()
             << " entries is assembled. Catalog version: "
@@ -257,7 +265,7 @@ void CatalogServer::UpdateCatalogTopicCallback(
 [[noreturn]] void CatalogServer::GatherCatalogUpdatesThread() {
   while (1) {
     unique_lock<mutex> unique_lock(catalog_lock_);
-    // Protect against spurious wakups by checking the value of topic_updates_ready_.
+    // Protect against spurious wake-ups by checking the value of topic_updates_ready_.
     // It is only safe to continue on and update the shared pending_topic_updates_
     // when topic_updates_ready_ is false, otherwise we may be in the middle of
     // processing a heartbeat.
@@ -284,7 +292,6 @@ void CatalogServer::UpdateCatalogTopicCallback(
       if (!status.ok()) {
         LOG(ERROR) << status.GetDetail();
       } else {
-        catalog_objects_min_version_ = last_sent_catalog_version_;
         catalog_objects_max_version_ = resp.max_catalog_version;
       }
     }
@@ -303,6 +310,16 @@ void CatalogServer::CatalogUrlCallback(const Webserver::ArgumentMap& args,
     Value error(status.GetDetail().c_str(), document->GetAllocator());
     document->AddMember("error", error, document->GetAllocator());
     return;
+  }
+  long current_catalog_version;
+  status = catalog_->GetCatalogVersion(&current_catalog_version);
+  if (status.ok()) {
+    Value version_value;
+    version_value.SetInt(current_catalog_version);
+    document->AddMember("version", version_value, document->GetAllocator());
+  } else {
+    Value error(status.GetDetail().c_str(), document->GetAllocator());
+    document->AddMember("versionError", error, document->GetAllocator());
   }
   Value databases(kArrayType);
   for (const TDatabase& db: get_dbs_result.dbs) {
@@ -358,9 +375,8 @@ void CatalogServer::GetCatalogUsage(Document* document) {
         large_table.table_name.table_name).c_str(), document->GetAllocator());
     tbl_obj.AddMember("name", tbl_name, document->GetAllocator());
     DCHECK(large_table.__isset.memory_estimate_bytes);
-    Value memory_estimate(PrettyPrinter::Print(large_table.memory_estimate_bytes,
-        TUnit::BYTES).c_str(), document->GetAllocator());
-    tbl_obj.AddMember("mem_estimate", memory_estimate, document->GetAllocator());
+    tbl_obj.AddMember("mem_estimate", large_table.memory_estimate_bytes,
+        document->GetAllocator());
     large_tables.PushBack(tbl_obj, document->GetAllocator());
   }
   Value has_large_tables;

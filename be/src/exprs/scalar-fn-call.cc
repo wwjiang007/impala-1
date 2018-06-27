@@ -124,8 +124,8 @@ Status ScalarFnCall::Init(const RowDescriptor& desc, RuntimeState* state) {
           fn_.name.function_name, MAX_INTERP_ARGS));
     }
 
-    Status status = LibCache::instance()->GetSoFunctionPtr(
-        fn_.hdfs_location, fn_.scalar_fn.symbol, &scalar_fn_, &cache_entry_);
+    Status status = LibCache::instance()->GetSoFunctionPtr(fn_.hdfs_location,
+        fn_.scalar_fn.symbol, fn_.last_modified_time, &scalar_fn_, &cache_entry_);
     if (!status.ok()) {
       if (fn_.binary_type == TFunctionBinaryType::BUILTIN) {
         // Builtins symbols should exist unless there is a version mismatch.
@@ -182,13 +182,13 @@ Status ScalarFnCall::OpenEvaluator(FunctionContext::FunctionStateScope scope,
 
     // If we're calling MathFunctions::RoundUpTo(), we need to set output_scale_
     // which determines how many decimal places are printed.
-    // TODO: Move this to Expr initialization.
-    if (this == &eval->root()) {
-      if (fn_.name.function_name == "round" && type_.type == TYPE_DOUBLE) {
-        DCHECK_EQ(children_.size(), 2);
-        IntVal* scale_arg = reinterpret_cast<IntVal*>(constant_args[1]);
-        if (scale_arg != nullptr) eval->output_scale_ = scale_arg->val;
-      }
+    // TODO: Move this to Expr initialization when IMPALA-4743 is fixed.
+    if (this == &eval->root() &&
+        fn_.name.function_name == "round" &&
+        type_.type == TYPE_DOUBLE &&
+        children_.size() == 2) {
+      BigIntVal* scale_arg = reinterpret_cast<BigIntVal*>(constant_args[1]);
+      if (scale_arg != nullptr) eval->output_scale_ = scale_arg->val;
     }
   }
 
@@ -427,7 +427,7 @@ Status ScalarFnCall::GetFunction(LlvmCodeGen* codegen, const string& symbol, voi
   if (fn_.binary_type == TFunctionBinaryType::NATIVE
       || fn_.binary_type == TFunctionBinaryType::BUILTIN) {
     return LibCache::instance()->GetSoFunctionPtr(
-        fn_.hdfs_location, symbol, fn, &cache_entry_);
+        fn_.hdfs_location, symbol, fn_.last_modified_time, fn, &cache_entry_);
   } else {
     DCHECK_EQ(fn_.binary_type, TFunctionBinaryType::IR);
     DCHECK(codegen != NULL);

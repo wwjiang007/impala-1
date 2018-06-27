@@ -20,10 +20,12 @@
 #include "common/logging.h"
 #include "gen-cpp/Frontend_types.h"
 #include "rpc/thrift-util.h"
+#include "runtime/coordinator.h"
 #include "runtime/exec-env.h"
 #include "runtime/raw-value.inline.h"
 #include "runtime/timestamp-value.h"
 #include "service/client-request-state.h"
+#include "service/frontend.h"
 #include "service/query-options.h"
 #include "service/query-result-set.h"
 #include "util/auth-util.h"
@@ -65,7 +67,6 @@ void ImpalaServer::query(QueryHandle& query_handle, const Query& query) {
   RAISE_IF_ERROR(Execute(&query_ctx, session, &request_state),
       SQLSTATE_SYNTAX_ERROR_OR_ACCESS_VIOLATION);
 
-  request_state->UpdateNonErrorQueryState(beeswax::QueryState::RUNNING);
   // start thread to wait for results to become available, which will allow
   // us to advance query state to FINISHED or EXCEPTION
   Status status = request_state->WaitAsync();
@@ -110,7 +111,6 @@ void ImpalaServer::executeAndWait(QueryHandle& query_handle, const Query& query,
   RAISE_IF_ERROR(Execute(&query_ctx, session, &request_state),
       SQLSTATE_SYNTAX_ERROR_OR_ACCESS_VIOLATION);
 
-  request_state->UpdateNonErrorQueryState(beeswax::QueryState::RUNNING);
   // Once the query is running do a final check for session closure and add it to the
   // set of in-flight queries.
   Status status = SetQueryInflight(session, request_state);
@@ -255,9 +255,10 @@ beeswax::QueryState::type ImpalaServer::get_state(const QueryHandle& handle) {
   // Take the lock to ensure that if the client sees a query_state == EXCEPTION, it is
   // guaranteed to see the error query_status.
   lock_guard<mutex> l(*request_state->lock());
-  DCHECK_EQ(request_state->query_state() == beeswax::QueryState::EXCEPTION,
+  beeswax::QueryState::type query_state = request_state->BeeswaxQueryState();
+  DCHECK_EQ(query_state == beeswax::QueryState::EXCEPTION,
       !request_state->query_status().ok());
-  return request_state->query_state();
+  return query_state;
 }
 
 void ImpalaServer::echo(string& echo_string, const string& input_string) {
@@ -283,7 +284,7 @@ void ImpalaServer::get_log(string& log, const LogContextId& context) {
   shared_ptr<ClientRequestState> request_state = GetClientRequestState(query_id);
   if (request_state.get() == nullptr) {
     stringstream str;
-    str << "unknown query id: " << query_id;
+    str << "unknown query id: " << PrintId(query_id);
     LOG(ERROR) << str.str();
     return;
   }
@@ -293,7 +294,7 @@ void ImpalaServer::get_log(string& log, const LogContextId& context) {
     // Take the lock to ensure that if the client sees a query_state == EXCEPTION, it is
     // guaranteed to see the error query_status.
     lock_guard<mutex> l(*request_state->lock());
-    DCHECK_EQ(request_state->query_state() == beeswax::QueryState::EXCEPTION,
+    DCHECK_EQ(request_state->BeeswaxQueryState() == beeswax::QueryState::EXCEPTION,
         !request_state->query_status().ok());
     // If the query status is !ok, include the status error message at the top of the log.
     if (!request_state->query_status().ok()) {
@@ -307,8 +308,8 @@ void ImpalaServer::get_log(string& log, const LogContextId& context) {
   }
 
   // Add warnings from execution
-  if (request_state->coord() != nullptr) {
-    const std::string coord_errors = request_state->coord()->GetErrorLog();
+  if (request_state->GetCoordinator() != nullptr) {
+    const std::string coord_errors = request_state->GetCoordinator()->GetErrorLog();
     if (!coord_errors.empty()) error_log_ss << coord_errors << "\n";
   }
   log = error_log_ss.str();
@@ -455,7 +456,7 @@ Status ImpalaServer::QueryToTQueryContext(const Query& query,
 
   // Only query options not set in the session or confOverlay can be overridden by the
   // pool options.
-  AddPoolQueryOptions(query_ctx, ~set_query_options_mask);
+  AddPoolConfiguration(query_ctx, ~set_query_options_mask);
   VLOG_QUERY << "TClientRequest.queryOptions: "
              << ThriftDebugString(query_ctx->client_request.query_options);
   return Status::OK();
@@ -562,22 +563,8 @@ Status ImpalaServer::CloseInsertInternal(const TUniqueId& query_id,
       // Note that when IMPALA-87 is fixed (INSERT without FROM clause) we might
       // need to revisit this, since that might lead us to insert a row without a
       // coordinator, depending on how we choose to drive the table sink.
-      int64_t num_row_errors = 0;
-      bool has_kudu_stats = false;
-      if (request_state->coord() != nullptr) {
-        for (const PartitionStatusMap::value_type& v:
-             request_state->coord()->per_partition_status()) {
-          const pair<string, TInsertPartitionStatus> partition_status = v;
-          insert_result->rows_modified[partition_status.first] =
-              partition_status.second.num_modified_rows;
-
-          if (partition_status.second.__isset.stats &&
-              partition_status.second.stats.__isset.kudu_stats) {
-            has_kudu_stats = true;
-          }
-          num_row_errors += partition_status.second.stats.kudu_stats.num_row_errors;
-        }
-        if (has_kudu_stats) insert_result->__set_num_row_errors(num_row_errors);
+      if (request_state->GetCoordinator() != nullptr) {
+        request_state->GetCoordinator()->dml_exec_state()->ToTInsertResult(insert_result);
       }
     }
   }

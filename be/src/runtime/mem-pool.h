@@ -155,6 +155,9 @@ class MemPool {
   /// All offsets handed out by calls to GetCurrentOffset() for 'src' become invalid.
   void AcquireData(MemPool* src, bool keep_current);
 
+  /// Change the MemTracker, updating consumption on the current and new tracker.
+  void SetMemTracker(MemTracker* new_tracker);
+
   std::string DebugString();
 
   int64_t total_allocated_bytes() const { return total_allocated_bytes_; }
@@ -175,8 +178,9 @@ class MemPool {
   static const int INITIAL_CHUNK_SIZE = 4 * 1024;
 
   /// The maximum size of chunk that should be allocated. Allocations larger than this
-  /// size will get their own individual chunk.
-  static const int MAX_CHUNK_SIZE = 1024 * 1024;
+  /// size will get their own individual chunk. Chosen to be small enough that it gets
+  /// a freelist in TCMalloc's central cache.
+  static const int MAX_CHUNK_SIZE = 512 * 1024;
 
   struct ChunkInfo {
     uint8_t* data; // Owned by the ChunkInfo.

@@ -18,12 +18,18 @@
 # under the License.
 
 set -euo pipefail
-trap 'echo Error in $0 at line $LINENO: $(cd "'$PWD'" && awk "NR == $LINENO" $0)' ERR
 
 # run buildall.sh -help to see options
-
 ROOT=`dirname "$0"`
 ROOT=`cd "$ROOT" >/dev/null; pwd`
+
+if [[ "'$ROOT'" =~ [[:blank:]] ]]
+then
+   echo "IMPALA_HOME cannot have spaces in the path"
+   exit 1
+fi
+
+trap 'echo Error in $0 at line $LINENO: $(cd "'$PWD'" && awk "NR == $LINENO" $0)' ERR
 
 # Grab this *before* we source impala-config.sh to see if the caller has
 # kerberized environment variables already or not.
@@ -177,6 +183,9 @@ do
       LZO_CMAKE_ARGS+=" -GNinja"
       MAKE_CMD=ninja
       ;;
+    -cmake_only)
+      MAKE_IMPALA_ARGS+=" -cmake_only"
+      ;;
     -help|*)
       echo "buildall.sh - Builds Impala and runs all tests."
       echo "[-noclean] : Omits cleaning all packages before building. Will not kill"\
@@ -211,6 +220,8 @@ do
       echo "[-so|-build_shared_libs] : Dynamically link executables (default is static)"
       echo "[-kerberize] : Enable kerberos on the cluster"
       echo "[-fe_only] : Build just the frontend"
+      echo "[-ninja] : Use ninja instead of make"
+      echo "[-cmake_only] : Generate makefiles only, instead of doing a full build"
       echo "-----------------------------------------------------------------------------
 Examples of common tasks:
 
@@ -328,7 +339,7 @@ bootstrap_dependencies() {
     echo "SKIP_TOOLCHAIN_BOOTSTRAP is true, skipping download of Python dependencies."
     echo "SKIP_TOOLCHAIN_BOOTSTRAP is true, skipping toolchain bootstrap."
   else
-    echo "Downloading Python dependencies"
+    echo ">>> Downloading Python dependencies"
     # Download all the Python dependencies we need before doing anything
     # of substance. Does not re-download anything that is already present.
     if ! "$IMPALA_HOME/infra/python/deps/download_requirements"; then
@@ -338,9 +349,12 @@ bootstrap_dependencies() {
       echo "Finished downloading Python dependencies"
     fi
 
-    echo "Downloading and extracting toolchain dependencies."
+    echo ">>> Downloading and extracting toolchain dependencies."
     "$IMPALA_HOME/bin/bootstrap_toolchain.py"
     echo "Toolchain bootstrap complete."
+
+    # Reset python path to include thrift
+    . "$IMPALA_HOME/bin/set-pythonpath.sh"
   fi
 }
 
@@ -351,6 +365,7 @@ build_fe() {
 
 # Build all components.
 build_all_components() {
+  echo ">>> Building all components"
   # Build the Impala frontend, backend and external data source API.
   MAKE_IMPALA_ARGS+=" -fe -cscope -tarballs"
   if [[ -e "$IMPALA_LZO" ]]
@@ -415,6 +430,7 @@ start_test_cluster_dependencies() {
 # This does all data loading, except for the metastore snapshot which must be loaded
 # earlier before the cluster is running.
 load_test_data() {
+  echo ">>> Loading test data"
   "$IMPALA_HOME/bin/create_testdata.sh"
   # We have 4 cases:
   # - test-warehouse and metastore snapshots exists.

@@ -30,6 +30,7 @@ IS_ISILON = FILESYSTEM == "isilon"
 IS_LOCAL = FILESYSTEM == "local"
 IS_HDFS = FILESYSTEM == "hdfs"
 IS_ADLS = FILESYSTEM == "adls"
+IS_EC = os.getenv("ERASURE_CODING") == "true"
 # This condition satisfies both the states where one can assume a default fs
 #   - The environment variable is set to an empty string.
 #   - Tne environment variables is unset ( None )
@@ -49,10 +50,14 @@ ADLS_CLIENT_ID = os.getenv("azure_client_id")
 ADLS_TENANT_ID = os.getenv("azure_tenant_id")
 ADLS_CLIENT_SECRET = os.getenv("azure_client_secret")
 
+def prepend_with_fs(fs, path):
+  """Prepend 'path' with 'fs' if it's not already the prefix."""
+  return path if path.startswith(fs) else "%s%s" % (fs, path)
+
 def get_fs_path(path):
-  return "%s%s" % (FILESYSTEM_PREFIX, path)
+  return prepend_with_fs(FILESYSTEM_PREFIX, path)
 
 def get_secondary_fs_path(path):
-  return "%s%s" % (SECONDARY_FILESYSTEM, path)
+  return prepend_with_fs(SECONDARY_FILESYSTEM, path)
 
 WAREHOUSE = get_fs_path('/test-warehouse')

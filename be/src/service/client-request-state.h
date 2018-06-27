@@ -18,17 +18,19 @@
 #ifndef IMPALA_SERVICE_CLIENT_REQUEST_STATE_H
 #define IMPALA_SERVICE_CLIENT_REQUEST_STATE_H
 
+#include "common/atomic.h"
 #include "common/status.h"
 #include "exec/catalog-op-executor.h"
 #include "runtime/timestamp-value.h"
 #include "scheduling/query-schedule.h"
 #include "service/child-query.h"
 #include "service/impala-server.h"
+#include "service/query-result-set.h"
 #include "util/auth-util.h"
 #include "util/condition-variable.h"
 #include "util/runtime-profile.h"
 #include "gen-cpp/Frontend_types.h"
-#include "gen-cpp/Frontend_types.h"
+#include "gen-cpp/ImpalaHiveServer2Service.h"
 
 #include <boost/thread.hpp>
 #include <boost/unordered_set.hpp>
@@ -44,6 +46,7 @@ class Expr;
 class TupleRow;
 class Frontend;
 class ClientRequestStateCleaner;
+enum class AdmissionOutcome;
 
 /// Execution state of the client-facing side a query. This captures everything
 /// necessary to convert row batches received by the coordinator into results
@@ -63,7 +66,9 @@ class ClientRequestState {
 
   ~ClientRequestState();
 
-  /// Initiates execution of a exec_request.
+  /// Based on query type, this either initiates execution of a exec_request or submits
+  /// the query to the Admission controller for asynchronous admission control. When this
+  /// returns the operation state is either RUNNING_STATE or PENDING_STATE.
   /// Non-blocking.
   /// Must *not* be called with lock_ held.
   Status Exec(TExecRequest* exec_request) WARN_UNUSED_RESULT;
@@ -74,8 +79,8 @@ class ClientRequestState {
   Status Exec(const TMetadataOpRequest& exec_request) WARN_UNUSED_RESULT;
 
   /// Call this to ensure that rows are ready when calling FetchRows(). Updates the
-  /// query_status_, and advances query_state_ to FINISHED or EXCEPTION. Must be preceded
-  /// by call to Exec(). Waits for all child queries to complete. Takes lock_.
+  /// query_status_, and advances operation_state_ to FINISHED or EXCEPTION. Must be
+  /// preceded by call to Exec(). Waits for all child queries to complete. Takes lock_.
   void Wait();
 
   /// Calls Wait() asynchronously in a thread and returns immediately.
@@ -93,7 +98,7 @@ class ClientRequestState {
   /// Caller needs to hold fetch_rows_lock_ and lock_.
   /// Caller should verify that EOS has not be reached before calling.
   /// Must be preceeded by call to Wait() (or WaitAsync()/BlockOnWait()).
-  /// Also updates query_state_/status_ in case of error.
+  /// Also updates operation_state_/query_status_ in case of error.
   Status FetchRows(const int32_t max_rows, QueryResultSet* fetched_rows)
       WARN_UNUSED_RESULT;
 
@@ -106,11 +111,12 @@ class ClientRequestState {
   /// The caller must hold fetch_rows_lock_ and lock_.
   Status RestartFetch() WARN_UNUSED_RESULT;
 
-  /// Update query state if the requested state isn't already obsolete. This is only for
-  /// non-error states - if the query encounters an error the query status needs to be set
-  /// with information about the error so UpdateQueryStatus must be used instead.
-  /// Takes lock_.
-  void UpdateNonErrorQueryState(beeswax::QueryState::type query_state);
+  /// Update operation state if the requested state isn't already obsolete. This is
+  /// only for non-error states (PENDING_STATE, RUNNING_STATE and FINISHED_STATE) - if the
+  /// query encounters an error the query status needs to be set with information about
+  /// the error so UpdateQueryStatus() must be used instead. Takes lock_.
+  void UpdateNonErrorOperationState(
+      apache::hive::service::cli::thrift::TOperationState::type operation_state);
 
   /// Update the query status and the "Query Status" summary profile string.
   /// If current status is already != ok, no update is made (we preserve the first error)
@@ -123,9 +129,9 @@ class ClientRequestState {
   Status UpdateQueryStatus(const Status& status) WARN_UNUSED_RESULT;
 
   /// Cancels the child queries and the coordinator with the given cause.
-  /// If cause is NULL, assume this was deliberately cancelled by the user.
-  /// Otherwise, sets state to EXCEPTION.
-  /// Does nothing if the query has reached EOS or already cancelled.
+  /// If cause is NULL, it assume this was deliberately cancelled by the user while in
+  /// FINISHED operation state. Otherwise, sets state to ERROR_STATE (TODO: IMPALA-1262:
+  /// use CANCELED_STATE). Does nothing if the query has reached EOS or already cancelled.
   ///
   /// Only returns an error if 'check_inflight' is true and the query is not yet
   /// in-flight. Otherwise, proceed and return Status::OK() even if the query isn't
@@ -137,9 +143,18 @@ class ClientRequestState {
   void Done();
 
   /// Sets the API-specific (Beeswax, HS2) result cache and its size bound.
-  /// The given cache is owned by this query exec state, even if an error is returned.
+  /// The given cache is owned by this client request state, even if an error is returned.
   /// Returns a non-ok status if max_size exceeds the per-impalad allowed maximum.
   Status SetResultCache(QueryResultSet* cache, int64_t max_size) WARN_UNUSED_RESULT;
+
+  /// Wrappers around Coordinator::UpdateBackendExecStatus() and
+  /// Coordinator::UpdateFilter() respectively for the coordinator object associated with
+  /// 'this' ClientRequestState object. It ensures that these updates are applied to the
+  /// coordinator even before it becomes accessible through GetCoordinator(). These
+  /// methods should be used instead of calling them directly using the coordinator
+  /// object.
+  Status UpdateBackendExecStatus(const TReportExecStatusParams& params);
+  void UpdateFilter(const TUpdateFilterParams& params);
 
   ImpalaServer::SessionState* session() const { return session_.get(); }
 
@@ -154,15 +169,22 @@ class ClientRequestState {
   const TUniqueId& session_id() const { return query_ctx_.session.session_id; }
   const std::string& default_db() const { return query_ctx_.session.database; }
   bool eos() const { return eos_; }
-  Coordinator* coord() const { return coord_.get(); }
   QuerySchedule* schedule() { return schedule_.get(); }
+
+  /// Returns the Coordinator for 'QUERY' and 'DML' requests once Coordinator::Exec()
+  /// completes successfully. Otherwise returns null.
+  Coordinator* GetCoordinator() const {
+    return coord_exec_called_.Load() ? coord_.get() : nullptr;
+  }
 
   /// Resource pool associated with this query, or an empty string if the schedule has not
   /// been created and had the pool set yet, or this StmtType doesn't go through admission
   /// control.
+  /// Admission control resource pool associated with this query.
   std::string request_pool() const {
-    return schedule_ == nullptr ? "" : schedule_->request_pool();
+    return query_ctx_.__isset.request_pool ? query_ctx_.request_pool : "";
   }
+
   int num_rows_fetched() const { return num_rows_fetched_; }
   void set_fetched_rows() { fetched_rows_ = true; }
   bool fetched_rows() const { return fetched_rows_; }
@@ -179,7 +201,12 @@ class ClientRequestState {
   }
   boost::mutex* lock() { return &lock_; }
   boost::mutex* fetch_rows_lock() { return &fetch_rows_lock_; }
-  beeswax::QueryState::type query_state() const { return query_state_; }
+  apache::hive::service::cli::thrift::TOperationState::type operation_state() const {
+    return operation_state_;
+  }
+  // Translate operation_state() to a beeswax::QueryState. TODO: remove calls to this
+  // and replace with uses of operation_state() directly.
+  beeswax::QueryState::type BeeswaxQueryState() const;
   const Status& query_status() const { return query_status_; }
   void set_result_metadata(const TResultSetMetadata& md) { result_metadata_ = md; }
   void set_user_profile_access(bool user_has_profile_access) {
@@ -252,6 +279,12 @@ class ClientRequestState {
   /// Executor for any child queries (e.g. compute stats subqueries). Always non-NULL.
   const boost::scoped_ptr<ChildQueryExecutor> child_query_executor_;
 
+  /// Promise used by the admission controller. AdmissionController:AdmitQuery() will
+  /// block on this promise until the query is either rejected, admitted, times out, or is
+  /// cancelled. Can be set to CANCELLED by the ClientRequestState in order to cancel, but
+  /// otherwise is set by AdmissionController with the admission decision.
+  Promise<AdmissionOutcome, PromiseMode::MULTIPLE_PRODUCER> admit_outcome_;
+
   /// Protects all following fields. Acquirers should be careful not to hold it for too
   /// long, e.g. during RPCs because this lock is required to make progress on various
   /// ImpalaServer requests. If held for too long it can block progress of client
@@ -279,8 +312,23 @@ class ClientRequestState {
   /// Resource assignment determined by scheduler. Owned by obj_pool_.
   boost::scoped_ptr<QuerySchedule> schedule_;
 
-  /// Not set for ddl queries.
+  /// Thread for asynchronously running the admission control code-path and starting
+  /// execution in the following cases:
+  /// 1. exec_request().stmt_type == QUERY or DML.
+  /// 2. CTAS query for creating a table that does not exist.
+  std::unique_ptr<Thread> async_exec_thread_;
+
+  /// Set by the async-exec-thread after successful admission. Accessed through
+  /// GetCoordinator() since most Coordinator methods can be called only after
+  /// Coordinator::Exec() returns success. The only exceptions to this are
+  /// FinishExecQueryOrDmlRequest(), which initializes it, calls Exec() on it and sets
+  /// 'coord_exec_called_' to true, and UpdateBackendExecStatus() and UpdateFilter(),
+  /// which can be called before Coordinator::Exec() returns.
   boost::scoped_ptr<Coordinator> coord_;
+
+  /// Used by GetCoordinator() to check if 'coord_' can be made accessible. Set to true by
+  /// the async-exec-thread only after Exec() has been successfully called on 'coord_'.
+  AtomicBool coord_exec_called_;
 
   /// Runs statements that query or modify the catalog via the CatalogService.
   boost::scoped_ptr<CatalogOpExecutor> catalog_op_executor_;
@@ -335,15 +383,20 @@ class ClientRequestState {
 
   bool is_cancelled_ = false; // if true, Cancel() was called.
   bool eos_ = false;  // if true, there are no more rows to return
-  /// We enforce the invariant that query_status_ is not OK iff query_state_ is EXCEPTION,
-  /// given that lock_ is held. query_state_ should only be updated using
-  /// UpdateQueryState(), to ensure that the query profile is also updated.
-  beeswax::QueryState::type query_state_ = beeswax::QueryState::CREATED;
+
+  /// We enforce the invariant that query_status_ is not OK iff operation_state_ is
+  /// ERROR_STATE, given that lock_ is held. operation_state_ should only be updated
+  /// using UpdateOperationState(), to ensure that the query profile is also updated.
+  apache::hive::service::cli::thrift::TOperationState::type operation_state_ =
+      apache::hive::service::cli::thrift::TOperationState::INITIALIZED_STATE;
+
   Status query_status_;
   TExecRequest exec_request_;
+
   /// If true, effective_user() has access to the runtime profile and execution
   /// summary.
   bool user_has_profile_access_ = true;
+
   TResultSetMetadata result_metadata_; // metadata for select query
   RowBatch* current_batch_ = nullptr; // the current row batch; only applicable if coord is set
   int current_batch_row_ = 0 ; // number of rows fetched within the current batch
@@ -378,15 +431,18 @@ class ClientRequestState {
   /// actively processed. Takes expiration_data_lock_.
   void MarkActive();
 
-  /// Core logic of initiating a query or dml execution request.
-  /// Initiates execution of plan fragments, if there are any, and sets
-  /// up the output exprs for subsequent calls to FetchRows().
-  /// 'coord_' is only valid after this method is called, and may be invalid if it
-  /// returns an error.
-  /// Also sets up profile and pre-execution counters.
+  /// Sets up profile and pre-execution counters, creates the query schedule, and spawns
+  /// a thread that calls FinishExecQueryOrDmlRequest() which contains the core logic of
+  /// executing a QUERY or DML execution request.
   /// Non-blocking.
-  Status ExecQueryOrDmlRequest(const TQueryExecRequest& query_exec_request)
+  Status ExecAsyncQueryOrDmlRequest(const TQueryExecRequest& query_exec_request)
       WARN_UNUSED_RESULT;
+
+  /// Submits the QuerySchedule to the admission controller and on successful admission,
+  /// starts up the coordinator execution, makes it accessible by setting
+  /// 'coord_exec_called_' to true and advances operation_state_ to RUNNING. Handles
+  /// async cancellation of queries and cleans up state if needed.
+  void FinishExecQueryOrDmlRequest();
 
   /// Core logic of executing a ddl statement. May internally initiate execution of
   /// queries (e.g., compute stats) or dml (e.g., create table as select)
@@ -395,10 +451,10 @@ class ClientRequestState {
   /// Executes a LOAD DATA
   Status ExecLoadDataRequest() WARN_UNUSED_RESULT;
 
-  /// Core logic of Wait(). Does not update query_state_/status_.
+  /// Core logic of Wait(). Does not update operation_state_/query_status_.
   Status WaitInternal() WARN_UNUSED_RESULT;
 
-  /// Core logic of FetchRows(). Does not update query_state_/status_.
+  /// Core logic of FetchRows(). Does not update operation_state_/query_status_.
   /// Caller needs to hold fetch_rows_lock_ and lock_.
   Status FetchRowsInternal(const int32_t max_rows, QueryResultSet* fetched_rows)
       WARN_UNUSED_RESULT;
@@ -420,7 +476,7 @@ class ClientRequestState {
 
   /// Sets the result set for a CREATE TABLE AS SELECT statement. The results will not be
   /// ready until all BEs complete execution. This can be called as part of Wait(),
-  /// at which point results will be avilable.
+  /// at which point results will be available.
   void SetCreateTableAsSelectResultSet();
 
   /// Updates the metastore's table and column statistics based on the child-query results
@@ -436,10 +492,11 @@ class ClientRequestState {
   /// This function is a no-op if the cache has already been cleared.
   void ClearResultCache();
 
-  /// Update the query state and the "Query State" summary profile string.
+  /// Update the operation state and the "Query State" summary profile string.
   /// Does not take lock_, but requires it: caller must ensure lock_
-  /// is taken before calling UpdateQueryState.
-  void UpdateQueryState(beeswax::QueryState::type query_state);
+  /// is taken before calling UpdateOperationState.
+  void UpdateOperationState(
+      apache::hive::service::cli::thrift::TOperationState::type operation_state);
 
   /// Gets the query options, their values and levels and populates the result set
   /// with them. It covers the subset of options for 'SET' and all of them for

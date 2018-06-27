@@ -17,6 +17,7 @@
 
 #include "exec/hdfs-parquet-scanner.h"
 
+#include <algorithm>
 #include <queue>
 
 #include <gutil/strings/substitute.h>
@@ -27,7 +28,9 @@
 #include "exec/parquet-column-stats.h"
 #include "exec/scanner-context.inline.h"
 #include "runtime/collection-value-builder.h"
+#include "runtime/exec-env.h"
 #include "runtime/io/disk-io-mgr.h"
+#include "runtime/io/request-context.h"
 #include "runtime/runtime-state.h"
 #include "runtime/runtime-filter.inline.h"
 #include "rpc/thrift-util.h"
@@ -35,21 +38,9 @@
 #include "common/names.h"
 
 using std::move;
+using std::sort;
 using namespace impala;
 using namespace impala::io;
-
-DEFINE_double(parquet_min_filter_reject_ratio, 0.1, "(Advanced) If the percentage of "
-    "rows rejected by a runtime filter drops below this value, the filter is disabled.");
-
-// The number of row batches between checks to see if a filter is effective, and
-// should be disabled. Must be a power of two.
-constexpr int BATCHES_PER_FILTER_SELECTIVITY_CHECK = 16;
-static_assert(BitUtil::IsPowerOf2(BATCHES_PER_FILTER_SELECTIVITY_CHECK),
-    "BATCHES_PER_FILTER_SELECTIVITY_CHECK must be a power of two");
-
-// Max dictionary page header size in bytes. This is an estimate and only needs to be an
-// upper bound.
-const int MAX_DICT_HEADER_SIZE = 100;
 
 // Max entries in the dictionary before switching to PLAIN encoding. If a dictionary
 // has fewer entries, then the entire column is dictionary encoded. This threshold
@@ -57,86 +48,38 @@ const int MAX_DICT_HEADER_SIZE = 100;
 // THIS RECORDS INFORMATION ABOUT PAST BEHAVIOR. DO NOT CHANGE THIS CONSTANT.
 const int LEGACY_IMPALA_MAX_DICT_ENTRIES = 40000;
 
-const int64_t HdfsParquetScanner::FOOTER_SIZE;
 const int16_t HdfsParquetScanner::ROW_GROUP_END;
 const int16_t HdfsParquetScanner::INVALID_LEVEL;
 const int16_t HdfsParquetScanner::INVALID_POS;
 
 const char* HdfsParquetScanner::LLVM_CLASS_NAME = "class.impala::HdfsParquetScanner";
 
-const string PARQUET_MEM_LIMIT_EXCEEDED =
+static const string PARQUET_MEM_LIMIT_EXCEEDED =
     "HdfsParquetScanner::$0() failed to allocate $1 bytes for $2.";
+
+namespace impala {
+
+static const string IDEAL_RESERVATION_COUNTER_NAME = "ParquetRowGroupIdealReservation";
+static const string ACTUAL_RESERVATION_COUNTER_NAME = "ParquetRowGroupActualReservation";
 
 Status HdfsParquetScanner::IssueInitialRanges(HdfsScanNodeBase* scan_node,
     const vector<HdfsFileDesc*>& files) {
-  vector<ScanRange*> footer_ranges;
-  for (int i = 0; i < files.size(); ++i) {
+  DCHECK(!files.empty());
+  // Add Parquet-specific counters.
+  ADD_SUMMARY_STATS_COUNTER(
+      scan_node->runtime_profile(), IDEAL_RESERVATION_COUNTER_NAME, TUnit::BYTES);
+  ADD_SUMMARY_STATS_COUNTER(
+      scan_node->runtime_profile(), ACTUAL_RESERVATION_COUNTER_NAME, TUnit::BYTES);
+
+  for (HdfsFileDesc* file : files) {
     // If the file size is less than 12 bytes, it is an invalid Parquet file.
-    if (files[i]->file_length < 12) {
+    if (file->file_length < 12) {
       return Status(Substitute("Parquet file $0 has an invalid file length: $1",
-          files[i]->filename, files[i]->file_length));
-    }
-    // Compute the offset of the file footer.
-    int64_t footer_size = min(FOOTER_SIZE, files[i]->file_length);
-    int64_t footer_start = files[i]->file_length - footer_size;
-    DCHECK_GE(footer_start, 0);
-
-    // Try to find the split with the footer.
-    ScanRange* footer_split = FindFooterSplit(files[i]);
-
-    for (int j = 0; j < files[i]->splits.size(); ++j) {
-      ScanRange* split = files[i]->splits[j];
-
-      DCHECK_LE(split->offset() + split->len(), files[i]->file_length);
-      // If there are no materialized slots (such as count(*) over the table), we can
-      // get the result with the file metadata alone and don't need to read any row
-      // groups. We only want a single node to process the file footer in this case,
-      // which is the node with the footer split.  If it's not a count(*), we create a
-      // footer range for the split always.
-      if (!scan_node->IsZeroSlotTableScan() || footer_split == split) {
-        ScanRangeMetadata* split_metadata =
-            static_cast<ScanRangeMetadata*>(split->meta_data());
-        // Each split is processed by first issuing a scan range for the file footer, which
-        // is done here, followed by scan ranges for the columns of each row group within
-        // the actual split (in InitColumns()). The original split is stored in the
-        // metadata associated with the footer range.
-        ScanRange* footer_range;
-        if (footer_split != nullptr) {
-          footer_range = scan_node->AllocateScanRange(files[i]->fs,
-              files[i]->filename.c_str(), footer_size, footer_start,
-              split_metadata->partition_id, footer_split->disk_id(),
-              footer_split->expected_local(),
-              BufferOpts(footer_split->try_cache(), files[i]->mtime), split);
-        } else {
-          // If we did not find the last split, we know it is going to be a remote read.
-          footer_range =
-              scan_node->AllocateScanRange(files[i]->fs, files[i]->filename.c_str(),
-                  footer_size, footer_start, split_metadata->partition_id, -1, false,
-                  BufferOpts::Uncached(), split);
-        }
-
-        footer_ranges.push_back(footer_range);
-      } else {
-        scan_node->RangeComplete(THdfsFileFormat::PARQUET, THdfsCompression::NONE);
-      }
+          file->filename, file->file_length));
     }
   }
-  // The threads that process the footer will also do the scan, so we mark all the files
-  // as complete here.
-  RETURN_IF_ERROR(scan_node->AddDiskIoRanges(footer_ranges, files.size()));
-  return Status::OK();
+  return IssueFooterRanges(scan_node, THdfsFileFormat::PARQUET, files);
 }
-
-ScanRange* HdfsParquetScanner::FindFooterSplit(HdfsFileDesc* file) {
-  DCHECK(file != nullptr);
-  for (int i = 0; i < file->splits.size(); ++i) {
-    ScanRange* split = file->splits[i];
-    if (split->offset() + split->len() == file->file_length) return split;
-  }
-  return nullptr;
-}
-
-namespace impala {
 
 HdfsParquetScanner::HdfsParquetScanner(HdfsScanNodeBase* scan_node, RuntimeState* state)
   : HdfsScanner(scan_node, state),
@@ -228,6 +171,7 @@ Status HdfsParquetScanner::Open(ScannerContext* context) {
 
   // Release I/O buffers immediately to make sure they are cleaned up
   // in case we return a non-OK status anywhere below.
+  stream_ = nullptr;
   context_->ReleaseCompletedResources(true);
   context_->ClearStreams();
   RETURN_IF_ERROR(footer_status);
@@ -247,10 +191,6 @@ Status HdfsParquetScanner::Open(ScannerContext* context) {
   template_tuple_ = template_tuple_map_[scan_node_->tuple_desc()];
 
   RETURN_IF_ERROR(InitDictFilterStructures());
-
-  // The scanner-wide stream was used only to read the file footer.  Each column has added
-  // its own stream.
-  stream_ = nullptr;
   return Status::OK();
 }
 
@@ -379,18 +319,6 @@ int HdfsParquetScanner::CountScalarColumns(const vector<ParquetColumnReader*>& c
   return num_columns;
 }
 
-void HdfsParquetScanner::CheckFiltersEffectiveness() {
-  for (int i = 0; i < filter_stats_.size(); ++i) {
-    LocalFilterStats* stats = &filter_stats_[i];
-    const RuntimeFilter* filter = filter_ctxs_[i]->filter;
-    double reject_ratio = stats->rejected / static_cast<double>(stats->considered);
-    if (filter->AlwaysTrue() ||
-        reject_ratio < FLAGS_parquet_min_filter_reject_ratio) {
-      stats->enabled = 0;
-    }
-  }
-}
-
 Status HdfsParquetScanner::ProcessSplit() {
   DCHECK(scan_node_->HasRowBatchQueue());
   HdfsScanNode* scan_node = static_cast<HdfsScanNode*>(scan_node_);
@@ -435,8 +363,8 @@ Status HdfsParquetScanner::GetNextInternal(RowBatch* row_batch) {
       Tuple* dst_tuple = reinterpret_cast<Tuple*>(tuple_buf);
       TupleRow* dst_row = row_batch->GetRow(row_batch->AddRow());
       InitTuple(template_tuple_, dst_tuple);
-      int64_t* dst_slot = reinterpret_cast<int64_t*>(dst_tuple->GetSlot(
-          scan_node_->parquet_count_star_slot_offset()));
+      int64_t* dst_slot =
+          dst_tuple->GetBigIntSlot(scan_node_->parquet_count_star_slot_offset());
       *dst_slot = file_metadata_.row_groups[row_group_idx_].num_rows;
       row_group_rows_read_ += *dst_slot;
       dst_row->SetTuple(0, dst_tuple);
@@ -674,15 +602,13 @@ Status HdfsParquetScanner::NextRowGroup() {
     }
 
     InitCollectionColumns();
+    RETURN_IF_ERROR(InitScalarColumns());
 
-    // Prepare dictionary filtering columns for first read
-    // This must be done before dictionary filtering, because this code initializes
-    // the column offsets and streams needed to read the dictionaries.
-    // TODO: Restructure the code so that the dictionary can be read without the rest
-    // of the column.
-    RETURN_IF_ERROR(InitScalarColumns(row_group_idx_, dict_filterable_readers_));
+    // Start scanning dictionary filtering column readers, so we can read the dictionary
+    // pages in EvalDictionaryFilters().
+    RETURN_IF_ERROR(BaseScalarColumnReader::StartScans(dict_filterable_readers_));
 
-    // InitColumns() may have allocated resources to scan columns. If we skip this row
+    // StartScans() may have allocated resources to scan columns. If we skip this row
     // group below, we must call ReleaseSkippedRowGroupResources() before continuing.
 
     // If there is a dictionary-encoded column where every value is eliminated
@@ -703,45 +629,19 @@ Status HdfsParquetScanner::NextRowGroup() {
     }
 
     // At this point, the row group has passed any filtering criteria
-    // Prepare non-dictionary filtering column readers for first read and
-    // initialize their dictionaries.
-    RETURN_IF_ERROR(InitScalarColumns(row_group_idx_, non_dict_filterable_readers_));
-    status = InitDictionaries(non_dict_filterable_readers_);
+    // Start scanning non-dictionary filtering column readers and initialize their
+    // dictionaries.
+    RETURN_IF_ERROR(BaseScalarColumnReader::StartScans(non_dict_filterable_readers_));
+    status = BaseScalarColumnReader::InitDictionaries(non_dict_filterable_readers_);
     if (!status.ok()) {
       // Either return an error or skip this row group if it is ok to ignore errors
       RETURN_IF_ERROR(state_->LogOrReturnError(status.msg()));
       ReleaseSkippedRowGroupResources();
       continue;
     }
-
-    bool seeding_failed = false;
-    for (ParquetColumnReader* col_reader: column_readers_) {
-      // Seed collection and boolean column readers with NextLevel().
-      // The ScalarColumnReaders use an optimized ReadValueBatch() that
-      // should not be seeded.
-      // TODO: Refactor the column readers to look more like the optimized
-      // ScalarColumnReader::ReadValueBatch() which does not need seeding. This
-      // will allow better sharing of code between the row-wise and column-wise
-      // materialization strategies.
-      if (col_reader->NeedsSeedingForBatchedReading()
-          && !col_reader->NextLevels()) {
-        seeding_failed = true;
-        break;
-      }
-    }
-    if (seeding_failed) {
-      if (!parse_status_.ok()) {
-        RETURN_IF_ERROR(state_->LogOrReturnError(parse_status_.msg()));
-      }
-      ReleaseSkippedRowGroupResources();
-      continue;
-    } else {
-      // Seeding succeeded - we're ready to read the row group.
-      DCHECK(parse_status_.ok()) << "Invalid parse_status_" << parse_status_.GetDetail();
-      break;
-    }
+    DCHECK(parse_status_.ok()) << "Invalid parse_status_" << parse_status_.GetDetail();
+    break;
   }
-
   DCHECK(parse_status_.ok());
   return Status::OK();
 }
@@ -799,6 +699,7 @@ void HdfsParquetScanner::PartitionReaders(
     } else {
       BaseScalarColumnReader* scalar_reader =
           static_cast<BaseScalarColumnReader*>(reader);
+      scalar_readers_.push_back(scalar_reader);
       if (can_eval_dict_filters && IsDictFilterable(scalar_reader)) {
         dict_filterable_readers_.push_back(scalar_reader);
       } else {
@@ -990,7 +891,7 @@ Status HdfsParquetScanner::EvalDictionaryFilters(const parquet::RowGroup& row_gr
 
   // Any columns that were not 100% dictionary encoded need to initialize
   // their dictionaries here.
-  RETURN_IF_ERROR(InitDictionaries(deferred_dict_init_list));
+  RETURN_IF_ERROR(BaseScalarColumnReader::InitDictionaries(deferred_dict_init_list));
 
   return Status::OK();
 }
@@ -1123,7 +1024,6 @@ Status HdfsParquetScanner::Codegen(HdfsScanNodeBase* node,
   *process_scratch_batch_fn = nullptr;
   LlvmCodeGen* codegen = node->runtime_state()->codegen();
   DCHECK(codegen != nullptr);
-  SCOPED_TIMER(codegen->codegen_timer());
 
   llvm::Function* fn = codegen->GetFunction(IRFunction::PROCESS_SCRATCH_BATCH, true);
   DCHECK(fn != nullptr);
@@ -1147,104 +1047,6 @@ Status HdfsParquetScanner::Codegen(HdfsScanNodeBase* node,
   *process_scratch_batch_fn = codegen->FinalizeFunction(fn);
   if (*process_scratch_batch_fn == nullptr) {
     return Status("Failed to finalize process_scratch_batch_fn.");
-  }
-  return Status::OK();
-}
-
-bool HdfsParquetScanner::EvalRuntimeFilters(TupleRow* row) {
-  int num_filters = filter_ctxs_.size();
-  for (int i = 0; i < num_filters; ++i) {
-    if (!EvalRuntimeFilter(i, row)) return false;
-  }
-  return true;
-}
-
-// ; Function Attrs: noinline
-// define i1 @EvalRuntimeFilters(%"class.impala::HdfsParquetScanner"* %this,
-//                               %"class.impala::TupleRow"* %row) #34 {
-// entry:
-//   %0 = call i1 @_ZN6impala18HdfsParquetScanner17EvalRuntimeFilterEiPNS_8TupleRowE.2(
-//       %"class.impala::HdfsParquetScanner"* %this, i32 0, %"class.impala::TupleRow"*
-//       %row)
-//   br i1 %0, label %continue, label %bail_out
-//
-// bail_out:                                         ; preds = %entry
-//   ret i1 false
-//
-// continue:                                         ; preds = %entry
-//   ret i1 true
-// }
-//
-// EvalRuntimeFilter() is the same as the cross-compiled version except EvalOneFilter()
-// is replaced with the one generated by CodegenEvalOneFilter().
-Status HdfsParquetScanner::CodegenEvalRuntimeFilters(
-    LlvmCodeGen* codegen, const vector<ScalarExpr*>& filter_exprs, llvm::Function** fn) {
-  llvm::LLVMContext& context = codegen->context();
-  LlvmBuilder builder(context);
-
-  *fn = nullptr;
-  llvm::Type* this_type = codegen->GetStructPtrType<HdfsParquetScanner>();
-  llvm::PointerType* tuple_row_ptr_type = codegen->GetStructPtrType<TupleRow>();
-  LlvmCodeGen::FnPrototype prototype(codegen, "EvalRuntimeFilters",
-      codegen->bool_type());
-  prototype.AddArgument(LlvmCodeGen::NamedVariable("this", this_type));
-  prototype.AddArgument(LlvmCodeGen::NamedVariable("row", tuple_row_ptr_type));
-
-  llvm::Value* args[2];
-  llvm::Function* eval_runtime_filters_fn = prototype.GeneratePrototype(&builder, args);
-  llvm::Value* this_arg = args[0];
-  llvm::Value* row_arg = args[1];
-
-  int num_filters = filter_exprs.size();
-  if (num_filters == 0) {
-    builder.CreateRet(codegen->true_value());
-  } else {
-    // row_rejected_block: jump target for when a filter is evaluated to false.
-    llvm::BasicBlock* row_rejected_block =
-        llvm::BasicBlock::Create(context, "row_rejected", eval_runtime_filters_fn);
-
-    DCHECK_GT(num_filters, 0);
-    for (int i = 0; i < num_filters; ++i) {
-      llvm::Function* eval_runtime_filter_fn =
-          codegen->GetFunction(IRFunction::PARQUET_SCANNER_EVAL_RUNTIME_FILTER, true);
-      DCHECK(eval_runtime_filter_fn != nullptr);
-
-      // Codegen function for inlining filter's expression evaluation and constant fold
-      // the type of the expression into the hashing function to avoid branches.
-      llvm::Function* eval_one_filter_fn;
-      DCHECK(filter_exprs[i] != nullptr);
-      RETURN_IF_ERROR(FilterContext::CodegenEval(codegen, filter_exprs[i],
-          &eval_one_filter_fn));
-      DCHECK(eval_one_filter_fn != nullptr);
-
-      int replaced = codegen->ReplaceCallSites(eval_runtime_filter_fn, eval_one_filter_fn,
-          "FilterContext4Eval");
-      DCHECK_EQ(replaced, 1);
-
-      llvm::Value* idx = codegen->GetI32Constant(i);
-      llvm::Value* passed_filter = builder.CreateCall(
-          eval_runtime_filter_fn, llvm::ArrayRef<llvm::Value*>({this_arg, idx, row_arg}));
-
-      llvm::BasicBlock* continue_block =
-          llvm::BasicBlock::Create(context, "continue", eval_runtime_filters_fn);
-      builder.CreateCondBr(passed_filter, continue_block, row_rejected_block);
-      builder.SetInsertPoint(continue_block);
-    }
-    builder.CreateRet(codegen->true_value());
-
-    builder.SetInsertPoint(row_rejected_block);
-    builder.CreateRet(codegen->false_value());
-
-    // Don't inline this function to avoid code bloat in ProcessScratchBatch().
-    // If there is any filter, EvalRuntimeFilters() is large enough to not benefit
-    // much from inlining.
-    eval_runtime_filters_fn->addFnAttr(llvm::Attribute::NoInline);
-  }
-
-  *fn = codegen->FinalizeFunction(eval_runtime_filters_fn);
-  if (*fn == nullptr) {
-    return Status("Codegen'd HdfsParquetScanner::EvalRuntimeFilters() failed "
-        "verification, see log");
   }
   return Status::OK();
 }
@@ -1341,7 +1143,11 @@ inline bool HdfsParquetScanner::ReadCollectionItem(
       FILE_CHECK_GE(col_reader->def_level(),
                     col_reader->def_level_of_immediate_repeated_ancestor());
       // Fill in position slot if applicable
-      if (col_reader->pos_slot_desc() != nullptr) col_reader->ReadPosition(tuple);
+      const SlotDescriptor* pos_slot_desc = col_reader->pos_slot_desc();
+      if (pos_slot_desc != nullptr) {
+        col_reader->ReadPositionNonBatched(
+            tuple->GetBigIntSlot(pos_slot_desc->tuple_offset()));
+      }
       continue_execution = col_reader->ReadValue(pool, tuple);
     } else {
       // A containing repeated field is empty or NULL
@@ -1430,7 +1236,6 @@ Status HdfsParquetScanner::ProcessFooter() {
       return scan_node_->mem_tracker()->MemLimitExceeded(state_, details, metadata_size);
     }
     metadata_ptr = metadata_buffer.buffer();
-    DiskIoMgr* io_mgr = scan_node_->runtime_state()->io_mgr();
 
     // Read the header into the metadata buffer.
     ScanRange* metadata_range = scan_node_->AllocateScanRange(
@@ -1439,12 +1244,15 @@ Status HdfsParquetScanner::ProcessFooter() {
         BufferOpts::ReadInto(metadata_buffer.buffer(), metadata_size));
 
     unique_ptr<BufferDescriptor> io_buffer;
+    bool needs_buffers;
     RETURN_IF_ERROR(
-        io_mgr->Read(scan_node_->reader_context(), metadata_range, &io_buffer));
+        scan_node_->reader_context()->StartScanRange(metadata_range, &needs_buffers));
+    DCHECK(!needs_buffers) << "Already provided a buffer";
+    RETURN_IF_ERROR(metadata_range->GetNext(&io_buffer));
     DCHECK_EQ(io_buffer->buffer(), metadata_buffer.buffer());
     DCHECK_EQ(io_buffer->len(), metadata_size);
     DCHECK(io_buffer->eosr());
-    io_mgr->ReturnBuffer(move(io_buffer));
+    metadata_range->ReturnBuffer(move(io_buffer));
   }
 
   // Deserialize file header
@@ -1644,23 +1452,16 @@ void HdfsParquetScanner::InitCollectionColumns() {
   }
 }
 
-Status HdfsParquetScanner::InitScalarColumns(
-    int row_group_idx, const vector<BaseScalarColumnReader*>& column_readers) {
+Status HdfsParquetScanner::InitScalarColumns() {
   int64_t partition_id = context_->partition_descriptor()->id();
   const HdfsFileDesc* file_desc = scan_node_->GetFileDesc(partition_id, filename());
   DCHECK(file_desc != nullptr);
-  parquet::RowGroup& row_group = file_metadata_.row_groups[row_group_idx];
+  parquet::RowGroup& row_group = file_metadata_.row_groups[row_group_idx_];
 
-  // All the scan ranges (one for each column).
-  vector<ScanRange*> col_ranges;
   // Used to validate that the number of values in each reader in column_readers_ at the
   // same SchemaElement is the same.
   unordered_map<const parquet::SchemaElement*, int> num_values_map;
-  // Used to validate we issued the right number of scan ranges
-  int num_scalar_readers = 0;
-
-  for (BaseScalarColumnReader* scalar_reader: column_readers) {
-    ++num_scalar_readers;
+  for (BaseScalarColumnReader* scalar_reader : scalar_readers_) {
     const parquet::ColumnChunk& col_chunk = row_group.columns[scalar_reader->col_idx()];
     auto num_values_it = num_values_map.find(&scalar_reader->schema_element());
     int num_values = -1;
@@ -1669,78 +1470,137 @@ Status HdfsParquetScanner::InitScalarColumns(
     } else {
       num_values_map[&scalar_reader->schema_element()] = col_chunk.meta_data.num_values;
     }
-    int64_t col_start = col_chunk.meta_data.data_page_offset;
-
     if (num_values != -1 && col_chunk.meta_data.num_values != num_values) {
       // TODO: improve this error message by saying which columns are different,
       // and also specify column in other error messages as appropriate
       return Status(TErrorCode::PARQUET_NUM_COL_VALS_ERROR, scalar_reader->col_idx(),
           col_chunk.meta_data.num_values, num_values, filename());
     }
-
-    RETURN_IF_ERROR(ParquetMetadataUtils::ValidateRowGroupColumn(file_metadata_,
-        filename(), row_group_idx, scalar_reader->col_idx(),
-        scalar_reader->schema_element(), state_));
-
-    if (col_chunk.meta_data.__isset.dictionary_page_offset) {
-      // Already validated in ValidateColumnOffsets()
-      DCHECK_LT(col_chunk.meta_data.dictionary_page_offset, col_start);
-      col_start = col_chunk.meta_data.dictionary_page_offset;
-    }
-    int64_t col_len = col_chunk.meta_data.total_compressed_size;
-    if (col_len <= 0) {
-      return Status(Substitute("File '$0' contains invalid column chunk size: $1",
-          filename(), col_len));
-    }
-    int64_t col_end = col_start + col_len;
-
-    // Already validated in ValidateColumnOffsets()
-    DCHECK_GT(col_end, 0);
-    DCHECK_LT(col_end, file_desc->file_length);
-    if (file_version_.application == "parquet-mr" && file_version_.VersionLt(1, 2, 9)) {
-      // The Parquet MR writer had a bug in 1.2.8 and below where it didn't include the
-      // dictionary page header size in total_compressed_size and total_uncompressed_size
-      // (see IMPALA-694). We pad col_len to compensate.
-      int64_t bytes_remaining = file_desc->file_length - col_end;
-      int64_t pad = min<int64_t>(MAX_DICT_HEADER_SIZE, bytes_remaining);
-      col_len += pad;
-    }
-
-    // TODO: this will need to change when we have co-located files and the columns
-    // are different files.
-    if (!col_chunk.file_path.empty() && col_chunk.file_path != filename()) {
-      return Status(Substitute("Expected parquet column file path '$0' to match "
-          "filename '$1'", col_chunk.file_path, filename()));
-    }
-
-    const ScanRange* split_range =
-        static_cast<ScanRangeMetadata*>(metadata_range_->meta_data())->original_split;
-
-    // Determine if the column is completely contained within a local split.
-    bool col_range_local = split_range->expected_local()
-        && col_start >= split_range->offset()
-        && col_end <= split_range->offset() + split_range->len();
-    ScanRange* col_range = scan_node_->AllocateScanRange(metadata_range_->fs(),
-        filename(), col_len, col_start, partition_id, split_range->disk_id(),
-        col_range_local,
-        BufferOpts(split_range->try_cache(), file_desc->mtime));
-    col_ranges.push_back(col_range);
-
-    // Get the stream that will be used for this column
-    ScannerContext::Stream* stream = context_->AddStream(col_range);
-    DCHECK(stream != nullptr);
-
-    RETURN_IF_ERROR(scalar_reader->Reset(&col_chunk.meta_data, stream));
+    RETURN_IF_ERROR(scalar_reader->Reset(*file_desc, col_chunk, row_group_idx_));
   }
-  DCHECK_EQ(col_ranges.size(), num_scalar_readers);
-
-  // Issue all the column chunks to the io mgr and have them scheduled immediately.
-  // This means these ranges aren't returned via DiskIoMgr::GetNextRange and
-  // instead are scheduled to be read immediately.
-  RETURN_IF_ERROR(scan_node_->runtime_state()->io_mgr()->AddScanRanges(
-      scan_node_->reader_context(), col_ranges, true));
-
+  RETURN_IF_ERROR(DivideReservationBetweenColumns(scalar_readers_));
   return Status::OK();
+}
+
+Status HdfsParquetScanner::DivideReservationBetweenColumns(
+    const vector<BaseScalarColumnReader*>& column_readers) {
+  DiskIoMgr* io_mgr = ExecEnv::GetInstance()->disk_io_mgr();
+  const int64_t min_buffer_size = io_mgr->min_buffer_size();
+  const int64_t max_buffer_size = io_mgr->max_buffer_size();
+  // The HdfsScanNode reservation calculation in the planner ensures that we have
+  // reservation for at least one buffer per column.
+  if (context_->total_reservation() < min_buffer_size * column_readers.size()) {
+    return Status(TErrorCode::INTERNAL_ERROR,
+        Substitute("Not enough reservation in Parquet scanner for file '$0'. Need at "
+                   "least $1 bytes per column for $2 columns but had $3 bytes",
+            filename(), min_buffer_size, column_readers.size(),
+            context_->total_reservation()));
+  }
+
+  vector<int64_t> col_range_lengths(column_readers.size());
+  for (int i = 0; i < column_readers.size(); ++i) {
+    col_range_lengths[i] = column_readers[i]->scan_range()->len();
+  }
+
+  // The scanner-wide stream was used only to read the file footer.  Each column has added
+  // its own stream. We can use the total reservation now that 'stream_''s resources have
+  // been released. We may benefit from increasing reservation further, so let's compute
+  // the ideal reservation to scan all the columns.
+  int64_t ideal_reservation = ComputeIdealReservation(col_range_lengths);
+  if (ideal_reservation > context_->total_reservation()) {
+    context_->TryIncreaseReservation(ideal_reservation);
+  }
+  scan_node_->runtime_profile()->GetSummaryStatsCounter(ACTUAL_RESERVATION_COUNTER_NAME)->
+      UpdateCounter(context_->total_reservation());
+  scan_node_->runtime_profile()->GetSummaryStatsCounter(IDEAL_RESERVATION_COUNTER_NAME)->
+      UpdateCounter(ideal_reservation);
+
+  vector<pair<int, int64_t>> tmp_reservations = DivideReservationBetweenColumnsHelper(
+      min_buffer_size, max_buffer_size, col_range_lengths, context_->total_reservation());
+  for (auto& tmp_reservation : tmp_reservations) {
+    column_readers[tmp_reservation.first]->set_io_reservation(tmp_reservation.second);
+  }
+  return Status::OK();
+}
+
+int64_t HdfsParquetScanner::ComputeIdealReservation(
+    const vector<int64_t>& col_range_lengths) {
+  DiskIoMgr* io_mgr = ExecEnv::GetInstance()->disk_io_mgr();
+  int64_t ideal_reservation = 0;
+  for (int64_t len : col_range_lengths) {
+    ideal_reservation += io_mgr->ComputeIdealBufferReservation(len);
+  }
+  return ideal_reservation;
+}
+
+vector<pair<int, int64_t>> HdfsParquetScanner::DivideReservationBetweenColumnsHelper(
+    int64_t min_buffer_size, int64_t max_buffer_size,
+    const vector<int64_t>& col_range_lengths, int64_t reservation_to_distribute) {
+  // Pair of (column index, reservation allocated).
+  vector<pair<int, int64_t>> tmp_reservations;
+  for (int i = 0; i < col_range_lengths.size(); ++i) tmp_reservations.emplace_back(i, 0);
+
+  // Sort in descending order of length, breaking ties by index so that larger columns
+  // get allocated reservation first. It is common to have dramatically different column
+  // sizes in a single file because of different value sizes and compressibility. E.g.
+  // consider a large STRING "comment" field versus a highly compressible
+  // dictionary-encoded column with only a few distinct values. We want to give max-sized
+  // buffers to large columns first to maximize the size of I/Os that we do while reading
+  // this row group.
+  sort(tmp_reservations.begin(), tmp_reservations.end(),
+      [&col_range_lengths](const pair<int, int64_t>& left, const pair<int, int64_t>& right) {
+        int64_t left_len = col_range_lengths[left.first];
+        int64_t right_len = col_range_lengths[right.first];
+        return left_len != right_len ? left_len > right_len : left.first < right.first;
+      });
+
+  // Set aside the minimum reservation per column.
+  reservation_to_distribute -= min_buffer_size * col_range_lengths.size();
+
+  // Allocate reservations to columns by repeatedly allocating either a max-sized buffer
+  // or a large enough buffer to fit the remaining data for each column. Do this
+  // round-robin up to the ideal number of I/O buffers.
+  for (int i = 0; i < DiskIoMgr::IDEAL_MAX_SIZED_BUFFERS_PER_SCAN_RANGE; ++i) {
+    for (auto& tmp_reservation : tmp_reservations) {
+      // Add back the reservation we set aside above.
+      if (i == 0) reservation_to_distribute += min_buffer_size;
+
+      int64_t bytes_left_in_range =
+          col_range_lengths[tmp_reservation.first] - tmp_reservation.second;
+      int64_t bytes_to_add;
+      if (bytes_left_in_range >= max_buffer_size) {
+        if (reservation_to_distribute >= max_buffer_size) {
+          bytes_to_add = max_buffer_size;
+        } else if (i == 0) {
+          DCHECK_EQ(0, tmp_reservation.second);
+          // Ensure this range gets at least one buffer on the first iteration.
+          bytes_to_add = BitUtil::RoundDownToPowerOfTwo(reservation_to_distribute);
+        } else {
+          DCHECK_GT(tmp_reservation.second, 0);
+          // We need to read more than the max buffer size, but can't allocate a
+          // max-sized buffer. Stop adding buffers to this column: we prefer to use
+          // the existing max-sized buffers without small buffers mixed in so that
+          // we will alway do max-sized I/Os, which make efficient use of I/O devices.
+          bytes_to_add = 0;
+        }
+      } else if (bytes_left_in_range > 0 &&
+          reservation_to_distribute >= min_buffer_size) {
+        // Choose a buffer size that will fit the rest of the bytes left in the range.
+        bytes_to_add = max(min_buffer_size, BitUtil::RoundUpToPowerOfTwo(bytes_left_in_range));
+        // But don't add more reservation than is available.
+        bytes_to_add =
+            min(bytes_to_add, BitUtil::RoundDownToPowerOfTwo(reservation_to_distribute));
+      } else {
+        bytes_to_add = 0;
+      }
+      DCHECK(bytes_to_add == 0 || bytes_to_add >= min_buffer_size) << bytes_to_add;
+      reservation_to_distribute -= bytes_to_add;
+      tmp_reservation.second += bytes_to_add;
+      DCHECK_GE(reservation_to_distribute, 0);
+      DCHECK_GT(tmp_reservation.second, 0);
+    }
+  }
+  return tmp_reservations;
 }
 
 Status HdfsParquetScanner::InitDictionaries(

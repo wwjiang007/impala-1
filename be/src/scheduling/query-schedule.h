@@ -46,7 +46,8 @@ typedef std::unordered_map<TNetworkAddress, PerNodeScanRanges>
     FragmentScanRangeAssignment;
 
 /// Execution parameters for a single backend. Computed by Scheduler::Schedule(), set
-/// via QuerySchedule::set_per_backend_exec_params(). Used as an input to a BackendState.
+/// via QuerySchedule::set_per_backend_exec_params(). Used as an input to
+/// AdmissionController and a BackendState.
 struct BackendExecParams {
   /// The fragment instance params assigned to this backend. All instances of a
   /// particular fragment are contiguous in this vector. Query lifetime;
@@ -58,19 +59,28 @@ struct BackendExecParams {
   // concurrently-executing operators at any point in query execution. It may be less
   // than the initial reservation total claims (below) if execution of some operators
   // never overlaps, which allows reuse of reservations.
-  int64_t min_reservation_bytes;
+  int64_t min_mem_reservation_bytes = 0;
 
   // Total of the initial buffer reservations that we expect to be claimed on this
   // backend for all fragment instances in instance_params. I.e. the sum over all
   // operators in all fragment instances that execute on this backend. This is used for
   // an optimization in InitialReservation. Measured in bytes.
-  int64_t initial_reservation_total_claims;
+  int64_t initial_mem_reservation_total_claims = 0;
+
+  // Total thread reservation for fragment instances scheduled on this backend. This is
+  // the peak number of required threads that may be required by the
+  // concurrently-executing fragment instances at any point in query execution.
+  int64_t thread_reservation = 0;
+
+  // The process memory limit of this backend. Obtained from the scheduler's executors
+  // configuration which is updated by membership updates from the statestore.
+  int64_t proc_mem_limit = 0;
 };
 
 /// map from an impalad host address to the list of assigned fragment instance params.
 typedef std::map<TNetworkAddress, BackendExecParams> PerBackendExecParams;
 
-/// execution parameters for a single fragment instance; used to assemble the
+/// Execution parameters for a single fragment instance; used to assemble the
 /// TPlanFragmentInstanceCtx
 struct FInstanceExecParams {
   TUniqueId instance_id;
@@ -84,7 +94,7 @@ struct FInstanceExecParams {
   /// uniquely identify it to a receiver. -1 = invalid.
   int sender_id;
 
-  /// the parent FragmentExecParams
+  /// The parent FragmentExecParams
   const FragmentExecParams& fragment_exec_params;
   const TPlanFragment& fragment() const;
 
@@ -143,8 +153,9 @@ class QuerySchedule {
   const TUniqueId& query_id() const { return query_id_; }
   const TQueryExecRequest& request() const { return request_; }
   const TQueryOptions& query_options() const { return query_options_; }
-  const std::string& request_pool() const { return request_pool_; }
-  void set_request_pool(const std::string& pool_name) { request_pool_ = pool_name; }
+
+  // Valid after Schedule() succeeds.
+  const std::string& request_pool() const { return request().query_ctx.request_pool; }
 
   /// Gets the estimated memory (bytes) per-node. Returns the user specified estimate
   /// (MEM_LIMIT query parameter) if provided or the estimate from planning if available,
@@ -207,8 +218,6 @@ class QuerySchedule {
 
   const FInstanceExecParams& GetCoordInstanceExecParams() const;
 
-  bool is_admitted() const { return is_admitted_; }
-  void set_is_admitted(bool is_admitted) { is_admitted_ = is_admitted; }
   RuntimeProfile* summary_profile() { return summary_profile_; }
   RuntimeProfile::EventSequence* query_events() { return query_events_; }
 
@@ -249,12 +258,6 @@ class QuerySchedule {
 
   /// Used to generate consecutive fragment instance ids.
   TUniqueId next_instance_id_;
-
-  /// Request pool to which the request was submitted for admission.
-  std::string request_pool_;
-
-  /// Indicates if the query has been admitted for execution.
-  bool is_admitted_;
 
   /// Populate fragment_exec_params_ from request_.plan_exec_info.
   /// Sets is_coord_fragment and input_fragments.

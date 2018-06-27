@@ -42,9 +42,6 @@ const i32 NUM_NODES_ALL_RACKS = -1
 // constants for TPlanNodeId
 const i32 INVALID_PLAN_NODE_ID = -1
 
-// Constant default partition ID, must be < 0 to avoid collisions
-const i64 DEFAULT_PARTITION_ID = -1;
-
 enum TParquetFallbackSchemaResolution {
   POSITION,
   NAME
@@ -61,6 +58,13 @@ enum TParquetArrayResolution {
 enum TJoinDistributionMode {
   BROADCAST,
   SHUFFLE
+}
+
+// Consistency level options for Kudu scans.
+enum TKuduReadMode {
+  DEFAULT,
+  READ_LATEST,
+  READ_AT_SNAPSHOT
 }
 
 // Query options that correspond to ImpalaService.ImpalaQueryOptions, with their
@@ -272,6 +276,28 @@ struct TQueryOptions {
   // not include time spent in planning, scheduling or admission control. A value of 0
   // means no time limit.
   63: optional i32 exec_time_limit_s = 0;
+
+  // When a query has both grouping and distinct exprs, impala can optionally include the
+  // distinct exprs in the hash exchange of the first aggregation phase to spread the data
+  // among more nodes. However, this plan requires another hash exchange on the grouping
+  // exprs in the second phase which is not required when omitting the distinct exprs in
+  // the first phase. Shuffling by both is better if the grouping exprs have low NDVs.
+  64: optional bool shuffle_distinct_exprs = true;
+
+  // See comment in ImpalaService.thrift.
+  65: optional i64 max_mem_estimate_for_admission = 0;
+
+  // See comment in ImpalaService.thrift.
+  // The default values is set fairly high based on empirical data - queries with up to
+  // this number of reserved threads have run successfully as part of production
+  // workloads but with very degraded performance.
+  66: optional i32 thread_reservation_limit = 3000;
+
+  // See comment in ImpalaService.thrift.
+  67: optional i32 thread_reservation_aggregate_limit = 0;
+
+  // See comment in ImpalaService.thrift.
+  68: optional TKuduReadMode kudu_read_mode = TKuduReadMode.DEFAULT;
 }
 
 // Impala currently has two types of sessions: Beeswax and HiveServer2
@@ -389,13 +415,18 @@ struct TQueryCtx {
   // List of tables with scan ranges that map to blocks with missing disk IDs.
   15: optional list<CatalogObjects.TTableName> tables_missing_diskids
 
-  // The pool to which this request has been submitted. Used to update pool statistics
-  // for admission control.
+  // The resolved admission control pool to which this request will be submitted. May be
+  // unset for statements that aren't subjected to admission control (e.g. USE, SET).
   16: optional string request_pool
 
   // String containing a timestamp (in UTC) set as the query submission time. It
   // represents the same point in time as now_string
   17: required string utc_timestamp_string
+
+  // String containing name of the local timezone.
+  // It is guaranteed to be a valid timezone on the coordinator (but not necessarily on
+  // the executor, since in theory the executor could have a different timezone db).
+  18: required string local_time_zone
 }
 
 // Specification of one output destination of a plan fragment
@@ -492,19 +523,19 @@ struct TExecQueryFInstancesParams {
   // required in V1
   5: optional list<TPlanFragmentInstanceCtx> fragment_instance_ctxs
 
-  // The minimum query-wide buffer reservation size (in bytes) required for the backend
+  // The minimum query-wide memory reservation (in bytes) required for the backend
   // executing the instances in fragment_instance_ctxs. This is the peak minimum
   // reservation that may be required by the concurrently-executing operators at any
   // point in query execution. It may be less than the initial reservation total claims
   // (below) if execution of some operators never overlaps, which allows reuse of
   // reservations. required in V1
-  6: optional i64 min_reservation_bytes
+  6: optional i64 min_mem_reservation_bytes
 
   // Total of the initial buffer reservations that we expect to be claimed on this
   // backend for all fragment instances in fragment_instance_ctxs. I.e. the sum over all
   // operators in all fragment instances that execute on this backend. This is used for
   // an optimization in InitialReservation. Measured in bytes. required in V1
-  7: optional i64 initial_reservation_total_claims
+  7: optional i64 initial_mem_reservation_total_claims
 }
 
 struct TExecQueryFInstancesResult {

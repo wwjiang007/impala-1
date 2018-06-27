@@ -37,6 +37,7 @@ add_library(Runtime
   data-stream-sender.cc
   debug-options.cc
   descriptors.cc
+  dml-exec-state.cc
   exec-env.cc
   fragment-instance-state.cc
   hbase-table.cc
@@ -46,6 +47,7 @@ add_library(Runtime
   krpc-data-stream-mgr.cc
   krpc-data-stream-recvr.cc
   krpc-data-stream-sender.cc
+  krpc-data-stream-sender-ir.cc
   lib-cache.cc
   mem-tracker.cc
   mem-pool.cc
@@ -56,6 +58,7 @@ add_library(Runtime
   types.cc
   raw-value.cc
   raw-value-ir.cc
+  reservation-manager.cc
   row-batch.cc
   ${ROW_BATCH_PROTO_SRCS}
   runtime-filter.cc
@@ -75,22 +78,22 @@ add_library(Runtime
 )
 add_dependencies(Runtime gen-deps)
 
-ADD_BE_TEST(mem-pool-test)
-ADD_BE_TEST(free-pool-test)
-ADD_BE_TEST(string-buffer-test)
-ADD_BE_TEST(data-stream-test)
-ADD_BE_TEST(timestamp-test)
-ADD_BE_TEST(raw-value-test)
-ADD_BE_TEST(string-compare-test)
-ADD_BE_TEST(string-search-test)
-ADD_BE_TEST(string-value-test)
-ADD_BE_TEST(thread-resource-mgr-test)
-ADD_BE_TEST(mem-tracker-test)
-ADD_BE_TEST(multi-precision-test)
-ADD_BE_TEST(decimal-test)
-ADD_BE_TEST(buffered-tuple-stream-test)
-ADD_BE_TEST(hdfs-fs-cache-test)
-ADD_BE_TEST(tmp-file-mgr-test)
-ADD_BE_TEST(row-batch-serialize-test)
-ADD_BE_TEST(row-batch-test)
-ADD_BE_TEST(collection-value-builder-test)
+ADD_BE_LSAN_TEST(mem-pool-test)
+ADD_BE_LSAN_TEST(free-pool-test)
+ADD_BE_LSAN_TEST(string-buffer-test)
+ADD_BE_TEST(data-stream-test) # TODO: this test leaks
+ADD_BE_LSAN_TEST(timestamp-test)
+ADD_BE_LSAN_TEST(raw-value-test)
+ADD_BE_LSAN_TEST(string-compare-test)
+ADD_BE_LSAN_TEST(string-search-test)
+ADD_BE_LSAN_TEST(string-value-test)
+ADD_BE_LSAN_TEST(thread-resource-mgr-test)
+ADD_BE_LSAN_TEST(mem-tracker-test)
+ADD_BE_LSAN_TEST(multi-precision-test)
+ADD_BE_LSAN_TEST(decimal-test)
+ADD_BE_LSAN_TEST(buffered-tuple-stream-test)
+ADD_BE_LSAN_TEST(hdfs-fs-cache-test)
+ADD_BE_LSAN_TEST(tmp-file-mgr-test)
+ADD_BE_LSAN_TEST(row-batch-serialize-test)
+ADD_BE_LSAN_TEST(row-batch-test)
+ADD_BE_LSAN_TEST(collection-value-builder-test)

@@ -26,11 +26,12 @@ from functools import partial
 
 from tests.common.environ import IMPALAD_BUILD
 from tests.util.filesystem_utils import (
+    IS_ADLS,
+    IS_EC,
+    IS_HDFS,
     IS_ISILON,
     IS_LOCAL,
-    IS_HDFS,
     IS_S3,
-    IS_ADLS,
     SECONDARY_FILESYSTEM)
 
 
@@ -44,6 +45,8 @@ class SkipIfS3:
   jira = partial(pytest.mark.skipif, IS_S3)
   hdfs_encryption = pytest.mark.skipif(IS_S3,
       reason="HDFS encryption is not supported with S3")
+  empty_directory = pytest.mark.skipif(IS_S3,
+      reason="Empty directories are not supported on S3")
 
   # These ones need test infra work to re-enable.
   udfs = pytest.mark.skipif(IS_S3, reason="udas/udfs not copied to S3")
@@ -125,8 +128,6 @@ class SkipIfLocal:
       reason="HBase not started when using local file system")
   hdfs_client = pytest.mark.skipif(IS_LOCAL,
       reason="HDFS not started when using local file system")
-  mem_usage_different = pytest.mark.skipif(IS_LOCAL,
-      reason="Memory limit too low when running single node")
   qualified_path = pytest.mark.skipif(IS_LOCAL,
       reason="Tests rely on HDFS qualified paths")
   root_path = pytest.mark.skipif(IS_LOCAL,
@@ -136,7 +137,16 @@ class SkipIfNotHdfsMinicluster:
   # These ones are skipped when not running against a local HDFS mini-cluster.
   plans = pytest.mark.skipif(not IS_HDFS or pytest.config.option.testing_remote_cluster,
       reason="Test assumes plans from local HDFS mini-cluster")
+  tuned_for_minicluster = pytest.mark.skipif(
+      not IS_HDFS or IS_EC or pytest.config.option.testing_remote_cluster,
+      reason="Test is tuned for 3-node HDFS minicluster with no EC")
 
 class SkipIfBuildType:
   not_dev_build = pytest.mark.skipif(not IMPALAD_BUILD.is_dev(),
       reason="Tests depends on debug build startup option.")
+
+class SkipIfEC:
+  remote_read = pytest.mark.skipif(IS_EC, reason="EC files are read remotely and "
+      "features relying on local read do not work.")
+  oom = pytest.mark.skipif(IS_EC, reason="Probably broken by HDFS-13540.")
+  fix_later = pytest.mark.skipif(IS_EC, reason="It should work but doesn't.")
