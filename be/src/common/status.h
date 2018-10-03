@@ -98,6 +98,12 @@ class NODISCARD Status {
   static const Status CANCELLED;
   static const Status DEPRECATED_RPC;
 
+  /// Return a CANCELLED_INTERNALLY error. This should be used for "internal"
+  /// cancellation messages that were not user-initiated and are not expected to be shown
+  /// to the client. 'subsystem' is the name of the subsystem in which the cancellation
+  /// occurred, so that we can determine where the cancellation came from.
+  static Status CancelledInternal(const char* subsystem);
+
   /// Copy c'tor makes copy of error detail so Status can be returned by value.
   ALWAYS_INLINE Status(const Status& status) : msg_(NULL) {
     if (UNLIKELY(status.msg_ != NULL)) CopyMessageFrom(status);
@@ -105,7 +111,7 @@ class NODISCARD Status {
 
   /// Move constructor that moves the error message (if any) and resets 'other' to the
   /// default OK Status.
-  ALWAYS_INLINE Status(Status&& other) : msg_(other.msg_) { other.msg_ = NULL; }
+  ALWAYS_INLINE Status(Status&& other) noexcept : msg_(other.msg_) { other.msg_ = NULL; }
 
   /// Status using only the error code as a parameter. This can be used for error messages
   /// that don't take format parameters.
@@ -198,8 +204,10 @@ class NODISCARD Status {
 
   bool ALWAYS_INLINE ok() const { return msg_ == NULL; }
 
+  /// Return true if this is a user-initiated or internal cancellation.
   bool IsCancelled() const {
-    return msg_ != NULL && msg_->error() == TErrorCode::CANCELLED;
+    return msg_ != NULL && (msg_->error() == TErrorCode::CANCELLED
+                               || msg_->error() == TErrorCode::CANCELLED_INTERNALLY);
   }
 
   bool IsMemLimitExceeded() const {
@@ -288,8 +296,8 @@ std::ostream& operator<<(std::ostream& os, const Status& status);
 /// some generally useful macros
 #define RETURN_IF_ERROR(stmt)                          \
   do {                                                 \
-    ::impala::Status __status__ = (stmt);              \
-    if (UNLIKELY(!__status__.ok())) return __status__; \
+    const ::impala::Status& _status = (stmt);       \
+    if (UNLIKELY(!_status.ok())) return _status; \
   } while (false)
 
 #define RETURN_VOID_IF_ERROR(stmt)                     \
@@ -299,9 +307,9 @@ std::ostream& operator<<(std::ostream& os, const Status& status);
 
 #define ABORT_IF_ERROR(stmt) \
   do { \
-    ::impala::Status __status__ = (stmt); \
-    if (UNLIKELY(!__status__.ok())) { \
-      ABORT_WITH_ERROR(__status__.GetDetail()); \
+    const ::impala::Status& _status = (stmt); \
+    if (UNLIKELY(!_status.ok())) { \
+      ABORT_WITH_ERROR(_status.GetDetail()); \
     } \
   } while (false)
 

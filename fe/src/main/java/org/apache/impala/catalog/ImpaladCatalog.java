@@ -19,12 +19,11 @@ package org.apache.impala.catalog;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 
-import org.apache.hadoop.fs.Path;
 import org.apache.impala.analysis.TableName;
-import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.common.Pair;
 import org.apache.impala.service.FeSupport;
@@ -33,8 +32,7 @@ import org.apache.impala.thrift.TCatalogObjectType;
 import org.apache.impala.thrift.TDataSource;
 import org.apache.impala.thrift.TDatabase;
 import org.apache.impala.thrift.TFunction;
-import org.apache.impala.thrift.TPrivilege;
-import org.apache.impala.thrift.TRole;
+import org.apache.impala.thrift.TGetPartitionStatsResponse;
 import org.apache.impala.thrift.TTable;
 import org.apache.impala.thrift.TUniqueId;
 import org.apache.impala.thrift.TUpdateCatalogCacheRequest;
@@ -74,12 +72,9 @@ import com.google.common.base.Preconditions;
  */
 public class ImpaladCatalog extends Catalog implements FeCatalog {
   private static final Logger LOG = Logger.getLogger(ImpaladCatalog.class);
-  private static final TUniqueId INITIAL_CATALOG_SERVICE_ID = new TUniqueId(0L, 0L);
-  public static final String BUILTINS_DB = "_impala_builtins";
-
   // The last known Catalog Service ID. If the ID changes, it indicates the CatalogServer
   // has restarted.
-  private TUniqueId catalogServiceId_ = INITIAL_CATALOG_SERVICE_ID;
+  private TUniqueId catalogServiceId_ = Catalog.INITIAL_CATALOG_SERVICE_ID;
 
   // The catalog version received in the last StateStore heartbeat. It is guaranteed
   // all objects in the catalog have at a minimum, this version. Because updates may
@@ -98,28 +93,57 @@ public class ImpaladCatalog extends Catalog implements FeCatalog {
   // Used during table creation.
   private final String defaultKuduMasterHosts_;
 
-  // DB that contains all builtins
-  private static Db builtinsDb_;
-
   public ImpaladCatalog(String defaultKuduMasterHosts) {
     super();
-    builtinsDb_ = new BuiltinsDb(BUILTINS_DB);
-    addDb(builtinsDb_);
+    addDb(BuiltinsDb.getInstance());
     defaultKuduMasterHosts_ = defaultKuduMasterHosts;
-    // Ensure the contents of the CatalogObjectVersionQueue instance are cleared when a
+    // Ensure the contents of the CatalogObjectVersionSet instance are cleared when a
     // new instance of ImpaladCatalog is created (see IMPALA-6486).
-    CatalogObjectVersionQueue.INSTANCE.clear();
+    CatalogObjectVersionSet.INSTANCE.clear();
   }
 
   /**
-   * Returns true if the given object does not depend on any other object already
-   * existing in the catalog in order to be added.
+   * Utility class for sequencing the order in which a set of updated catalog objects
+   * need to be applied to the catalog in order to satisfy referential constraints.
+   *
+   * If one type of object refers to another type of object, it needs to be added
+   * after it and deleted before it.
    */
-  private boolean isTopLevelCatalogObject(TCatalogObject catalogObject) {
-    return catalogObject.getType() == TCatalogObjectType.DATABASE ||
-        catalogObject.getType() == TCatalogObjectType.DATA_SOURCE ||
-        catalogObject.getType() == TCatalogObjectType.HDFS_CACHE_POOL ||
-        catalogObject.getType() == TCatalogObjectType.ROLE;
+  public static class ObjectUpdateSequencer {
+    private final ArrayDeque<TCatalogObject> updatedObjects = new ArrayDeque<>();
+    private final ArrayDeque<TCatalogObject> deletedObjects = new ArrayDeque<>();
+
+    public void add(TCatalogObject obj, boolean isDeleted) {
+      if (!isDeleted) {
+        // Update top-level objects first.
+        if (isTopLevelCatalogObject(obj)) {
+          updatedObjects.addFirst(obj);
+        } else {
+          updatedObjects.addLast(obj);
+        }
+      } else {
+        // Remove low-level objects first.
+        if (isTopLevelCatalogObject(obj)) {
+          deletedObjects.addLast(obj);
+        } else {
+          deletedObjects.addFirst(obj);
+        }
+      }
+    }
+
+    public Iterable<TCatalogObject> getUpdatedObjects() { return updatedObjects; }
+    public Iterable<TCatalogObject> getDeletedObjects() { return deletedObjects; }
+
+    /**
+     * Returns true if the given object does not depend on any other object already
+     * existing in the catalog in order to be added.
+     */
+    private static boolean isTopLevelCatalogObject(TCatalogObject catalogObject) {
+      return catalogObject.getType() == TCatalogObjectType.DATABASE ||
+          catalogObject.getType() == TCatalogObjectType.DATA_SOURCE ||
+          catalogObject.getType() == TCatalogObjectType.HDFS_CACHE_POOL ||
+          catalogObject.getType() == TCatalogObjectType.PRINCIPAL;
+    }
   }
 
   /**
@@ -161,8 +185,7 @@ public class ImpaladCatalog extends Catalog implements FeCatalog {
     TUpdateCatalogCacheRequest req) throws CatalogException, TException {
     // For updates from catalog op results, the service ID is set in the request.
     if (req.isSetCatalog_service_id()) setCatalogServiceId(req.catalog_service_id);
-    ArrayDeque<TCatalogObject> updatedObjects = new ArrayDeque<>();
-    ArrayDeque<TCatalogObject> deletedObjects = new ArrayDeque<>();
+    ObjectUpdateSequencer sequencer = new ObjectUpdateSequencer();
     long newCatalogVersion = lastSyncedCatalogVersion_.get();
     Pair<Boolean, ByteBuffer> update;
     while ((update = FeSupport.NativeGetNextCatalogObjectUpdate(req.native_iterator_ptr))
@@ -182,24 +205,12 @@ public class ImpaladCatalog extends Catalog implements FeCatalog {
       if (obj.type == TCatalogObjectType.CATALOG) {
         setCatalogServiceId(obj.catalog.catalog_service_id);
         newCatalogVersion = obj.catalog_version;
-      } else if (!update.first) {
-        // Update top-level objects first.
-        if (isTopLevelCatalogObject(obj)) {
-          updatedObjects.addFirst(obj);
-        } else {
-          updatedObjects.addLast(obj);
-        }
       } else {
-        // Remove low-level objects first.
-        if (isTopLevelCatalogObject(obj)) {
-          deletedObjects.addLast(obj);
-        } else {
-          deletedObjects.addFirst(obj);
-        }
+        sequencer.add(obj, update.first);
       }
     }
 
-    for (TCatalogObject catalogObject: updatedObjects) {
+    for (TCatalogObject catalogObject: sequencer.getUpdatedObjects()) {
       try {
         addCatalogObject(catalogObject);
       } catch (Exception e) {
@@ -207,7 +218,9 @@ public class ImpaladCatalog extends Catalog implements FeCatalog {
       }
     }
 
-    for (TCatalogObject catalogObject: deletedObjects) removeCatalogObject(catalogObject);
+    for (TCatalogObject catalogObject: sequencer.getDeletedObjects()) {
+      removeCatalogObject(catalogObject);
+    }
 
     lastSyncedCatalogVersion_.set(newCatalogVersion);
     // Cleanup old entries in the log.
@@ -217,7 +230,7 @@ public class ImpaladCatalog extends Catalog implements FeCatalog {
       catalogUpdateEventNotifier_.notifyAll();
     }
     return new TUpdateCatalogCacheResponse(catalogServiceId_,
-        CatalogObjectVersionQueue.INSTANCE.getMinimumVersion(), newCatalogVersion);
+        CatalogObjectVersionSet.INSTANCE.getMinimumVersion(), newCatalogVersion);
   }
 
 
@@ -227,29 +240,18 @@ public class ImpaladCatalog extends Catalog implements FeCatalog {
   }
 
   @Override // FeCatalog
+  public TGetPartitionStatsResponse getPartitionStats(
+      TableName table) throws InternalException {
+    return FeSupport.GetPartitionStats(table);
+  }
+
+  @Override // FeCatalog
   public void waitForCatalogUpdate(long timeoutMs) {
     synchronized (catalogUpdateEventNotifier_) {
       try {
         catalogUpdateEventNotifier_.wait(timeoutMs);
       } catch (InterruptedException e) {
         // Ignore
-      }
-    }
-  }
-
-
-  @Override // FeCatalog
-  public Path getTablePath(org.apache.hadoop.hive.metastore.api.Table msTbl)
-      throws TException {
-    try (MetaStoreClient msClient = getMetaStoreClient()) {
-      // If the table did not have its path set, build the path based on the the
-      // location property of the parent database.
-      if (msTbl.getSd().getLocation() == null || msTbl.getSd().getLocation().isEmpty()) {
-        String dbLocation =
-            msClient.getHiveClient().getDatabase(msTbl.getDbName()).getLocationUri();
-        return new Path(dbLocation, msTbl.getTableName().toLowerCase());
-      } else {
-        return new Path(msTbl.getSd().getLocation());
       }
     }
   }
@@ -290,14 +292,14 @@ public class ImpaladCatalog extends Catalog implements FeCatalog {
       case DATA_SOURCE:
         addDataSource(catalogObject.getData_source(), catalogObject.getCatalog_version());
         break;
-      case ROLE:
-        Role role = Role.fromThrift(catalogObject.getRole());
-        role.setCatalogVersion(catalogObject.getCatalog_version());
-        authPolicy_.addRole(role);
+      case PRINCIPAL:
+        Principal principal = Principal.fromThrift(catalogObject.getPrincipal());
+        principal.setCatalogVersion(catalogObject.getCatalog_version());
+        authPolicy_.addPrincipal(principal);
         break;
       case PRIVILEGE:
-        RolePrivilege privilege =
-            RolePrivilege.fromThrift(catalogObject.getPrivilege());
+        PrincipalPrivilege privilege =
+            PrincipalPrivilege.fromThrift(catalogObject.getPrivilege());
         privilege.setCatalogVersion(catalogObject.getCatalog_version());
         try {
           authPolicy_.addPrivilege(privilege);
@@ -337,11 +339,13 @@ public class ImpaladCatalog extends Catalog implements FeCatalog {
       case DATA_SOURCE:
         removeDataSource(catalogObject.getData_source(), dropCatalogVersion);
         break;
-      case ROLE:
-        removeRole(catalogObject.getRole(), dropCatalogVersion);
+      case PRINCIPAL:
+        authPolicy_.removePrincipalIfLowerVersion(catalogObject.getPrincipal(),
+            dropCatalogVersion);
         break;
       case PRIVILEGE:
-        removePrivilege(catalogObject.getPrivilege(), dropCatalogVersion);
+        authPolicy_.removePrivilegeIfLowerVersion(catalogObject.getPrivilege(),
+            dropCatalogVersion);
         break;
       case HDFS_CACHE_POOL:
         HdfsCachePool existingItem =
@@ -368,13 +372,13 @@ public class ImpaladCatalog extends Catalog implements FeCatalog {
       newDb.setCatalogVersion(catalogVersion);
       addDb(newDb);
       if (existingDb != null) {
-        CatalogObjectVersionQueue.INSTANCE.updateVersions(
+        CatalogObjectVersionSet.INSTANCE.updateVersions(
             existingDb.getCatalogVersion(), catalogVersion);
-        CatalogObjectVersionQueue.INSTANCE.removeAll(existingDb.getTables());
-        CatalogObjectVersionQueue.INSTANCE.removeAll(
+        CatalogObjectVersionSet.INSTANCE.removeAll(existingDb.getTables());
+        CatalogObjectVersionSet.INSTANCE.removeAll(
             existingDb.getFunctions(null, new PatternMatcher()));
       } else {
-        CatalogObjectVersionQueue.INSTANCE.addVersion(catalogVersion);
+        CatalogObjectVersionSet.INSTANCE.addVersion(catalogVersion);
       }
     }
   }
@@ -411,10 +415,10 @@ public class ImpaladCatalog extends Catalog implements FeCatalog {
         existingFn.getCatalogVersion() < catalogVersion) {
       db.addFunction(function);
       if (existingFn != null) {
-        CatalogObjectVersionQueue.INSTANCE.updateVersions(
+        CatalogObjectVersionSet.INSTANCE.updateVersions(
             existingFn.getCatalogVersion(), catalogVersion);
       } else {
-        CatalogObjectVersionQueue.INSTANCE.addVersion(catalogVersion);
+        CatalogObjectVersionSet.INSTANCE.addVersion(catalogVersion);
       }
     }
   }
@@ -438,10 +442,10 @@ public class ImpaladCatalog extends Catalog implements FeCatalog {
     Db db = getDb(thriftDb.getDb_name());
     if (db != null && db.getCatalogVersion() < dropCatalogVersion) {
       removeDb(db.getName());
-      CatalogObjectVersionQueue.INSTANCE.removeVersion(
+      CatalogObjectVersionSet.INSTANCE.removeVersion(
           db.getCatalogVersion());
-      CatalogObjectVersionQueue.INSTANCE.removeAll(db.getTables());
-      CatalogObjectVersionQueue.INSTANCE.removeAll(
+      CatalogObjectVersionSet.INSTANCE.removeAll(db.getTables());
+      CatalogObjectVersionSet.INSTANCE.removeAll(
           db.getFunctions(null, new PatternMatcher()));
     }
   }
@@ -468,29 +472,8 @@ public class ImpaladCatalog extends Catalog implements FeCatalog {
     if (fn != null && fn.getCatalogVersion() < dropCatalogVersion) {
       LibCacheRemoveEntry(fn.getLocation().getLocation());
       db.removeFunction(thriftFn.getSignature());
-      CatalogObjectVersionQueue.INSTANCE.removeVersion(
+      CatalogObjectVersionSet.INSTANCE.removeVersion(
           fn.getCatalogVersion());
-    }
-  }
-
-  private void removeRole(TRole thriftRole, long dropCatalogVersion) {
-    Role existingRole = authPolicy_.getRole(thriftRole.getRole_name());
-    // version of the drop, remove the function.
-    if (existingRole != null && existingRole.getCatalogVersion() < dropCatalogVersion) {
-      authPolicy_.removeRole(thriftRole.getRole_name());
-      CatalogObjectVersionQueue.INSTANCE.removeAll(existingRole.getPrivileges());
-    }
-  }
-
-  private void removePrivilege(TPrivilege thriftPrivilege, long dropCatalogVersion) {
-    Role role = authPolicy_.getRole(thriftPrivilege.getRole_id());
-    if (role == null) return;
-    RolePrivilege existingPrivilege =
-        role.getPrivilege(thriftPrivilege.getPrivilege_name());
-    // version of the drop, remove the function.
-    if (existingPrivilege != null &&
-        existingPrivilege.getCatalogVersion() < dropCatalogVersion) {
-      role.removePrivilege(thriftPrivilege.getPrivilege_name());
     }
   }
 
@@ -525,6 +508,4 @@ public class ImpaladCatalog extends Catalog implements FeCatalog {
 
   @Override
   public TUniqueId getCatalogServiceId() { return catalogServiceId_; }
-
-  public static Db getBuiltinsDb() { return builtinsDb_; }
 }

@@ -54,7 +54,6 @@ import org.apache.impala.catalog.ScalarType;
 import org.apache.impala.catalog.Table;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.catalog.View;
-import org.apache.impala.compat.MiniclusterProfile;
 import org.apache.impala.service.CatalogOpExecutor;
 import org.apache.impala.service.Frontend;
 import org.apache.impala.testutil.ImpaladTestCatalog;
@@ -98,7 +97,7 @@ public class FrontendTestBase {
 
   @AfterClass
   public static void cleanUp() throws Exception {
-    RuntimeEnv.INSTANCE.setTestEnv(false);
+    RuntimeEnv.INSTANCE.reset();
   }
 
   // Adds a Udf: default.name(args) to the catalog.
@@ -212,8 +211,17 @@ public class FrontendTestBase {
    * Returns the new view.
    */
   protected Table addTestView(String createViewSql) {
+    return addTestView(catalog_, createViewSql);
+  }
+
+  /**
+   * Adds a test-local view to the specified catalog based on the given CREATE VIEW sql.
+   * The test views are registered in testTables_ and removed in the @After method.
+   * Returns the new view.
+   */
+  protected Table addTestView(Catalog catalog, String createViewSql) {
     CreateViewStmt createViewStmt = (CreateViewStmt) AnalyzesOk(createViewSql);
-    Db db = catalog_.getDb(createViewStmt.getDb());
+    Db db = catalog.getDb(createViewStmt.getDb());
     Preconditions.checkNotNull(db, "Test views must be created in an existing db.");
     // Do not analyze the stmt to avoid applying rewrites that would alter the view
     // definition. We want to model real views as closely as possible.
@@ -267,6 +275,7 @@ public class FrontendTestBase {
   public ParseNode ParsesOk(String stmt) {
     SqlScanner input = new SqlScanner(new StringReader(stmt));
     SqlParser parser = new SqlParser(input);
+    parser.setQueryOptions(new TQueryOptions());
     ParseNode node = null;
     try {
       node = (ParseNode) parser.parse().value;
@@ -409,15 +418,14 @@ public class FrontendTestBase {
       String errorString = e.getMessage();
       Preconditions.checkNotNull(errorString, "Stack trace lost during exception.");
       String msg = "got error:\n" + errorString + "\nexpected:\n" + expectedErrorString;
-      if (MiniclusterProfile.MINICLUSTER_PROFILE == 3) {
-        // Different versions of Hive have slightly different error messages;
-        // we normalize here as follows:
-        // 'No FileSystem for Scheme "x"' -> 'No FileSystem for scheme: x'
-        if (errorString.contains("No FileSystem for scheme ")) {
-          errorString = errorString.replace("\"", "");
-          errorString = errorString.replace("No FileSystem for scheme ",
-              "No FileSystem for scheme: ");
-        }
+      // TODO: This logic can be removed.
+      // Different versions of Hive have slightly different error messages;
+      // we normalize here as follows:
+      // 'No FileSystem for Scheme "x"' -> 'No FileSystem for scheme: x'
+      if (errorString.contains("No FileSystem for scheme ")) {
+        errorString = errorString.replace("\"", "");
+        errorString = errorString.replace("No FileSystem for scheme ",
+            "No FileSystem for scheme: ");
       }
       Assert.assertTrue(msg, errorString.startsWith(expectedErrorString));
       return;
@@ -432,7 +440,7 @@ public class FrontendTestBase {
 
   protected AnalysisResult parseAndAnalyze(String stmt, AnalysisContext ctx, Frontend fe)
       throws ImpalaException {
-    StatementBase parsedStmt = fe.parse(stmt);
+    StatementBase parsedStmt = fe.parse(stmt, ctx.getQueryOptions());
     StmtMetadataLoader mdLoader =
         new StmtMetadataLoader(fe, ctx.getQueryCtx().session.database, null);
     StmtTableCache stmtTableCache = mdLoader.loadTables(parsedStmt);

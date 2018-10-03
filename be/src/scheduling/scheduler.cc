@@ -46,8 +46,6 @@ using namespace apache::thrift;
 using namespace org::apache::impala::fb;
 using namespace strings;
 
-DECLARE_bool(use_krpc);
-
 namespace impala {
 
 static const string LOCAL_ASSIGNMENTS_KEY("simple-scheduler.local-assignments.total");
@@ -75,12 +73,10 @@ Status Scheduler::Init(const TNetworkAddress& backend_address,
   // requests.
   local_backend_descriptor_.ip_address = ip;
   LOG(INFO) << "Scheduler using " << ip << " as IP address";
-  if (FLAGS_use_krpc) {
-    // KRPC relies on resolved IP address.
-    DCHECK(IsResolvedAddress(krpc_address));
-    DCHECK_EQ(krpc_address.hostname, ip);
-    local_backend_descriptor_.__set_krpc_address(krpc_address);
-  }
+  // KRPC relies on resolved IP address.
+  DCHECK(IsResolvedAddress(krpc_address));
+  DCHECK_EQ(krpc_address.hostname, ip);
+  local_backend_descriptor_.__set_krpc_address(krpc_address);
 
   coord_only_backend_config_.AddBackend(local_backend_descriptor_);
 
@@ -88,7 +84,9 @@ Status Scheduler::Init(const TNetworkAddress& backend_address,
     StatestoreSubscriber::UpdateCallback cb =
         bind<void>(mem_fn(&Scheduler::UpdateMembership), this, _1, _2);
     Status status = statestore_subscriber_->AddTopic(
-        Statestore::IMPALA_MEMBERSHIP_TOPIC, true, false, cb);
+        Statestore::IMPALA_MEMBERSHIP_TOPIC, /* is_transient=*/ true,
+        /* populate_min_subscriber_topic_version=*/ false,
+        /* filter_prefix= */"", cb);
     if (!status.ok()) {
       status.AddDetail("Scheduler failed to register membership topic");
       return status;
@@ -192,7 +190,14 @@ void Scheduler::UpdateMembership(
            << TNetworkAddressToString(local_backend_descriptor_.address) << ")";
       continue;
     }
-    if (be_desc.is_executor) {
+    if (be_desc.is_quiescing) {
+      // Make sure backends that are shutting down are not scheduled on.
+      auto it = current_executors_.find(item.key);
+      if (it != current_executors_.end()) {
+        new_executors_config->RemoveBackend(it->second);
+        current_executors_.erase(it);
+      }
+    } else if (be_desc.is_executor) {
       new_executors_config->AddBackend(be_desc);
       current_executors_.insert(make_pair(item.key, be_desc));
     }
@@ -345,13 +350,11 @@ void Scheduler::ComputeFragmentExecParams(
         TPlanFragmentDestination& dest = src_params->destinations[i];
         dest.__set_fragment_instance_id(dest_params->instance_exec_params[i].instance_id);
         const TNetworkAddress& host = dest_params->instance_exec_params[i].host;
-        dest.__set_server(host);
-        if (FLAGS_use_krpc) {
-          const TBackendDescriptor& desc = LookUpBackendDesc(executor_config, host);
-          DCHECK(desc.__isset.krpc_address);
-          DCHECK(IsResolvedAddress(desc.krpc_address));
-          dest.__set_krpc_server(desc.krpc_address);
-        }
+        dest.__set_thrift_backend(host);
+        const TBackendDescriptor& desc = LookUpBackendDesc(executor_config, host);
+        DCHECK(desc.__isset.krpc_address);
+        DCHECK(IsResolvedAddress(desc.krpc_address));
+        dest.__set_krpc_backend(desc.krpc_address);
       }
 
       // enumerate senders consecutively;

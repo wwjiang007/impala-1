@@ -21,13 +21,14 @@ import java.util.Collections;
 import java.util.EnumSet;
 import java.util.List;
 
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.impala.authorization.Privilege;
-import org.apache.impala.catalog.Db;
 import org.apache.impala.catalog.FeDb;
 import org.apache.impala.catalog.FeFsTable;
+import org.apache.impala.catalog.FeKuduTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.HdfsFileFormat;
-import org.apache.impala.catalog.HdfsTable;
 import org.apache.impala.catalog.KuduTable;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
@@ -108,7 +109,9 @@ public class CreateTableAsSelectStmt extends StatementBase {
   public InsertStmt getInsertStmt() { return insertStmt_; }
   public CreateTableStmt getCreateStmt() { return createStmt_; }
   @Override
-  public String toSql() { return ToSqlUtils.getCreateTableSql(this); }
+  public String toSql(boolean rewritten) {
+    return ToSqlUtils.getCreateTableSql(this, rewritten);
+  }
 
   @Override
   public void collectTableRefs(List<TableRef> tblRefs) {
@@ -204,22 +207,22 @@ public class CreateTableAsSelectStmt extends StatementBase {
         CatalogOpExecutor.createMetaStoreTable(createStmt_.toThrift());
 
     try {
-      // Set a valid location of this table using the same rules as the metastore. If the
-      // user specified a location for the table this will be a no-op.
-      msTbl.getSd().setLocation(analyzer.getCatalog().getTablePath(msTbl).toString());
+      // Set a valid location of this table using the same rules as the metastore, unless
+      // the user specified a path.
+      if (msTbl.getSd().getLocation() == null || msTbl.getSd().getLocation().isEmpty()) {
+        msTbl.getSd().setLocation(getPathForNewTable(db, msTbl));
+      }
 
       FeTable tmpTable = null;
       if (KuduTable.isKuduTable(msTbl)) {
-        // TODO(todd): avoid downcast to 'Db' here
-        tmpTable = KuduTable.createCtasTarget((Db)db, msTbl, createStmt_.getColumnDefs(),
+        tmpTable = db.createKuduCtasTarget(msTbl, createStmt_.getColumnDefs(),
             createStmt_.getPrimaryKeyColumnDefs(),
             createStmt_.getKuduPartitionParams());
       } else if (HdfsFileFormat.isHdfsInputFormatClass(msTbl.getSd().getInputFormat())) {
-        // TODO(todd): avoid downcast to 'Db' here
-        tmpTable = HdfsTable.createCtasTarget((Db)db, msTbl);
+        tmpTable = db.createFsCtasTarget(msTbl);
       }
       Preconditions.checkState(tmpTable != null &&
-          (tmpTable instanceof FeFsTable || tmpTable instanceof KuduTable));
+          (tmpTable instanceof FeFsTable || tmpTable instanceof FeKuduTable));
 
       insertStmt_.setTargetTable(tmpTable);
     } catch (Exception e) {
@@ -228,6 +231,11 @@ public class CreateTableAsSelectStmt extends StatementBase {
 
     // Finally, run analysis on the insert statement.
     insertStmt_.analyze(analyzer);
+  }
+
+  private static String getPathForNewTable(FeDb db, Table msTbl) {
+    String dbLocation = db.getMetaStoreDb().getLocationUri();
+    return new Path(dbLocation, msTbl.getTableName().toLowerCase()).toString();
   }
 
   @Override

@@ -18,6 +18,8 @@
 package org.apache.impala.analysis;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
@@ -28,13 +30,12 @@ import java.util.List;
 
 import org.apache.impala.analysis.TimestampArithmeticExpr.TimeUnit;
 import org.apache.impala.catalog.AggregateFunction;
+import org.apache.impala.catalog.BuiltinsDb;
 import org.apache.impala.catalog.Catalog;
-import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.Db;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.Function.CompareMode;
-import org.apache.impala.catalog.ImpaladCatalog;
 import org.apache.impala.catalog.PrimitiveType;
 import org.apache.impala.catalog.ScalarFunction;
 import org.apache.impala.catalog.ScalarType;
@@ -261,6 +262,15 @@ public class AnalyzeExprsTest extends AnalyzerTest {
               + operator + " " + operand2);
         }
       }
+
+      // IMPALA-7260: Check that when a numerical type gets implicitly cast to decimal,
+      // we do not get an error when the type of the decimal operand is not able to fit
+      // all of the digits of the non-deicmal operand.
+      AnalyzesOk("select cast(1 as decimal(38,37)) " + operator + " cast(2 as bigint)");
+      AnalyzesOk("select cast(1 as bigint) " + operator + " cast(2 as decimal(38,37))");
+      AnalyzesOk("select cast(1 as decimal(38,1)) " + operator + " cast(2 as bigint)");
+      AnalyzesOk("select cast(1 as decimal(38,37)) " + operator + " cast(2 as tinyint)");
+      AnalyzesOk("select cast(1 as decimal(38,37)) " + operator + " cast(2 as double)");
 
       // Chars of different length are comparable
       for (int i = 1; i < 16; ++i) {
@@ -720,6 +730,25 @@ public class AnalyzeExprsTest extends AnalyzerTest {
         "where int_struct_col between 10 and 20",
         "Incompatible return types 'STRUCT<f1:INT,f2:INT>' and 'TINYINT' " +
         "of exprs 'int_struct_col' and '10'.");
+    // IMPALA-7211: Do not cast decimal types to other decimal types
+    AnalyzesOk("select cast(1 as decimal(38,2)) between " +
+        "0.9 * cast(1 as decimal(38,3)) and 3");
+    AnalyzesOk("select cast(2 as decimal(38,37)) between " +
+        "cast(1 as decimal(38,1)) and cast(3 as decimal(38,15))");
+    AnalyzesOk("select cast(2 as decimal(38,37)) between " +
+        "cast(1 as double) and cast(3 as decimal(38,1))");
+    AnalyzesOk("select cast(2 as decimal(38,37)) between " +
+        "cast(1 as decimal(38,1)) and cast(3 as double)");
+    AnalyzesOk("select cast(2 as decimal(38,37)) between " +
+        "cast(1 as decimal(38,1)) and cast(3 as bigint)");
+    AnalyzesOk("select cast(2 as decimal(38,37)) between " +
+        "cast(1 as bigint) and cast(3 as bigint)");
+    AnalyzesOk("select cast(2 as decimal(38,37)) between " +
+        "cast(1 as bigint) and cast(3 as decimal(38,1))");
+    AnalyzesOk("select cast(2 as decimal(38,37)) between " +
+        "cast(1 as decimal(38,1)) and cast(3 as int)");
+    AnalyzesOk("select cast(2 as decimal(38,37)) between " +
+        "cast(1 as int) and cast(3 as decimal(38,1))");
   }
 
   @Test
@@ -2176,13 +2205,15 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     TupleDescriptor tblRefDesc = stmt.fromClause_.get(0).getDesc();
     tblRefDesc.materializeSlots();
     tblRefDesc.computeMemLayout();
-    if (stmt.hasAggInfo()) {
-      TupleDescriptor intDesc = stmt.getAggInfo().intermediateTupleDesc_;
+    if (stmt.hasMultiAggInfo()) {
+      Preconditions.checkState(stmt.getMultiAggInfo().getAggClasses().size() == 1);
+      AggregateInfo aggInfo = stmt.getMultiAggInfo().getAggClass(0);
+      TupleDescriptor intDesc = aggInfo.intermediateTupleDesc_;
       intDesc.materializeSlots();
       intDesc.computeMemLayout();
-      checkSerializedMTime(stmt.getAggInfo().getAggregateExprs().get(0), expectMTime);
+      checkSerializedMTime(aggInfo.getAggregateExprs().get(0), expectMTime);
       checkSerializedMTime(
-          stmt.getAggInfo().getMergeAggInfo().getAggregateExprs().get(0), expectMTime);
+          aggInfo.getMergeAggInfo().getAggregateExprs().get(0), expectMTime);
     } else {
       checkSerializedMTime(stmt.getSelectList().getItems().get(0).getExpr(), expectMTime);
     }
@@ -2288,36 +2319,61 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     testFuncExprDepthLimit("cast(", "1", " as int)");
   }
 
-  // Verifies the resulting expr decimal type is expectedType under decimal v1 and
+  // Verifies the resulting expr decimal type is expectedType under decimal v1 or
   // decimal v2.
-  private void testDecimalExpr(String expr,
-      Type decimalV1ExpectedType, Type decimalV2ExpectedType) {
+  private void testDecimalExpr(String expr, Type decimalExpectedType, boolean isV2) {
     TQueryOptions queryOpts = new TQueryOptions();
 
-    queryOpts.setDecimal_v2(false);
+    queryOpts.setDecimal_v2(isV2);
     SelectStmt selectStmt =
         (SelectStmt) AnalyzesOk("select " + expr, createAnalysisCtx(queryOpts));
     Expr root = selectStmt.resultExprs_.get(0);
     Type actualType = root.getType();
     Assert.assertTrue(
-        "Expr: " + expr + " Decimal Version: 1" +
-        " Expected: " + decimalV1ExpectedType + " Actual: " + actualType,
-        decimalV1ExpectedType.equals(actualType));
+        "Expr: " + expr + " Decimal Version: " + (isV2? "2" : "1") +
+        " Expected: " + decimalExpectedType + " Actual: " + actualType,
+        decimalExpectedType.equals(actualType));
+  }
 
-    queryOpts.setDecimal_v2(true);
-    selectStmt = (SelectStmt) AnalyzesOk("select " + expr, createAnalysisCtx(queryOpts));
-    root = selectStmt.resultExprs_.get(0);
-    actualType = root.getType();
-    Assert.assertTrue(
-        "Expr: " + expr + " Decimal Version: 2" +
-            " Expected: " + decimalV2ExpectedType + " Actual: " + actualType,
-        decimalV2ExpectedType.equals(actualType));
+  // Verifies the resulting expr decimal type is expectedType under decimal v1.
+  private void testDecimalExprV1(String expr, Type decimalExpectedType) {
+    testDecimalExpr(expr, decimalExpectedType, false);
+  }
+
+  // Verifies the resulting expr decimal type is expectedType under decimal v2.
+  private void testDecimalExprV2(String expr, Type decimalExpectedType) {
+    testDecimalExpr(expr, decimalExpectedType, true);
+  }
+
+  // Verifies the resulting expr decimal type is expectedType under decimal v1 and
+  // decimal v2.
+  private void testDecimalExpr(String expr,
+      Type decimalV1ExpectedType, Type decimalV2ExpectedType) {
+    testDecimalExprV1(expr, decimalV1ExpectedType);
+    testDecimalExprV2(expr, decimalV2ExpectedType);
   }
 
   // Verifies the resulting expr decimal type is exptectedType
   private void testDecimalExpr(String expr, Type expectedType) {
     testDecimalExpr(expr, expectedType, expectedType);
   }
+
+  // Verify that mod and % returns the same type when it's DECIMAL V2 mdoe.
+  // See IMPALA-6202.
+  @Test
+  public void TestModReturnType() {
+    testDecimalExprV2("mod(9.8, 3)", ScalarType.createDecimalType(2,1));
+    testDecimalExprV2("9.7 % 3", ScalarType.createDecimalType(2,1));
+
+    testDecimalExprV2("mod(109.8, 3)", ScalarType.createDecimalType(4,1));
+    testDecimalExprV2("109.7 % 3", ScalarType.createDecimalType(4,1));
+
+    testDecimalExprV2("mod(109.8, 3.45)", ScalarType.createDecimalType(3,2));
+    testDecimalExprV2("109.7 % 3.45", ScalarType.createDecimalType(3,2));
+
+    testDecimalExprV1("mod(9.6, 3)", ScalarType.createDecimalType(4,1));
+    testDecimalExprV1("9.5 % 3", Type.DOUBLE);
+ }
 
   @Test
   public void TestDecimalArithmetic() {
@@ -2443,6 +2499,33 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     AnalysisError("select " + decimal_5_5 + " > 'cast(1 as timestamp)'",
         "operands of type DECIMAL(5,5) and STRING are not comparable: "
         + "CAST(1 AS DECIMAL(5,5)) > 'cast(1 as timestamp)'");
+
+    // IMPALA-7254: Inconsistent decimal behavior when finding a compatible type.
+    // for casting.
+    // In predicate that does not result in a new precision.
+    AnalyzesOk("select cast(2 as double) in " +
+        "(cast(2 as decimal(38, 37)), cast(3 as decimal(38, 37)))");
+    AnalyzesOk("select cast(2 as decimal(38, 37)) in " +
+        "(cast(2 as double), cast(3 as decimal(38, 37)))");
+    AnalyzesOk("select cast(2 as decimal(38, 37)) in " +
+        "(cast(2 as decimal(38, 37)), cast(3 as double))");
+    // In predicate that results in a precision.
+    AnalyzesOk("select cast(2 as double) in " +
+        "(cast(2 as decimal(5, 3)), cast(3 as decimal(10, 5)))");
+    AnalyzesOk("select cast(2 as decimal(5, 3)) in " +
+        "(cast(2 as double), cast(3 as decimal(10, 5)))");
+    AnalyzesOk("select cast(2 as decimal(5, 3)) in " +
+        "(cast(2 as decimal(10, 5)), cast(3 as double))");
+    // In predicate that results in a loss of precision.
+    AnalysisError("select cast(2 as decimal(38, 37)) in (cast(2 as decimal(38, 1)))",
+        "Incompatible return types 'DECIMAL(38,37)' and 'DECIMAL(38,1)' of exprs " +
+        "'CAST(2 AS DECIMAL(38,37))' and 'CAST(2 AS DECIMAL(38,1))'");
+    AnalyzesOk("select cast(2 as double) in " +
+        "(cast(2 as decimal(38, 37)), cast(3 as decimal(38, 1)))");
+    AnalyzesOk("select cast(2 as decimal(38, 37)) in " +
+        "(cast(2 as double), cast(3 as decimal(38, 1)))");
+    AnalyzesOk("select cast(2 as decimal(38, 37)) in " +
+        "(cast(2 as decimal(38, 1)), cast(3 as double))");
   }
 
   @Test
@@ -2672,7 +2755,7 @@ public class AnalyzeExprsTest extends AnalyzerTest {
   }
 
   @Test
-  public void TestAppxCountDistinctOption() throws AnalysisException, CatalogException {
+  public void TestAppxCountDistinctOption() throws AnalysisException {
     TQueryOptions queryOptions = new TQueryOptions();
     queryOptions.setAppx_count_distinct(true);
 
@@ -2681,20 +2764,24 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     // Accumulates count(distinct) for all columns of both alltypesTbl and decimalTbl.
     List<String> allCountDistinctFns = Lists.newArrayList();
 
-    Table alltypesTbl = catalog_.getTable("functional", "alltypes");
+    Table alltypesTbl = catalog_.getOrLoadTable("functional", "alltypes");
     for (Column col: alltypesTbl.getColumns()) {
       String colName = col.getName();
       // Test a single count(distinct) with some other aggs.
-      AnalyzesOk(String.format(
-          "select count(distinct %s), sum(distinct smallint_col), " +
+      String countDistinctFn = String.format("count(distinct %s)", colName);
+      SelectStmt stmt = (SelectStmt) AnalyzesOk(String.format(
+          "select %s, sum(distinct smallint_col), " +
           "avg(float_col), min(%s) " +
           "from functional.alltypes",
-          colName, colName), createAnalysisCtx(queryOptions));
-      countDistinctFns.add(String.format("count(distinct %s)", colName));
+          countDistinctFn, colName), createAnalysisCtx(queryOptions));
+      validateSingleColAppxCountDistinctRewrite(stmt, colName);
+      countDistinctFns.add(countDistinctFn);
     }
     // Test a single query with a count(distinct) on all columns of alltypesTbl.
-    AnalyzesOk(String.format("select %s from functional.alltypes",
+    SelectStmt alltypesStmt = (SelectStmt) AnalyzesOk(String.format(
+        "select %s from functional.alltypes",
         Joiner.on(",").join(countDistinctFns)), createAnalysisCtx(queryOptions));
+    assertAllNdvAggExprs(alltypesStmt, alltypesTbl.getColumns().size());
 
     allCountDistinctFns.addAll(countDistinctFns);
     countDistinctFns.clear();
@@ -2702,44 +2789,91 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     for (Column col: decimalTbl.getColumns()) {
       String colName = col.getName();
       // Test a single count(distinct) with some other aggs.
-      AnalyzesOk(String.format(
+      SelectStmt stmt = (SelectStmt) AnalyzesOk(String.format(
           "select count(distinct %s), sum(distinct d1), " +
           "avg(d2), min(%s) " +
           "from functional.decimal_tbl",
           colName, colName), createAnalysisCtx(queryOptions));
       countDistinctFns.add(String.format("count(distinct %s)", colName));
+      validateSingleColAppxCountDistinctRewrite(stmt, colName);
     }
     // Test a single query with a count(distinct) on all columns of decimalTbl.
-    AnalyzesOk(String.format("select %s from functional.decimal_tbl",
+    SelectStmt decimalTblStmt = (SelectStmt) AnalyzesOk(String.format(
+        "select %s from functional.decimal_tbl",
         Joiner.on(",").join(countDistinctFns)), createAnalysisCtx(queryOptions));
+    assertAllNdvAggExprs(decimalTblStmt, decimalTbl.getColumns().size());
 
     allCountDistinctFns.addAll(countDistinctFns);
 
     // Test a single query with a count(distinct) on all columns of both
     // alltypes/decimalTbl.
-    AnalyzesOk(String.format(
+    SelectStmt comboStmt = (SelectStmt) AnalyzesOk(String.format(
         "select %s from functional.alltypes cross join functional.decimal_tbl",
-        Joiner.on(",").join(countDistinctFns)), createAnalysisCtx(queryOptions));
+        Joiner.on(",").join(allCountDistinctFns)), createAnalysisCtx(queryOptions));
+    assertAllNdvAggExprs(comboStmt, alltypesTbl.getColumns().size() +
+        decimalTbl.getColumns().size());
 
     // The rewrite does not work for multiple count() arguments.
-    AnalysisError("select count(distinct int_col, bigint_col), " +
-        "count(distinct string_col, float_col) from functional.alltypes",
-        createAnalysisCtx(queryOptions),
-        "all DISTINCT aggregate functions need to have the same set of parameters as " +
-        "count(DISTINCT int_col, bigint_col); deviating function: " +
-        "count(DISTINCT string_col, float_col)");
+    SelectStmt noRewriteStmt = (SelectStmt) AnalyzesOk(
+        "select count(distinct int_col, bigint_col), " +
+        "count(distinct string_col, float_col) from functional.alltypes");
+    assertNoNdvAggExprs(noRewriteStmt, 2);
+
     // The rewrite only applies to the count() function.
-    AnalysisError(
+    noRewriteStmt = (SelectStmt) AnalyzesOk(
         "select avg(distinct int_col), sum(distinct float_col) from functional.alltypes",
-        createAnalysisCtx(queryOptions),
-        "all DISTINCT aggregate functions need to have the same set of parameters as " +
-        "avg(DISTINCT int_col); deviating function: sum(DISTINCT");
+        createAnalysisCtx(queryOptions));
+    assertNoNdvAggExprs(noRewriteStmt, 2);
+  }
+
+  // Checks that 'stmt' has two aggregate exprs - DISTINCT 'sum' and non-DISTINCT 'ndv'.
+  private void validateSingleColAppxCountDistinctRewrite(
+      SelectStmt stmt, String rewrittenColName) {
+    MultiAggregateInfo multiAggInfo = stmt.getMultiAggInfo();
+    List<FunctionCallExpr> aggExprs = multiAggInfo.getAggExprs();
+    assertEquals(4, aggExprs.size());
+    int numDistinctExprs = 0;
+    int numNdvExprs = 0;
+    for (FunctionCallExpr aggExpr : aggExprs) {
+      if (aggExpr.isDistinct()) {
+        assertEquals("sum", aggExpr.getFnName().toString());
+        ++numDistinctExprs;
+      }
+      if (aggExpr.getFnName().toString().equals("ndv")) {
+        assertEquals(rewrittenColName, aggExpr.getChild(0).toSql());
+        ++numNdvExprs;
+      }
+    }
+    assertEquals(1, numDistinctExprs);
+    assertEquals(1, numNdvExprs);
+  }
+
+  // Checks that all aggregate exprs in 'stmt' are non-DISTINCT 'ndv'.
+  private void assertAllNdvAggExprs(SelectStmt stmt, int expectedNumAggExprs) {
+    MultiAggregateInfo multiAggInfo = stmt.getMultiAggInfo();
+    List<FunctionCallExpr> aggExprs = multiAggInfo.getAggExprs();
+    assertEquals(expectedNumAggExprs, aggExprs.size());
+    for (FunctionCallExpr aggExpr : aggExprs) {
+      assertFalse(aggExpr.isDistinct());
+      assertEquals("ndv", aggExpr.getFnName().toString());
+    }
+  }
+
+  // Checks that all aggregate exprs in 'stmt' are DISTINCT and not 'ndv'.
+  private void assertNoNdvAggExprs(SelectStmt stmt, int expectedNumAggExprs) {
+    MultiAggregateInfo multiAggInfo = stmt.getMultiAggInfo();
+    List<FunctionCallExpr> aggExprs = multiAggInfo.getAggExprs();
+    assertEquals(expectedNumAggExprs, aggExprs.size());
+    for (FunctionCallExpr aggExpr : aggExprs) {
+      assertTrue(aggExpr.isDistinct());
+      assertNotEquals("ndv", aggExpr.getFnName().toString());
+    }
   }
 
   @Test
   // IMPALA-2233: Regression test for loss of precision through implicit casts.
   public void TestImplicitArgumentCasts() throws AnalysisException {
-    FunctionName fnName = new FunctionName(ImpaladCatalog.BUILTINS_DB, "greatest");
+    FunctionName fnName = new FunctionName(BuiltinsDb.NAME, "greatest");
     Function tinyIntFn = new Function(fnName, new Type[] {ScalarType.DOUBLE},
         Type.DOUBLE, true);
     Function decimalFn = new Function(fnName,
@@ -2749,7 +2883,7 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     Assert.assertTrue(tinyIntFn.compare(decimalFn,
         CompareMode.IS_NONSTRICT_SUPERTYPE_OF));
     // Check that this resolves to the decimal version of the function.
-    Db db = catalog_.getDb(ImpaladCatalog.BUILTINS_DB);
+    Db db = catalog_.getDb(BuiltinsDb.NAME);
     Function foundFn = db.getFunction(decimalFn, CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
     assertNotNull(foundFn);
     Assert.assertTrue(foundFn.getArgs()[0].isDecimal());
@@ -2782,7 +2916,7 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     Assert.assertNotNull(foundFn);
     Assert.assertEquals(Type.DOUBLE, foundFn.getArgs()[0]);
 
-    FunctionName lagFnName = new FunctionName(ImpaladCatalog.BUILTINS_DB, "lag");
+    FunctionName lagFnName = new FunctionName(BuiltinsDb.NAME, "lag");
     // Timestamp should not be converted to string if string overload available.
     Function lagStringFn = new Function(lagFnName,
         new Type[] {ScalarType.STRING, Type.TINYINT}, Type.INVALID, false);

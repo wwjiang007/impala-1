@@ -35,12 +35,13 @@ int Encode(const InternalType& v, int encoded_byte_size, uint8_t* buffer,
   return ParquetPlainEncoder::Encode(v, encoded_byte_size, buffer);
 }
 
-// Handle special case of encoding decimal types stored as BYTE_ARRAY since it is not
-// implemented in Impala.
+// Handle special case of encoding decimal types stored as BYTE_ARRAY, INT32, and INT64,
+// since these are not implemented in Impala.
 // When parquet_type equals BYTE_ARRAY: 'encoded_byte_size' is the sum of the
 // minimum number of bytes required to store the unscaled value and the bytes required to
 // store the size. Value 'v' passed to it should not contain leading zeros as this
 // method does not strictly conform to the parquet spec in removing those.
+// When parquet_type is INT32 or INT64, we simply write the unscaled value to the buffer.
 template <typename DecimalType>
 int EncodeDecimal(const DecimalType& v, int encoded_byte_size, uint8_t* buffer,
     parquet::Type::type parquet_type) {
@@ -51,6 +52,9 @@ int EncodeDecimal(const DecimalType& v, int encoded_byte_size, uint8_t* buffer,
     memcpy(buffer, &decimal_size, sizeof(int32_t));
     DecimalUtil::EncodeToFixedLenByteArray(buffer + sizeof(int32_t), decimal_size, v);
     return encoded_byte_size;
+  } else if (parquet_type == parquet::Type::INT32 ||
+             parquet_type == parquet::Type::INT64) {
+    return ParquetPlainEncoder::Encode(v.value(), encoded_byte_size, buffer);
   }
   return -1;
 }
@@ -93,6 +97,27 @@ void TestTruncate(const InternalType& v, int expected_byte_size) {
   }
 }
 
+template <typename InternalType, typename WidenInternalType,
+    parquet::Type::type PARQUET_TYPE>
+void TestTruncate(const InternalType& v, int expected_byte_size) {
+  uint8_t buffer[expected_byte_size];
+  int encoded_size = Encode(v, expected_byte_size, buffer, PARQUET_TYPE);
+  EXPECT_EQ(encoded_size, expected_byte_size);
+
+  // Check all possible truncations of the buffer.
+  for (int truncated_size = encoded_size - 1; truncated_size >= 0; --truncated_size) {
+    WidenInternalType result;
+    /// Copy to heap-allocated buffer so that ASAN can detect buffer overruns.
+    uint8_t* truncated_buffer = new uint8_t[truncated_size];
+    memcpy(truncated_buffer, buffer, truncated_size);
+    int decoded_size = ParquetPlainEncoder::Decode<WidenInternalType, PARQUET_TYPE>(
+        truncated_buffer, truncated_buffer + truncated_size, expected_byte_size,
+        &result);
+    EXPECT_EQ(-1, decoded_size);
+    delete[] truncated_buffer;
+  }
+}
+
 template <typename InternalType, parquet::Type::type PARQUET_TYPE>
 void TestType(const InternalType& v, int expected_byte_size) {
   uint8_t buffer[expected_byte_size];
@@ -106,6 +131,23 @@ void TestType(const InternalType& v, int expected_byte_size) {
   EXPECT_EQ(result, v);
 
   TestTruncate<InternalType, PARQUET_TYPE>(v, expected_byte_size);
+}
+
+template <typename InternalType, typename WidenInternalType,
+    parquet::Type::type PARQUET_TYPE>
+void TestTypeWidening(const InternalType& v, int expected_byte_size) {
+  uint8_t buffer[expected_byte_size];
+  int encoded_size = Encode(v, expected_byte_size, buffer, PARQUET_TYPE);
+  EXPECT_EQ(encoded_size, expected_byte_size);
+
+  WidenInternalType result;
+  int decoded_size = ParquetPlainEncoder::Decode<WidenInternalType, PARQUET_TYPE>(
+      buffer, buffer + expected_byte_size, expected_byte_size, &result);
+  EXPECT_EQ(decoded_size, expected_byte_size);
+  EXPECT_EQ(v, result);
+
+  TestTruncate<InternalType, WidenInternalType, PARQUET_TYPE>(
+      v, expected_byte_size);
 }
 
 TEST(PlainEncoding, Basic) {
@@ -127,6 +169,11 @@ TEST(PlainEncoding, Basic) {
   TestType<StringValue, parquet::Type::BYTE_ARRAY>(sv, sizeof(int32_t) + sv.len);
   TestType<TimestampValue, parquet::Type::INT96>(tv, 12);
 
+  // Test type widening.
+  TestTypeWidening<int32_t, int64_t, parquet::Type::INT32>(i32, sizeof(int32_t));
+  TestTypeWidening<int32_t, double, parquet::Type::INT32>(i32, sizeof(int32_t));
+  TestTypeWidening<float, double, parquet::Type::FLOAT>(f, sizeof(float));
+
   int test_val = 1234;
   int var_len_decimal_size = sizeof(int32_t)
       + 2 /*min bytes required for storing test_val*/;
@@ -139,6 +186,10 @@ TEST(PlainEncoding, Basic) {
       sizeof(Decimal4Value));
   TestType<Decimal4Value, parquet::Type::FIXED_LEN_BYTE_ARRAY>(
       Decimal4Value(test_val * -1), sizeof(Decimal4Value));
+  TestType<Decimal4Value, parquet::Type::INT32>(Decimal4Value(test_val),
+      sizeof(int32_t));
+  TestType<Decimal4Value, parquet::Type::INT32>(Decimal4Value(test_val * -1),
+      sizeof(int32_t));
 
   // Decimal8Value: General test case
   TestType<Decimal8Value, parquet::Type::BYTE_ARRAY>(Decimal8Value(test_val),
@@ -149,6 +200,10 @@ TEST(PlainEncoding, Basic) {
       sizeof(Decimal8Value));
   TestType<Decimal8Value, parquet::Type::FIXED_LEN_BYTE_ARRAY>(
       Decimal8Value(test_val * -1), sizeof(Decimal8Value));
+  TestType<Decimal8Value, parquet::Type::INT64>(Decimal8Value(test_val),
+      sizeof(int64_t));
+  TestType<Decimal8Value, parquet::Type::INT64>(Decimal8Value(test_val * -1),
+      sizeof(int64_t));
 
   // Decimal16Value: General test case
   TestType<Decimal16Value, parquet::Type::BYTE_ARRAY>(Decimal16Value(test_val),
@@ -171,6 +226,10 @@ TEST(PlainEncoding, Basic) {
       Decimal8Value(std::numeric_limits<int32_t>::max()), sizeof(Decimal8Value));
   TestType<Decimal8Value, parquet::Type::FIXED_LEN_BYTE_ARRAY>(
       Decimal8Value(std::numeric_limits<int32_t>::min()), sizeof(Decimal8Value));
+  TestType<Decimal8Value, parquet::Type::INT64>(
+      Decimal8Value(std::numeric_limits<int32_t>::max()), sizeof(int64_t));
+  TestType<Decimal8Value, parquet::Type::INT64>(
+      Decimal8Value(std::numeric_limits<int32_t>::min()), sizeof(int64_t));
 
   // Decimal16Value: int32 limits test
   TestType<Decimal16Value, parquet::Type::BYTE_ARRAY>(
@@ -205,6 +264,8 @@ TEST(PlainEncoding, Basic) {
           i + sizeof(int32_t));
       TestType<Decimal4Value, parquet::Type::FIXED_LEN_BYTE_ARRAY>(Decimal4Value(i), i);
       TestType<Decimal4Value, parquet::Type::FIXED_LEN_BYTE_ARRAY>(Decimal4Value(-i), i);
+      TestType<Decimal4Value, parquet::Type::INT32>(Decimal4Value(i), sizeof(int32_t));
+      TestType<Decimal4Value, parquet::Type::INT32>(Decimal4Value(-i), sizeof(int32_t));
     }
     if (i <= 8) {
       TestType<Decimal8Value, parquet::Type::BYTE_ARRAY>(Decimal8Value(i),
@@ -213,6 +274,8 @@ TEST(PlainEncoding, Basic) {
           i + sizeof(int32_t));
       TestType<Decimal8Value, parquet::Type::FIXED_LEN_BYTE_ARRAY>(Decimal8Value(i), i);
       TestType<Decimal8Value, parquet::Type::FIXED_LEN_BYTE_ARRAY>(Decimal8Value(-i), i);
+      TestType<Decimal8Value, parquet::Type::INT64>(Decimal8Value(i), sizeof(int64_t));
+      TestType<Decimal8Value, parquet::Type::INT64>(Decimal8Value(-i), sizeof(int64_t));
     }
     TestType<Decimal16Value, parquet::Type::BYTE_ARRAY>(Decimal16Value(i),
         i + sizeof(int32_t));

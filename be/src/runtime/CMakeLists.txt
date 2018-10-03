@@ -32,9 +32,9 @@ add_library(Runtime
   client-cache.cc
   coordinator.cc
   coordinator-backend-state.cc
-  data-stream-mgr.cc
-  data-stream-recvr.cc
-  data-stream-sender.cc
+  datetime-parse-util.cc
+  date-parse-util.cc
+  date-value.cc
   debug-options.cc
   descriptors.cc
   dml-exec-state.cc
@@ -61,10 +61,12 @@ add_library(Runtime
   reservation-manager.cc
   row-batch.cc
   ${ROW_BATCH_PROTO_SRCS}
+  row-batch-queue.cc
   runtime-filter.cc
   runtime-filter-bank.cc
   runtime-filter-ir.cc
   runtime-state.cc
+  scanner-mem-limiter.cc
   sorted-run-merger.cc
   sorter.cc
   string-value.cc
@@ -82,6 +84,7 @@ ADD_BE_LSAN_TEST(mem-pool-test)
 ADD_BE_LSAN_TEST(free-pool-test)
 ADD_BE_LSAN_TEST(string-buffer-test)
 ADD_BE_TEST(data-stream-test) # TODO: this test leaks
+ADD_BE_LSAN_TEST(date-test)
 ADD_BE_LSAN_TEST(timestamp-test)
 ADD_BE_LSAN_TEST(raw-value-test)
 ADD_BE_LSAN_TEST(string-compare-test)

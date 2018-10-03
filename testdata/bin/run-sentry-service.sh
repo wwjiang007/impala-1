@@ -18,11 +18,18 @@
 # under the License.
 
 set -euo pipefail
-trap 'echo Error in $0 at line $LINENO: $(cd "'$PWD'" && awk "NR == $LINENO" $0)' ERR
+. $IMPALA_HOME/bin/report_build_error.sh
+setup_report_build_error
 
 . ${IMPALA_HOME}/bin/set-classpath.sh
 
-SENTRY_SERVICE_CONFIG=${SENTRY_CONF_DIR}/sentry-site.xml
+SENTRY_SERVICE_CONFIG=${SENTRY_SERVICE_CONFIG:-}
+
+if [ -z ${SENTRY_SERVICE_CONFIG} ]
+then
+  SENTRY_SERVICE_CONFIG=${SENTRY_CONF_DIR}/sentry-site.xml
+fi
+
 LOGDIR="${IMPALA_CLUSTER_LOGS_DIR}"/sentry
 
 mkdir -p "${LOGDIR}" || true
@@ -31,7 +38,7 @@ mkdir -p "${LOGDIR}" || true
 $IMPALA_HOME/testdata/bin/kill-sentry-service.sh
 
 # Sentry picks up JARs from the HADOOP_CLASSPATH and not the CLASSPATH.
-export HADOOP_CLASSPATH=${POSTGRES_JDBC_DRIVER}
+export HADOOP_CLASSPATH=${POSTGRES_JDBC_DRIVER}:$IMPALA_HOME/fe/target/test-classes
 # Start the service.
 ${SENTRY_HOME}/bin/sentry --command service -c ${SENTRY_SERVICE_CONFIG} > "${LOGDIR}"/sentry.out 2>&1 &
 

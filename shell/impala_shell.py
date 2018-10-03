@@ -43,7 +43,6 @@ from option_parser import get_option_parser, get_config_from_file
 from shell_output import DelimitedOutputFormatter, OutputStream, PrettyOutputFormatter
 from shell_output import OverwritingStdErrOutputStream
 from subprocess import call
-from thrift.Thrift import TException
 
 VERSION_FORMAT = "Impala Shell v%(version)s (%(git_hash)s) built on %(build_date)s"
 VERSION_STRING = "build version not available"
@@ -58,6 +57,18 @@ try:
                                      'build_date': get_build_date()}
 except Exception:
   pass
+
+def strip_comments(sql):
+  """sqlparse default implementation of strip comments has a bad performance when parsing
+  very large SQL due to the grouping. This is because the default implementation tries to
+  format the SQL for pretty-printing. Impala shell use of strip comments is mostly for
+  checking and not for altering the actual SQL, so having a pretty-formatted SQL is
+  irrelevant in Impala shell. Removing the grouping gives a significant performance boost.
+  """
+  stack = sqlparse.engine.FilterStack()
+  stack.stmtprocess.append(sqlparse.filters.StripCommentsFilter())
+  stack.postprocess.append(sqlparse.filters.SerializerUnicode())
+  return ''.join(stack.run(sql, 'utf-8')).strip()
 
 class CmdStatus:
   """Values indicate the execution status of a command to the cmd shell driver module
@@ -128,10 +139,16 @@ class ImpalaShell(object, cmd.Cmd):
   DML_REGEX = re.compile("^(insert|upsert|update|delete)$", re.I)
   # Seperator for queries in the history file.
   HISTORY_FILE_QUERY_DELIM = '_IMP_DELIM_'
+  # Strings that are interpreted as True for some shell options.
+  TRUE_STRINGS = ("true", "TRUE", "True", "1")
 
   VALID_SHELL_OPTIONS = {
-    'LIVE_PROGRESS' : (lambda x: x in ("true", "TRUE", "True", "1"), "print_progress"),
-    'LIVE_SUMMARY' : (lambda x: x in ("true", "TRUE", "True", "1"), "print_summary")
+    'LIVE_PROGRESS' : (lambda x: x in ImpalaShell.TRUE_STRINGS, "print_progress"),
+    'LIVE_SUMMARY' : (lambda x: x in ImpalaShell.TRUE_STRINGS, "print_summary"),
+    'WRITE_DELIMITED' : (lambda x: x in ImpalaShell.TRUE_STRINGS, "write_delimited"),
+    'VERBOSE' : (lambda x: x in ImpalaShell.TRUE_STRINGS, "verbose"),
+    'DELIMITER' : (lambda x: " " if x == '\\s' else x, "output_delimiter"),
+    'OUTPUT_FILE' : (lambda x: None if x == '' else x, "output_file"),
   }
 
   # Minimum time in seconds between two calls to get the exec summary.
@@ -158,7 +175,7 @@ class ImpalaShell(object, cmd.Cmd):
     self.webserver_address = ImpalaShell.UNKNOWN_WEBSERVER
 
     self.current_db = options.default_db
-    self.history_file = os.path.expanduser("~/.impalahistory")
+    self.history_file = os.path.expanduser(options.history_file)
     # Stores the state of user input until a delimiter is seen.
     self.partial_cmd = str()
     # Stores the old prompt while the user input is incomplete.
@@ -168,7 +185,8 @@ class ImpalaShell(object, cmd.Cmd):
 
     # Output formatting flags/options
     self.output_file = options.output_file
-    self.output_delimiter = options.output_delimiter
+    self.output_delimiter = " " if options.output_delimiter == "\\s" \
+        else options.output_delimiter
     self.write_delimited = options.write_delimited
     self.print_header = options.print_header
 
@@ -212,6 +230,8 @@ class ImpalaShell(object, cmd.Cmd):
 
     if options.impalad is not None:
       self.do_connect(options.impalad)
+      # Check if the database in shell option exists
+      self._validate_database(immediately=True)
 
     # We handle Ctrl-C ourselves, using an Event object to signal cancellation
     # requests between the handler and the main shell thread.
@@ -400,13 +420,13 @@ class ImpalaShell(object, cmd.Cmd):
     # Strip any comments to make a statement such as the following be considered as
     # ending with a delimiter:
     # select 1 + 1; -- this is a comment
-    line = sqlparse.format(line, strip_comments=True).encode('utf-8').rstrip()
+    line = strip_comments(line).encode('utf-8').rstrip()
     if line.endswith(ImpalaShell.CMD_DELIM):
       try:
         # Look for an open quotation in the entire command, and not just the
         # current line.
         if self.partial_cmd:
-          line = sqlparse.format('%s %s' % (self.partial_cmd, line), strip_comments=True)
+          line = strip_comments('%s %s' % (self.partial_cmd, line))
         self._shlex_split(line)
         return True
       # If the command ends with a delimiter, check if it has an open quotation.
@@ -513,7 +533,7 @@ class ImpalaShell(object, cmd.Cmd):
         new_imp_client = self._new_impala_client()
         new_imp_client.connect()
         new_imp_client.cancel_query(self.last_query_handle, False)
-        self.imp_client.close_query(self.last_query_handle)
+        new_imp_client.close_query(self.last_query_handle)
         break
       except Exception, e:
         # Suppress harmless errors.
@@ -549,6 +569,10 @@ class ImpalaShell(object, cmd.Cmd):
     else:
       return query
 
+  def set_prompt(self, db):
+    self.prompt = ImpalaShell.PROMPT_FORMAT.format(
+        host=self.impalad[0], port=self.impalad[1], db=db)
+
   def precmd(self, args):
     args = self.sanitise_input(args)
     if not args: return args
@@ -562,9 +586,7 @@ class ImpalaShell(object, cmd.Cmd):
       # If cmdqueue is populated, then commands are executed from the cmdqueue, and user
       # input is ignored. Send an empty string as the user input just to be safe.
       return str()
-    try:
-      self.imp_client.test_connection()
-    except TException:
+    if not self.imp_client.is_connected():
       print_to_stderr("Connection lost, reconnecting...")
       self._connect()
       self._validate_database(immediately=True)
@@ -639,6 +661,14 @@ class ImpalaShell(object, cmd.Cmd):
     try:
       handle = self.VALID_SHELL_OPTIONS[token]
       self.__dict__[handle[1]] = handle[0](value)
+      return True
+    except KeyError:
+      return False
+
+  def _handle_unset_shell_options(self, token):
+    try:
+      handle = self.VALID_SHELL_OPTIONS[token]
+      self.__dict__[handle[1]] = impala_shell_defaults[handle[1]]
       return True
     except KeyError:
       return False
@@ -725,6 +755,8 @@ class ImpalaShell(object, cmd.Cmd):
     elif self.set_query_options.get(option):
       print 'Unsetting option %s' % option
       del self.set_query_options[option]
+    elif self._handle_unset_shell_options(option):
+      print 'Unsetting shell option %s' % option
     else:
       print "No option called %s is set" % option
 
@@ -783,8 +815,7 @@ class ImpalaShell(object, cmd.Cmd):
     if self.imp_client.connected:
       self._print_if_verbose('Connected to %s:%s' % self.impalad)
       self._print_if_verbose('Server version: %s' % self.server_version)
-      self.prompt = ImpalaShell.PROMPT_FORMAT.format(
-        host=self.impalad[0], port=self.impalad[1], db=ImpalaShell.DEFAULT_DB)
+      self.set_prompt(ImpalaShell.DEFAULT_DB)
       self._validate_database()
     try:
       self.imp_client.build_default_query_options_dict()
@@ -814,8 +845,11 @@ class ImpalaShell(object, cmd.Cmd):
     except TApplicationException:
       # We get a TApplicationException if the transport is valid,
       # but the RPC does not exist.
-      print_to_stderr("Error: Unable to communicate with impalad service. This "
-               "service may not be an impalad instance. Check host:port and try again.")
+      print_to_stderr("\n".join(textwrap.wrap(
+        "Error: Unable to communicate with impalad service. This "
+        "service may not be an impalad instance. A common problem is "
+        "that the port specified does not match the -beeswax_port flag on "
+        "the underlying impalad. Check host:port and try again.")))
       self.imp_client.close_connection()
       raise
     except ImportError:
@@ -854,10 +888,12 @@ class ImpalaShell(object, cmd.Cmd):
     If immediately is False, it appends the USE command to self.cmdqueue.
     If immediately is True, it executes the USE command right away.
     """
+    if not self.imp_client.connected:
+      return
+    # Should only check if successfully connected.
     if self.current_db:
       self.current_db = self.current_db.strip('`')
       use_current_db = ('use `%s`' % self.current_db)
-
       if immediately:
         self.onecmd(use_current_db)
       else:
@@ -1138,24 +1174,25 @@ class ImpalaShell(object, cmd.Cmd):
     query = self._create_beeswax_query(args)
     # Set posix=True and add "'" to escaped quotes
     # to deal with escaped quotes in string literals
-    lexer = shlex.shlex(sqlparse.format(query.query.lstrip(), strip_comments=True)
+    lexer = shlex.shlex(strip_comments(query.query.lstrip())
                         .encode('utf-8'), posix=True)
     lexer.escapedquotes += "'"
-    # Because the WITH clause may precede DML or SELECT queries,
-    # just checking the first token is insufficient.
-    is_dml = False
-    tokens = list(lexer)
-    if filter(self.DML_REGEX.match, tokens): is_dml = True
-    return self._execute_stmt(query, is_dml=is_dml, print_web_link=True)
+    try:
+      # Because the WITH clause may precede DML or SELECT queries,
+      # just checking the first token is insufficient.
+      is_dml = False
+      tokens = list(lexer)
+      if filter(self.DML_REGEX.match, tokens): is_dml = True
+      return self._execute_stmt(query, is_dml=is_dml, print_web_link=True)
+    except ValueError as e:
+      return self._execute_stmt(query, print_web_link=True)
 
   def do_use(self, args):
     """Executes a USE... query"""
     query = self._create_beeswax_query(args)
     if self._execute_stmt(query) is CmdStatus.SUCCESS:
       self.current_db = args.strip('`').strip()
-      self.prompt = ImpalaShell.PROMPT_FORMAT.format(host=self.impalad[0],
-                                                     port=self.impalad[1],
-                                                     db=self.current_db)
+      self.set_prompt(self.current_db)
     elif args.strip('`') == self.current_db:
       # args == current_db means -d option was passed but the "use [db]" operation failed.
       # We need to set the current_db to None so that it does not show a database, which
@@ -1338,24 +1375,31 @@ class ImpalaShell(object, cmd.Cmd):
       def _process(self, tlist):
         token = tlist.token_first()
         if self._is_comment(token):
-          self.comment = token.value
-          tidx = tlist.token_index(token)
-          tlist.tokens.pop(tidx)
+          self.comment = ''
+          while token:
+            if self._is_comment(token) or self._is_whitespace(token):
+              tidx = tlist.token_index(token)
+              self.comment += token.value
+              tlist.tokens.pop(tidx)
+              tidx -= 1
+              token = tlist.token_next(tidx, False)
+            else:
+              break
 
       def _is_comment(self, token):
-        if isinstance(token, sqlparse.sql.Comment):
-          return True
-        for comment in sqlparse.tokens.Comment:
-          if token.ttype == comment:
-            return True
-        return False
+        return isinstance(token, sqlparse.sql.Comment) or \
+               token.ttype == sqlparse.tokens.Comment.Single or \
+               token.ttype == sqlparse.tokens.Comment.Multiline
+
+      def _is_whitespace(self, token):
+        return token.ttype == sqlparse.tokens.Whitespace or \
+               token.ttype == sqlparse.tokens.Newline
 
       def process(self, stack, stmt):
         [self.process(stack, sgroup) for sgroup in stmt.get_sublists()]
         self._process(stmt)
 
     stack = sqlparse.engine.FilterStack()
-    stack.enable_grouping()
     strip_leading_comment_filter = StripLeadingCommentFilter()
     stack.stmtprocess.append(strip_leading_comment_filter)
     stack.postprocess.append(sqlparse.filters.SerializerUnicode())
@@ -1425,7 +1469,7 @@ LIVE_PROGRESS=1;'.",
 to remove formatting from results you want to save for later, or to benchmark Impala.",
   "You can run a single query from the command line using the '-q' option.",
   "When pretty-printing is disabled, you can use the '--output_delimiter' flag to set \
-the delimiter for fields in the same row. The default is ','.",
+the delimiter for fields in the same row. The default is '\\t'.",
   "Run the PROFILE command after a query has finished to see a comprehensive summary of \
 all the performance and diagnostic information that Impala gathered for that query. Be \
 warned, it can be very long!",
@@ -1478,7 +1522,7 @@ def parse_query_text(query_text, utf8_encode_policy='strict'):
   # "--comment2" is sent as is. Impala's parser however doesn't consider it a valid SQL
   # and throws an exception. We identify such trailing comments and ignore them (do not
   # send them to Impala).
-  if query_list and not sqlparse.format(query_list[-1], strip_comments=True).strip("\n"):
+  if query_list and not strip_comments(query_list[-1]).strip("\n"):
     query_list.pop()
   return query_list
 

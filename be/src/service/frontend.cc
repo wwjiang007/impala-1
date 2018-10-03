@@ -81,7 +81,8 @@ Frontend::Frontend() {
     {"getHadoopGroups", "([B)[B", &get_hadoop_groups_id_},
     {"checkConfiguration", "()Ljava/lang/String;", &check_config_id_},
     {"updateCatalogCache", "([B)[B", &update_catalog_cache_id_},
-    {"updateMembership", "([B)V", &update_membership_id_},
+    {"updateExecutorMembership", "([B)V", &update_membership_id_},
+    {"getCatalogMetrics", "()[B", &get_catalog_metrics_id_},
     {"getTableNames", "([B)[B", &get_table_names_id_},
     {"describeDb", "([B)[B", &describe_db_id_},
     {"describeTable", "([B)[B", &describe_table_id_},
@@ -92,7 +93,7 @@ Frontend::Frontend() {
     {"getFunctions", "([B)[B", &get_functions_id_},
     {"getCatalogObject", "([B)[B", &get_catalog_object_id_},
     {"getRoles", "([B)[B", &show_roles_id_},
-    {"getRolePrivileges", "([B)[B", &get_role_privileges_id_},
+    {"getPrincipalPrivileges", "([B)[B", &get_principal_privileges_id_},
     {"execHiveServer2MetadataOp", "([B)[B", &exec_hs2_metadata_op_id_},
     {"setCatalogIsReady", "()V", &set_catalog_is_ready_id_},
     {"waitForCatalog", "()V", &wait_for_catalog_id_},
@@ -125,7 +126,7 @@ Status Frontend::UpdateCatalogCache(const TUpdateCatalogCacheRequest& req,
   return JniUtil::CallJniMethod(fe_, update_catalog_cache_id_, req, resp);
 }
 
-Status Frontend::UpdateMembership(const TUpdateMembershipRequest& req) {
+Status Frontend::UpdateExecutorMembership(const TUpdateExecutorMembershipRequest& req) {
   return JniUtil::CallJniMethod(fe_, update_membership_id_, req);
 }
 
@@ -150,6 +151,10 @@ Status Frontend::ShowCreateTable(const TTableName& table_name, string* response)
 
 Status Frontend::ShowCreateFunction(const TGetFunctionsParams& params, string* response) {
   return JniUtil::CallJniMethod(fe_, show_create_function_id_, params, response);
+}
+
+Status Frontend::GetCatalogMetrics(TGetCatalogMetricsResult* resp) {
+  return JniUtil::CallJniMethod(fe_, get_catalog_metrics_id_, resp);
 }
 
 Status Frontend::GetTableNames(const string& db, const string* pattern,
@@ -181,9 +186,9 @@ Status Frontend::GetStats(const TShowStatsParams& params,
   return JniUtil::CallJniMethod(fe_, get_stats_id_, params, result);
 }
 
-Status Frontend::GetRolePrivileges(const TShowGrantRoleParams& params,
+Status Frontend::GetPrincipalPrivileges(const TShowGrantPrincipalParams& params,
     TResultSet* result) {
-  return JniUtil::CallJniMethod(fe_, get_role_privileges_id_, params, result);
+  return JniUtil::CallJniMethod(fe_, get_principal_privileges_id_, params, result);
 }
 
 Status Frontend::GetFunctions(TFunctionCategory::type fn_category, const string& db,
@@ -219,23 +224,9 @@ Status Frontend::GetExplainPlan(
 Status Frontend::ValidateSettings() {
   // Use FE to check Hadoop config setting
   // TODO: check OS setting
-  stringstream ss;
-  JNIEnv* jni_env = getJNIEnv();
-  JniLocalFrame jni_frame;
-  RETURN_IF_ERROR(jni_frame.push(jni_env));
-  jstring error_string =
-      static_cast<jstring>(jni_env->CallObjectMethod(fe_, check_config_id_));
-  RETURN_ERROR_IF_EXC(jni_env);
-  jboolean is_copy;
-  const char *str = jni_env->GetStringUTFChars(error_string, &is_copy);
-  RETURN_ERROR_IF_EXC(jni_env);
-  ss << str;
-  jni_env->ReleaseStringUTFChars(error_string, str);
-  RETURN_ERROR_IF_EXC(jni_env);
-
-  if (ss.str().size() > 0) {
-    return Status(ss.str());
-  }
+  string err;
+  RETURN_IF_ERROR(JniCall::instance_method(fe_, check_config_id_).Call(&err));
+  if (!err.empty()) return Status(err);
   return Status::OK();
 }
 

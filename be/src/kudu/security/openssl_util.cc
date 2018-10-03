@@ -17,30 +17,31 @@
 
 #include "kudu/security/openssl_util.h"
 
+#include <cerrno>
+#include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <mutex>
-#include <sstream>
 #include <string>
 #include <vector>
 
 #include <glog/logging.h>
+#include <openssl/crypto.h>
 #include <openssl/err.h>
 #include <openssl/rand.h>
-#include <openssl/ssl.h>
 
 #include "kudu/gutil/strings/split.h"
 #include "kudu/gutil/strings/strip.h"
+#include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/debug/leakcheck_disabler.h"
 #include "kudu/util/errno.h"
 #include "kudu/util/mutex.h"
 #include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/status.h"
 #include "kudu/util/subprocess.h"
-#include "kudu/util/thread.h"
 
 using std::ostringstream;
 using std::string;
+using std::vector;
 
 namespace kudu {
 namespace security {
@@ -63,6 +64,9 @@ bool g_disable_ssl_init = false;
 
 // Array of locks used by OpenSSL.
 // We use an intentionally-leaked C-style array here to avoid non-POD static data.
+//
+// As of OpenSSL 1.1, locking callbacks are no longer used.
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
 Mutex* kCryptoLocks = nullptr;
 
 // Lock/Unlock the nth lock. Only to be used by OpenSSL.
@@ -75,6 +79,7 @@ void LockingCB(int mode, int type, const char* /*file*/, int /*line*/) {
     m->unlock();
   }
 }
+#endif
 
 Status CheckOpenSSLInitialized() {
   if (!CRYPTO_get_locking_callback()) {
@@ -89,6 +94,26 @@ Status CheckOpenSSLInitialized() {
 }
 
 void DoInitializeOpenSSL() {
+#if OPENSSL_VERSION_NUMBER > 0x10100000L
+  // The OPENSSL_init_ssl manpage [1] says "As of version 1.1.0 OpenSSL will
+  // automatically allocate all resources it needs so no explicit initialisation
+  // is required." However, eliding library initialization leads to a memory
+  // leak in some versions of OpenSSL 1.1 when the first OpenSSL is
+  // ERR_peek_error [2]. In Kudu this is often the
+  // case due to prolific application of SCOPED_OPENSSL_NO_PENDING_ERRORS.
+  //
+  // Rather than determine whether this particular OpenSSL instance is
+  // leak-free, we'll initialize the library explicitly.
+  //
+  // 1. https://www.openssl.org/docs/man1.1.0/ssl/OPENSSL_init_ssl.html
+  // 2. https://github.com/openssl/openssl/issues/5899
+  if (g_disable_ssl_init) {
+    VLOG(2) << "Not initializing OpenSSL (disabled by application)";
+    return;
+  }
+  CHECK_EQ(1, OPENSSL_init_ssl(0, nullptr));
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
+#else
   // In case the user's thread has left some error around, clear it.
   ERR_clear_error();
   SCOPED_OPENSSL_NO_PENDING_ERRORS;
@@ -133,6 +158,7 @@ void DoInitializeOpenSSL() {
     // Callbacks used by OpenSSL required in a multi-threaded setting.
     CRYPTO_set_locking_callback(LockingCB);
   }
+#endif
 
   g_ssl_is_initialized = true;
 }
@@ -145,7 +171,7 @@ STACK_OF(X509)* PEM_read_STACK_OF_X509(BIO* bio, void* /* unused */, pem_passwor
   // Extract information from the chain certificate.
   STACK_OF(X509_INFO)* info = PEM_X509_INFO_read_bio(bio, nullptr, nullptr, nullptr);
   if (!info) return nullptr;
-  auto cleanup = MakeScopedCleanup([&]() {
+  SCOPED_CLEANUP({
     sk_X509_INFO_pop_free(info, X509_INFO_free);
   });
 

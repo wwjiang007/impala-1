@@ -29,19 +29,19 @@
 #include "codegen/llvm-codegen.h"
 #include "exec/plan-root-sink.h"
 #include "exec/exec-node.h"
-#include "exec/hdfs-scan-node-base.h"  // for PerVolumeStats
+#include "exec/hdfs-scan-node-base.h"
 #include "exec/exchange-node.h"
 #include "exec/scan-node.h"
 #include "runtime/exec-env.h"
 #include "runtime/backend-client.h"
-#include "runtime/runtime-filter-bank.h"
 #include "runtime/client-cache.h"
-#include "runtime/data-stream-mgr.h"
-#include "runtime/runtime-state.h"
+#include "runtime/krpc-data-stream-mgr.h"
 #include "runtime/query-state.h"
 #include "runtime/query-state.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/row-batch.h"
+#include "runtime/runtime-filter-bank.h"
+#include "runtime/runtime-state.h"
 #include "runtime/thread-resource-mgr.h"
 #include "scheduling/query-schedule.h"
 #include "util/debug-util.h"
@@ -71,13 +71,18 @@ FragmentInstanceState::FragmentInstanceState(
 }
 
 Status FragmentInstanceState::Exec() {
+  bool is_prepared = false;
   Status status = Prepare();
   DCHECK(runtime_state_ != nullptr);  // we need to guarantee at least that
-  discard_result(prepared_promise_.Set(status));
+
   if (!status.ok()) {
     discard_result(opened_promise_.Set(status));
     goto done;
   }
+  // Tell the managing 'QueryState' that we're done with Prepare().
+  query_state_->DonePreparing();
+  is_prepared = true;
+
   status = Open();
   discard_result(opened_promise_.Set(status));
   if (!status.ok()) goto done;
@@ -90,7 +95,23 @@ Status FragmentInstanceState::Exec() {
     status = ExecInternal();
   }
 
+  if (!status.ok()) goto done;
+  // Tell the managing 'QueryState' that we're done with executing and that we've stopped
+  // the reporting thread.
+  query_state_->DoneExecuting();
+
 done:
+  if (!status.ok()) {
+    if (!is_prepared) {
+      DCHECK_LE(current_state_.Load(), TFInstanceExecState::WAITING_FOR_PREPARE);
+      // Tell the managing 'QueryState' that we hit an error during Prepare().
+      query_state_->ErrorDuringPrepare(status, instance_id());
+    } else {
+      DCHECK_GT(current_state_.Load(), TFInstanceExecState::WAITING_FOR_PREPARE);
+      // Tell the managing 'QueryState' that we hit an error during execution.
+      query_state_->ErrorDuringExecute(status, instance_id());
+    }
+  }
   UpdateState(StateEvent::EXEC_END);
   // call this before Close() to make sure the thread token got released
   Finalize(status);
@@ -99,18 +120,14 @@ done:
 }
 
 void FragmentInstanceState::Cancel() {
-  // Make sure Prepare() finished. We don't care about the status since the query is
-  // being cancelled.
-  discard_result(WaitForPrepare());
-
   DCHECK(runtime_state_ != nullptr);
   runtime_state_->set_is_cancelled();
   if (root_sink_ != nullptr) root_sink_->Cancel(runtime_state_);
-  runtime_state_->stream_mgr()->Cancel(runtime_state_->fragment_instance_id());
+  ExecEnv::GetInstance()->stream_mgr()->Cancel(runtime_state_->fragment_instance_id());
 }
 
 Status FragmentInstanceState::Prepare() {
-  DCHECK(!prepared_promise_.IsSet());
+  DCHECK_EQ(current_state_.Load(), TFInstanceExecState::WAITING_FOR_EXEC);
   VLOG(2) << "fragment_instance_ctx:\n" << ThriftDebugString(instance_ctx_);
 
   // Do not call RETURN_IF_ERROR or explicitly return before this line,
@@ -132,11 +149,15 @@ Status FragmentInstanceState::Prepare() {
   event_sequence_->Start(query_state_->fragment_events_start_time());
   UpdateState(StateEvent::PREPARE_START);
 
+  // Reserve one main thread from the pool
+  runtime_state_->resource_pool()->AcquireThreadToken();
+
+  // Exercise debug actions at the first point where errors are possible in Prepare().
+  RETURN_IF_ERROR(DebugAction(query_state_->query_options(), "FIS_IN_PREPARE"));
+
   RETURN_IF_ERROR(runtime_state_->InitFilterBank(
       fragment_ctx_.fragment.runtime_filters_reservation_bytes));
 
-  // Reserve one main thread from the pool
-  runtime_state_->resource_pool()->AcquireThreadToken();
   avg_thread_tokens_ = profile()->AddSamplingCounter("AverageThreadTokens",
       bind<int64_t>(mem_fn(&ThreadResourcePool::num_threads),
           runtime_state_->resource_pool()));
@@ -232,8 +253,8 @@ Status FragmentInstanceState::Prepare() {
 }
 
 Status FragmentInstanceState::Open() {
-  DCHECK(prepared_promise_.IsSet());
   DCHECK(!opened_promise_.IsSet());
+  DCHECK_EQ(current_state_.Load(), TFInstanceExecState::WAITING_FOR_PREPARE);
   SCOPED_TIMER(profile()->total_time_counter());
   SCOPED_TIMER(ADD_TIMER(timings_profile_, OPEN_TIMER_NAME));
   SCOPED_THREAD_COUNTER_MEASUREMENT(runtime_state_->total_thread_statistics());
@@ -262,6 +283,9 @@ Status FragmentInstanceState::Open() {
 
   {
     UpdateState(StateEvent::OPEN_START);
+    // Inject failure if debug actions are enabled.
+    RETURN_IF_ERROR(DebugAction(query_state_->query_options(), "FIS_IN_OPEN"));
+
     SCOPED_TIMER(ADD_CHILD_TIMER(timings_profile_, "ExecTreeOpenTime", OPEN_TIMER_NAME));
     RETURN_IF_ERROR(exec_tree_->Open(runtime_state_));
   }
@@ -269,6 +293,10 @@ Status FragmentInstanceState::Open() {
 }
 
 Status FragmentInstanceState::ExecInternal() {
+  DCHECK_EQ(current_state_.Load(), TFInstanceExecState::WAITING_FOR_OPEN);
+  // Inject failure if debug actions are enabled.
+  RETURN_IF_ERROR(DebugAction(query_state_->query_options(), "FIS_IN_EXEC_INTERNAL"));
+
   RuntimeProfile::Counter* plan_exec_timer =
       ADD_CHILD_TIMER(timings_profile_, "ExecTreeExecTime", EXEC_TIMER_NAME);
   SCOPED_THREAD_COUNTER_MEASUREMENT(runtime_state_->total_thread_statistics());
@@ -480,14 +508,6 @@ void FragmentInstanceState::ReleaseThreadToken() {
   }
 }
 
-Status FragmentInstanceState::WaitForPrepare() {
-  return prepared_promise_.Get();
-}
-
-bool FragmentInstanceState::IsPrepared() {
-  return prepared_promise_.IsSet();
-}
-
 Status FragmentInstanceState::WaitForOpen() {
   return opened_promise_.Get();
 }
@@ -495,8 +515,6 @@ Status FragmentInstanceState::WaitForOpen() {
 void FragmentInstanceState::PublishFilter(const TPublishFilterParams& params) {
   VLOG_FILE << "PublishFilter(): instance_id=" << PrintId(instance_id())
             << " filter_id=" << params.filter_id;
-  // Wait until Prepare() is done, so we know that the filter bank is set up.
-  if (!WaitForPrepare().ok()) return;
   runtime_state_->filter_bank()->PublishGlobalFilter(params);
 }
 
@@ -504,14 +522,15 @@ string FragmentInstanceState::ExecStateToString(const TFInstanceExecState::type 
   // Labels to send to the debug webpages to display the current state to the user.
   static const string finstance_state_labels[] = {
       "Waiting for Exec",         // WAITING_FOR_EXEC
-      "Waiting for Codegen",      // WAITING_FOR_CODEGEN
       "Waiting for Prepare",      // WAITING_FOR_PREPARE
+      "Waiting for Codegen",      // WAITING_FOR_CODEGEN
       "Waiting for First Batch",  // WAITING_FOR_OPEN
       "Waiting for First Batch",  // WAITING_FOR_FIRST_BATCH
       "First batch produced",     // FIRST_BATCH_PRODUCED
       "Producing Data",           // PRODUCING_DATA
       "Last batch sent",          // LAST_BATCH_SENT
       "Finished"                  // FINISHED
+
   };
   /// Make sure we have a label for every possible state.
   static_assert(

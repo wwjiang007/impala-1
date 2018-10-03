@@ -19,6 +19,7 @@ package org.apache.impala.analysis;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
@@ -37,17 +38,16 @@ import org.apache.impala.authorization.PrivilegeRequest;
 import org.apache.impala.authorization.PrivilegeRequestBuilder;
 import org.apache.impala.authorization.User;
 import org.apache.impala.catalog.Column;
-import org.apache.impala.catalog.DataSourceTable;
 import org.apache.impala.catalog.DatabaseNotFoundException;
 import org.apache.impala.catalog.FeCatalog;
 import org.apache.impala.catalog.FeDataSourceTable;
 import org.apache.impala.catalog.FeDb;
 import org.apache.impala.catalog.FeFsTable;
+import org.apache.impala.catalog.FeHBaseTable;
+import org.apache.impala.catalog.FeKuduTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.FeView;
-import org.apache.impala.catalog.HBaseTable;
 import org.apache.impala.catalog.IncompleteTable;
-import org.apache.impala.catalog.KuduTable;
 import org.apache.impala.catalog.TableLoadingException;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
@@ -569,13 +569,21 @@ public class Analyzer {
       // an analysis error. We should not accidentally reveal the non-existence of a
       // table/database if the user is not authorized.
       if (rawPath.size() > 1) {
-        registerPrivReq(new PrivilegeRequestBuilder()
+        PrivilegeRequestBuilder builder = new PrivilegeRequestBuilder()
             .onTable(rawPath.get(0), rawPath.get(1))
-            .allOf(tableRef.getPrivilege()).toRequest());
+            .allOf(tableRef.getPrivilege());
+        if (tableRef.requireGrantOption()) {
+          builder.grantOption();
+        }
+        registerPrivReq(builder.toRequest());
       }
-      registerPrivReq(new PrivilegeRequestBuilder()
+      PrivilegeRequestBuilder builder = new PrivilegeRequestBuilder()
           .onTable(getDefaultDb(), rawPath.get(0))
-          .allOf(tableRef.getPrivilege()).toRequest());
+          .allOf(tableRef.getPrivilege());
+      if (tableRef.requireGrantOption()) {
+        builder.grantOption();
+      }
+      registerPrivReq(builder.toRequest());
       throw e;
     } catch (TableLoadingException e) {
       throw new AnalysisException(String.format(
@@ -588,8 +596,8 @@ public class Analyzer {
       if (table instanceof FeView) return new InlineViewRef((FeView) table, tableRef);
       // The table must be a base table.
       Preconditions.checkState(table instanceof FeFsTable ||
-          table instanceof KuduTable ||
-          table instanceof HBaseTable ||
+          table instanceof FeKuduTable ||
+          table instanceof FeHBaseTable ||
           table instanceof FeDataSourceTable);
       return new BaseTableRef(tableRef, resolvedPath);
     } else {
@@ -2260,17 +2268,33 @@ public class Analyzer {
   /**
    * Determines compatible type for given exprs, and casts them to compatible type.
    * Calls analyze() on each of the exprs.
-   * Throw an AnalysisException if the types are incompatible,
-   * returns compatible type otherwise.
+   * Throws an AnalysisException if the types are incompatible,
    */
-  public Type castAllToCompatibleType(List<Expr> exprs) throws AnalysisException {
-    // Determine compatible type of exprs.
-    Expr lastCompatibleExpr = exprs.get(0);
+  public void castAllToCompatibleType(List<Expr> exprs) throws AnalysisException {
+    // Group all the decimal types together at the end of the list to avoid comparing
+    // the decimals with each other first. For example, if we have the following list,
+    // [decimal, decimal, double], we will end up casting everything to a double anyways,
+    // so it does not matter if the decimals are not compatible with each other.
+    //
+    // We need to create a new sorted list instead of mutating it when sorting it because
+    // mutating the original exprs will change the order of the original exprs.
+    List<Expr> sortedExprs = new ArrayList<>(exprs);
+    Collections.sort(sortedExprs, new Comparator<Expr>() {
+      @Override
+      public int compare(Expr expr1, Expr expr2) {
+        if ((expr1.getType().isDecimal() && expr2.getType().isDecimal()) ||
+            (!expr1.getType().isDecimal() && !expr2.getType().isDecimal())) {
+          return 0;
+        }
+        return expr1.getType().isDecimal() ? 1 : -1;
+      }
+    });
+    Expr lastCompatibleExpr = sortedExprs.get(0);
     Type compatibleType = null;
-    for (int i = 0; i < exprs.size(); ++i) {
-      exprs.get(i).analyze(this);
+    for (int i = 0; i < sortedExprs.size(); ++i) {
+      sortedExprs.get(i).analyze(this);
       compatibleType = getCompatibleType(compatibleType, lastCompatibleExpr,
-          exprs.get(i));
+          sortedExprs.get(i));
     }
     // Add implicit casts if necessary.
     for (int i = 0; i < exprs.size(); ++i) {
@@ -2279,7 +2303,6 @@ public class Analyzer {
         exprs.set(i, castExpr);
       }
     }
-    return compatibleType;
   }
 
   /**
@@ -2317,6 +2340,15 @@ public class Analyzer {
 
   public String getDefaultDb() { return globalState_.queryCtx.session.database; }
   public User getUser() { return user_; }
+  public String getUserShortName() throws AnalysisException {
+    try {
+      return getUser().getShortName();
+    } catch (InternalException e) {
+      throw new AnalysisException("Could not get the shortened name for user: " +
+          getUser().getName(), e);
+    }
+  }
+
   public TQueryCtx getQueryCtx() { return globalState_.queryCtx; }
   public TQueryOptions getQueryOptions() {
     return globalState_.queryCtx.client_request.getQuery_options();
@@ -2381,21 +2413,25 @@ public class Analyzer {
    * Returns the Table with the given name from the 'loadedTables' map in the global
    * analysis state. Throws an AnalysisException if the table or the db does not exist.
    * Throws a TableLoadingException if the registered table failed to load.
-   * Always registers a privilege request for the table at the given privilege level,
+   * Always registers privilege request(s) for the table at the given privilege level(s),
    * regardless of the state of the table (i.e. whether it exists, is loaded, etc.).
-   * If addAccessEvent is true adds an access event for successfully loaded tables.
+   * If addAccessEvent is true adds access event(s) for successfully loaded tables. When
+   * multiple privileges are specified, all those privileges will be required for the
+   * authorization check.
    */
-  public FeTable getTable(TableName tableName, Privilege privilege, boolean addAccessEvent)
-      throws AnalysisException, TableLoadingException {
+  public FeTable getTable(TableName tableName, boolean addAccessEvent,
+      Privilege... privilege) throws AnalysisException, TableLoadingException {
     Preconditions.checkNotNull(tableName);
     Preconditions.checkNotNull(privilege);
     tableName = getFqTableName(tableName);
-    if (privilege == Privilege.ANY) {
-      registerPrivReq(new PrivilegeRequestBuilder()
-          .any().onAnyColumn(tableName.getDb(), tableName.getTbl()).toRequest());
-    } else {
-      registerPrivReq(new PrivilegeRequestBuilder()
-          .allOf(privilege).onTable(tableName.getDb(), tableName.getTbl()).toRequest());
+    for (Privilege priv : privilege) {
+      if (priv == Privilege.ANY) {
+        registerPrivReq(new PrivilegeRequestBuilder()
+            .any().onAnyColumn(tableName.getDb(), tableName.getTbl()).toRequest());
+      } else {
+        registerPrivReq(new PrivilegeRequestBuilder()
+            .allOf(priv).onTable(tableName.getDb(), tableName.getTbl()).toRequest());
+      }
     }
     FeTable table = getTable(tableName.getDb(), tableName.getTbl());
     Preconditions.checkNotNull(table);
@@ -2403,8 +2439,10 @@ public class Analyzer {
       // Add an audit event for this access
       TCatalogObjectType objectType = TCatalogObjectType.TABLE;
       if (table instanceof FeView) objectType = TCatalogObjectType.VIEW;
-      globalState_.accessEvents.add(new TAccessEvent(
-          tableName.toString(), objectType, privilege.toString()));
+      for (Privilege priv : privilege) {
+        globalState_.accessEvents.add(new TAccessEvent(
+            tableName.toString(), objectType, priv.toString()));
+      }
     }
     return table;
   }
@@ -2417,13 +2455,29 @@ public class Analyzer {
    * AuthorizationException is thrown.
    * If the table or the db does not exist in the Catalog, an AnalysisError is thrown.
    */
-  public FeTable getTable(TableName tableName, Privilege privilege)
+  public FeTable getTable(TableName tableName, Privilege... privilege)
       throws AnalysisException {
     try {
-      return getTable(tableName, privilege, true);
+      return getTable(tableName, true, privilege);
     } catch (TableLoadingException e) {
       throw new AnalysisException(e);
     }
+  }
+
+  /**
+   * If the database does not exist in the catalog an AnalysisError is thrown.
+   * This method does not require the grant option permission.
+   */
+  public FeDb getDb(String dbName, Privilege privilege) throws AnalysisException {
+    return getDb(dbName, privilege, true);
+  }
+
+  /**
+   * This method does not require the grant option permission.
+   */
+  public FeDb getDb(String dbName, Privilege privilege, boolean throwIfDoesNotExist)
+      throws AnalysisException {
+    return getDb(dbName, privilege, throwIfDoesNotExist, false);
   }
 
   /**
@@ -2433,15 +2487,17 @@ public class Analyzer {
    *
    * Registers a new access event if the catalog lookup was successful.
    *
-   * If the database does not exist in the catalog an AnalysisError is thrown.
+   * If throwIfDoesNotExist is set to true and the database does not exist in the catalog
+   * an AnalysisError is thrown.
+   * If requireGrantOption is set to true, the grant option permission is required for
+   * the specified privilege.
    */
-  public FeDb getDb(String dbName, Privilege privilege) throws AnalysisException {
-    return getDb(dbName, privilege, true);
-  }
-
-  public FeDb getDb(String dbName, Privilege privilege, boolean throwIfDoesNotExist)
-      throws AnalysisException {
+  public FeDb getDb(String dbName, Privilege privilege, boolean throwIfDoesNotExist,
+      boolean requireGrantOption) throws AnalysisException {
     PrivilegeRequestBuilder pb = new PrivilegeRequestBuilder();
+    if (requireGrantOption) {
+      pb.grantOption();
+    }
     if (privilege == Privilege.ANY) {
       registerPrivReq(
           pb.any().onAnyColumn(dbName, AuthorizeableTable.ANY_TABLE_NAME).toRequest());
@@ -2572,11 +2628,20 @@ public class Analyzer {
   }
 
   /**
-   * Registers a table-level privilege request and an access event for auditing
-   * for the given table and privilege. The table must be a base table or a
-   * catalog view (not a local view).
+   * This method does not require the grant option permission.
    */
   public void registerAuthAndAuditEvent(FeTable table, Privilege priv) {
+    registerAuthAndAuditEvent(table, priv, false);
+  }
+
+  /**
+   * Registers a table-level privilege request and an access event for auditing
+   * for the given table and privilege. The table must be a base table or a
+   * catalog view (not a local view). If requireGrantOption is set to true, the
+   * the grant option permission is required for the specified privilege.
+   */
+  public void registerAuthAndAuditEvent(FeTable table, Privilege priv,
+      boolean requireGrantOption) {
     // Add access event for auditing.
     if (table instanceof FeView) {
       FeView view = (FeView) table;
@@ -2591,8 +2656,21 @@ public class Analyzer {
     }
     // Add privilege request.
     TableName tableName = table.getTableName();
-    registerPrivReq(new PrivilegeRequestBuilder()
+    PrivilegeRequestBuilder builder = new PrivilegeRequestBuilder()
         .onTable(tableName.getDb(), tableName.getTbl())
-        .allOf(priv).toRequest());
+        .allOf(priv);
+    if (requireGrantOption) {
+      builder.grantOption();
+    }
+    registerPrivReq(builder.toRequest());
+  }
+
+  /**
+   * Returns the server name if authorization is enabled. Returns null when authorization
+   * is not enabled.
+   */
+  public String getServerName() {
+    return getAuthzConfig().isEnabled() ? getAuthzConfig().getServerName().intern() :
+        null;
   }
 }

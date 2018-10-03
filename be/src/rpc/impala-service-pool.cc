@@ -170,7 +170,7 @@ kudu::Status ImpalaServicePool::QueueInboundCall(
     // fail. The check and the consumption need to be atomic so as to bound the memory
     // usage.
     unique_lock<SpinLock> mem_tracker_lock(mem_tracker_lock_);
-    if (UNLIKELY(service_mem_tracker_->AnyLimitExceeded())) {
+    if (UNLIKELY(service_mem_tracker_->AnyLimitExceeded(MemLimit::HARD))) {
       // Discards the transfer early so the transfer size drops to 0. This is to ensure
       // the MemTracker::Release() call in FailAndReleaseRpc() is correct as we haven't
       // called MemTracker::Consume() at this point.
@@ -220,7 +220,7 @@ void ImpalaServicePool::RunThread() {
     }
 
     // We need to call RecordHandlingStarted() to update the InboundCall timing.
-    incoming->RecordHandlingStarted(incoming_queue_time_);
+    incoming->RecordHandlingStarted(incoming_queue_time_.get());
     ADOPT_TRACE(incoming->trace());
 
     if (UNLIKELY(incoming->ClientTimedOut())) {

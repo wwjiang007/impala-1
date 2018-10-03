@@ -41,14 +41,21 @@ ImpalaInternalService::ImpalaInternalService() {
 
 void ImpalaInternalService::ExecQueryFInstances(TExecQueryFInstancesResult& return_val,
     const TExecQueryFInstancesParams& params) {
-  VLOG_QUERY << "ExecQueryFInstances():" << " query_id=" <<
-      PrintId(params.query_ctx.query_id);
   FAULT_INJECTION_RPC_DELAY(RPC_EXECQUERYFINSTANCES);
   DCHECK(params.__isset.coord_state_idx);
   DCHECK(params.__isset.query_ctx);
   DCHECK(params.__isset.fragment_ctxs);
   DCHECK(params.__isset.fragment_instance_ctxs);
-  query_exec_mgr_->StartQuery(params).SetTStatus(&return_val);
+  VLOG_QUERY << "ExecQueryFInstances():" << " query_id="
+             << PrintId(params.query_ctx.query_id)
+             << " coord=" << TNetworkAddressToString(params.query_ctx.coord_address)
+             << " #instances=" << params.fragment_instance_ctxs.size();
+  Status status = query_exec_mgr_->StartQuery(params);
+  status.SetTStatus(&return_val);
+  if (!status.ok()) {
+    LOG(INFO) << "ExecQueryFInstances() failed: query_id="
+              << PrintId(params.query_ctx.query_id) << ": " << status.GetDetail();
+  }
 }
 
 template <typename T> void SetUnknownIdError(
@@ -80,15 +87,6 @@ void ImpalaInternalService::ReportExecStatus(TReportExecStatusResult& return_val
   impala_server_->ReportExecStatus(return_val, params);
 }
 
-void ImpalaInternalService::TransmitData(TTransmitDataResult& return_val,
-    const TTransmitDataParams& params) {
-  FAULT_INJECTION_RPC_DELAY(RPC_TRANSMITDATA);
-  DCHECK(params.__isset.dest_fragment_instance_id);
-  DCHECK(params.__isset.sender_id);
-  DCHECK(params.__isset.dest_node_id);
-  impala_server_->TransmitData(return_val, params);
-}
-
 void ImpalaInternalService::UpdateFilter(TUpdateFilterResult& return_val,
     const TUpdateFilterParams& params) {
   FAULT_INJECTION_RPC_DELAY(RPC_UPDATEFILTER);
@@ -108,4 +106,12 @@ void ImpalaInternalService::PublishFilter(TPublishFilterResult& return_val,
   QueryState::ScopedRef qs(params.dst_query_id);
   if (qs.get() == nullptr) return;
   qs->PublishFilter(params);
+}
+
+void ImpalaInternalService::RemoteShutdown(TRemoteShutdownResult& return_val,
+    const TRemoteShutdownParams& params) {
+  FAULT_INJECTION_RPC_DELAY(RPC_REMOTESHUTDOWN);
+  Status status = impala_server_->StartShutdown(
+      params.__isset.deadline_s ? params.deadline_s : -1, &return_val.shutdown_status);
+  status.ToThrift(&return_val.status);
 }

@@ -40,8 +40,8 @@ using namespace rapidjson;
 namespace accumulators = boost::accumulators;
 
 Coordinator::BackendState::BackendState(
-    const TUniqueId& query_id, int state_idx, TRuntimeFilterMode::type filter_mode)
-  : query_id_(query_id),
+    const Coordinator& coord, int state_idx, TRuntimeFilterMode::type filter_mode)
+  : coord_(coord),
     state_idx_(state_idx),
     filter_mode_(filter_mode) {
 }
@@ -150,16 +150,16 @@ void Coordinator::BackendState::SetRpcParams(const DebugOptions& debug_options,
 }
 
 void Coordinator::BackendState::Exec(
-    const TQueryCtx& query_ctx, const DebugOptions& debug_options,
+    const DebugOptions& debug_options,
     const FilterRoutingTable& filter_routing_table,
     CountingBarrier* exec_complete_barrier) {
   NotifyBarrierOnExit notifier(exec_complete_barrier);
   TExecQueryFInstancesParams rpc_params;
-  rpc_params.__set_query_ctx(query_ctx);
+  rpc_params.__set_query_ctx(query_ctx());
   SetRpcParams(debug_options, filter_routing_table, &rpc_params);
   VLOG_FILE << "making rpc: ExecQueryFInstances"
       << " host=" << TNetworkAddressToString(impalad_address()) << " query_id="
-      << PrintId(query_id_);
+      << PrintId(query_id());
 
   // guard against concurrent UpdateBackendExecStatus() that may arrive after RPC returns
   lock_guard<mutex> l(lock_);
@@ -180,7 +180,7 @@ void Coordinator::BackendState::Exec(
 
   if (!rpc_status.ok()) {
     const string& err_msg =
-        Substitute(ERR_TEMPLATE, PrintId(query_id_), rpc_status.msg().msg());
+        Substitute(ERR_TEMPLATE, PrintId(query_id()), rpc_status.msg().msg());
     VLOG_QUERY << err_msg;
     status_ = Status::Expected(err_msg);
     return;
@@ -188,7 +188,7 @@ void Coordinator::BackendState::Exec(
 
   Status exec_status = Status(thrift_result.status);
   if (!exec_status.ok()) {
-    const string& err_msg = Substitute(ERR_TEMPLATE, PrintId(query_id_),
+    const string& err_msg = Substitute(ERR_TEMPLATE, PrintId(query_id()),
         exec_status.msg().GetFullMessageDetails());
     VLOG_QUERY << err_msg;
     status_ = Status::Expected(err_msg);
@@ -196,7 +196,7 @@ void Coordinator::BackendState::Exec(
   }
 
   for (const auto& entry: instance_stats_map_) entry.second->stopwatch_.Start();
-  VLOG_FILE << "rpc succeeded: ExecQueryFInstances query_id=" << PrintId(query_id_);
+  VLOG_FILE << "rpc succeeded: ExecQueryFInstances query_id=" << PrintId(query_id());
 }
 
 Status Coordinator::BackendState::GetStatus(bool* is_fragment_failure,
@@ -210,9 +210,35 @@ Status Coordinator::BackendState::GetStatus(bool* is_fragment_failure,
   return status_;
 }
 
-int64_t Coordinator::BackendState::GetPeakConsumption() {
+Coordinator::ResourceUtilization Coordinator::BackendState::ComputeResourceUtilization() {
   lock_guard<mutex> l(lock_);
-  return peak_consumption_;
+  return ComputeResourceUtilizationLocked();
+}
+
+Coordinator::ResourceUtilization
+Coordinator::BackendState::ComputeResourceUtilizationLocked() {
+  ResourceUtilization result;
+  for (const auto& entry : instance_stats_map_) {
+    RuntimeProfile* profile = entry.second->profile_;
+    ResourceUtilization instance_utilization;
+    // Update resource utilization and apply delta.
+    RuntimeProfile::Counter* user_time = profile->GetCounter("TotalThreadsUserTime");
+    if (user_time != nullptr) instance_utilization.cpu_user_ns = user_time->value();
+
+    RuntimeProfile::Counter* system_time = profile->GetCounter("TotalThreadsSysTime");
+    if (system_time != nullptr) instance_utilization.cpu_sys_ns = system_time->value();
+
+    for (RuntimeProfile::Counter* c : entry.second->bytes_read_counters_) {
+      instance_utilization.bytes_read += c->value();
+    }
+
+    RuntimeProfile::Counter* peak_mem =
+        profile->GetCounter(FragmentInstanceState::PER_HOST_PEAK_MEM_COUNTER);
+    if (peak_mem != nullptr)
+      instance_utilization.peak_per_host_mem_consumption = peak_mem->value();
+    result.Merge(instance_utilization);
+  }
+  return result;
 }
 
 void Coordinator::BackendState::MergeErrorLog(ErrorLogMap* merged) {
@@ -225,7 +251,7 @@ void Coordinator::BackendState::LogFirstInProgress(
   for (Coordinator::BackendState* backend_state : backend_states) {
     lock_guard<mutex> l(backend_state->lock_);
     if (!backend_state->IsDone()) {
-      VLOG_QUERY << "query_id=" << PrintId(backend_state->query_id_)
+      VLOG_QUERY << "query_id=" << PrintId(backend_state->query_id())
                  << ": first in-progress backend: "
                  << TNetworkAddressToString(backend_state->impalad_address());
       break;
@@ -258,11 +284,6 @@ bool Coordinator::BackendState::ApplyExecStatusReport(
     if (instance_stats->done_) continue;
 
     instance_stats->Update(instance_exec_status, exec_summary, scan_range_progress);
-    if (instance_stats->peak_mem_counter_ != nullptr) {
-      // protect against out-of-order status updates
-      peak_consumption_ =
-        max(peak_consumption_, instance_stats->peak_mem_counter_->value());
-    }
 
     // If a query is aborted due to an error encountered by a single fragment instance,
     // all other fragment instances will report a cancelled status; make sure not to mask
@@ -351,46 +372,41 @@ bool Coordinator::BackendState::Cancel() {
 
   TCancelQueryFInstancesParams params;
   params.protocol_version = ImpalaInternalServiceVersion::V1;
-  params.__set_query_id(query_id_);
+  params.__set_query_id(query_id());
   TCancelQueryFInstancesResult dummy;
-  VLOG_QUERY << "sending CancelQueryFInstances rpc for query_id=" << PrintId(query_id_) <<
+  VLOG_QUERY << "sending CancelQueryFInstances rpc for query_id=" << PrintId(query_id()) <<
       " backend=" << TNetworkAddressToString(impalad_address());
 
-  Status rpc_status;
-  Status client_status;
-  // Try to send the RPC 3 times before failing.
-  for (int i = 0; i < 3; ++i) {
-    ImpalaBackendConnection backend_client(ExecEnv::GetInstance()->impalad_client_cache(),
-        impalad_address(), &client_status);
-    if (client_status.ok()) {
-      // The return value 'dummy' is ignored as it's only set if the fragment instance
-      // cannot be found in the backend. The fragment instances of a query can all be
-      // cancelled locally in a backend due to RPC failure to coordinator. In which case,
-      // the query state can be gone already.
-      rpc_status = backend_client.DoRpc(
-          &ImpalaBackendClient::CancelQueryFInstances, params, &dummy);
-      if (rpc_status.ok()) break;
+
+  // The return value 'dummy' is ignored as it's only set if the fragment
+  // instance cannot be found in the backend. The fragment instances of a query
+  // can all be cancelled locally in a backend due to RPC failure to
+  // coordinator. In which case, the query state can be gone already.
+  ImpalaBackendConnection::RpcStatus rpc_status = ImpalaBackendConnection::DoRpcWithRetry(
+      ExecEnv::GetInstance()->impalad_client_cache(), impalad_address(),
+      &ImpalaBackendClient::CancelQueryFInstances, params,
+      [this] () {
+        return DebugAction(query_ctx().client_request.query_options,
+            "COORD_CANCEL_QUERY_FINSTANCES_RPC");
+      }, &dummy);
+  if (!rpc_status.status.ok()) {
+    status_.MergeStatus(rpc_status.status);
+    if (rpc_status.client_error) {
+      VLOG_QUERY << "CancelQueryFInstances query_id= " << PrintId(query_id())
+                 << " failed to connect to " << TNetworkAddressToString(impalad_address())
+                 << " :" << rpc_status.status.msg().msg();
+    } else {
+      VLOG_QUERY << "CancelQueryFInstances query_id= " << PrintId(query_id())
+                 << " rpc to " << TNetworkAddressToString(impalad_address())
+                 << " failed: " << rpc_status.status.msg().msg();
     }
-  }
-  if (!client_status.ok()) {
-    status_.MergeStatus(client_status);
-    VLOG_QUERY << "CancelQueryFInstances query_id= " << PrintId(query_id_)
-               << " failed to connect to " << TNetworkAddressToString(impalad_address())
-               << " :" << client_status.msg().msg();
-    return true;
-  }
-  if (!rpc_status.ok()) {
-    status_.MergeStatus(rpc_status);
-    VLOG_QUERY << "CancelQueryFInstances query_id= " << PrintId(query_id_)
-               << " rpc to " << TNetworkAddressToString(impalad_address())
-               << " failed: " << rpc_status.msg().msg();
     return true;
   }
   return true;
 }
 
 void Coordinator::BackendState::PublishFilter(const TPublishFilterParams& rpc_params) {
-  DCHECK(rpc_params.dst_query_id == query_id_);
+  DCHECK(rpc_params.dst_query_id == query_id());
   {
     // If the backend is already done, it's not waiting for this filter, so we skip
     // sending it in this case.
@@ -441,15 +457,17 @@ void Coordinator::BackendState::InstanceStats::InitCounters() {
     RuntimeProfile::Counter* c =
         p->GetCounter(ScanNode::SCAN_RANGES_COMPLETE_COUNTER);
     if (c != nullptr) scan_ranges_complete_counters_.push_back(c);
+
+    RuntimeProfile::Counter* bytes_read =
+        p->GetCounter(ScanNode::BYTES_READ_COUNTER);
+    if (bytes_read != nullptr) bytes_read_counters_.push_back(bytes_read);
   }
 
-  peak_mem_counter_ =
-      profile_->GetCounter(FragmentInstanceState::PER_HOST_PEAK_MEM_COUNTER);
 }
 
 void Coordinator::BackendState::InstanceStats::Update(
-    const TFragmentInstanceExecStatus& exec_status,
-    ExecSummary* exec_summary, ProgressUpdater* scan_range_progress) {
+    const TFragmentInstanceExecStatus& exec_status, ExecSummary* exec_summary,
+    ProgressUpdater* scan_range_progress) {
   last_report_time_ms_ = MonotonicMillis();
   if (exec_status.done) stopwatch_.Stop();
   profile_->Update(exec_status.profile);
@@ -575,10 +593,17 @@ void Coordinator::FragmentStats::AddExecStats() {
 
 void Coordinator::BackendState::ToJson(Value* value, Document* document) {
   lock_guard<mutex> l(lock_);
+  ResourceUtilization resource_utilization = ComputeResourceUtilizationLocked();
   value->AddMember("num_instances", fragments_.size(), document->GetAllocator());
   value->AddMember("done", IsDone(), document->GetAllocator());
-  value->AddMember(
-      "peak_mem_consumption", peak_consumption_, document->GetAllocator());
+  value->AddMember("peak_per_host_mem_consumption",
+      resource_utilization.peak_per_host_mem_consumption, document->GetAllocator());
+  value->AddMember("bytes_read", resource_utilization.bytes_read,
+      document->GetAllocator());
+  value->AddMember("cpu_user_s", resource_utilization.cpu_user_ns / 1e9,
+      document->GetAllocator());
+  value->AddMember("cpu_sys_s", resource_utilization.cpu_sys_ns / 1e9,
+      document->GetAllocator());
 
   string host = TNetworkAddressToString(impalad_address());
   Value val(host.c_str(), document->GetAllocator());

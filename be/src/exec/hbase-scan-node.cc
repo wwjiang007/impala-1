@@ -19,6 +19,7 @@
 
 #include <algorithm>
 
+#include "runtime/exec-env.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/runtime-state.h"
 #include "runtime/row-batch.h"
@@ -57,9 +58,11 @@ HBaseScanNode::~HBaseScanNode() {
 
 Status HBaseScanNode::Prepare(RuntimeState* state) {
   RETURN_IF_ERROR(ScanNode::Prepare(state));
-  read_timer_ = ADD_TIMER(runtime_profile(), TOTAL_HBASE_READ_TIMER);
+  hbase_read_timer_ = ADD_TIMER(runtime_profile(), TOTAL_HBASE_READ_TIMER);
+  AddBytesReadCounters();
 
-  hbase_scanner_.reset(new HBaseTableScanner(this, state->htable_factory(), state));
+  hbase_scanner_.reset(
+      new HBaseTableScanner(this, ExecEnv::GetInstance()->htable_factory(), state));
 
   tuple_desc_ = state->desc_tbl().GetTupleDescriptor(tuple_id_);
   if (tuple_desc_ == NULL) {
@@ -152,7 +155,6 @@ Status HBaseScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eo
   // but there's still some considerable time inside here.
   // TODO: need to understand how the time is spent inside this function.
   SCOPED_TIMER(runtime_profile_->total_time_counter());
-  SCOPED_THREAD_COUNTER_MEASUREMENT(scanner_thread_counters());
 
   if (scan_range_vector_.empty() || ReachedLimit()) {
     *eos = true;
@@ -272,8 +274,7 @@ Status HBaseScanNode::Reset(RuntimeState* state) {
 void HBaseScanNode::Close(RuntimeState* state) {
   if (is_closed()) return;
   SCOPED_TIMER(runtime_profile_->total_time_counter());
-  PeriodicCounterUpdater::StopRateCounter(total_throughput_counter());
-  PeriodicCounterUpdater::StopTimeSeriesCounter(bytes_read_timeseries_counter_);
+  runtime_profile_->StopPeriodicCounters();
 
   if (hbase_scanner_.get() != NULL) {
     JNIEnv* env = getJNIEnv();

@@ -17,20 +17,27 @@
 
 #include "kudu/rpc/rpc_controller.h"
 
-#include <algorithm>
 #include <memory>
 #include <mutex>
+#include <ostream>
+#include <utility>
 
 #include <glog/logging.h>
 
+#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/outbound_call.h"
 #include "kudu/rpc/rpc_header.pb.h"
+#include "kudu/rpc/rpc_sidecar.h"
+#include "kudu/rpc/transfer.h"
+#include "kudu/util/slice.h"
+
 
 using std::unique_ptr;
 using strings::Substitute;
 namespace kudu {
+
 namespace rpc {
 
 RpcController::RpcController()

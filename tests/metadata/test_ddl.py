@@ -16,11 +16,13 @@
 # under the License.
 
 import getpass
+import itertools
 import pytest
 import re
 import time
 
 from test_ddl_base import TestDdlBase
+from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.impala_test_suite import LOG
 from tests.common.parametrize import UniqueDatabase
 from tests.common.skip import SkipIf, SkipIfADLS, SkipIfLocal
@@ -202,13 +204,13 @@ class TestDdlStatements(TestDdlBase):
     comment = self._get_db_comment(unique_database)
     assert 'comment' == comment
 
-    self.client.execute("comment on database {0} is '\\'comment\\''".format(unique_database))
-    comment = self._get_db_comment(unique_database)
-    assert "\\'comment\\'" == comment
-
     self.client.execute("comment on database {0} is ''".format(unique_database))
     comment = self._get_db_comment(unique_database)
     assert '' == comment
+
+    self.client.execute("comment on database {0} is '\\'comment\\''".format(unique_database))
+    comment = self._get_db_comment(unique_database)
+    assert "\\'comment\\'" == comment
 
     self.client.execute("comment on database {0} is null".format(unique_database))
     comment = self._get_db_comment(unique_database)
@@ -226,6 +228,28 @@ class TestDdlStatements(TestDdlBase):
     properties = self._get_db_owner_properties(unique_database)
     assert len(properties) == 1
     assert {'foo_role': 'ROLE'} == properties
+
+  def test_alter_table_set_owner(self, vector, unique_database):
+    table_name = "{0}.test_owner_tbl".format(unique_database)
+    self.client.execute("create table {0}(i int)".format(table_name))
+    self.client.execute("alter table {0} set owner user foo_user".format(table_name))
+    owner = self._get_table_or_view_owner(table_name)
+    assert ('foo_user', 'USER') == owner
+
+    self.client.execute("alter table {0} set owner role foo_role".format(table_name))
+    owner = self._get_table_or_view_owner(table_name)
+    assert ('foo_role', 'ROLE') == owner
+
+  def test_alter_view_set_owner(self, vector, unique_database):
+    view_name = "{0}.test_owner_tbl".format(unique_database)
+    self.client.execute("create view {0} as select 1".format(view_name))
+    self.client.execute("alter view {0} set owner user foo_user".format(view_name))
+    owner = self._get_table_or_view_owner(view_name)
+    assert ('foo_user', 'USER') == owner
+
+    self.client.execute("alter view {0} set owner role foo_role".format(view_name))
+    owner = self._get_table_or_view_owner(view_name)
+    assert ('foo_role', 'ROLE') == owner
 
   # There is a query in QueryTest/create-table that references nested types, which is not
   # supported if old joins and aggs are enabled. Since we do not get any meaningful
@@ -274,13 +298,13 @@ class TestDdlStatements(TestDdlBase):
     comment = self._get_table_or_view_comment(table)
     assert "comment" == comment
 
-    self.client.execute("comment on table {0} is '\\'comment\\''".format(table))
-    comment = self._get_table_or_view_comment(table)
-    assert "\\\\'comment\\\\'" == comment
-
     self.client.execute("comment on table {0} is ''".format(table))
     comment = self._get_table_or_view_comment(table)
     assert "" == comment
+
+    self.client.execute("comment on table {0} is '\\'comment\\''".format(table))
+    comment = self._get_table_or_view_comment(table)
+    assert "\\\\'comment\\\\'" == comment
 
     self.client.execute("comment on table {0} is null".format(table))
     comment = self._get_table_or_view_comment(table)
@@ -297,17 +321,68 @@ class TestDdlStatements(TestDdlBase):
     comment = self._get_table_or_view_comment(view)
     assert "comment" == comment
 
-    self.client.execute("comment on view {0} is '\\'comment\\''".format(view))
-    comment = self._get_table_or_view_comment(view)
-    assert "\\\\'comment\\\\'" == comment
-
     self.client.execute("comment on view {0} is ''".format(view))
     comment = self._get_table_or_view_comment(view)
     assert "" == comment
 
+    self.client.execute("comment on view {0} is '\\'comment\\''".format(view))
+    comment = self._get_table_or_view_comment(view)
+    assert "\\\\'comment\\\\'" == comment
+
     self.client.execute("comment on view {0} is null".format(view))
     comment = self._get_table_or_view_comment(view)
     assert comment is None
+
+  def test_comment_on_column(self, vector, unique_database):
+    table = "{0}.comment_table".format(unique_database)
+    self.client.execute("create table {0} (i int) partitioned by (j int)".format(table))
+
+    comment = self._get_column_comment(table, 'i')
+    assert '' == comment
+
+    # Updating comment on a regular column.
+    self.client.execute("comment on column {0}.i is 'comment 1'".format(table))
+    comment = self._get_column_comment(table, 'i')
+    assert "comment 1" == comment
+
+    # Updating comment on a partition column.
+    self.client.execute("comment on column {0}.j is 'comment 2'".format(table))
+    comment = self._get_column_comment(table, 'j')
+    assert "comment 2" == comment
+
+    self.client.execute("comment on column {0}.i is ''".format(table))
+    comment = self._get_column_comment(table, 'i')
+    assert "" == comment
+
+    self.client.execute("comment on column {0}.i is '\\'comment\\''".format(table))
+    comment = self._get_column_comment(table, 'i')
+    assert "\\'comment\\'" == comment
+
+    self.client.execute("comment on column {0}.i is null".format(table))
+    comment = self._get_column_comment(table, 'i')
+    assert "" == comment
+
+    view = "{0}.comment_view".format(unique_database)
+    self.client.execute("create view {0}(i) as select 1".format(view))
+
+    comment = self._get_column_comment(view, 'i')
+    assert "" == comment
+
+    self.client.execute("comment on column {0}.i is 'comment'".format(view))
+    comment = self._get_column_comment(view, 'i')
+    assert "comment" == comment
+
+    self.client.execute("comment on column {0}.i is ''".format(view))
+    comment = self._get_column_comment(view, 'i')
+    assert "" == comment
+
+    self.client.execute("comment on column {0}.i is '\\'comment\\''".format(view))
+    comment = self._get_column_comment(view, 'i')
+    assert "\\'comment\\'" == comment
+
+    self.client.execute("comment on column {0}.i is null".format(view))
+    comment = self._get_column_comment(view, 'i')
+    assert "" == comment
 
   @UniqueDatabase.parametrize(sync_ddl=True)
   def test_sync_ddl_drop(self, vector, unique_database):
@@ -442,36 +517,63 @@ class TestDdlStatements(TestDdlBase):
 |  01:SCAN HDFS [functional.alltypes b]
 00:SCAN HDFS [functional.alltypestiny a]""" in '\n'.join(plan.data)
 
+  def _verify_describe_view(self, vector, view_name, expected_substr):
+    """
+    Verify across all impalads that the view 'view_name' has the given substring in its
+    expanded SQL.
+
+    If SYNC_DDL is enabled, the verification should complete immediately. Otherwise,
+    loops waiting for the expected condition to pass.
+    """
+    if vector.get_value('exec_option')['sync_ddl']:
+      num_attempts = 1
+    else:
+      num_attempts = 60
+    for impalad in ImpalaCluster().impalads:
+      client = impalad.service.create_beeswax_client()
+      try:
+        for attempt in itertools.count(1):
+          assert attempt <= num_attempts, "ran out of attempts"
+          try:
+            result = self.execute_query_expect_success(
+                client, "describe formatted %s" % view_name)
+            exp_line = [l for l in result.data if 'View Expanded' in l][0]
+          except ImpalaBeeswaxException, e:
+            # In non-SYNC_DDL tests, it's OK to get a "missing view" type error
+            # until the metadata propagates.
+            exp_line = "Exception: %s" % e
+          if expected_substr in exp_line.lower():
+            return
+          time.sleep(1)
+      finally:
+        client.close()
+
+
   def test_views_describe(self, vector, unique_database):
     # IMPALA-6896: Tests that altered views can be described by all impalads.
     impala_cluster = ImpalaCluster()
     impalads = impala_cluster.impalads
+    view_name = "%s.test_describe_view" % unique_database
+    query_opts = vector.get_value('exec_option')
     first_client = impalads[0].service.create_beeswax_client()
     try:
+      # Create a view and verify it's visible.
       self.execute_query_expect_success(first_client,
-                                        "create view {0}.test_describe_view as "
+                                        "create view {0} as "
                                         "select * from functional.alltypes"
-                                        .format(unique_database), {'sync_ddl': 1})
+                                        .format(view_name), query_opts)
+      self._verify_describe_view(vector, view_name, "select * from functional.alltypes")
+
+      # Alter the view and verify the alter is visible.
       self.execute_query_expect_success(first_client,
-                                        "alter view {0}.test_describe_view as "
+                                        "alter view {0} as "
                                         "select * from functional.alltypesagg"
-                                        .format(unique_database))
+                                        .format(view_name), query_opts)
+      self._verify_describe_view(vector, view_name,
+                                 "select * from functional.alltypesagg")
     finally:
       first_client.close()
 
-    for impalad in impalads:
-      client = impalad.service.create_beeswax_client()
-      try:
-        while True:
-          result = self.execute_query_expect_success(
-              client, "describe formatted {0}.test_describe_view"
-              .format(unique_database))
-          if any("select * from functional.alltypesagg" in s.lower()
-                 for s in result.data):
-            break
-          time.sleep(1)
-      finally:
-        client.close()
 
   @UniqueDatabase.parametrize(sync_ddl=True)
   def test_functions_ddl(self, vector, unique_database):

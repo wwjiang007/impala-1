@@ -18,16 +18,14 @@
 package org.apache.impala.catalog;
 
 import java.io.IOException;
-import java.lang.reflect.Method;
-import java.net.URL;
-import java.net.URLClassLoader;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -35,55 +33,61 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
-import org.apache.commons.codec.binary.Base64;
-import org.apache.hadoop.fs.Path;
+import com.google.common.annotations.VisibleForTesting;
 import org.apache.hadoop.fs.RemoteIterator;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
 import org.apache.hadoop.hdfs.protocol.CachePoolEntry;
 import org.apache.hadoop.hdfs.protocol.CachePoolInfo;
-import org.apache.hadoop.hive.metastore.api.FunctionType;
 import org.apache.hadoop.hive.metastore.api.NoSuchObjectException;
-import org.apache.hadoop.hive.metastore.api.ResourceType;
-import org.apache.hadoop.hive.metastore.api.ResourceUri;
 import org.apache.hadoop.hive.metastore.api.UnknownDBException;
-import org.apache.hadoop.hive.ql.exec.FunctionUtils;
 import org.apache.impala.authorization.SentryConfig;
 import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
 import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.common.ImpalaException;
-import org.apache.impala.common.ImpalaRuntimeException;
-import org.apache.impala.common.JniUtil;
 import org.apache.impala.common.Pair;
 import org.apache.impala.common.Reference;
-import org.apache.impala.hive.executor.UdfExecutor;
+import org.apache.impala.common.RuntimeEnv;
+import org.apache.impala.service.BackendConfig;
 import org.apache.impala.service.FeSupport;
+import org.apache.impala.thrift.CatalogLookupStatus;
+import org.apache.impala.thrift.CatalogServiceConstants;
 import org.apache.impala.thrift.TCatalog;
+import org.apache.impala.thrift.TCatalogInfoSelector;
 import org.apache.impala.thrift.TCatalogObject;
 import org.apache.impala.thrift.TCatalogObjectType;
 import org.apache.impala.thrift.TCatalogUpdateResult;
+import org.apache.impala.thrift.TDatabase;
 import org.apache.impala.thrift.TFunction;
 import org.apache.impala.thrift.TGetCatalogUsageResponse;
+import org.apache.impala.thrift.TGetPartialCatalogObjectRequest;
+import org.apache.impala.thrift.TGetPartialCatalogObjectResponse;
+import org.apache.impala.thrift.TPartialCatalogInfo;
+import org.apache.impala.thrift.TGetPartitionStatsRequest;
 import org.apache.impala.thrift.TPartitionKeyValue;
+import org.apache.impala.thrift.TPartitionStats;
+import org.apache.impala.thrift.TPrincipalType;
 import org.apache.impala.thrift.TPrivilege;
 import org.apache.impala.thrift.TTable;
 import org.apache.impala.thrift.TTableName;
+import org.apache.impala.thrift.TTableUsage;
 import org.apache.impala.thrift.TTableUsageMetrics;
 import org.apache.impala.thrift.TUniqueId;
+import org.apache.impala.util.FunctionUtils;
+import org.apache.impala.thrift.TUpdateTableUsageRequest;
 import org.apache.impala.util.PatternMatcher;
 import org.apache.impala.util.SentryProxy;
 import org.apache.log4j.Logger;
 import org.apache.thrift.TException;
 import org.apache.thrift.TSerializer;
 import org.apache.thrift.protocol.TBinaryProtocol;
-import org.apache.thrift.protocol.TCompactProtocol;
 
 import com.codahale.metrics.Timer;
-import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
+
 
 /**
  * Specialized Catalog that implements the CatalogService specific Catalog
@@ -163,7 +167,7 @@ import com.google.common.collect.Sets;
  * loading thread pool.
  */
 public class CatalogServiceCatalog extends Catalog {
-  private static final Logger LOG = Logger.getLogger(CatalogServiceCatalog.class);
+  public static final Logger LOG = Logger.getLogger(CatalogServiceCatalog.class);
 
   private static final int INITIAL_META_STORE_CLIENT_POOL_SIZE = 10;
   private static final int MAX_NUM_SKIPPED_TOPIC_UPDATES = 2;
@@ -204,9 +208,6 @@ public class CatalogServiceCatalog extends Catalog {
   // policy metadata. Null if Sentry Service is not enabled.
   private final SentryProxy sentryProxy_;
 
-  // Local temporary directory to copy UDF Jars.
-  private static String localLibraryPath_;
-
   // Log of deleted catalog objects.
   private final CatalogDeltaLog deleteLog_;
 
@@ -220,6 +221,20 @@ public class CatalogServiceCatalog extends Catalog {
 
   private final TopicUpdateLog topicUpdateLog_ = new TopicUpdateLog();
 
+  private final String localLibraryPath_;
+
+  private CatalogdTableInvalidator catalogdTableInvalidator_;
+
+  /**
+   * See the gflag definition in be/.../catalog-server.cc for details on these modes.
+   */
+  private static enum TopicMode {
+    FULL,
+    MIXED,
+    MINIMAL
+  };
+  final TopicMode topicMode_;
+
   /**
    * Initialize the CatalogServiceCatalog. If 'loadInBackground' is true, table metadata
    * will be loaded in the background. 'initialHmsCnxnTimeoutSec' specifies the time (in
@@ -229,7 +244,7 @@ public class CatalogServiceCatalog extends Catalog {
    */
   public CatalogServiceCatalog(boolean loadInBackground, int numLoadingThreads,
       int initialHmsCnxnTimeoutSec, SentryConfig sentryConfig, TUniqueId catalogServiceId,
-      String kerberosPrincipal, String localLibraryPath) {
+      String kerberosPrincipal, String localLibraryPath) throws ImpalaException {
     super(INITIAL_META_STORE_CLIENT_POOL_SIZE, initialHmsCnxnTimeoutSec);
     catalogServiceId_ = catalogServiceId;
     tableLoadingMgr_ = new TableLoadingMgr(this, numLoadingThreads);
@@ -249,8 +264,12 @@ public class CatalogServiceCatalog extends Catalog {
     } else {
       sentryProxy_ = null;
     }
-    localLibraryPath_ = new String("file://" + localLibraryPath);
+    localLibraryPath_ = localLibraryPath;
     deleteLog_ = new CatalogDeltaLog();
+    topicMode_ = TopicMode.valueOf(
+        BackendConfig.INSTANCE.getBackendCfg().catalog_topic_mode.toUpperCase());
+    catalogdTableInvalidator_ = CatalogdTableInvalidator.create(this,
+        BackendConfig.INSTANCE);
   }
 
   // Timeout for acquiring a table lock
@@ -390,6 +409,66 @@ public class CatalogServiceCatalog extends Catalog {
   }
 
   /**
+   * Retrieves TPartitionStats as a map that associates partitions with their
+   * statistics. The table partitions are specified in
+   * TGetPartitionStatsRequest. If statistics are not available for a partition,
+   * a default TPartitionStats is used. Partitions are identified by their partitioning
+   * column string values.
+   */
+  public Map<String, ByteBuffer> getPartitionStats(TGetPartitionStatsRequest request)
+      throws CatalogException {
+    Preconditions.checkState(BackendConfig.INSTANCE.pullIncrementalStatistics()
+        && !RuntimeEnv.INSTANCE.isTestEnv());
+    TTableName tableName = request.table_name;
+    LOG.info("Fetching partition statistics for: " + tableName.getDb_name() + "."
+        + tableName.getTable_name());
+    Table table = getOrLoadTable(tableName.db_name, tableName.table_name);
+
+    // Table could be null if it does not exist anymore.
+    if (table == null) {
+      throw new CatalogException(
+          "Requested partition statistics for table that does not exist: "
+          + request.table_name);
+    }
+
+    // Table could be incomplete, in which case an exception should be thrown.
+    if (table instanceof IncompleteTable) {
+      throw new CatalogException("No statistics available for incompletely"
+          + " loaded table: " + request.table_name, ((IncompleteTable) table).getCause());
+    }
+
+    // Table must be a FeFsTable type at this point.
+    Preconditions.checkArgument(table instanceof HdfsTable,
+        "Partition statistics can only be requested for FS tables, type is: %s",
+        table.getClass().getCanonicalName());
+
+    // Table must be loaded.
+    Preconditions.checkState(table.isLoaded());
+
+    Map<String, ByteBuffer> stats = Maps.newHashMap();
+    HdfsTable hdfsTable = (HdfsTable) table;
+    hdfsTable.getLock().lock();
+    try {
+      Collection<? extends PrunablePartition> partitions = hdfsTable.getPartitions();
+      for (PrunablePartition partition : partitions) {
+        Preconditions.checkState(partition instanceof FeFsPartition);
+        FeFsPartition fsPartition = (FeFsPartition) partition;
+        TPartitionStats partStats = fsPartition.getPartitionStats();
+        if (partStats != null) {
+          ByteBuffer compressedStats =
+              ByteBuffer.wrap(fsPartition.getPartitionStatsCompressed());
+          stats.put(FeCatalogUtils.getPartitionName(fsPartition), compressedStats);
+        }
+      }
+    } finally {
+      hdfsTable.getLock().unlock();
+    }
+    LOG.info("Fetched partition statistics for " + stats.size()
+        + " partitions on: " + hdfsTable.getFullName());
+    return stats;
+  }
+
+  /**
    * The context for add*ToCatalogDelta(), called by getCatalogDelta. It contains
    * callback information, version range and collected topics.
    */
@@ -421,12 +500,69 @@ public class CatalogServiceCatalog extends Catalog {
       }
       // TODO: TSerializer.serialize() returns a copy of the internal byte array, which
       // could be elided.
-      byte[] data = serializer.serialize(obj);
-      if (!FeSupport.NativeAddPendingTopicItem(nativeCatalogServerPtr, key,
-          obj.catalog_version, data, delete)) {
-        LOG.error("NativeAddPendingTopicItem failed in BE. key=" + key + ", delete="
-            + delete + ", data_size=" + data.length);
+      if (topicMode_ == TopicMode.FULL || topicMode_ == TopicMode.MIXED) {
+        String v1Key = CatalogServiceConstants.CATALOG_TOPIC_V1_PREFIX + key;
+        byte[] data = serializer.serialize(obj);
+        if (!FeSupport.NativeAddPendingTopicItem(nativeCatalogServerPtr, v1Key,
+            obj.catalog_version, data, delete)) {
+          LOG.error("NativeAddPendingTopicItem failed in BE. key=" + v1Key + ", delete="
+              + delete + ", data_size=" + data.length);
+        }
       }
+
+      if (topicMode_ == TopicMode.MINIMAL || topicMode_ == TopicMode.MIXED) {
+        // Serialize a minimal version of the object that can be used by impalads
+        // that are running in 'local-catalog' mode. This is used by those impalads
+        // to invalidate their local cache.
+        TCatalogObject minimalObject = getMinimalObjectForV2(obj);
+        if (minimalObject != null) {
+          byte[] data = serializer.serialize(minimalObject);
+          String v2Key = CatalogServiceConstants.CATALOG_TOPIC_V2_PREFIX + key;
+          if (!FeSupport.NativeAddPendingTopicItem(nativeCatalogServerPtr, v2Key,
+              obj.catalog_version, data, delete)) {
+            LOG.error("NativeAddPendingTopicItem failed in BE. key=" + v2Key + ", delete="
+                + delete + ", data_size=" + data.length);
+          }
+        }
+      }
+    }
+
+    private TCatalogObject getMinimalObjectForV2(TCatalogObject obj) {
+      Preconditions.checkState(topicMode_ == TopicMode.MINIMAL ||
+          topicMode_ == TopicMode.MIXED);
+      TCatalogObject min = new TCatalogObject(obj.type, obj.catalog_version);
+      switch (obj.type) {
+      case DATABASE:
+        min.setDb(new TDatabase(obj.db.db_name));
+        break;
+      case TABLE:
+      case VIEW:
+        min.setTable(new TTable(obj.table.db_name, obj.table.tbl_name));
+        break;
+      case CATALOG:
+        // Sending the top-level catalog version is important for implementing SYNC_DDL.
+        // This also allows impalads to detect a catalogd restart and invalidate the
+        // whole catalog.
+        // TODO(todd) ensure that the impalad does this invalidation as required.
+        return obj;
+      case PRIVILEGE:
+      case PRINCIPAL:
+        // The caching of this data on the impalad side is somewhat complex
+        // and this code is also under some churn at the moment. So, we'll just publish
+        // the full information rather than doing fetch-on-demand.
+        return obj;
+      case FUNCTION:
+        min.setFn(new TFunction(obj.fn.getName()));
+        break;
+      case DATA_SOURCE:
+      case HDFS_CACHE_POOL:
+        // These are currently not cached by v2 impalad.
+        // TODO(todd): handle these items.
+        return null;
+      default:
+        throw new AssertionError("Unexpected catalog object type: " + obj.type);
+      }
+      return min;
     }
   }
 
@@ -455,7 +591,10 @@ public class CatalogServiceCatalog extends Catalog {
       addHdfsCachePoolToCatalogDelta(cachePool, ctx);
     }
     for (Role role: getAllRoles()) {
-      addRoleToCatalogDelta(role, ctx);
+      addPrincipalToCatalogDelta(role, ctx);
+    }
+    for (User user: getAllUsers()) {
+      addPrincipalToCatalogDelta(user, ctx);
     }
     // Identify the catalog objects that were removed from the catalog for which their
     // versions are in range ('ctx.fromVersion', 'ctx.toVersion']. We need to make sure
@@ -504,7 +643,7 @@ public class CatalogServiceCatalog extends Catalog {
   /**
    * Get a snapshot view of all the databases in the catalog.
    */
-  private List<Db> getAllDbs() {
+  List<Db> getAllDbs() {
     versionLock_.readLock().lock();
     try {
       return ImmutableList.copyOf(dbCache_.get().values());
@@ -550,6 +689,18 @@ public class CatalogServiceCatalog extends Catalog {
   }
 
   /**
+   * Get a snapshot view of all the users in the catalog.
+   */
+  private List<User> getAllUsers() {
+    versionLock_.readLock().lock();
+    try {
+      return ImmutableList.copyOf(authPolicy_.getAllUsers());
+    } finally {
+      versionLock_.readLock().unlock();
+    }
+  }
+
+  /**
    * Adds a database in the topic update if its version is in the range
    * ('ctx.fromVersion', 'ctx.toVersion']. It iterates through all the tables and
    * functions of this database to determine if they can be included in the topic update.
@@ -574,7 +725,7 @@ public class CatalogServiceCatalog extends Catalog {
   /**
    * Get a snapshot view of all the tables in a database.
    */
-  private List<Table> getAllTables(Db db) {
+  List<Table> getAllTables(Db db) {
     Preconditions.checkNotNull(db);
     versionLock_.readLock().lock();
     try {
@@ -713,42 +864,42 @@ public class CatalogServiceCatalog extends Catalog {
 
 
   /**
-   * Adds a role to the topic update if its version is in the range
+   * Adds a principal to the topic update if its version is in the range
    * ('ctx.fromVersion', 'ctx.toVersion']. It iterates through all the privileges of
-   * this role to determine if they can be inserted in the topic update.
+   * this principal to determine if they can be inserted in the topic update.
    */
-  private void addRoleToCatalogDelta(Role role, GetCatalogDeltaContext ctx)
-      throws TException  {
-    long roleVersion = role.getCatalogVersion();
-    if (roleVersion > ctx.fromVersion && roleVersion <= ctx.toVersion) {
-      TCatalogObject thriftRole =
-          new TCatalogObject(TCatalogObjectType.ROLE, roleVersion);
-      thriftRole.setRole(role.toThrift());
-      ctx.addCatalogObject(thriftRole, false);
+  private void addPrincipalToCatalogDelta(Principal principal, GetCatalogDeltaContext ctx)
+      throws TException {
+    long principalVersion = principal.getCatalogVersion();
+    if (principalVersion > ctx.fromVersion && principalVersion <= ctx.toVersion) {
+      TCatalogObject thriftPrincipal =
+          new TCatalogObject(TCatalogObjectType.PRINCIPAL, principalVersion);
+      thriftPrincipal.setPrincipal(principal.toThrift());
+      ctx.addCatalogObject(thriftPrincipal, false);
     }
-    for (RolePrivilege p: getAllPrivileges(role)) {
-      addRolePrivilegeToCatalogDelta(p, ctx);
+    for (PrincipalPrivilege p: getAllPrivileges(principal)) {
+      addPrincipalPrivilegeToCatalogDelta(p, ctx);
     }
   }
 
   /**
-   * Get a snapshot view of all the privileges in a role.
+   * Get a snapshot view of all the privileges in a principal.
    */
-  private List<RolePrivilege> getAllPrivileges(Role role) {
-    Preconditions.checkNotNull(role);
+  private List<PrincipalPrivilege> getAllPrivileges(Principal principal) {
+    Preconditions.checkNotNull(principal);
     versionLock_.readLock().lock();
     try {
-      return ImmutableList.copyOf(role.getPrivileges());
+      return ImmutableList.copyOf(principal.getPrivileges());
     } finally {
       versionLock_.readLock().unlock();
     }
   }
 
   /**
-   * Adds a role privilege to the topic update if its version is in the range
+   * Adds a principal privilege to the topic update if its version is in the range
    * ('ctx.fromVersion', 'ctx.toVersion'].
    */
-  private void addRolePrivilegeToCatalogDelta(RolePrivilege priv,
+  private void addPrincipalPrivilegeToCatalogDelta(PrincipalPrivilege priv,
       GetCatalogDeltaContext ctx) throws TException  {
     long privVersion = priv.getCatalogVersion();
     if (privVersion <= ctx.fromVersion || privVersion > ctx.toVersion) return;
@@ -780,131 +931,6 @@ public class CatalogServiceCatalog extends Catalog {
   }
 
   /**
-   * Checks if the Hive function 'fn' is Impala compatible. A function is Impala
-   * compatible iff
-   *
-   * 1. The function is JAVA based,
-   * 2. Has exactly one binary resource associated (We don't support loading
-   *    dependencies yet) and
-   * 3. The binary is of type JAR.
-   *
-   * Returns true if compatible and false otherwise. In case of incompatible
-   * functions 'incompatMsg' has the reason for the incompatibility.
-   * */
-   public static boolean isFunctionCompatible(
-       org.apache.hadoop.hive.metastore.api.Function fn, StringBuilder incompatMsg) {
-    boolean isCompatible = true;
-    if (fn.getFunctionType() != FunctionType.JAVA) {
-      isCompatible = false;
-      incompatMsg.append("Function type: " + fn.getFunctionType().name()
-          + " is not supported. Only " + FunctionType.JAVA.name() + " functions "
-          + "are supported.");
-    } else if (fn.getResourceUrisSize() == 0) {
-      isCompatible = false;
-      incompatMsg.append("No executable binary resource (like a JAR file) is " +
-          "associated with this function. To fix this, recreate the function by " +
-          "specifying a 'location' in the function create statement.");
-    } else if (fn.getResourceUrisSize() != 1) {
-      isCompatible = false;
-      List<String> resourceUris = Lists.newArrayList();
-      for (ResourceUri resource: fn.getResourceUris()) {
-        resourceUris.add(resource.getUri());
-      }
-      incompatMsg.append("Impala does not support multiple Jars for dependencies."
-          + "(" + Joiner.on(",").join(resourceUris) + ") ");
-    } else if (fn.getResourceUris().get(0).getResourceType() != ResourceType.JAR) {
-      isCompatible = false;
-      incompatMsg.append("Function binary type: " +
-        fn.getResourceUris().get(0).getResourceType().name()
-        + " is not supported. Only " + ResourceType.JAR.name()
-        + " type is supported.");
-    }
-    return isCompatible;
-  }
-
-  /**
-   * Returns a list of Impala Functions, one per compatible "evaluate" method in the UDF
-   * class referred to by the given Java function. This method copies the UDF Jar
-   * referenced by "function" to a temporary file in localLibraryPath_ and loads it
-   * into the jvm. Then we scan all the methods in the class using reflection and extract
-   * those methods and create corresponding Impala functions. Currently Impala supports
-   * only "JAR" files for symbols and also a single Jar containing all the dependent
-   * classes rather than a set of Jar files.
-   */
-  public static List<Function> extractFunctions(String db,
-      org.apache.hadoop.hive.metastore.api.Function function)
-      throws ImpalaRuntimeException{
-    List<Function> result = Lists.newArrayList();
-    List<String> addedSignatures = Lists.newArrayList();
-    StringBuilder warnMessage = new StringBuilder();
-    if (!isFunctionCompatible(function, warnMessage)) {
-      LOG.warn("Skipping load of incompatible function: " +
-          function.getFunctionName() + ". " + warnMessage.toString());
-      return result;
-    }
-    String jarUri = function.getResourceUris().get(0).getUri();
-    Class<?> udfClass = null;
-    Path localJarPath = null;
-    try {
-      localJarPath = new Path(localLibraryPath_, UUID.randomUUID().toString() + ".jar");
-      try {
-        FileSystemUtil.copyToLocal(new Path(jarUri), localJarPath);
-      } catch (IOException e) {
-        String errorMsg = "Error loading Java function: " + db + "." +
-            function.getFunctionName() + ". Couldn't copy " + jarUri +
-            " to local path: " + localJarPath.toString();
-        LOG.error(errorMsg, e);
-        throw new ImpalaRuntimeException(errorMsg);
-      }
-      URL[] classLoaderUrls = new URL[] {new URL(localJarPath.toString())};
-      URLClassLoader urlClassLoader = new URLClassLoader(classLoaderUrls);
-      udfClass = urlClassLoader.loadClass(function.getClassName());
-      // Check if the class is of UDF type. Currently we don't support other functions
-      // TODO: Remove this once we support Java UDAF/UDTF
-      if (FunctionUtils.getUDFClassType(udfClass) != FunctionUtils.UDFClassType.UDF) {
-        LOG.warn("Ignoring load of incompatible Java function: " +
-            function.getFunctionName() + " as " + FunctionUtils.getUDFClassType(udfClass)
-            + " is not a supported type. Only UDFs are supported");
-        return result;
-      }
-      // Load each method in the UDF class and create the corresponding Impala Function
-      // object.
-      for (Method m: udfClass.getMethods()) {
-        if (!m.getName().equals(UdfExecutor.UDF_FUNCTION_NAME)) continue;
-        Function fn = ScalarFunction.fromHiveFunction(db,
-            function.getFunctionName(), function.getClassName(),
-            m.getParameterTypes(), m.getReturnType(), jarUri);
-        if (fn == null) {
-          LOG.warn("Ignoring incompatible method: " + m.toString() + " during load of " +
-             "Hive UDF:" + function.getFunctionName() + " from " + udfClass);
-          continue;
-        }
-        if (!addedSignatures.contains(fn.signatureString())) {
-          result.add(fn);
-          addedSignatures.add(fn.signatureString());
-        }
-      }
-    } catch (ClassNotFoundException c) {
-      String errorMsg = "Error loading Java function: " + db + "." +
-          function.getFunctionName() + ". Symbol class " + udfClass +
-          "not found in Jar: " + jarUri;
-      LOG.error(errorMsg);
-      throw new ImpalaRuntimeException(errorMsg, c);
-    } catch (Exception e) {
-      LOG.error("Skipping function load: " + function.getFunctionName(), e);
-      throw new ImpalaRuntimeException("Error extracting functions", e);
-    } catch (LinkageError e) {
-      String errorMsg = "Error resolving dependencies for Java function: " + db + "." +
-          function.getFunctionName();
-      LOG.error(errorMsg);
-      throw new ImpalaRuntimeException(errorMsg, e);
-    } finally {
-      if (localJarPath != null) FileSystemUtil.deleteIfExists(localJarPath);
-    }
-    return result;
-  }
-
- /**
    * Extracts Impala functions stored in metastore db parameters and adds them to
    * the catalog cache.
    */
@@ -912,21 +938,13 @@ public class CatalogServiceCatalog extends Catalog {
       org.apache.hadoop.hive.metastore.api.Database msDb) {
     if (msDb == null || msDb.getParameters() == null) return;
     LOG.info("Loading native functions for database: " + db.getName());
-    TCompactProtocol.Factory protocolFactory = new TCompactProtocol.Factory();
-    for (String key: msDb.getParameters().keySet()) {
-      if (!key.startsWith(Db.FUNCTION_INDEX_PREFIX)) continue;
-      try {
-        TFunction fn = new TFunction();
-        JniUtil.deserializeThrift(protocolFactory, fn,
-            Base64.decodeBase64(msDb.getParameters().get(key)));
-        Function addFn = Function.fromThrift(fn);
-        db.addFunction(addFn, false);
-        addFn.setCatalogVersion(incrementAndGetCatalogVersion());
-      } catch (ImpalaException e) {
-        LOG.error("Encountered an error during function load: key=" + key
-            + ",continuing", e);
-      }
+    List<Function> funcs = FunctionUtils.deserializeNativeFunctionsFromDbParams(
+        msDb.getParameters());
+    for (Function f : funcs) {
+      db.addFunction(f, false);
+      f.setCatalogVersion(incrementAndGetCatalogVersion());
     }
+
     LOG.info("Loaded native functions for database: " + db.getName());
   }
 
@@ -938,10 +956,16 @@ public class CatalogServiceCatalog extends Catalog {
   private void loadJavaFunctions(Db db,
       List<org.apache.hadoop.hive.metastore.api.Function> functions) {
     Preconditions.checkNotNull(functions);
+    if (BackendConfig.INSTANCE.disableCatalogDataOpsDebugOnly()) {
+      LOG.info("Skip loading Java functions: catalog data ops disabled.");
+      return;
+    }
     LOG.info("Loading Java functions for database: " + db.getName());
     for (org.apache.hadoop.hive.metastore.api.Function function: functions) {
       try {
-        for (Function fn: extractFunctions(db.getName(), function)) {
+        List<Function> fns = FunctionUtils.extractFunctions(db.getName(), function,
+            localLibraryPath_);
+        for (Function fn: fns) {
           db.addFunction(fn);
           fn.setCatalogVersion(incrementAndGetCatalogVersion());
         }
@@ -1603,12 +1627,49 @@ public class CatalogServiceCatalog extends Catalog {
    * If a role with the same name already exists it will be overwritten.
    */
   public Role addRole(String roleName, Set<String> grantGroups) {
+    Principal role = addPrincipal(roleName, grantGroups, TPrincipalType.ROLE);
+    Preconditions.checkState(role instanceof Role);
+    return (Role) role;
+  }
+
+  /**
+   * Adds a new user with the given name to the AuthorizationPolicy.
+   * If a user with the same name already exists it will be overwritten.
+   */
+  public User addUser(String userName) {
+    Principal user = addPrincipal(userName, Sets.<String>newHashSet(),
+        TPrincipalType.USER);
+    Preconditions.checkState(user instanceof User);
+    return (User) user;
+  }
+
+  /**
+   * Add a user to the catalog if it doesn't exist. This is necessary so privileges
+   * can be added for a user. example: owner privileges.
+   */
+  public User addUserIfNotExists(String owner, Reference<Boolean> existingUser) {
     versionLock_.writeLock().lock();
     try {
-      Role role = new Role(roleName, grantGroups);
-      role.setCatalogVersion(incrementAndGetCatalogVersion());
-      authPolicy_.addRole(role);
-      return role;
+      User user = getAuthPolicy().getUser(owner);
+      existingUser.setRef(Boolean.TRUE);
+      if (user == null) {
+        user = addUser(owner);
+        existingUser.setRef(Boolean.FALSE);
+      }
+      return user;
+    } finally {
+      versionLock_.writeLock().unlock();
+    }
+  }
+
+  private Principal addPrincipal(String principalName, Set<String> grantGroups,
+      TPrincipalType type) {
+    versionLock_.writeLock().lock();
+    try {
+      Principal principal = Principal.newInstance(principalName, type, grantGroups);
+      principal.setCatalogVersion(incrementAndGetCatalogVersion());
+      authPolicy_.addPrincipal(principal);
+      return principal;
     } finally {
       versionLock_.writeLock().unlock();
     }
@@ -1620,17 +1681,38 @@ public class CatalogServiceCatalog extends Catalog {
    * exists.
    */
   public Role removeRole(String roleName) {
+    Principal role = removePrincipal(roleName, TPrincipalType.ROLE);
+    if (role == null) return null;
+    Preconditions.checkState(role instanceof Role);
+    return (Role) role;
+  }
+
+  /**
+   * Removes the user with the given name from the AuthorizationPolicy. Returns the
+   * removed user with an incremented catalog version, or null if no user with this name
+   * exists.
+   */
+  public User removeUser(String userName) {
+    Principal user = removePrincipal(userName, TPrincipalType.USER);
+    if (user == null) return null;
+    Preconditions.checkState(user instanceof User);
+    return (User) user;
+  }
+
+  private Principal removePrincipal(String principalName, TPrincipalType type) {
     versionLock_.writeLock().lock();
     try {
-      Role role = authPolicy_.removeRole(roleName);
-      if (role == null) return null;
-      for (RolePrivilege priv: role.getPrivileges()) {
+      Principal principal = authPolicy_.removePrincipal(principalName, type);
+      // TODO(todd): does this end up leaking the privileges associated
+      // with this principal into the CatalogObjectVersionSet on the catalogd?
+      if (principal == null) return null;
+      for (PrincipalPrivilege priv: principal.getPrivileges()) {
         priv.setCatalogVersion(incrementAndGetCatalogVersion());
         deleteLog_.addRemovedObject(priv.toTCatalogObject());
       }
-      role.setCatalogVersion(incrementAndGetCatalogVersion());
-      deleteLog_.addRemovedObject(role.toTCatalogObject());
-      return role;
+      principal.setCatalogVersion(incrementAndGetCatalogVersion());
+      deleteLog_.addRemovedObject(principal.toTCatalogObject());
+      return principal;
     } finally {
       versionLock_.writeLock().unlock();
     }
@@ -1644,7 +1726,7 @@ public class CatalogServiceCatalog extends Catalog {
       throws CatalogException {
     versionLock_.writeLock().lock();
     try {
-      Role role = authPolicy_.addGrantGroup(roleName, groupName);
+      Role role = authPolicy_.addRoleGrantGroup(roleName, groupName);
       Preconditions.checkNotNull(role);
       role.setCatalogVersion(incrementAndGetCatalogVersion());
       return role;
@@ -1661,7 +1743,7 @@ public class CatalogServiceCatalog extends Catalog {
       throws CatalogException {
     versionLock_.writeLock().lock();
     try {
-      Role role = authPolicy_.removeGrantGroup(roleName, groupName);
+      Role role = authPolicy_.removeRoleGrantGroup(roleName, groupName);
       Preconditions.checkNotNull(role);
       role.setCatalogVersion(incrementAndGetCatalogVersion());
       return role;
@@ -1671,17 +1753,37 @@ public class CatalogServiceCatalog extends Catalog {
   }
 
   /**
-   * Adds a privilege to the given role name. Returns the new RolePrivilege and
+   * Adds a privilege to the given role name. Returns the new PrincipalPrivilege and
    * increments the catalog version. If the parent role does not exist a CatalogException
    * is thrown.
    */
-  public RolePrivilege addRolePrivilege(String roleName, TPrivilege thriftPriv)
+  public PrincipalPrivilege addRolePrivilege(String roleName, TPrivilege thriftPriv)
       throws CatalogException {
+    Preconditions.checkArgument(thriftPriv.getPrincipal_type() == TPrincipalType.ROLE);
+    return addPrincipalPrivilege(roleName, thriftPriv, TPrincipalType.ROLE);
+  }
+
+  /**
+   * Adds a privilege to the given user name. Returns the new PrincipalPrivilege and
+   * increments the catalog version. If the user does not exist a CatalogException is
+   * thrown.
+   */
+  public PrincipalPrivilege addUserPrivilege(String userName, TPrivilege thriftPriv)
+      throws CatalogException {
+    Preconditions.checkArgument(thriftPriv.getPrincipal_type() == TPrincipalType.USER);
+    return addPrincipalPrivilege(userName, thriftPriv, TPrincipalType.USER);
+  }
+
+  private PrincipalPrivilege addPrincipalPrivilege(String principalName,
+      TPrivilege thriftPriv, TPrincipalType type) throws CatalogException {
     versionLock_.writeLock().lock();
     try {
-      Role role = authPolicy_.getRole(roleName);
-      if (role == null) throw new CatalogException("Role does not exist: " + roleName);
-      RolePrivilege priv = RolePrivilege.fromThrift(thriftPriv);
+      Principal principal = authPolicy_.getPrincipal(principalName, type);
+      if (principal == null) {
+        throw new CatalogException(String.format("%s does not exist: %s",
+            Principal.toString(type), principalName));
+      }
+      PrincipalPrivilege priv = PrincipalPrivilege.fromThrift(thriftPriv);
       priv.setCatalogVersion(incrementAndGetCatalogVersion());
       authPolicy_.addPrivilege(priv);
       return priv;
@@ -1691,39 +1793,63 @@ public class CatalogServiceCatalog extends Catalog {
   }
 
   /**
-   * Removes a RolePrivilege from the given role name. Returns the removed
-   * RolePrivilege with an incremented catalog version or null if no matching privilege
-   * was found. Throws a CatalogException if no role exists with this name.
+   * Removes a PrincipalPrivilege from the given role name and privilege name. Returns
+   * the removed PrincipalPrivilege with an incremented catalog version or null if no
+   * matching privilege was found. Throws a CatalogException if no role exists with this
+   * name.
    */
-  public RolePrivilege removeRolePrivilege(String roleName, TPrivilege thriftPriv)
+  public PrincipalPrivilege removeRolePrivilege(String roleName, String privilegeName)
       throws CatalogException {
+    return removePrincipalPrivilege(roleName, privilegeName, TPrincipalType.ROLE);
+  }
+
+  /**
+   * Removes a PrincipalPrivilege from the given user name and privilege name. Returns
+   * the removed PrincipalPrivilege with an incremented catalog version or null if no
+   * matching privilege was found. Throws a CatalogException if no user exists with this
+   * name.
+   */
+  public PrincipalPrivilege removeUserPrivilege(String userName, String privilegeName)
+      throws CatalogException {
+    return removePrincipalPrivilege(userName, privilegeName, TPrincipalType.USER);
+  }
+
+  private PrincipalPrivilege removePrincipalPrivilege(String principalName,
+      String privilegeName, TPrincipalType type) throws CatalogException {
     versionLock_.writeLock().lock();
     try {
-      Role role = authPolicy_.getRole(roleName);
-      if (role == null) throw new CatalogException("Role does not exist: " + roleName);
-      RolePrivilege rolePrivilege =
-          role.removePrivilege(thriftPriv.getPrivilege_name());
-      if (rolePrivilege == null) return null;
-      rolePrivilege.setCatalogVersion(incrementAndGetCatalogVersion());
-      deleteLog_.addRemovedObject(rolePrivilege.toTCatalogObject());
-      return rolePrivilege;
+      Principal principal = authPolicy_.getPrincipal(principalName, type);
+      if (principal == null) {
+        throw new CatalogException(String.format("%s does not exist: %s",
+            Principal.toString(type), principalName));
+      }
+      PrincipalPrivilege principalPrivilege = principal.removePrivilege(privilegeName);
+      if (principalPrivilege == null) return null;
+      principalPrivilege.setCatalogVersion(incrementAndGetCatalogVersion());
+      deleteLog_.addRemovedObject(principalPrivilege.toTCatalogObject());
+      return principalPrivilege;
     } finally {
       versionLock_.writeLock().unlock();
     }
   }
 
   /**
-   * Gets a RolePrivilege from the given role name. Returns the privilege if it exists,
-   * or null if no privilege matching the privilege spec exist.
-   * Throws a CatalogException if the role does not exist.
+   * Gets a PrincipalPrivilege from the given principal name. Returns the privilege
+   * if it exists, or null if no privilege matching the privilege spec exist.
+   * Throws a CatalogException if the principal does not exist.
    */
-  public RolePrivilege getRolePrivilege(String roleName, TPrivilege privSpec)
-      throws CatalogException {
+  public PrincipalPrivilege getPrincipalPrivilege(String principalName,
+      TPrivilege privSpec) throws CatalogException {
+    String privilegeName = PrincipalPrivilege.buildPrivilegeName(privSpec);
     versionLock_.readLock().lock();
     try {
-      Role role = authPolicy_.getRole(roleName);
-      if (role == null) throw new CatalogException("Role does not exist: " + roleName);
-      return role.getPrivilege(privSpec.getPrivilege_name());
+      Principal principal = authPolicy_.getPrincipal(principalName,
+          privSpec.getPrincipal_type());
+      if (principal == null) {
+        throw new CatalogException(Principal.toString(privSpec.getPrincipal_type()) +
+            " does not exist: " + principalName);
+      }
+      return principal.getPrivilege(privilegeName);
     } finally {
       versionLock_.readLock().unlock();
     }
@@ -1966,5 +2092,129 @@ public class CatalogServiceCatalog extends Catalog {
     } finally {
       tbl.getLock().unlock();
     }
+  }
+
+  /**
+   * Return a partial view of information about a given catalog object. This services
+   * the CatalogdMetaProvider running on impalads when they are configured in
+   * "local-catalog" mode. If required objects are not present, for example, the database
+   * from which a table is requested, the types of the missing objects will be set in the
+   * response's lookup_status.
+   */
+  public TGetPartialCatalogObjectResponse getPartialCatalogObject(
+      TGetPartialCatalogObjectRequest req) throws CatalogException {
+    TCatalogObject objectDesc = Preconditions.checkNotNull(req.object_desc,
+        "missing object_desc");
+    switch (objectDesc.type) {
+    case CATALOG:
+      return getPartialCatalogInfo(req);
+    case DATABASE:
+      TDatabase dbDesc = Preconditions.checkNotNull(req.object_desc.db);
+      versionLock_.readLock().lock();
+      try {
+        Db db = getDb(dbDesc.getDb_name());
+        if (db == null) {
+          return createGetPartialCatalogObjectError(CatalogLookupStatus.DB_NOT_FOUND);
+        }
+
+        return db.getPartialInfo(req);
+      } finally {
+        versionLock_.readLock().unlock();
+      }
+    case TABLE:
+    case VIEW: {
+      Table table;
+      try {
+        table = getOrLoadTable(
+            objectDesc.getTable().getDb_name(), objectDesc.getTable().getTbl_name());
+      } catch (DatabaseNotFoundException e) {
+        return createGetPartialCatalogObjectError(CatalogLookupStatus.DB_NOT_FOUND);
+      }
+      if (table == null) {
+        return createGetPartialCatalogObjectError(CatalogLookupStatus.TABLE_NOT_FOUND);
+      }
+      // TODO(todd): consider a read-write lock here.
+      table.getLock().lock();
+      try {
+        return table.getPartialInfo(req);
+      } finally {
+        table.getLock().unlock();
+      }
+    }
+    case FUNCTION: {
+      versionLock_.readLock().lock();
+      try {
+        Db db = getDb(objectDesc.fn.name.db_name);
+        if (db == null) {
+          return createGetPartialCatalogObjectError(CatalogLookupStatus.DB_NOT_FOUND);
+        }
+
+        List<Function> funcs = db.getFunctions(objectDesc.fn.name.function_name);
+        if (funcs.isEmpty()) {
+          return createGetPartialCatalogObjectError(
+              CatalogLookupStatus.FUNCTION_NOT_FOUND);
+        }
+        TGetPartialCatalogObjectResponse resp = new TGetPartialCatalogObjectResponse();
+        List<TFunction> thriftFuncs = Lists.newArrayListWithCapacity(funcs.size());
+        for (Function f : funcs) thriftFuncs.add(f.toThrift());
+        resp.setFunctions(thriftFuncs);
+        return resp;
+      } finally {
+        versionLock_.readLock().unlock();
+      }
+    }
+    default:
+      throw new CatalogException("Unable to fetch partial info for type: " +
+          req.object_desc.type);
+    }
+  }
+
+  private static TGetPartialCatalogObjectResponse createGetPartialCatalogObjectError(
+      CatalogLookupStatus status) {
+    TGetPartialCatalogObjectResponse resp = new TGetPartialCatalogObjectResponse();
+    resp.setLookup_status(status);
+    return resp;
+  }
+
+  /**
+   * Return a partial view of information about global parts of the catalog (eg
+   * the list of tables, etc).
+   */
+  private TGetPartialCatalogObjectResponse getPartialCatalogInfo(
+      TGetPartialCatalogObjectRequest req) {
+    TGetPartialCatalogObjectResponse resp = new TGetPartialCatalogObjectResponse();
+    resp.catalog_info = new TPartialCatalogInfo();
+    TCatalogInfoSelector sel = Preconditions.checkNotNull(req.catalog_info_selector,
+        "no catalog_info_selector in request");
+    if (sel.want_db_names) {
+      resp.catalog_info.db_names = ImmutableList.copyOf(dbCache_.get().keySet());
+    }
+    // TODO(todd) implement data sources and other global information.
+    return resp;
+  }
+
+  /**
+   * Set the last used time of specified tables to now.
+   * TODO: Make use of TTableUsage.num_usages.
+   */
+  public void updateTableUsage(TUpdateTableUsageRequest req) {
+    for (TTableUsage usage : req.usages) {
+      Table table = null;
+      try {
+        table = getTable(usage.table_name.db_name, usage.table_name.table_name);
+      } catch (DatabaseNotFoundException e) {
+        // do nothing
+      }
+      if (table != null) table.refreshLastUsedTime();
+    }
+  }
+
+  CatalogdTableInvalidator getCatalogdTableInvalidator() {
+    return catalogdTableInvalidator_;
+  }
+
+  @VisibleForTesting
+  void setCatalogdTableInvalidator(CatalogdTableInvalidator cleaner) {
+    catalogdTableInvalidator_ = cleaner;
   }
 }

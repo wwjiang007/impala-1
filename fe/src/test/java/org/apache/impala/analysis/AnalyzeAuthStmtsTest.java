@@ -22,6 +22,7 @@ import java.util.HashSet;
 import org.apache.impala.authorization.AuthorizationConfig;
 import org.apache.impala.catalog.Catalog;
 import org.apache.impala.catalog.Role;
+import org.apache.impala.catalog.User;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.testutil.TestUtils;
 import org.apache.impala.thrift.TQueryCtx;
@@ -29,9 +30,11 @@ import org.apache.impala.util.EventSequence;
 import org.junit.Test;
 
 public class AnalyzeAuthStmtsTest extends AnalyzerTest {
-  public AnalyzeAuthStmtsTest() throws AnalysisException {
-    catalog_.getAuthPolicy().addRole(
+  public AnalyzeAuthStmtsTest() {
+    catalog_.getAuthPolicy().addPrincipal(
         new Role("myRole", new HashSet<String>()));
+    catalog_.getAuthPolicy().addPrincipal(
+        new User("myUser", new HashSet<String>()));
   }
 
   @Override
@@ -70,22 +73,29 @@ public class AnalyzeAuthStmtsTest extends AnalyzerTest {
   }
 
   @Test
-  public void AnalyzeShowGrantRole() {
-    AnalyzesOk("SHOW GRANT ROLE myRole");
-    AnalyzesOk("SHOW GRANT ROLE myRole ON SERVER");
-    AnalyzesOk("SHOW GRANT ROLE myRole ON DATABASE functional");
-    AnalyzesOk("SHOW GRANT ROLE myRole ON TABLE functional.alltypes");
-    AnalyzesOk("SHOW GRANT ROLE myRole ON URI 'hdfs:////test-warehouse//foo'");
+  public void AnalyzeShowGrantPrincipal() {
+    for (String type: new String[]{"ROLE myRole", "USER myUser"}) {
+      AnalyzesOk(String.format("SHOW GRANT %s", type));
+      AnalyzesOk(String.format("SHOW GRANT %s ON SERVER", type));
+      AnalyzesOk(String.format("SHOW GRANT %s ON DATABASE functional", type));
+      AnalyzesOk(String.format("SHOW GRANT %s ON TABLE functional.alltypes", type));
+      AnalyzesOk(String.format("SHOW GRANT %s ON URI 'hdfs:////test-warehouse//foo'",
+          type));
+
+      AnalysisContext authDisabledCtx = createAuthDisabledAnalysisCtx();
+      AnalysisError("SHOW GRANT ROLE myRole", authDisabledCtx,
+          "Authorization is not enabled.");
+      AnalysisError("SHOW GRANT ROLE myRole ON SERVER", authDisabledCtx,
+          "Authorization is not enabled.");
+    }
     AnalysisError("SHOW GRANT ROLE does_not_exist",
         "Role 'does_not_exist' does not exist.");
     AnalysisError("SHOW GRANT ROLE does_not_exist ON SERVER",
         "Role 'does_not_exist' does not exist.");
 
-    AnalysisContext authDisabledCtx = createAuthDisabledAnalysisCtx();
-    AnalysisError("SHOW GRANT ROLE myRole", authDisabledCtx,
-        "Authorization is not enabled.");
-    AnalysisError("SHOW GRANT ROLE myRole ON SERVER", authDisabledCtx,
-        "Authorization is not enabled.");
+    // Determining if a user exists on the system is done in the AuthorizationPolicy and
+    // these tests run with authorization disabled. The SHOW GRANT USER will be tested
+    // in the custom cluster tests test_grant_revoke.
   }
 
   @Test

@@ -400,11 +400,8 @@ ScalarColumnReader<InternalType, PARQUET_TYPE, MATERIALIZED>::ScalarColumnReader
     fixed_len_size_ = -1;
   }
   needs_conversion_ = slot_desc_->type().type == TYPE_CHAR ||
-      // TODO: Add logic to detect file versions that have unconverted TIMESTAMP
-      // values. Currently all versions have converted values.
-      (FLAGS_convert_legacy_hive_parquet_utc_timestamps &&
-      slot_desc_->type().type == TYPE_TIMESTAMP &&
-      parent->file_version_.application == "parquet-mr");
+      (slot_desc_->type().type == TYPE_TIMESTAMP &&
+      parent->IsTimezoneConversionNeededForTimestamps());
 }
 
 template <typename InternalType, parquet::Type::type PARQUET_TYPE, bool MATERIALIZED>
@@ -697,9 +694,16 @@ inline bool ScalarColumnReader<TimestampValue, parquet::Type::INT96, true>
 template <>
 bool ScalarColumnReader<TimestampValue, parquet::Type::INT96, true>::ValidateValue(
     TimestampValue* val) const {
-  if (UNLIKELY(!TimestampValue::IsValidDate(val->date()))) {
-    ErrorMsg msg(TErrorCode::PARQUET_TIMESTAMP_OUT_OF_RANGE,
-        filename(), node_.element->name);
+  if (UNLIKELY(!TimestampValue::IsValidDate(val->date())
+      || !TimestampValue::IsValidTime(val->time()))) {
+    // If both are corrupt, invalid time takes precedence over invalid date, because
+    // invalid date may come from a more or less functional encoder that does not respect
+    // the 1400..9999 limit, while an invalid time is a good indicator of buggy encoder
+    // or memory garbage.
+    TErrorCode::type errorCode = TimestampValue::IsValidTime(val->time())
+        ? TErrorCode::PARQUET_TIMESTAMP_OUT_OF_RANGE
+        : TErrorCode::PARQUET_TIMESTAMP_INVALID_TIME_OF_DAY;
+    ErrorMsg msg(errorCode, filename(), node_.element->name);
     Status status = parent_->state_->LogOrReturnError(msg);
     if (!status.ok()) parent_->parse_status_ = status;
     return false;
@@ -1532,6 +1536,14 @@ static ParquetColumnReader* GetDecimalColumnReader(const SchemaNode& node,
             parent, node, slot_desc);
       }
       break;
+    case parquet::Type::INT32:
+      DCHECK_EQ(sizeof(Decimal4Value::StorageType), slot_desc->type().GetByteSize());
+      return new ScalarColumnReader<Decimal4Value, parquet::Type::INT32, true>(
+          parent, node, slot_desc);
+    case parquet::Type::INT64:
+      DCHECK_EQ(sizeof(Decimal8Value::StorageType), slot_desc->type().GetByteSize());
+      return new ScalarColumnReader<Decimal8Value, parquet::Type::INT64, true>(
+          parent, node, slot_desc);
     default:
       DCHECK(false) << "Invalid decimal primitive type";
   }
@@ -1565,16 +1577,36 @@ ParquetColumnReader* ParquetColumnReader::Create(const SchemaNode& node,
             slot_desc);
         break;
       case TYPE_BIGINT:
-        reader = new ScalarColumnReader<int64_t, parquet::Type::INT64, true>(parent, node,
-            slot_desc);
+        switch (node.element->type) {
+          case parquet::Type::INT32:
+            reader = new ScalarColumnReader<int64_t, parquet::Type::INT32, true>(parent,
+                node, slot_desc);
+            break;
+          default:
+            reader = new ScalarColumnReader<int64_t, parquet::Type::INT64, true>(parent,
+                node, slot_desc);
+            break;
+        }
         break;
       case TYPE_FLOAT:
         reader = new ScalarColumnReader<float, parquet::Type::FLOAT, true>(parent, node,
             slot_desc);
         break;
       case TYPE_DOUBLE:
-        reader = new ScalarColumnReader<double, parquet::Type::DOUBLE, true>(parent, node,
-            slot_desc);
+        switch (node.element->type) {
+          case parquet::Type::INT32:
+            reader = new ScalarColumnReader<double , parquet::Type::INT32, true>(parent,
+                node, slot_desc);
+            break;
+          case parquet::Type::FLOAT:
+            reader = new ScalarColumnReader<double, parquet::Type::FLOAT, true>(parent,
+                node, slot_desc);
+            break;
+          default:
+            reader = new ScalarColumnReader<double, parquet::Type::DOUBLE, true>(parent,
+                node, slot_desc);
+            break;
+        }
         break;
       case TYPE_TIMESTAMP:
         reader = new ScalarColumnReader<TimestampValue, parquet::Type::INT96, true>(

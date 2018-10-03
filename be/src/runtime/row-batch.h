@@ -198,7 +198,7 @@ class RowBatch {
     DCHECK_LE(num_rows_, capacity_);
     // Check AtCapacity() condition enforced in MarkNeedsDeepCopy() and
     // MarkFlushResources().
-    DCHECK((!needs_deep_copy_ && flush_ == FlushMode::NO_FLUSH_RESOURCES)
+    DCHECK((!needs_deep_copy_ && flush_mode_ == FlushMode::NO_FLUSH_RESOURCES)
         || num_rows_ == capacity_);
     int64_t mem_usage = attached_buffer_bytes_ + tuple_data_pool_.total_allocated_bytes();
     return num_rows_ == capacity_ || mem_usage >= AT_CAPACITY_MEM_USAGE;
@@ -241,6 +241,10 @@ class RowBatch {
       DCHECK_LE((row_ - parent_->tuple_ptrs_) / num_tuples_per_row_, parent_->capacity_);
       return Get();
     }
+
+    /// Returns the index in the RowBatch of the current row. This does an integer
+    /// division and so should not be used in hot inner loops.
+    int RowNum() { return (row_ - parent_->tuple_ptrs_) / num_tuples_per_row_; }
 
     /// Returns true if the iterator is beyond the last row for read iterators.
     /// Useful for read iterators to determine the limit. Write iterators should use
@@ -293,8 +297,10 @@ class RowBatch {
   void MarkFlushResources() {
     DCHECK_LE(num_rows_, capacity_);
     capacity_ = num_rows_;
-    flush_ = FlushMode::FLUSH_RESOURCES;
+    flush_mode_ = FlushMode::FLUSH_RESOURCES;
   }
+
+  FlushMode flush_mode() const { return flush_mode_; }
 
   /// Called to indicate that some resources backing this batch were not attached and
   /// will be cleaned up after the next GetNext() call. This means that the batch must
@@ -330,6 +336,10 @@ class RowBatch {
     memmove(tuple_ptrs_ + num_tuples_per_row_ * dest,
         tuple_ptrs_ + num_tuples_per_row_ * src,
         num_rows * num_tuples_per_row_ * sizeof(Tuple*));
+  }
+
+  void ClearTuplePointers() {
+    memset(tuple_ptrs_, 0, capacity_ * num_tuples_per_row_ * sizeof(Tuple*));
   }
 
   void ClearRow(TupleRow* row) {
@@ -416,6 +426,7 @@ class RowBatch {
   friend class RowBatchSerializeBaseline;
   friend class RowBatchSerializeBenchmark;
   friend class RowBatchSerializeTest;
+  friend class SimpleTupleStreamTest;
 
   /// Creates an empty row batch based on the serialized row batch header. Called from
   /// FromProtobuf() above before desrialization of a protobuf row batch.
@@ -499,10 +510,10 @@ class RowBatch {
   /// If FLUSH_RESOURCES, the resources attached to this batch should be freed or
   /// acquired by a new owner as soon as possible. See MarkFlushResources(). If
   /// FLUSH_RESOURCES, AtCapacity() is also true.
-  FlushMode flush_;
+  FlushMode flush_mode_;
 
   /// If true, this batch references unowned memory that will be cleaned up soon.
-  /// See MarkNeedsDeepCopy(). If true, 'flush_' is FLUSH_RESOURCES and
+  /// See MarkNeedsDeepCopy(). If true, 'flush_mode_' is FLUSH_RESOURCES and
   /// AtCapacity() is true.
   bool needs_deep_copy_;
 

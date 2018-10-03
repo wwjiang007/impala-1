@@ -34,10 +34,10 @@
 #include "exprs/timezone_db.h"
 #include "runtime/bufferpool/buffer-pool.h"
 #include "runtime/bufferpool/reservation-tracker.h"
-#include "runtime/data-stream-mgr-base.h"
-#include "runtime/data-stream-recvr.h"
 #include "runtime/descriptors.h"
 #include "runtime/exec-env.h"
+#include "runtime/krpc-data-stream-mgr.h"
+#include "runtime/krpc-data-stream-recvr.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/query-state.h"
 #include "runtime/runtime-filter-bank.h"
@@ -73,7 +73,6 @@ RuntimeState::RuntimeState(QueryState* query_state, const TPlanFragmentCtx& frag
     utc_timestamp_(new TimestampValue(TimestampValue::Parse(
         query_state->query_ctx().utc_timestamp_string))),
     local_time_zone_(&TimezoneDatabase::GetUtcTimezone()),
-    exec_env_(exec_env),
     profile_(RuntimeProfile::Create(
           obj_pool(), "Fragment " + PrintId(instance_ctx.fragment_instance_id))),
     instance_buffer_reservation_(new ReservationTracker) {
@@ -91,11 +90,10 @@ RuntimeState::RuntimeState(
     now_(new TimestampValue(TimestampValue::Parse(qctx.now_string))),
     utc_timestamp_(new TimestampValue(TimestampValue::Parse(qctx.utc_timestamp_string))),
     local_time_zone_(&TimezoneDatabase::GetUtcTimezone()),
-    exec_env_(exec_env),
     profile_(RuntimeProfile::Create(obj_pool(), "<unnamed>")) {
   // We may use execution resources while evaluating exprs, etc. Decremented in
   // ReleaseResources() to release resources.
-  local_query_state_->AcquireExecResourceRefcount();
+  local_query_state_->AcquireBackendResourceRefcount();
   if (query_ctx().request_pool.empty()) {
     const_cast<TQueryCtx&>(query_ctx()).request_pool = "test-pool";
   }
@@ -111,7 +109,7 @@ void RuntimeState::Init() {
   SCOPED_TIMER(profile_->total_time_counter());
 
   // Register with the thread mgr
-  resource_pool_ = exec_env_->thread_mgr()->CreatePool();
+  resource_pool_ = ExecEnv::GetInstance()->thread_mgr()->CreatePool();
   DCHECK(resource_pool_ != nullptr);
   if (fragment_ctx_ != nullptr) {
     // Ensure that the planner correctly determined the required threads.
@@ -213,11 +211,12 @@ Status RuntimeState::LogOrReturnError(const ErrorMsg& message) {
   DCHECK_NE(message.error(), TErrorCode::OK);
   // If either abort_on_error=true or the error necessitates execution stops
   // immediately, return an error status.
-  if (abort_on_error() ||
-      message.error() == TErrorCode::CANCELLED ||
-      message.error() == TErrorCode::MEM_LIMIT_EXCEEDED ||
-      message.error() == TErrorCode::INTERNAL_ERROR ||
-      message.error() == TErrorCode::DISK_IO_ERROR) {
+  if (abort_on_error()
+      || message.error() == TErrorCode::CANCELLED
+      || message.error() == TErrorCode::CANCELLED_INTERNALLY
+      || message.error() == TErrorCode::MEM_LIMIT_EXCEEDED
+      || message.error() == TErrorCode::INTERNAL_ERROR
+      || message.error() == TErrorCode::DISK_IO_ERROR) {
     return Status(message);
   }
   // Otherwise, add the error to the error log and continue.
@@ -255,7 +254,7 @@ void RuntimeState::SetMemLimitExceeded(MemTracker* tracker,
 
 Status RuntimeState::CheckQueryState() {
   DCHECK(instance_mem_tracker_ != nullptr);
-  if (UNLIKELY(instance_mem_tracker_->AnyLimitExceeded())) {
+  if (UNLIKELY(instance_mem_tracker_->AnyLimitExceeded(MemLimit::HARD))) {
     SetMemLimitExceeded(instance_mem_tracker_.get());
   }
   return GetQueryStatus();
@@ -265,7 +264,7 @@ void RuntimeState::ReleaseResources() {
   DCHECK(!released_resources_);
   if (filter_bank_ != nullptr) filter_bank_->Close();
   if (resource_pool_ != nullptr) {
-    exec_env_->thread_mgr()->DestroyPool(move(resource_pool_));
+    ExecEnv::GetInstance()->thread_mgr()->DestroyPool(move(resource_pool_));
   }
   // Release any memory associated with codegen.
   if (codegen_ != nullptr) codegen_->Close();
@@ -281,33 +280,13 @@ void RuntimeState::ReleaseResources() {
   instance_mem_tracker_->Close();
 
   if (local_query_state_.get() != nullptr) {
-    local_query_state_->ReleaseExecResourceRefcount();
+    local_query_state_->ReleaseBackendResourceRefcount();
   }
   released_resources_ = true;
 }
 
 const std::string& RuntimeState::GetEffectiveUser() const {
   return impala::GetEffectiveUser(query_ctx().session);
-}
-
-ImpalaBackendClientCache* RuntimeState::impalad_client_cache() {
-  return exec_env_->impalad_client_cache();
-}
-
-CatalogServiceClientCache* RuntimeState::catalogd_client_cache() {
-  return exec_env_->catalogd_client_cache();
-}
-
-io::DiskIoMgr* RuntimeState::io_mgr() {
-  return exec_env_->disk_io_mgr();
-}
-
-DataStreamMgrBase* RuntimeState::stream_mgr() {
-  return exec_env_->stream_mgr();
-}
-
-HBaseTableFactory* RuntimeState::htable_factory() {
-  return exec_env_->htable_factory();
 }
 
 ObjectPool* RuntimeState::obj_pool() const {

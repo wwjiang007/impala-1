@@ -36,7 +36,7 @@ enum TCatalogObjectType {
   VIEW,
   FUNCTION,
   DATA_SOURCE,
-  ROLE,
+  PRINCIPAL,
   PRIVILEGE,
   HDFS_CACHE_POOL,
 }
@@ -241,17 +241,37 @@ struct THdfsPartitionLocation {
 // Represents an HDFS partition
 // TODO(vercegovac): rename to TFsPartition
 struct THdfsPartition {
+
+  // ============================================================
+  // Fields included in the "Descriptor" format sent to the backend
+  // as part of query plans and fragments.
+  // ============================================================
+
   1: required byte lineDelim
   2: required byte fieldDelim
   3: required byte collectionDelim
   4: required byte mapKeyDelim
   5: required byte escapeChar
   6: required THdfsFileFormat fileFormat
+
   // These are Literal expressions
   7: list<Exprs.TExpr> partitionKeyExprs
   8: required i32 blockSize
-  9: optional list<THdfsFileDesc> file_desc
+
   10: optional THdfsPartitionLocation location
+
+  // Unique (in this table) id of this partition. May be set to
+  // PROTOTYPE_PARTITION_ID when this object is used to describe
+  // a partition which will be created as part of a query.
+  14: optional i64 id
+
+
+  // ============================================================
+  // Fields only included when the catalogd serializes a table to be
+  // sent to the impalad as part of a catalog update.
+  // ============================================================
+
+  9: optional list<THdfsFileDesc> file_desc
 
   // The access level Impala has on this partition (READ_WRITE, READ_ONLY, etc).
   11: optional TAccessLevel access_level
@@ -262,10 +282,6 @@ struct THdfsPartition {
   // True if this partition has been marked as cached (does not necessarily mean the
   // underlying data is cached).
   13: optional bool is_marked_cached
-
-  // Unique (in this table) id of this partition. If -1, the partition does not currently
-  // exist.
-  14: optional i64 id
 
   // (key,value) pairs stored in the Hive Metastore.
   15: optional map<string, string> hms_parameters
@@ -278,16 +294,26 @@ struct THdfsPartition {
   // Total file size in bytes of this partition.
   17: optional i64 total_file_size_bytes
 
-  // True, if this partition has incremental stats
-  18: optional bool has_incremental_stats
+  // byte[] representation of TPartitionStats for this partition that is compressed using
+  // 'deflate-compression'.
+  18: optional binary partition_stats
+
+  // Set to true if partition_stats contain intermediate column stats computed via
+  // incremental statistics, false otherwise.
+  19: optional bool has_incremental_stats
 }
 
-// Constant partition ID used for THdfsPartition.prototype_partition above.
+// Constant partition ID used for THdfsPartition.prototype_partition below.
 // Must be < 0 to avoid collisions
 const i64 PROTOTYPE_PARTITION_ID = -1;
 
 
 struct THdfsTable {
+  // ============================================================
+  // Fields included in the "Descriptor" format sent to the backend
+  // as part of query plans and fragments.
+  // ============================================================
+
   1: required string hdfsBaseDir
 
   // Deprecated. Use TTableDescriptor.colNames.
@@ -303,24 +329,28 @@ struct THdfsTable {
   6: optional string avroSchema
 
   // Map from partition id to partition metadata.
-  // Does not include the special prototype partition -1 (see below).
+  // Does not include the special prototype partition with id=PROTOTYPE_PARTITION_ID --
+  // that partition is separately included below.
   4: required map<i64, THdfsPartition> partitions
 
   // Prototype partition, used when creating new partitions during insert.
   10: required THdfsPartition prototype_partition
 
-  // Each TNetworkAddress is a datanode which contains blocks of a file in the table.
-  // Used so that each THdfsFileBlock can just reference an index in this list rather
-  // than duplicate the list of network address, which helps reduce memory usage.
-  7: optional list<Types.TNetworkAddress> network_addresses
-
-  // Indicates that this table's partitions reside on more than one filesystem.
-  // TODO: remove once INSERT across filesystems is supported.
-  8: optional bool multiple_filesystems
+  // REMOVED: 8: optional bool multiple_filesystems
 
   // The prefixes of locations of partitions in this table. See THdfsPartitionLocation for
   // the description of how a prefix is computed.
   9: optional list<string> partition_prefixes
+
+  // ============================================================
+  // Fields only included when the catalogd serializes a table to be
+  // sent to the impalad as part of a catalog update.
+  // ============================================================
+
+  // Each TNetworkAddress is a datanode which contains blocks of a file in the table.
+  // Used so that each THdfsFileBlock can just reference an index in this list rather
+  // than duplicate the list of network address, which helps reduce memory usage.
+  7: optional list<Types.TNetworkAddress> network_addresses
 }
 
 struct THBaseTable {
@@ -452,18 +482,28 @@ struct TDatabase {
   2: optional hive_metastore.Database metastore_db
 }
 
-// Represents a role in an authorization policy.
-struct TRole {
-  // Case-insensitive role name
-  1: required string role_name
+// Represents a principal type that maps to Sentry principal type.
+// https://github.com/apache/sentry/blob/3d062f39ce6a047138660a7b3d0024bde916c5b4/sentry-service/sentry-service-api/src/gen/thrift/gen-javabean/org/apache/sentry/api/service/thrift/TSentryPrincipalType.java
+enum TPrincipalType {
+  ROLE,
+  USER
+}
 
-  // Unique ID of this role, generated by the Catalog Server.
-  2: required i32 role_id
+// Represents a principal in an authorization policy.
+struct TPrincipal {
+  // Case-insensitive principal name
+  1: required string principal_name
 
-  // List of groups this role has been granted to (group names are case sensitive).
+  // Unique ID of this principal, generated by the Catalog Server.
+  2: required i32 principal_id
+
+  // Type of this principal.
+  3: required TPrincipalType principal_type
+
+  // List of groups this principal has been granted to (group names are case sensitive).
   // TODO: Keep a list of grant groups globally (in TCatalog?) and reference by ID since
-  // the same groups will likely be shared across multiple roles.
-  3: required list<string> grant_groups
+  // the same groups will likely be shared across multiple principals.
+  4: required list<string> grant_groups
 }
 
 // The scope a TPrivilege applies to.
@@ -483,19 +523,21 @@ enum TPrivilegeLevel {
   REFRESH,
   CREATE,
   ALTER,
-  DROP
+  DROP,
+  OWNER
 }
 
 // Represents a privilege in an authorization policy. Privileges contain the level
-// of access, the scope and role the privilege applies to, and details on what
+// of access, the scope and principal the privilege applies to, and details on what
 // catalog object the privilege is securing. Objects are hierarchical, so a privilege
 // corresponding to a table must also specify all the parent objects (database name
 // and server name).
 struct TPrivilege {
-  // A human readable name for this privilege. The combination of role_id +
+  // NOTE: This field is no longer needed. Keeping it here to keep the field numbers.
+  // A human readable name for this privilege. The combination of principal_id +
   // privilege_name is guaranteed to be unique. Stored in a form that can be passed
   // to Sentry: [ServerName]->[DbName]->[TableName]->[ColumnName]->[Action Granted].
-  1: required string privilege_name
+  // 1: required string privilege_name
 
   // The level of access this privilege provides.
   2: required TPrivilegeLevel privilege_level
@@ -504,32 +546,35 @@ struct TPrivilege {
   3: required TPrivilegeScope scope
 
   // If true, GRANT OPTION was specified. For a GRANT privilege statement, everyone
-  // granted this role should be able to issue GRANT/REVOKE privilege statements even if
-  // they are not an admin. For REVOKE privilege statements, the privilege should be
+  // granted this principal should be able to issue GRANT/REVOKE privilege statements even
+  // if they are not an admin. For REVOKE privilege statements, the privilege should be
   // retainined and the existing GRANT OPTION (if it was set) on the privilege should be
   // removed.
   4: required bool has_grant_opt
 
-  // The ID of the role this privilege belongs to.
-  5: optional i32 role_id
+  // The ID of the principal this privilege belongs to.
+  5: optional i32 principal_id
+
+  // The type of the principal this privilege belongs to.
+  6: optional TPrincipalType principal_type
 
   // Set if scope is SERVER, URI, DATABASE, or TABLE
-  6: optional string server_name
+  7: optional string server_name
 
   // Set if scope is DATABASE or TABLE
-  7: optional string db_name
+  8: optional string db_name
 
   // Unqualified table name. Set if scope is TABLE.
-  8: optional string table_name
+  9: optional string table_name
 
   // Set if scope is URI
-  9: optional string uri
+  10: optional string uri
 
   // Time this privilege was created (in milliseconds since epoch).
-  10: optional i64 create_time_ms
+  11: optional i64 create_time_ms
 
   // Set if scope is COLUMN
-  11: optional string column_name
+  12: optional string column_name
 }
 
 // Thrift representation of an HdfsCachePool.
@@ -570,8 +615,8 @@ struct TCatalogObject {
   // Set iff object type is DATA SOURCE
   7: optional TDataSource data_source
 
-  // Set iff object type is ROLE
-  8: optional TRole role
+  // Set iff object type is PRINCIPAL
+  8: optional TPrincipal principal
 
   // Set iff object type is PRIVILEGE
   9: optional TPrivilege privilege

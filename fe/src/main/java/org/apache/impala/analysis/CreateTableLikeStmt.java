@@ -52,6 +52,9 @@ public class CreateTableLikeStmt extends StatementBase {
   private String srcDbName_;
   private String owner_;
 
+  // Server name needed for privileges. Set during analysis.
+  private String serverName_;
+
   /**
    * Builds a CREATE TABLE LIKE statement
    * @param tableName - Name of the new table
@@ -139,6 +142,7 @@ public class CreateTableLikeStmt extends StatementBase {
     params.setLocation(location_ == null ? null : location_.toString());
     params.setIf_not_exists(getIfNotExists());
     params.setSort_columns(sortColumns_);
+    params.setServer_name(serverName_);
     return params;
   }
 
@@ -167,7 +171,10 @@ public class CreateTableLikeStmt extends StatementBase {
     srcDbName_ = srcTable.getDb().getName();
     tableName_.analyze();
     dbName_ = analyzer.getTargetDbName(tableName_);
-    owner_ = analyzer.getUser().getName();
+    owner_ = analyzer.getUserShortName();
+    // Set the servername here if authorization is enabled because analyzer_ is not
+    // available in the toThrift() method.
+    serverName_ = analyzer.getServerName();
 
     if (analyzer.dbContainsTable(dbName_, tableName_.getTbl(), Privilege.CREATE) &&
         !ifNotExists_) {

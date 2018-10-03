@@ -30,6 +30,7 @@ import org.slf4j.LoggerFactory;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
+import com.google.common.base.Joiner;
 
 /**
  * Base class for CREATE VIEW and ALTER VIEW AS SELECT statements.
@@ -40,13 +41,16 @@ public abstract class CreateOrAlterViewStmtBase extends StatementBase {
 
   protected final boolean ifNotExists_;
   protected final TableName tableName_;
-  protected final ArrayList<ColumnDef> columnDefs_;
+  protected final List<ColumnDef> columnDefs_;
   protected final String comment_;
   protected final QueryStmt viewDefStmt_;
 
   // Set during analysis
   protected String dbName_;
   protected String owner_;
+
+  // Server name needed for privileges. Set during analysis.
+  protected String serverName_;
 
   // The original SQL-string given as view definition. Set during analysis.
   // Corresponds to Hive's viewOriginalText.
@@ -67,10 +71,10 @@ public abstract class CreateOrAlterViewStmtBase extends StatementBase {
 
   // Columns to use in the select list of the expanded SQL string and when registering
   // this view in the metastore. Set in analysis.
-  protected ArrayList<ColumnDef> finalColDefs_;
+  protected List<ColumnDef> finalColDefs_;
 
   public CreateOrAlterViewStmtBase(boolean ifNotExists, TableName tableName,
-      ArrayList<ColumnDef> columnDefs, String comment, QueryStmt viewDefStmt) {
+      List<ColumnDef> columnDefs, String comment, QueryStmt viewDefStmt) {
     Preconditions.checkNotNull(tableName);
     Preconditions.checkNotNull(viewDefStmt);
     this.ifNotExists_ = ifNotExists;
@@ -185,7 +189,8 @@ public abstract class CreateOrAlterViewStmtBase extends StatementBase {
     params.setIf_not_exists(getIfNotExists());
     params.setOriginal_view_def(originalViewDef_);
     params.setExpanded_view_def(inlineViewDef_);
-    if (comment_ != null) params.setComment(comment_);
+    params.setServer_name(serverName_);
+    params.setComment(comment_);
     return params;
   }
 
@@ -204,6 +209,19 @@ public abstract class CreateOrAlterViewStmtBase extends StatementBase {
   public String getOwner() {
     Preconditions.checkNotNull(owner_);
     return owner_;
+  }
+
+  /**
+   * Returns the column names in columnDefs_. Should only be called for non-null
+   * columnDefs_.
+   */
+  protected String getColumnNames() {
+    Preconditions.checkNotNull(columnDefs_);
+    List<String> columnNames = Lists.newArrayList();
+    for (ColumnDef colDef : columnDefs_) {
+      columnNames.add(colDef.getColName());
+    }
+    return Joiner.on(", ").join(columnNames);
   }
 
   public boolean getIfNotExists() { return ifNotExists_; }

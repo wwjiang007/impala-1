@@ -15,21 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "exprs/math-functions.h"
-
 #include <iomanip>
 #include <random>
 #include <sstream>
 #include <math.h>
-
+#include <stdint.h>
+#include <string>
 #include "exprs/anyval-util.h"
 #include "exprs/scalar-expr.h"
 #include "exprs/operators.h"
+#include "exprs/math-functions.h"
 #include "util/string-parser.h"
+#include "runtime/decimal-value.inline.h"
 #include "runtime/runtime-state.h"
 #include "runtime/string-value.inline.h"
 #include "thirdparty/pcg-cpp-0.98/include/pcg_random.hpp"
-
+#include "exprs/decimal-operators.h"
 #include "common/names.h"
 
 using std::uppercase;
@@ -452,6 +453,123 @@ DoubleVal MathFunctions::FmodDouble(FunctionContext* ctx, const DoubleVal& a,
     const DoubleVal& b) {
   if (a.is_null || b.is_null || b.val == 0) return DoubleVal::null();
   return DoubleVal(fmod(a.val, b.val));
+}
+
+// The bucket_number is evaluated using the following formula:
+//
+//   bucket_number = dist_from_min * num_buckets / range_size + 1
+//      where -
+//        dist_from_min = expr - min_range
+//        range_size = max_range - min_range
+//        num_buckets = number of buckets
+//
+// Since expr, min_range, and max_range are all decimals with the same
+// byte size, precision, and scale we can interpret them as plain integers
+// and still calculate the proper bucket.
+//
+// There are some possibilities of overflowing during the calculation:
+// range_size = max_range - min_range
+// dist_from_min = expr - min_range
+// dist_from_min * num_buckets
+//
+// For all the above cases we use a bigger integer type provided by the
+// BitUtil::DoubleWidth<> metafunction.
+template <class  T1>
+BigIntVal MathFunctions::WidthBucketImpl(FunctionContext* ctx,
+    const T1& expr, const T1& min_range,
+    const T1& max_range, const IntVal& num_buckets) {
+  auto expr_val = expr.value();
+  using ActualType = decltype(expr_val);
+  auto min_range_val = min_range.value();
+  auto max_range_val = max_range.value();
+  auto num_buckets_val = static_cast<ActualType>(num_buckets.val);
+
+  if (UNLIKELY(num_buckets.val <= 0)) {
+    ostringstream error_msg;
+    error_msg << "Number of buckets should be greater than zero:" << num_buckets.val;
+    ctx->SetError(error_msg.str().c_str());
+    return BigIntVal::null();
+  }
+
+  if (UNLIKELY(min_range_val >= max_range_val)) {
+    ctx->SetError("Lower bound cannot be greater than or equal to the upper bound");
+    return BigIntVal::null();
+  }
+
+  if (expr_val < min_range_val) return 0;
+  if (expr_val >= max_range_val) {
+    return BigIntVal(static_cast<int64_t>(num_buckets.val) + 1);
+  }
+
+  bool bigger_type_needed = false;
+  // It is likely that this if stmt can be evaluated during codegen because
+  // 'max_range' and 'min_range' are almost certainly constant expressions:
+  if (max_range_val >= 0 && min_range_val < 0) {
+    if (static_cast<UnsignedType<ActualType>>(max_range_val) +
+        static_cast<UnsignedType<ActualType>>(abs(min_range_val)) >=
+        static_cast<UnsignedType<ActualType>>(BitUtil::Max<ActualType>())) {
+      bigger_type_needed = true;
+    }
+  }
+
+  auto MultiplicationOverflows = [](ActualType lhs, ActualType rhs) {
+    DCHECK(lhs > 0 && rhs > 0);
+    using ActualType = decltype(lhs);
+    return BitUtil::CountLeadingZeros(lhs) + BitUtil::CountLeadingZeros(rhs) <=
+        BitUtil::UnsignedWidth<ActualType>() + 1;
+  };
+
+  // It is likely that this can be evaluated during codegen:
+  bool multiplication_can_overflow = bigger_type_needed ||  MultiplicationOverflows(
+      max_range_val - min_range_val, num_buckets_val);
+  // 'expr_val' is not likely to be a constant expression, so this almost certainly
+  // needs runtime evaluation if 'bigger_type_needed' is false and
+  // 'multiplication_can_overflow' is true:
+  bigger_type_needed = bigger_type_needed || (
+      multiplication_can_overflow &&
+      expr_val != min_range_val &&
+      MultiplicationOverflows(expr_val - min_range_val, num_buckets_val));
+
+  auto BucketFunc = [](auto element, auto min_rng, auto max_rng, auto buckets) {
+    auto range_size = max_rng - min_rng;
+    auto dist_from_min = element - min_rng;
+    auto ret = dist_from_min * buckets / range_size;
+    return BigIntVal(static_cast<int64_t>(ret) + 1);
+  };
+
+  if (bigger_type_needed) {
+    using BiggerType = typename DoubleWidth<ActualType>::type;
+
+    return BucketFunc(static_cast<BiggerType>(expr_val),
+        static_cast<BiggerType>(min_range_val), static_cast<BiggerType>(max_range_val),
+        static_cast<BiggerType>(num_buckets.val));
+  } else {
+    return BucketFunc(expr_val, min_range_val, max_range_val, num_buckets.val);
+  }
+}
+
+BigIntVal MathFunctions::WidthBucket(FunctionContext* ctx, const DecimalVal& expr,
+    const DecimalVal& min_range, const DecimalVal& max_range,
+    const IntVal& num_buckets) {
+  if (expr.is_null || min_range.is_null || max_range.is_null || num_buckets.is_null) {
+    return BigIntVal::null();
+  }
+
+  int arg_size_type = ctx->impl()->GetConstFnAttr(FunctionContextImpl::ARG_TYPE_SIZE, 0);
+  switch (arg_size_type) {
+    case 4:
+      return WidthBucketImpl<Decimal4Value> (ctx, Decimal4Value(expr.val4),
+          Decimal4Value(min_range.val4), Decimal4Value(max_range.val4), num_buckets);
+    case 8:
+      return WidthBucketImpl<Decimal8Value> (ctx, Decimal8Value(expr.val8),
+          Decimal8Value(min_range.val8), Decimal8Value(max_range.val8), num_buckets);
+    case 16:
+      return WidthBucketImpl<Decimal16Value>(ctx, Decimal16Value(expr.val16),
+         Decimal16Value(min_range.val16), Decimal16Value(max_range.val16), num_buckets);
+    default:
+      DCHECK(false);
+      return BigIntVal::null();
+  }
 }
 
 template <typename T> T MathFunctions::Positive(FunctionContext* ctx, const T& val) {

@@ -35,7 +35,6 @@
 #include "runtime/bufferpool/reservation-tracker.h"
 #include "runtime/client-cache.h"
 #include "runtime/coordinator.h"
-#include "runtime/data-stream-mgr.h"
 #include "runtime/hbase-table-factory.h"
 #include "runtime/hdfs-fs-cache.h"
 #include "runtime/io/disk-io-mgr.h"
@@ -80,12 +79,25 @@ DEFINE_int32(state_store_subscriber_port, 23000,
     "port where StatestoreSubscriberService should be exported");
 DEFINE_int32(num_hdfs_worker_threads, 16,
     "(Advanced) The number of threads in the global HDFS operation pool");
-DEFINE_bool(use_krpc, true, "If true, use KRPC for the DataStream subsystem. "
-    "Otherwise use Thrift RPC.");
 
 DEFINE_bool_hidden(use_local_catalog, false,
-  "Use experimental implementation of a local catalog. If this is set, "
-  "the catalog service is not used and does not need to be started.");
+    "Use experimental implementation of a local catalog. If this is set, "
+    "the catalog service is not used and does not need to be started.");
+DEFINE_int32_hidden(local_catalog_cache_mb, -1,
+    "If --use_local_catalog is enabled, configures the size of the catalog "
+    "cache within each impalad. If this is set to -1, the cache is auto-"
+    "configured to 60% of the configured Java heap size. Note that the Java "
+    "heap size is distinct from and typically smaller than the overall "
+    "Impala memory limit.");
+DEFINE_int32_hidden(local_catalog_cache_expiration_s, 60 * 60,
+    "If --use_local_catalog is enabled, configures the expiration time "
+    "of the catalog cache within each impalad. Even if the configured "
+    "cache capacity has not been reached, items are removed from the cache "
+    "if they have not been accessed in this amount of time.");
+DEFINE_int32_hidden(local_catalog_max_fetch_retries, 40,
+    "If --use_local_catalog is enabled, configures the maximum number of times "
+    "the frontend retries when fetching a metadata object from the impalad "
+    "coordinator's local catalog cache.");
 
 DECLARE_int32(state_store_port);
 DECLARE_int32(num_threads_per_core);
@@ -117,6 +129,8 @@ DEFINE_int32(backend_client_rpc_timeout_ms, 300000, "(Advanced) The underlying "
 DEFINE_int32(catalog_client_connection_num_retries, 3, "Retry catalog connections.");
 DEFINE_int32(catalog_client_rpc_timeout_ms, 0, "(Advanced) The underlying TSocket "
     "send/recv timeout in milliseconds for a catalog client RPC.");
+DEFINE_int32(catalog_client_rpc_retry_interval_ms, 10000, "(Advanced) The time to wait "
+    "before retrying when the catalog RPC client fails to connect to catalogd.");
 
 const static string DEFAULT_FS = "fs.defaultFS";
 
@@ -143,7 +157,8 @@ ExecEnv::ExecEnv(int backend_port, int krpc_port,
             FLAGS_backend_client_rpc_timeout_ms, FLAGS_backend_client_rpc_timeout_ms, "",
             !FLAGS_ssl_client_ca_certificate.empty())),
     catalogd_client_cache_(
-        new CatalogServiceClientCache(FLAGS_catalog_client_connection_num_retries, 0,
+        new CatalogServiceClientCache(FLAGS_catalog_client_connection_num_retries,
+            FLAGS_catalog_client_rpc_retry_interval_ms,
             FLAGS_catalog_client_rpc_timeout_ms, FLAGS_catalog_client_rpc_timeout_ms, "",
             !FLAGS_ssl_client_ca_certificate.empty())),
     htable_factory_(new HBaseTableFactory()),
@@ -159,15 +174,10 @@ ExecEnv::ExecEnv(int backend_port, int krpc_port,
     enable_webserver_(FLAGS_enable_webserver && webserver_port > 0),
     configured_backend_address_(MakeNetworkAddress(FLAGS_hostname, backend_port)) {
 
-  if (FLAGS_use_krpc) {
-    VLOG_QUERY << "Using KRPC.";
-    // KRPC relies on resolved IP address. It's set in Init().
-    krpc_address_.__set_port(krpc_port);
-    rpc_mgr_.reset(new RpcMgr(IsInternalTlsConfigured()));
-    stream_mgr_.reset(new KrpcDataStreamMgr(metrics_.get()));
-  } else {
-    stream_mgr_.reset(new DataStreamMgr(metrics_.get()));
-  }
+  // KRPC relies on resolved IP address. It's set in Init().
+  krpc_address_.__set_port(krpc_port);
+  rpc_mgr_.reset(new RpcMgr(IsInternalTlsConfigured()));
+  stream_mgr_.reset(new KrpcDataStreamMgr(metrics_.get()));
 
   request_pool_service_.reset(new RequestPoolService(metrics_.get()));
 
@@ -298,19 +308,17 @@ Status ExecEnv::Init() {
       "Buffer Pool: Unused Reservation", mem_tracker_.get()));
 
   // Initializes the RPCMgr and DataStreamServices.
-  if (FLAGS_use_krpc) {
-    krpc_address_.__set_hostname(ip_address_);
-    // Initialization needs to happen in the following order due to dependencies:
-    // - RPC manager, DataStreamService and DataStreamManager.
-    RETURN_IF_ERROR(rpc_mgr_->Init());
-    data_svc_.reset(new DataStreamService(rpc_metrics_));
-    RETURN_IF_ERROR(data_svc_->Init());
-    RETURN_IF_ERROR(KrpcStreamMgr()->Init(data_svc_->mem_tracker()));
-    // Bump thread cache to 1GB to reduce contention for TCMalloc central
-    // list's spinlock.
-    if (FLAGS_tcmalloc_max_total_thread_cache_bytes == 0) {
-      FLAGS_tcmalloc_max_total_thread_cache_bytes = 1 << 30;
-    }
+  krpc_address_.__set_hostname(ip_address_);
+  // Initialization needs to happen in the following order due to dependencies:
+  // - RPC manager, DataStreamService and DataStreamManager.
+  RETURN_IF_ERROR(rpc_mgr_->Init());
+  data_svc_.reset(new DataStreamService(rpc_metrics_));
+  RETURN_IF_ERROR(data_svc_->Init());
+  RETURN_IF_ERROR(stream_mgr_->Init(data_svc_->mem_tracker()));
+  // Bump thread cache to 1GB to reduce contention for TCMalloc central
+  // list's spinlock.
+  if (FLAGS_tcmalloc_max_total_thread_cache_bytes == 0) {
+    FLAGS_tcmalloc_max_total_thread_cache_bytes = 1 << 30;
   }
 
 #if !defined(ADDRESS_SANITIZER) && !defined(THREAD_SANITIZER)
@@ -396,10 +404,8 @@ Status ExecEnv::StartStatestoreSubscriberService() {
 }
 
 Status ExecEnv::StartKrpcService() {
-  if (FLAGS_use_krpc) {
-    LOG(INFO) << "Starting KRPC service";
-    RETURN_IF_ERROR(rpc_mgr_->StartServices(krpc_address_));
-  }
+  LOG(INFO) << "Starting KRPC service";
+  RETURN_IF_ERROR(rpc_mgr_->StartServices(krpc_address_));
   return Status::OK();
 }
 
@@ -438,16 +444,6 @@ Status ExecEnv::GetKuduClient(
     *client = kudu_client_map_it->second->kudu_client.get();
   }
   return Status::OK();
-}
-
-DataStreamMgr* ExecEnv::ThriftStreamMgr() {
-  DCHECK(!FLAGS_use_krpc);
-  return dynamic_cast<DataStreamMgr*>(stream_mgr_.get());
-}
-
-KrpcDataStreamMgr* ExecEnv::KrpcStreamMgr() {
-  DCHECK(FLAGS_use_krpc);
-  return dynamic_cast<KrpcDataStreamMgr*>(stream_mgr_.get());
 }
 
 } // namespace impala

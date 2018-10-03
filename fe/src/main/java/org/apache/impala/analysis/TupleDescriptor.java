@@ -26,9 +26,9 @@ import java.util.Map;
 
 import org.apache.commons.lang.StringUtils;
 import org.apache.impala.catalog.ColumnStats;
+import org.apache.impala.catalog.FeFsTable;
+import org.apache.impala.catalog.FeKuduTable;
 import org.apache.impala.catalog.FeTable;
-import org.apache.impala.catalog.HdfsTable;
-import org.apache.impala.catalog.KuduTable;
 import org.apache.impala.catalog.StructType;
 import org.apache.impala.thrift.TTupleDescriptor;
 
@@ -323,7 +323,7 @@ public class TupleDescriptor {
    * Returns true if this tuple has at least one materialized nullable Kudu scan slot.
    */
   private boolean hasNullableKuduScanSlots() {
-    if (!(getTable() instanceof KuduTable)) return false;
+    if (!(getTable() instanceof FeKuduTable)) return false;
     for (SlotDescriptor d: slots_) {
       if (d.isMaterialized() && d.getIsNullable()) return true;
     }
@@ -335,9 +335,9 @@ public class TupleDescriptor {
    */
   public boolean hasClusteringColsOnly() {
     FeTable table = getTable();
-    if (!(table instanceof HdfsTable) || table.getNumClusteringCols() == 0) return false;
+    if (!(table instanceof FeFsTable) || table.getNumClusteringCols() == 0) return false;
 
-    HdfsTable hdfsTable = (HdfsTable)table;
+    FeFsTable hdfsTable = (FeFsTable)table;
     for (SlotDescriptor slotDesc: getSlots()) {
       if (!slotDesc.isMaterialized()) continue;
       if (slotDesc.getColumn() == null ||

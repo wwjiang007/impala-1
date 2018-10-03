@@ -17,45 +17,39 @@
 
 #include "kudu/rpc/connection.h"
 
-#include <stdint.h>
-
 #include <algorithm>
 #include <cerrno>
 #include <iostream>
 #include <memory>
 #include <set>
 #include <string>
-#include <unordered_set>
-#include <vector>
+#include <type_traits>
 
+#include <boost/intrusive/detail/list_iterator.hpp>
 #include <boost/intrusive/list.hpp>
-#include <gflags/gflags.h>
+#include <ev.h>
 #include <glog/logging.h>
 
 #include "kudu/gutil/map-util.h"
+#include "kudu/util/slice.h"
 #include "kudu/gutil/strings/human_readable.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/rpc/client_negotiation.h"
-#include "kudu/rpc/constants.h"
+#include "kudu/rpc/inbound_call.h"
 #include "kudu/rpc/messenger.h"
+#include "kudu/rpc/outbound_call.h"
 #include "kudu/rpc/reactor.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/rpc/rpc_introspection.pb.h"
 #include "kudu/rpc/transfer.h"
-#include "kudu/util/debug-util.h"
-#include "kudu/util/flag_tags.h"
-#include "kudu/util/logging.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/net/socket.h"
 #include "kudu/util/status.h"
-#include "kudu/util/trace.h"
 
 using std::includes;
 using std::set;
 using std::shared_ptr;
 using std::unique_ptr;
-using std::vector;
 using strings::Substitute;
 
 namespace kudu {
@@ -80,6 +74,7 @@ Connection::Connection(ReactorThread *reactor_thread,
       next_call_id_(1),
       credentials_policy_(policy),
       negotiation_complete_(false),
+      is_confidential_(false),
       scheduled_for_shutdown_(false) {
 }
 
@@ -169,7 +164,7 @@ void Connection::Shutdown(const Status &status,
       c->call->SetFailed(status,
                          negotiation_complete_ ? Phase::REMOTE_CALL
                                                : Phase::CONNECTION_NEGOTIATION,
-                         error.release());
+                         std::move(error));
     }
     // And we must return the CallAwaitingResponse to the pool
     car_pool_.Destroy(c);
@@ -311,7 +306,7 @@ struct CallTransferCallbacks : public TransferCallbacks {
   Connection* conn_;
 };
 
-void Connection::QueueOutboundCall(const shared_ptr<OutboundCall> &call) {
+void Connection::QueueOutboundCall(shared_ptr<OutboundCall> call) {
   DCHECK(call);
   DCHECK_EQ(direction_, CLIENT);
   DCHECK(reactor_thread_->IsCurrentThread());
@@ -392,7 +387,7 @@ void Connection::QueueOutboundCall(const shared_ptr<OutboundCall> &call) {
     car->timeout_timer.start();
   }
 
-  TransferCallbacks *cb = new CallTransferCallbacks(call, this);
+  TransferCallbacks *cb = new CallTransferCallbacks(std::move(call), this);
   awaiting_response_[call_id] = car.release();
   QueueOutbound(gscoped_ptr<OutboundTransfer>(
       OutboundTransfer::CreateForCallRequest(call_id, tmp_slices, n_slices, cb)));
@@ -478,6 +473,10 @@ void Connection::QueueResponseForCall(gscoped_ptr<InboundCall> call) {
 
   QueueTransferTask *task = new QueueTransferTask(std::move(t), this);
   reactor_thread_->reactor()->ScheduleReactorTask(task);
+}
+
+void Connection::set_confidential(bool is_confidential) {
+  is_confidential_ = is_confidential;
 }
 
 bool Connection::SatisfiesCredentialsPolicy(CredentialsPolicy policy) const {
@@ -637,8 +636,8 @@ void Connection::WriteHandler(ev::io &watcher, int revents) {
           outbound_transfers_.pop_front();
           Status s = Status::NotSupported("server does not support the required RPC features");
           transfer->Abort(s);
-          car->call->SetFailed(s, negotiation_complete_ ? Phase::REMOTE_CALL
-                                                        : Phase::CONNECTION_NEGOTIATION);
+          Phase phase = negotiation_complete_ ? Phase::REMOTE_CALL : Phase::CONNECTION_NEGOTIATION;
+          car->call->SetFailed(std::move(s), phase);
           // Test cancellation when 'call_' is in 'FINISHED_ERROR' state.
           MaybeInjectCancellation(car->call);
           car->call.reset();

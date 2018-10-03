@@ -19,10 +19,6 @@
 # after the toolchain is bootstrapped. Installed after requirements.txt
 
 argparse == 1.4.0
-Fabric == 1.10.2
-  paramiko == 1.15.2
-    ecdsa == 0.13
-  pycrypto == 2.6.1
 impyla == 0.14.0
   bitarray == 0.8.1
   sasl == 0.1.3

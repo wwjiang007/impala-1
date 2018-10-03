@@ -24,13 +24,14 @@
 #include "exprs/scalar-expr.h"
 #include "gutil/gscoped_ptr.h"
 #include "runtime/fragment-instance-state.h"
-#include "runtime/io/disk-io-mgr.h"
 #include "runtime/mem-pool.h"
-#include "runtime/runtime-state.h"
+#include "runtime/query-state.h"
+#include "runtime/row-batch-queue.h"
 #include "runtime/row-batch.h"
+#include "runtime/runtime-state.h"
+#include "runtime/scanner-mem-limiter.h"
 #include "runtime/thread-resource-mgr.h"
 #include "runtime/tuple-row.h"
-#include "util/disk-info.h"
 #include "util/runtime-profile-counters.h"
 
 #include "common/names.h"
@@ -38,43 +39,42 @@
 DEFINE_int32(kudu_max_row_batches, 0, "The maximum size of the row batch queue, "
     " for Kudu scanners.");
 
+// Empirically derived estimate for the Kudu scan's memory consumption per column of
+// data materialized.
+DEFINE_int64_hidden(kudu_scanner_thread_estimated_bytes_per_column, 384L * 1024L,
+    "Estimated bytes of memory per materialized column consumed by Kudu scanner thread.");
+
+// Empirically derived estimate for the maximum consumption of Kudu scan, based on
+// experiments with 250-column table with num_scanner_threads=1, where I wasn't able
+// to coax the scan to use more than 25MB of memory.
+DEFINE_int64_hidden(kudu_scanner_thread_max_estimated_bytes, 32L * 1024L * 1024L,
+    "Estimated maximum bytes of memory consumed by Kudu scanner thread for high column "
+    "counts.");
+
 namespace impala {
 
 KuduScanNode::KuduScanNode(ObjectPool* pool, const TPlanNode& tnode,
     const DescriptorTbl& descs)
     : KuduScanNodeBase(pool, tnode, descs),
-      num_active_scanners_(0),
       done_(false),
-      max_num_scanner_threads_(CpuInfo::num_cores()),
       thread_avail_cb_id_(-1) {
   DCHECK(KuduIsAvailable());
-
-  int max_row_batches = FLAGS_kudu_max_row_batches;
-  if (max_row_batches <= 0) {
-    // TODO: See comment on hdfs-scan-node.
-    // This value is built the same way as it assumes that the scan node runs co-located
-    // with a Kudu tablet server and that the tablet server is using disks similarly as
-    // a datanode would.
-    max_row_batches = 10 * (DiskInfo::num_disks() + io::DiskIoMgr::REMOTE_NUM_DISKS);
-  }
-  materialized_row_batches_.reset(new RowBatchQueue(max_row_batches));
 }
 
 KuduScanNode::~KuduScanNode() {
   DCHECK(is_closed());
 }
 
+Status KuduScanNode::Prepare(RuntimeState* state) {
+  RETURN_IF_ERROR(KuduScanNodeBase::Prepare(state));
+  thread_state_.Prepare(this, EstimateScannerThreadMemConsumption());
+  return Status::OK();
+}
+
 Status KuduScanNode::Open(RuntimeState* state) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
   RETURN_IF_ERROR(KuduScanNodeBase::Open(state));
-
-  num_scanner_threads_started_counter_ =
-      ADD_COUNTER(runtime_profile(), NUM_SCANNER_THREADS_STARTED, TUnit::UNIT);
-
-  if (state->query_options().num_scanner_threads > 0) {
-    max_num_scanner_threads_ = runtime_state_->query_options().num_scanner_threads;
-  }
-  DCHECK_GT(max_num_scanner_threads_, 0);
+  thread_state_.Open(this, FLAGS_kudu_max_row_batches);
 
   if (filter_ctxs_.size() > 0) WaitForRuntimeFilters();
 
@@ -100,7 +100,7 @@ Status KuduScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos
   }
 
   *eos = false;
-  unique_ptr<RowBatch> materialized_batch = materialized_row_batches_->GetBatch();
+  unique_ptr<RowBatch> materialized_batch = thread_state_.batch_queue()->GetBatch();
   if (materialized_batch != NULL) {
     row_batch->AcquireState(materialized_batch.get());
     num_rows_returned_ += row_batch->num_rows();
@@ -133,31 +133,51 @@ void KuduScanNode::Close(RuntimeState* state) {
 
   SetDone();
 
-  scanner_threads_.JoinAll();
-  DCHECK_EQ(num_active_scanners_, 0);
-  materialized_row_batches_->Cleanup();
+  thread_state_.Close(this);
   KuduScanNodeBase::Close(state);
 }
 
+int64_t KuduScanNode::EstimateScannerThreadMemConsumption() {
+  int64_t num_cols = max<int64_t>(1, tuple_desc()->slots().size());
+  return min(FLAGS_kudu_scanner_thread_max_estimated_bytes,
+      FLAGS_kudu_scanner_thread_estimated_bytes_per_column * num_cols);
+}
+
 void KuduScanNode::ThreadAvailableCb(ThreadResourcePool* pool) {
+  ScannerMemLimiter* mem_limiter = runtime_state_->query_state()->scanner_mem_limiter();
   while (true) {
     unique_lock<mutex> lock(lock_);
     // All done or all tokens are assigned.
     if (done_ || !HasScanToken()) break;
-    bool first_thread = num_active_scanners_ == 0;
+    bool first_thread = thread_state_.GetNumActive() == 0;
+
+    // * Don't start up a ScannerThread if the row batch queue is full since
+    //    we are not scanner bound.
+    // * Don't start up a thread if there is not enough memory available for the
+    //    estimated memory consumption (include reservation and non-reserved memory).
+    if (!first_thread) {
+      if (thread_state_.batch_queue()->AtCapacity()) break;
+      if (!mem_limiter->ClaimMemoryForScannerThread(
+              this, EstimateScannerThreadMemConsumption())) {
+        COUNTER_ADD(thread_state_.scanner_thread_mem_unavailable_counter(), 1);
+        break;
+      }
+    }
 
     // Check if we can get a token. We need at least one thread to run.
     if (first_thread) {
       pool->AcquireThreadToken();
-    } else if (active_scanner_thread_counter_.value() >= max_num_scanner_threads_
+    } else if (thread_state_.GetNumActive() >= thread_state_.max_num_scanner_threads()
         || !pool->TryAcquireThreadToken()) {
+      mem_limiter->ReleaseMemoryForScannerThread(
+          this, EstimateScannerThreadMemConsumption());
       break;
     }
 
     string name = Substitute(
         "kudu-scanner-thread (finst:$0, plan-node-id:$1, thread-idx:$2)",
         PrintId(runtime_state_->fragment_instance_id()), id(),
-        num_scanner_threads_started_counter_->value());
+        thread_state_.GetNumStarted());
 
     // Reserve the first token so no other thread picks it up.
     const string* token = GetNextScanToken();
@@ -173,6 +193,10 @@ void KuduScanNode::ThreadAvailableCb(ThreadResourcePool* pool) {
       // and ReleaseThreadToken()->InvokeCallbacks(). Second, Thread::Create() failed and
       // is likely to continue failing for future callbacks.
       pool->ReleaseThreadToken(first_thread, true);
+      if (!first_thread) {
+        mem_limiter->ReleaseMemoryForScannerThread(
+            this, EstimateScannerThreadMemConsumption());
+      }
 
       // Abort the query. This is still holding the lock_, so done_ is known to be
       // false and status_ must be ok.
@@ -182,10 +206,7 @@ void KuduScanNode::ThreadAvailableCb(ThreadResourcePool* pool) {
       break;
     }
     // Thread successfully started
-    COUNTER_ADD(num_scanner_threads_started_counter_, 1);
-    ++num_active_scanners_;
-    VLOG_RPC << "Thread started: " << name;
-    scanner_threads_.AddThread(move(t));
+    thread_state_.AddThread(move(t));
   }
 }
 
@@ -199,21 +220,21 @@ Status KuduScanNode::ProcessScanToken(KuduScanner* scanner, const string& scan_t
     RETURN_IF_ERROR(scanner->GetNext(row_batch.get(), &eos));
     while (!done_) {
       scanner->KeepKuduScannerAlive();
-      if (materialized_row_batches_->BlockingPutWithTimeout(move(row_batch), 1000000)) {
+      if (thread_state_.EnqueueBatchWithTimeout(&row_batch, 1000000)) {
         break;
       }
       // Make sure that we still own the RowBatch if BlockingPutWithTimeout() timed out.
       DCHECK(row_batch != nullptr);
     }
   }
-  if (eos) scan_ranges_complete_counter()->Add(1);
+  if (eos) scan_ranges_complete_counter_->Add(1);
   return Status::OK();
 }
 
 void KuduScanNode::RunScannerThread(
     bool first_thread, const string& name, const string* initial_token) {
   DCHECK(initial_token != nullptr);
-  SCOPED_THREAD_COUNTER_MEASUREMENT(scanner_thread_counters());
+  SCOPED_THREAD_COUNTER_MEASUREMENT(thread_state_.thread_counters());
   SCOPED_THREAD_COUNTER_MEASUREMENT(runtime_state_->total_thread_statistics());
   KuduScanner scanner(this, runtime_state_);
 
@@ -248,19 +269,24 @@ void KuduScanNode::RunScannerThread(
       status_ = status;
       SetDoneInternal();
     }
-    if (--num_active_scanners_ == 0) SetDoneInternal();
+    if (thread_state_.DecrementNumActive()) SetDoneInternal();
   }
 
   // lock_ is released before calling ThreadResourceMgr::ReleaseThreadToken() which
   // invokes ThreadAvailableCb() which attempts to take the same lock.
   VLOG_RPC << "Thread done: " << name;
+  if (!first_thread) {
+    ScannerMemLimiter* mem_limiter = runtime_state_->query_state()->scanner_mem_limiter();
+    mem_limiter->ReleaseMemoryForScannerThread(
+        this, EstimateScannerThreadMemConsumption());
+  }
   runtime_state_->resource_pool()->ReleaseThreadToken(first_thread);
 }
 
 void KuduScanNode::SetDoneInternal() {
   if (done_) return;
   done_ = true;
-  materialized_row_batches_->Shutdown();
+  thread_state_.Shutdown();
 }
 
 void KuduScanNode::SetDone() {

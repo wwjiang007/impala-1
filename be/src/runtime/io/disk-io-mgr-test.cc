@@ -59,13 +59,14 @@ const int MAX_BUFFER_SIZE = 1024;
 const int64_t LARGE_RESERVATION_LIMIT = 4L * 1024L * 1024L * 1024L;
 const int64_t LARGE_INITIAL_RESERVATION = 128L * 1024L * 1024L;
 const int64_t BUFFER_POOL_CAPACITY = LARGE_RESERVATION_LIMIT;
-
 namespace impala {
 namespace io {
 
+static Status CONTEXT_CANCELLED_STATUS =
+    Status::CancelledInternal("IoMgr RequestContext");
+
 class DiskIoMgrTest : public testing::Test {
  public:
-
   virtual void SetUp() {
     test_env_.reset(new TestEnv);
     // Tests try to allocate arbitrarily small buffers. Ensure Buffer Pool allows it.
@@ -101,7 +102,7 @@ class DiskIoMgrTest : public testing::Test {
   void WriteValidateCallback(int num_writes, WriteRange** written_range,
       DiskIoMgr* io_mgr, RequestContext* reader, BufferPool::ClientHandle* client,
       int32_t* data, Status expected_status, const Status& status) {
-    if (expected_status.code() == TErrorCode::CANCELLED) {
+    if (expected_status.code() == TErrorCode::CANCELLED_INTERNALLY) {
       EXPECT_TRUE(status.ok() || status.IsCancelled()) << "Error: " << status.GetDetail();
     } else {
       EXPECT_EQ(status.code(), expected_status.code());
@@ -491,7 +492,7 @@ TEST_F(DiskIoMgrTest, SingleWriterCancel) {
       for (int i = 0; i < num_ranges; ++i) {
         if (i == num_ranges_before_cancel) {
           writer->Cancel();
-          validate_status = Status::CANCELLED;
+          validate_status = CONTEXT_CANCELLED_STATUS;
         }
         int32_t* data = tmp_pool.Add(new int32_t);
         *data = rand();
@@ -499,7 +500,7 @@ TEST_F(DiskIoMgrTest, SingleWriterCancel) {
         WriteRange::WriteDoneCallback callback =
             bind(mem_fn(&DiskIoMgrTest::WriteValidateCallback), this,
                 num_ranges_before_cancel, new_range, read_io_mgr.get(), reader.get(),
-                &read_client, data, Status::CANCELLED, _1);
+                &read_client, data, CONTEXT_CANCELLED_STATUS, _1);
         *new_range = tmp_pool.Add(
             new WriteRange(tmp_file, cur_offset, num_ranges % num_disks, callback));
         (*new_range)->SetData(reinterpret_cast<uint8_t*>(data), sizeof(int32_t));
@@ -635,7 +636,7 @@ TEST_F(DiskIoMgrTest, AddScanRangeTest) {
       for (int i = 0; i < 3; ++i) {
         threads.add_thread(
             new thread(ScanRangeThread, &io_mgr, reader.get(), &read_client, data,
-                strlen(data), Status::CANCELLED, 0, &num_ranges_processed));
+                strlen(data), Status::CancelledInternal(""), 0, &num_ranges_processed));
       }
 
       threads.join_all();
@@ -770,9 +771,9 @@ TEST_F(DiskIoMgrTest, SingleReaderCancel) {
       // Start up some threads and then cancel
       thread_group threads;
       for (int i = 0; i < 3; ++i) {
-        threads.add_thread(new thread(ScanRangeThread, &io_mgr, reader.get(),
-            &read_client, data, strlen(data), Status::CANCELLED, 0,
-            &num_ranges_processed));
+        threads.add_thread(
+            new thread(ScanRangeThread, &io_mgr, reader.get(), &read_client, data,
+                strlen(data), Status::CancelledInternal(""), 0, &num_ranges_processed));
       }
 
       reader->Cancel();
@@ -1256,8 +1257,8 @@ TEST_F(DiskIoMgrTest, SkipAllocateBuffers) {
   ASSERT_OK(reader->AddScanRanges(vector<ScanRange*>({ranges[2], ranges[3]})));
 
   // Cancel two directly, cancel the other two indirectly via the context.
-  ranges[0]->Cancel(Status::CANCELLED);
-  ranges[2]->Cancel(Status::CANCELLED);
+  ranges[0]->Cancel(Status::CancelledInternal("foo"));
+  ranges[2]->Cancel(Status::CancelledInternal("bar"));
   reader->Cancel();
 
   io_mgr.UnregisterContext(reader.get());
@@ -1299,12 +1300,64 @@ TEST_F(DiskIoMgrTest, CancelReleasesResources) {
     // Give disk I/O thread a chance to start read.
     SleepForMs(1);
 
-    range->Cancel(Status::CANCELLED);
+    range->Cancel(Status::CancelledInternal("bar"));
     // Resources should be released immediately once Cancel() returns.
     EXPECT_EQ(0, read_client.GetUsedReservation()) << " iter " << i;
   }
   buffer_pool()->DeregisterClient(&read_client);
   io_mgr.UnregisterContext(reader.get());
+}
+
+// Regression test for IMPALA-7402 - RequestContext::Cancel() propagation via
+// ScanRange::GetNext() does not guarantee buffers are released.
+TEST_F(DiskIoMgrTest, FinalGetNextReleasesResources) {
+  InitRootReservation(LARGE_RESERVATION_LIMIT);
+  const char* tmp_file = "/tmp/disk_io_mgr_test.txt";
+  const char* data = "the quick brown fox jumped over the lazy dog";
+  int len = strlen(data);
+  const int64_t MIN_BUFFER_SIZE = 2;
+  const int64_t MAX_BUFFER_SIZE = 1024;
+  CreateTempFile(tmp_file, data);
+
+  // Get mtime for file
+  struct stat stat_val;
+  stat(tmp_file, &stat_val);
+
+  const int NUM_DISK_THREADS = 20;
+  DiskIoMgr io_mgr(
+      1, NUM_DISK_THREADS, NUM_DISK_THREADS, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE);
+#ifndef NDEBUG
+  auto s = ScopedFlagSetter<int32_t>::Make(&FLAGS_stress_disk_read_delay_ms, 5);
+#endif
+
+  ASSERT_OK(io_mgr.Init());
+  BufferPool::ClientHandle read_client;
+  RegisterBufferPoolClient(
+      LARGE_RESERVATION_LIMIT, LARGE_INITIAL_RESERVATION, &read_client);
+
+  for (int i = 0; i < 10; ++i) {
+    unique_ptr<RequestContext> reader = io_mgr.RegisterContext();
+    ScanRange* range = InitRange(&pool_, tmp_file, 0, len, 0, stat_val.st_mtime);
+    bool needs_buffers;
+    ASSERT_OK(reader->StartScanRange(range, &needs_buffers));
+    EXPECT_TRUE(needs_buffers);
+    ASSERT_OK(io_mgr.AllocateBuffersForRange(&read_client, range, MAX_BUFFER_SIZE));
+    // Give disk I/O thread a chance to start read.
+    SleepForMs(1);
+
+    reader->Cancel();
+    // The scan range should hold no resources once ScanRange::GetNext() returns.
+    unique_ptr<BufferDescriptor> buffer;
+    Status status = range->GetNext(&buffer);
+    if (status.ok()) {
+      DCHECK(buffer->eosr());
+      range->ReturnBuffer(move(buffer));
+    }
+    EXPECT_EQ(0, read_client.GetUsedReservation()) << " iter " << i << ": "
+                                                   << status.GetDetail();
+    io_mgr.UnregisterContext(reader.get());
+  }
+  buffer_pool()->DeregisterClient(&read_client);
 }
 
 // Test reading into a client-allocated buffer.

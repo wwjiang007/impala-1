@@ -130,12 +130,13 @@ TEST(Webserver, ArgsTest) {
 
 void JsonCallback(bool always_text, const Webserver::ArgumentMap& args,
     Document* document) {
-  document->AddMember(SALUTATION_KEY.c_str(), SALUTATION_VALUE.c_str(),
-      document->GetAllocator());
-  document->AddMember(TO_ESCAPE_KEY.c_str(), TO_ESCAPE_VALUE.c_str(),
-      document->GetAllocator());
+  document->AddMember(rapidjson::StringRef(SALUTATION_KEY.c_str()),
+      StringRef(SALUTATION_VALUE.c_str()), document->GetAllocator());
+  document->AddMember(rapidjson::StringRef(TO_ESCAPE_KEY.c_str()),
+      StringRef(TO_ESCAPE_VALUE.c_str()), document->GetAllocator());
   if (always_text) {
-    document->AddMember(Webserver::ENABLE_RAW_JSON_KEY, true, document->GetAllocator());
+    document->AddMember(rapidjson::StringRef(Webserver::ENABLE_RAW_HTML_KEY), true,
+        document->GetAllocator());
   }
 }
 
@@ -174,7 +175,7 @@ TEST(Webserver, JsonTest) {
           Substitute("$0?raw", JSON_TEST_PATH), &raw_contents));
   ASSERT_TRUE(raw_contents.str().find("text/plain") != string::npos);
 
-  // Any callback that includes ENABLE_RAW_JSON_KEY should always return text.
+  // Any callback that includes ENABLE_RAW_HTML_KEY should always return text.
   stringstream raw_cb_contents;
   ASSERT_OK(HttpGet("localhost", FLAGS_webserver_port, RAW_TEXT_PATH,
       &raw_cb_contents));

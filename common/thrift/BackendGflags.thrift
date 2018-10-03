@@ -79,4 +79,24 @@ struct TBackendGflags {
   26: required string authorized_proxy_group_config
 
   27: required bool use_local_catalog
+
+  28: required bool disable_catalog_data_ops_debug_only
+
+  29: required i32 local_catalog_cache_mb
+
+  30: required i32 local_catalog_cache_expiration_s
+
+  31: required bool pull_incremental_statistics
+
+  32: required string catalog_topic_mode
+
+  33: required i32 invalidate_tables_timeout_s
+
+  34: required bool invalidate_tables_on_memory_pressure
+
+  35: required double invalidate_tables_gc_old_gen_full_threshold
+
+  36: required double invalidate_tables_fraction_on_memory_pressure
+
+  37: required i32 local_catalog_max_fetch_retries
 }

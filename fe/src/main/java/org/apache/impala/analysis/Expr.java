@@ -26,16 +26,18 @@ import java.util.ListIterator;
 import java.util.Set;
 
 import org.apache.impala.analysis.BinaryPredicate.Operator;
-import org.apache.impala.catalog.Catalog;
+import org.apache.impala.catalog.BuiltinsDb;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.Function.CompareMode;
-import org.apache.impala.catalog.ImpaladCatalog;
 import org.apache.impala.catalog.PrimitiveType;
 import org.apache.impala.catalog.ScalarType;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
+import org.apache.impala.common.InternalException;
 import org.apache.impala.common.TreeNode;
 import org.apache.impala.rewrite.ExprRewriter;
+import org.apache.impala.service.FeSupport;
+import org.apache.impala.thrift.TColumnValue;
 import org.apache.impala.thrift.TExpr;
 import org.apache.impala.thrift.TExprNode;
 import org.apache.impala.thrift.TFunction;
@@ -418,7 +420,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
    */
   protected Function getBuiltinFunction(Analyzer analyzer, String name,
       Type[] argTypes, CompareMode mode) throws AnalysisException {
-    FunctionName fnName = new FunctionName(ImpaladCatalog.BUILTINS_DB, name);
+    FunctionName fnName = new FunctionName(BuiltinsDb.NAME, name);
     Function searchDesc = new Function(fnName, argTypes, Type.INVALID, false);
     return analyzer.getCatalog().getFunction(searchDesc, mode);
   }
@@ -470,10 +472,20 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
       int ix = Math.min(fnArgs.length - 1, i);
       if (fnArgs[ix].isWildcardDecimal()) {
         if (children_.get(i).type_.isDecimal() && ignoreWildcardDecimals) continue;
-        Preconditions.checkState(resolvedWildcardType != null);
-        Preconditions.checkState(!resolvedWildcardType.isInvalid());
-        if (!children_.get(i).type_.equals(resolvedWildcardType)) {
-          castChild(resolvedWildcardType, i);
+        if (children_.get(i).type_.isDecimal() || !ignoreWildcardDecimals) {
+          Preconditions.checkState(resolvedWildcardType != null);
+          Preconditions.checkState(!resolvedWildcardType.isInvalid());
+          if (!children_.get(i).type_.equals(resolvedWildcardType)) {
+            castChild(resolvedWildcardType, i);
+          }
+        } else if (children_.get(i).type_.isNull()) {
+          castChild(ScalarType.createDecimalType(), i);
+        } else {
+          Preconditions.checkState(children_.get(i).type_.isScalarType());
+          // It is safe to assign an arbitrary decimal here only if the backend function
+          // can handle it (in which case ignoreWildcardDecimals is true).
+          Preconditions.checkState(ignoreWildcardDecimals);
+          castChild(((ScalarType) children_.get(i).type_).getMinResolutionDecimal(), i);
         }
       } else if (!children_.get(i).type_.matchesType(fnArgs[ix])) {
         castChild(fnArgs[ix], i);
@@ -504,12 +516,12 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
         ScalarType decimalType = (ScalarType) childType;
         result = decimalType.getMinResolutionDecimal();
       } else {
-        Preconditions.checkState(childType.isDecimal() || result.isDecimal());
         result = Type.getAssignmentCompatibleType(
             result, childType, false, strictDecimal);
       }
     }
     if (result != null && !result.isNull()) {
+      result = ((ScalarType)result).getMinResolutionDecimal();
       Preconditions.checkState(result.isDecimal() || result.isInvalid());
       Preconditions.checkState(!result.isWildcardDecimal());
     }
@@ -1339,6 +1351,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
     return Objects.toStringHelper(this.getClass())
         .add("id", id_)
         .add("type", type_)
+        .add("toSql", toSql())
         .add("sel", selectivity_)
         .add("evalCost", evalCost_)
         .add("#distinct", numDistinctValues_)
@@ -1494,5 +1507,64 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
         }
     };
     return Joiner.on(",").join(Iterables.transform(exprs, toSql));
+  }
+
+  /**
+   * Analyzes and evaluates expression to an integral value, returned as a long.
+   * Throws if the expression cannot be evaluated or if the value evaluates to null.
+   * The 'name' parameter is used in exception messages, e.g. "LIMIT expression
+   * evaluates to NULL".
+   */
+  public long evalToInteger(Analyzer analyzer, String name) throws AnalysisException {
+    // Check for slotrefs and subqueries before analysis so we can provide a more
+    // helpful error message.
+    if (contains(SlotRef.class) || contains(Subquery.class)) {
+      throw new AnalysisException(name + " expression must be a constant expression: " +
+          toSql());
+    }
+    analyze(analyzer);
+    if (!isConstant()) {
+      throw new AnalysisException(name + " expression must be a constant expression: " +
+          toSql());
+    }
+    if (!getType().isIntegerType()) {
+      throw new AnalysisException(name + " expression must be an integer type but is '" +
+          getType() + "': " + toSql());
+    }
+    TColumnValue val = null;
+    try {
+      val = FeSupport.EvalExprWithoutRow(this, analyzer.getQueryCtx());
+    } catch (InternalException e) {
+      throw new AnalysisException("Failed to evaluate expr: " + toSql(), e);
+    }
+    long value;
+    if (val.isSetLong_val()) {
+      value = val.getLong_val();
+    } else if (val.isSetInt_val()) {
+      value = val.getInt_val();
+    } else if (val.isSetShort_val()) {
+      value = val.getShort_val();
+    } else if (val.isSetByte_val()) {
+      value = val.getByte_val();
+    } else {
+      throw new AnalysisException(name + " expression evaluates to NULL: " + toSql());
+    }
+    return value;
+  }
+
+  /**
+   * Analyzes and evaluates expression to a non-negative integral value, returned as a
+   * long. Throws if the expression cannot be evaluated, if the value evaluates to null,
+   * or if the result is negative. The 'name' parameter is used in exception messages,
+   * e.g. "LIMIT expression evaluates to NULL".
+   */
+  public long evalToNonNegativeInteger(Analyzer analyzer, String name)
+      throws AnalysisException {
+    long value = evalToInteger(analyzer, name);
+    if (value < 0) {
+      throw new AnalysisException(name + " must be a non-negative integer: " +
+          toSql() + " = " + value);
+    }
+    return value;
   }
 }

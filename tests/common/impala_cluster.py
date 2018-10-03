@@ -32,7 +32,6 @@ from tests.common.impala_service import (
     StateStoredService)
 from tests.util.shell_util import exec_process, exec_process_async
 
-logging.basicConfig(level=logging.ERROR, format='%(threadName)s: %(message)s')
 LOG = logging.getLogger('impala_cluster')
 LOG.setLevel(level=logging.DEBUG)
 
@@ -162,6 +161,9 @@ class Process(object):
   def get_pid(self):
     """Gets the PID of the process. Returns None if the PID cannot be determined"""
     LOG.info("Attempting to find PID for %s" % ' '.join(self.cmd))
+    return self.__get_pid()
+
+  def __get_pid(self):
     for pid in psutil.get_pid_list():
       try:
         process = psutil.Process(pid)
@@ -197,9 +199,15 @@ class Process(object):
   def restart(self):
     """Kills and restarts the process"""
     self.kill()
-    # Wait for a bit so the ports will be released.
-    sleep(1)
+    self.wait_for_exit()
     self.start()
+
+  def wait_for_exit(self):
+    """Wait until the process exits (or return immediately if it already has exited."""
+    LOG.info('Waiting for exit: {0} (PID: {1})'.format(
+        ' '.join(self.cmd), self.get_pid()))
+    while self.__get_pid() is not None:
+      sleep(0.01)
 
   def __str__(self):
     return "Command: %s PID: %s" % (self.cmd, self.get_pid())

@@ -119,6 +119,7 @@ Status HdfsScanNodeBase::Init(const TPlanNode& tnode, RuntimeState* state) {
 Status HdfsScanNodeBase::Prepare(RuntimeState* state) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
   RETURN_IF_ERROR(ScanNode::Prepare(state));
+  AddBytesReadCounters();
 
   // Prepare collection conjuncts
   for (const auto& entry: conjuncts_map_) {
@@ -339,30 +340,28 @@ Status HdfsScanNodeBase::Open(RuntimeState* state) {
   }
 
   RETURN_IF_ERROR(ClaimBufferReservation(state));
-  reader_context_ = runtime_state_->io_mgr()->RegisterContext();
+  reader_context_ = ExecEnv::GetInstance()->disk_io_mgr()->RegisterContext();
 
   // Initialize HdfsScanNode specific counters
-  // TODO: Revisit counters and move the counters specific to multi-threaded scans
-  // into HdfsScanNode.
-  read_timer_ = ADD_TIMER(runtime_profile(), TOTAL_HDFS_READ_TIMER);
-  open_file_timer_ = ADD_TIMER(runtime_profile(), TOTAL_HDFS_OPEN_FILE_TIMER);
+  hdfs_read_timer_ = ADD_TIMER(runtime_profile(), TOTAL_HDFS_READ_TIMER);
+  hdfs_open_file_timer_ = ADD_TIMER(runtime_profile(), TOTAL_HDFS_OPEN_FILE_TIMER);
   per_read_thread_throughput_counter_ = runtime_profile()->AddDerivedCounter(
       PER_READ_THREAD_THROUGHPUT_COUNTER, TUnit::BYTES_PER_SECOND,
-      bind<int64_t>(&RuntimeProfile::UnitsPerSecond, bytes_read_counter_, read_timer_));
+      bind<int64_t>(&RuntimeProfile::UnitsPerSecond, bytes_read_counter_,
+      hdfs_read_timer_));
   scan_ranges_complete_counter_ =
       ADD_COUNTER(runtime_profile(), SCAN_RANGES_COMPLETE_COUNTER, TUnit::UNIT);
+  collection_items_read_counter_ =
+      ADD_COUNTER(runtime_profile(), COLLECTION_ITEMS_READ_COUNTER, TUnit::UNIT);
   if (DiskInfo::num_disks() < 64) {
     num_disks_accessed_counter_ =
         ADD_COUNTER(runtime_profile(), NUM_DISKS_ACCESSED_COUNTER, TUnit::UNIT);
   } else {
     num_disks_accessed_counter_ = NULL;
   }
-  num_scanner_threads_started_counter_ =
-      ADD_COUNTER(runtime_profile(), NUM_SCANNER_THREADS_STARTED, TUnit::UNIT);
-
   reader_context_->set_bytes_read_counter(bytes_read_counter());
-  reader_context_->set_read_timer(read_timer());
-  reader_context_->set_open_file_timer(open_file_timer());
+  reader_context_->set_read_timer(hdfs_read_timer_);
+  reader_context_->set_open_file_timer(hdfs_open_file_timer_);
   reader_context_->set_active_read_thread_counter(&active_hdfs_read_thread_counter_);
   reader_context_->set_disks_accessed_bitmap(&disks_accessed_bitmap_);
 
@@ -393,7 +392,8 @@ Status HdfsScanNodeBase::Open(RuntimeState* state) {
       "MaxCompressedTextFileLength", TUnit::BYTES);
 
   hdfs_read_thread_concurrency_bucket_ = runtime_profile()->AddBucketingCounters(
-      &active_hdfs_read_thread_counter_, state->io_mgr()->num_total_disks() + 1);
+      &active_hdfs_read_thread_counter_,
+      ExecEnv::GetInstance()->disk_io_mgr()->num_total_disks() + 1);
 
   counters_running_ = true;
 
@@ -414,13 +414,12 @@ void HdfsScanNodeBase::Close(RuntimeState* state) {
   if (reader_context_ != nullptr) {
     // Need to wait for all the active scanner threads to finish to ensure there is no
     // more memory tracked by this scan node's mem tracker.
-    state->io_mgr()->UnregisterContext(reader_context_.get());
+    ExecEnv::GetInstance()->disk_io_mgr()->UnregisterContext(reader_context_.get());
   }
 
   StopAndFinalizeCounters();
 
-  // There should be no active scanner threads and hdfs read threads.
-  DCHECK_EQ(active_scanner_thread_counter_.value(), 0);
+  // There should be no active hdfs read threads.
   DCHECK_EQ(active_hdfs_read_thread_counter_.value(), 0);
 
   if (scan_node_pool_.get() != NULL) scan_node_pool_->FreeAll();
@@ -571,7 +570,8 @@ ScanRange* HdfsScanNodeBase::AllocateScanRange(hdfsFS fs, const char* file,
   DCHECK_GE(len, 0);
   DCHECK_LE(offset + len, GetFileDesc(metadata->partition_id, file)->file_length)
       << "Scan range beyond end of file (offset=" << offset << ", len=" << len << ")";
-  disk_id = runtime_state_->io_mgr()->AssignQueue(file, disk_id, expected_local);
+  disk_id = ExecEnv::GetInstance()->disk_io_mgr()->AssignQueue(
+      file, disk_id, expected_local);
 
   ScanRange* range = runtime_state_->obj_pool()->Add(new ScanRange);
   range->Reset(fs, file, len, offset, disk_id, expected_local, buffer_opts, metadata);
@@ -757,7 +757,7 @@ void HdfsScanNodeBase::RangeComplete(const THdfsFileFormat::type& file_type,
 
 void HdfsScanNodeBase::RangeComplete(const THdfsFileFormat::type& file_type,
     const vector<THdfsCompression::type>& compression_types, bool skipped) {
-  scan_ranges_complete_counter()->Add(1);
+  scan_ranges_complete_counter_->Add(1);
   progress_.Update(1);
   HdfsCompressionTypesSet compression_set;
   for (int i = 0; i < compression_types.size(); ++i) {
@@ -911,9 +911,11 @@ void HdfsScanNodeBase::StopAndFinalizeCounters() {
 
     if (unexpected_remote_bytes_->value() >= UNEXPECTED_REMOTE_BYTES_WARN_THRESHOLD) {
       runtime_state_->LogError(ErrorMsg(TErrorCode::GENERAL, Substitute(
-          "Read $0 of data across network that was expected to be local. "
-          "Block locality metadata for table '$1.$2' may be stale. Consider running "
-          "\"INVALIDATE METADATA `$1`.`$2`\".",
+          "Read $0 of data across network that was expected to be local. Block locality "
+          "metadata for table '$1.$2' may be stale. This only affects query performance "
+          "and not result correctness. One of the common causes for this warning is HDFS "
+          "rebalancer moving some of the file's blocks. If the issue persists, consider "
+          "running \"INVALIDATE METADATA `$1`.`$2`\".",
           PrettyPrinter::Print(unexpected_remote_bytes_->value(), TUnit::BYTES),
           hdfs_table_->database(), hdfs_table_->name())));
     }

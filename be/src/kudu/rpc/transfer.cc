@@ -17,20 +17,23 @@
 
 #include "kudu/rpc/transfer.h"
 
-#include <stdint.h>
+#include <sys/uio.h>
 
+#include <algorithm>
+#include <cstdint>
 #include <iostream>
-#include <sstream>
+#include <limits>
+#include <set>
 
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 
 #include "kudu/gutil/endian.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/constants.h"
-#include "kudu/rpc/messenger.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/logging.h"
-#include "kudu/util/net/sockaddr.h"
 #include "kudu/util/net/socket.h"
 
 DEFINE_int64_hidden(rpc_max_message_size, (50 * 1024 * 1024),
@@ -62,13 +65,16 @@ using std::set;
 using std::string;
 using strings::Substitute;
 
-#define RETURN_ON_ERROR_OR_SOCKET_NOT_READY(status) \
-  if (PREDICT_FALSE(!status.ok())) {                            \
-    if (Socket::IsTemporarySocketError(status.posix_code())) {  \
-      return Status::OK(); /* EAGAIN, etc. */                   \
-    }                                                           \
-    return status;                                              \
-  }
+#define RETURN_ON_ERROR_OR_SOCKET_NOT_READY(status)               \
+  do {                                                            \
+    Status _s = (status);                                         \
+    if (PREDICT_FALSE(!_s.ok())) {                                \
+      if (Socket::IsTemporarySocketError(_s.posix_code())) {      \
+        return Status::OK(); /* EAGAIN, etc. */                   \
+      }                                                           \
+      return _s;                                                  \
+    }                                                             \
+  } while (0)
 
 TransferCallbacks::~TransferCallbacks()
 {}

@@ -35,8 +35,8 @@ import org.apache.impala.analysis.LiteralExpr;
 import org.apache.impala.analysis.SlotDescriptor;
 import org.apache.impala.analysis.StringLiteral;
 import org.apache.impala.analysis.TupleDescriptor;
+import org.apache.impala.catalog.FeHBaseTable;
 import org.apache.impala.catalog.HBaseColumn;
-import org.apache.impala.catalog.HBaseTable;
 import org.apache.impala.catalog.PrimitiveType;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.ImpalaException;
@@ -53,7 +53,8 @@ import org.apache.impala.thrift.TScanRange;
 import org.apache.impala.thrift.TScanRangeLocation;
 import org.apache.impala.thrift.TScanRangeLocationList;
 import org.apache.impala.thrift.TScanRangeSpec;
-import org.apache.impala.util.MembershipSnapshot;
+import org.apache.impala.util.BitUtil;
+import org.apache.impala.util.ExecutorMembershipSnapshot;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -99,6 +100,18 @@ public class HBaseScanNode extends ScanNode {
   private final static int MAX_HBASE_FETCH_BATCH_SIZE = 500 * 1024 * 1024;
   private final static int DEFAULT_SUGGESTED_CACHING = 1024;
   private int suggestedCaching_ = DEFAULT_SUGGESTED_CACHING;
+
+  // Used for memory estimation when the column max size stat is missing (happens only
+  // in case of string type columns).
+  private final static int DEFAULT_STRING_COL_BYTES = 32 * 1024;
+
+  // Used for memory estimation to clamp the max estimate to 128 MB in case of
+  // missing stats.
+  private final static int DEFAULT_MAX_ESTIMATE_BYTES = 128 * 1024 * 1024;
+
+  // Used for memory estimation to clamp the min estimate to 4 KB which is min
+  // block size that can be allocated by the mem-pool.
+  private final static int DEFAULT_MIN_ESTIMATE_BYTES = 4 * 1024;
 
   public HBaseScanNode(PlanNodeId id, TupleDescriptor desc) {
     super(id, desc, "SCAN HBASE");
@@ -192,7 +205,7 @@ public class HBaseScanNode extends ScanNode {
   @Override
   public void computeStats(Analyzer analyzer) {
     super.computeStats(analyzer);
-    HBaseTable tbl = (HBaseTable) desc_.getTable();
+    FeHBaseTable tbl = (FeHBaseTable) desc_.getTable();
 
     ValueRange rowRange = keyRanges_.get(0);
     if (isEmpty_) {
@@ -218,11 +231,10 @@ public class HBaseScanNode extends ScanNode {
       LOG.trace("computeStats HbaseScan: cardinality=" + Long.toString(cardinality_));
     }
 
-    // Assume that each node in the cluster gets a scan range, unless there are fewer
+    // Assume that each executor in the cluster gets a scan range, unless there are fewer
     // scan ranges than nodes.
-    numNodes_ = Math.max(1,
-        Math.min(scanRangeSpecs_.getConcrete_rangesSize(),
-            MembershipSnapshot.getCluster().numNodes()));
+    numNodes_ = Math.max(1, Math.min(scanRangeSpecs_.getConcrete_rangesSize(),
+                                ExecutorMembershipSnapshot.getCluster().numExecutors()));
     if (LOG.isTraceEnabled()) {
       LOG.trace("computeStats HbaseScan: #nodes=" + Integer.toString(numNodes_));
     }
@@ -230,7 +242,7 @@ public class HBaseScanNode extends ScanNode {
 
   @Override
   protected String debugString() {
-    HBaseTable tbl = (HBaseTable) desc_.getTable();
+    FeHBaseTable tbl = (FeHBaseTable) desc_.getTable();
     return Objects.toStringHelper(this)
         .add("tid", desc_.getId().asInt())
         .add("hiveTblName", tbl.getFullName())
@@ -279,7 +291,7 @@ public class HBaseScanNode extends ScanNode {
   @Override
   protected void toThrift(TPlanNode msg) {
     msg.node_type = TPlanNodeType.HBASE_SCAN_NODE;
-    HBaseTable tbl = (HBaseTable) desc_.getTable();
+    FeHBaseTable tbl = (FeHBaseTable) desc_.getTable();
     msg.hbase_scan_node =
       new THBaseScanNode(desc_.getId().asInt(), tbl.getHBaseTableName());
     if (!filters_.isEmpty()) {
@@ -300,13 +312,10 @@ public class HBaseScanNode extends ScanNode {
     if (isEmpty_) return;
 
     // Retrieve relevant HBase regions and their region servers
-    HBaseTable tbl = (HBaseTable) desc_.getTable();
-    org.apache.hadoop.hbase.client.Table hbaseTbl = null;
+    FeHBaseTable tbl = (FeHBaseTable) desc_.getTable();
     List<HRegionLocation> regionsLoc;
     try {
-      hbaseTbl = tbl.getHBaseTable();
-      regionsLoc = HBaseTable.getRegionsInRange(hbaseTbl, startKey_, stopKey_);
-      hbaseTbl.close();
+      regionsLoc = FeHBaseTable.Util.getRegionsInRange(tbl, startKey_, stopKey_);
     } catch (IOException e) {
       throw new RuntimeException(
           "couldn't retrieve HBase table (" + tbl.getHBaseTableName() + ") info:\n"
@@ -404,7 +413,7 @@ public class HBaseScanNode extends ScanNode {
   @Override
   protected String getNodeExplainString(String prefix, String detailPrefix,
       TExplainLevel detailLevel) {
-    HBaseTable table = (HBaseTable) desc_.getTable();
+    FeHBaseTable table = (FeHBaseTable) desc_.getTable();
     StringBuilder output = new StringBuilder();
     if (isEmpty_) {
       output.append(prefix + "empty scan node\n");
@@ -500,17 +509,74 @@ public class HBaseScanNode extends ScanNode {
 
   @Override
   public void computeNodeResourceProfile(TQueryOptions queryOptions) {
-    // TODO: What's a good estimate of memory consumption?
-    nodeResourceProfile_ =  ResourceProfile.noReservation(1024L * 1024L * 1024L);
+    FeHBaseTable tbl = (FeHBaseTable) desc_.getTable();
+    // The first column in an HBase table is always the key column.
+    HBaseColumn keyCol = (HBaseColumn) tbl.getColumns().get(0);
+
+    List<HBaseColumn> colsToFetchFromHBase = new ArrayList<HBaseColumn>();
+    for (SlotDescriptor slot : desc_.getSlots()) {
+      HBaseColumn col = (HBaseColumn) tbl.getColumn(slot.getLabel());
+      // Will add key column separately, since its always fetched.
+      if (col.getColumnFamily().equals(FeHBaseTable.Util.ROW_KEY_COLUMN_FAMILY)) continue;
+      colsToFetchFromHBase.add(col);
+    }
+    // Add the key column.
+    colsToFetchFromHBase.add(keyCol);
+    long mem_estimate = memoryEstimateForFetchingColumns(colsToFetchFromHBase);
+    mem_estimate = Math.max(mem_estimate, DEFAULT_MIN_ESTIMATE_BYTES);
+    nodeResourceProfile_ = ResourceProfile.noReservation(mem_estimate);
   }
 
   /**
-   * Returns the per-host upper bound of memory that any number of concurrent scan nodes
-   * will use. Used for estimating the per-host memory requirement of queries.
+   * Returns an estimate of memory required by the HBase scan node for fetching
+   * the given list of HBase columns. Primarily used as a helper function but
+   * also exposed at the package level for testing.
    */
-  public static long getPerHostMemUpperBound() {
-    // TODO: What's a good estimate of memory consumption?
-    return 1024L * 1024L * 1024L;
+  protected static long memoryEstimateForFetchingColumns(List<HBaseColumn> columns) {
+    // In HBase, every column value is stored in the following format:
+    // http://hbase.apache.org/0.94/book/regions.arch.html#keyvalue
+    // and out of this only rowKey per row and (columnFamily, columnQualifier and
+    // columnValue) per column per row are allocated. The following estimations are based
+    // on that and its interaction with the mem-pool. Currently, we do an
+    // allocate-clear cycle on mem-pool for each row fetched from HBase (See
+    // HBaseTableScanner::Next()). To get an approx upper limit on mem
+    // allocation, we take the max row size possible and assume all possible
+    // chunk sizes below it have been allocated in previous row iterations. So,
+    // for a value of n bytes the max possible mem allocation for a mem pool
+    // that only uses power of 2 chunk sizes will be:
+    // (2^(ceil((log(n))+1) - 1) ~ 2 * BitUtil.roundUpToPowerOf2(n)
+    long maxRowSize = 0;
+    boolean isMissingStats = false;
+    for (HBaseColumn col : columns) {
+      long colMaxSize = col.getStats().getMaxSize();
+      if (col.getType().isStringType()) {
+        if (colMaxSize == -1) {
+          colMaxSize = DEFAULT_STRING_COL_BYTES;
+          isMissingStats = true;
+        }
+        // Round off string col size to next power of 2. For strings less than
+        // 512 KB (MemPool::MAX_CHUNK_SIZE) this ensures enough contribution to
+        // the max row size so that the final round off can accommodate any
+        // fluctuations in size. For larger strings, this approximates that it
+        // completely takes up the new chunk allocated for it.
+        colMaxSize = BitUtil.roundUpToPowerOf2(colMaxSize);
+      }
+      Preconditions.checkState(colMaxSize != -1);
+      maxRowSize += colMaxSize;
+      if (!col.getColumnFamily().equals(FeHBaseTable.Util.ROW_KEY_COLUMN_FAMILY)) {
+        // For non-key columns, their respective column family and column qualifier
+        // strings need to be fetched and mem needs to be allocated for that too.
+        maxRowSize += col.getColumnFamily().length() + col.getColumnQualifier().length();
+      }
+    }
+    // Use the max allocation assuming all possible chunk sizes below it have
+    // been allocated.
+    long mem_estimate = BitUtil.roundUpToPowerOf2(maxRowSize) * 2;
+    // We use a default of 32 KB for string cols that dont have max length set.
+    // Assuming such large cols are uncommon we set an upper limit to avoid extreme
+    // overestimation.
+    if (isMissingStats) mem_estimate = Math.min(mem_estimate, DEFAULT_MAX_ESTIMATE_BYTES);
+    return mem_estimate;
   }
 
   @Override

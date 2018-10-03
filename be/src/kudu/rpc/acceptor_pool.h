@@ -22,7 +22,8 @@
 #include <vector>
 
 #include "kudu/gutil/atomicops.h"
-#include "kudu/util/thread.h"
+#include "kudu/gutil/macros.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/net/socket.h"
 #include "kudu/util/status.h"
@@ -30,7 +31,7 @@
 namespace kudu {
 
 class Counter;
-class Socket;
+class Thread;
 
 namespace rpc {
 

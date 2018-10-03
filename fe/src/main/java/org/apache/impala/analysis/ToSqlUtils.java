@@ -41,13 +41,14 @@ import org.apache.hadoop.hive.metastore.TableType;
 import org.apache.hadoop.hive.ql.parse.HiveLexer;
 import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.Column;
+import org.apache.impala.catalog.FeFsTable;
+import org.apache.impala.catalog.FeHBaseTable;
+import org.apache.impala.catalog.FeKuduTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.FeView;
 import org.apache.impala.catalog.Function;
-import org.apache.impala.catalog.HBaseTable;
 import org.apache.impala.catalog.HdfsCompression;
 import org.apache.impala.catalog.HdfsFileFormat;
-import org.apache.impala.catalog.HdfsTable;
 import org.apache.impala.catalog.KuduColumn;
 import org.apache.impala.catalog.KuduTable;
 import org.apache.impala.catalog.RowFormat;
@@ -186,9 +187,13 @@ public class ToSqlUtils {
 
   /**
    * Returns the "CREATE TABLE" SQL string corresponding to the given
-   * CreateTableAsSelectStmt statement.
+   * CreateTableAsSelectStmt statement. If rewritten is true, returns the rewritten SQL
+   * only if the statement was rewritten. Otherwise, the original SQL will be returned
+   * instead. It is the caller's responsibility to know if/when the statement was indeed
+   * rewritten.
    */
-  public static String getCreateTableSql(CreateTableAsSelectStmt stmt) {
+  public static String getCreateTableSql(CreateTableAsSelectStmt stmt,
+      boolean rewritten) {
     CreateTableStmt innerStmt = stmt.getCreateStmt();
     // Only add partition column labels to output. Table columns must not be specified as
     // they are deduced from the select statement.
@@ -212,7 +217,7 @@ public class ToSqlUtils {
         innerStmt.isExternal(), innerStmt.getIfNotExists(), innerStmt.getRowFormat(),
         HdfsFileFormat.fromThrift(innerStmt.getFileFormat()), HdfsCompression.NONE, null,
         innerStmt.getLocation());
-    return createTableSql + " AS " + stmt.getQueryStmt().toSql();
+    return createTableSql + " AS " + stmt.getQueryStmt().toSql(rewritten);
   }
 
   /**
@@ -235,7 +240,7 @@ public class ToSqlUtils {
     removeHiddenTableProperties(properties, Maps.<String, String>newHashMap());
     ArrayList<String> colsSql = Lists.newArrayList();
     ArrayList<String> partitionColsSql = Lists.newArrayList();
-    boolean isHbaseTable = table instanceof HBaseTable;
+    boolean isHbaseTable = table instanceof FeHBaseTable;
     for (int i = 0; i < table.getColumns().size(); i++) {
       if (!isHbaseTable && i < table.getNumClusteringCols()) {
         partitionColsSql.add(columnToSql(table.getColumns().get(i)));
@@ -252,8 +257,8 @@ public class ToSqlUtils {
     String storageHandlerClassName = table.getStorageHandlerClassName();
     List<String> primaryKeySql = Lists.newArrayList();
     String kuduPartitionByParams = null;
-    if (table instanceof KuduTable) {
-      KuduTable kuduTable = (KuduTable) table;
+    if (table instanceof FeKuduTable) {
+      FeKuduTable kuduTable = (FeKuduTable) table;
       // Kudu tables don't use LOCATION syntax
       location = null;
       format = HdfsFileFormat.KUDU;
@@ -281,7 +286,7 @@ public class ToSqlUtils {
         // We shouldn't output the columns for external tables
         colsSql = null;
       }
-    } else if (table instanceof HdfsTable) {
+    } else if (table instanceof FeFsTable) {
       String inputFormat = msTable.getSd().getInputFormat();
       format = HdfsFileFormat.fromHdfsInputFormatClass(inputFormat);
       compression = HdfsCompression.fromHdfsInputFormatClass(inputFormat);

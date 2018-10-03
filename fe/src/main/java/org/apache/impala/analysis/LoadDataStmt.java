@@ -28,15 +28,13 @@ import org.apache.hadoop.fs.permission.FsAction;
 import org.apache.hadoop.fs.s3a.S3AFileSystem;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
 import org.apache.impala.authorization.Privilege;
+import org.apache.impala.catalog.FeFsTable;
 import org.apache.impala.catalog.FeTable;
-import org.apache.impala.catalog.HdfsPartition;
-import org.apache.impala.catalog.HdfsTable;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.thrift.TLoadDataReq;
 import org.apache.impala.thrift.TTableName;
 import org.apache.impala.util.FsPermissionChecker;
-import org.apache.impala.util.TAccessLevelUtil;
 
 import com.google.common.base.Preconditions;
 
@@ -105,7 +103,7 @@ public class LoadDataStmt extends StatementBase {
   public void analyze(Analyzer analyzer) throws AnalysisException {
     dbName_ = analyzer.getTargetDbName(tableName_);
     FeTable table = analyzer.getTable(tableName_, Privilege.INSERT);
-    if (!(table instanceof HdfsTable)) {
+    if (!(table instanceof FeFsTable)) {
       throw new AnalysisException("LOAD DATA only supported for HDFS tables: " +
           dbName_ + "." + getTbl());
     }
@@ -122,7 +120,7 @@ public class LoadDataStmt extends StatementBase {
             "specified: " + dbName_ + "." + getTbl());
       }
     }
-    analyzePaths(analyzer, (HdfsTable) table);
+    analyzePaths(analyzer, (FeFsTable) table);
   }
 
   /**
@@ -134,7 +132,7 @@ public class LoadDataStmt extends StatementBase {
    * We don't check permissions for the S3AFileSystem and the AdlFileSystem due to
    * limitations with thier getAclStatus() API. (see HADOOP-13892 and HADOOP-14437)
    */
-  private void analyzePaths(Analyzer analyzer, HdfsTable hdfsTable)
+  private void analyzePaths(Analyzer analyzer, FeFsTable table)
       throws AnalysisException {
     // The user must have permission to access the source location. Since the files will
     // be moved from this location, the user needs to have all permission.
@@ -198,24 +196,9 @@ public class LoadDataStmt extends StatementBase {
         }
       }
 
-      String noWriteAccessErrorMsg = String.format("Unable to LOAD DATA into " +
-          "target table (%s) because Impala does not have WRITE access to HDFS " +
-          "location: ", hdfsTable.getFullName());
-
-      if (partitionSpec_ != null) {
-        HdfsPartition partition = hdfsTable.getPartition(
-            partitionSpec_.getPartitionSpecKeyValues());
-        String location = partition.getLocation();
-        if (!TAccessLevelUtil.impliesWriteAccess(partition.getAccessLevel())) {
-          throw new AnalysisException(noWriteAccessErrorMsg + location);
-        }
-      } else {
-        // No specific partition specified, so we need to check write access
-        // on the table as a whole.
-        if (!hdfsTable.hasWriteAccess()) {
-          throw new AnalysisException(noWriteAccessErrorMsg + hdfsTable.getLocation());
-        }
-      }
+      FeFsTable.Utils.checkWriteAccess(table,
+          partitionSpec_ != null ? partitionSpec_.getPartitionSpecKeyValues() : null,
+          "LOAD DATA");
     } catch (FileNotFoundException e) {
       throw new AnalysisException("File not found: " + e.getMessage(), e);
     } catch (IOException e) {

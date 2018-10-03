@@ -17,11 +17,13 @@
 #ifndef KUDU_UTIL_NET_SOCKET_H
 #define KUDU_UTIL_NET_SOCKET_H
 
-#include <sys/uio.h>
-#include <string>
+#include <cstddef>
+#include <cstdint>
 
 #include "kudu/gutil/macros.h"
 #include "kudu/util/status.h"
+
+struct iovec;
 
 namespace kudu {
 
@@ -82,6 +84,9 @@ class Socket {
 
   // Sets SO_REUSEADDR to 'flag'. Should be used prior to Bind().
   Status SetReuseAddr(bool flag);
+
+  // Sets SO_REUSEPORT to 'flag'. Should be used prior to Bind().
+  Status SetReusePort(bool flag);
 
   // Convenience method to invoke the common sequence:
   // 1) SetReuseAddr(true)
@@ -150,7 +155,7 @@ class Socket {
 
  private:
   // Called internally from SetSend/RecvTimeout().
-  Status SetTimeout(int opt, std::string optname, const MonoDelta& timeout);
+  Status SetTimeout(int opt, const char* optname, const MonoDelta& timeout);
 
   // Called internally during socket setup.
   Status SetCloseOnExec();
@@ -158,6 +163,10 @@ class Socket {
   // Bind the socket to a local address before making an outbound connection,
   // based on the value of FLAGS_local_ip_for_outbound_sockets.
   Status BindForOutgoingConnection();
+
+  // Set an option on the socket.
+  template<typename T>
+  Status SetSockOpt(int level, int option, const T& value);
 
   int fd_;
 

@@ -27,6 +27,7 @@ import java.util.concurrent.locks.ReentrantLock;
 
 import org.apache.hadoop.hive.metastore.IMetaStoreClient;
 import org.apache.hadoop.hive.metastore.TableType;
+import org.apache.hadoop.hive.metastore.api.ColumnStatisticsData;
 import org.apache.hadoop.hive.metastore.api.ColumnStatisticsObj;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.impala.analysis.TableName;
@@ -39,8 +40,12 @@ import org.apache.impala.thrift.TCatalogObject;
 import org.apache.impala.thrift.TCatalogObjectType;
 import org.apache.impala.thrift.TColumn;
 import org.apache.impala.thrift.TColumnDescriptor;
+import org.apache.impala.thrift.TGetPartialCatalogObjectRequest;
+import org.apache.impala.thrift.TGetPartialCatalogObjectResponse;
+import org.apache.impala.thrift.TPartialTableInfo;
 import org.apache.impala.thrift.TTable;
 import org.apache.impala.thrift.TTableDescriptor;
+import org.apache.impala.thrift.TTableInfoSelector;
 import org.apache.impala.thrift.TTableStats;
 import org.apache.impala.util.HdfsCachingUtil;
 import org.apache.log4j.Logger;
@@ -99,6 +104,11 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
 
   // True if this object is stored in an Impalad catalog cache.
   protected boolean storedInImpaladCatalogCache_ = false;
+
+  // Last used time of this table in nanoseconds as returned by
+  // CatalogdTableInvalidator.nanoTime(). This is only set in catalogd and not used by
+  // impalad.
+  protected long lastUsedTime_;
 
   // Table metrics. These metrics are applicable to all table types. Each subclass of
   // Table can define additional metrics specific to that table type.
@@ -162,6 +172,12 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
     return storedInImpaladCatalogCache_ || RuntimeEnv.INSTANCE.isTestEnv();
   }
 
+  public long getLastUsedTime() {
+    Preconditions.checkState(lastUsedTime_ != 0 &&
+        !isStoredInImpaladCatalogCache());
+    return lastUsedTime_;
+  }
+
   /**
    * Populate members of 'this' from metastore info. If 'reuseMetadata' is true, reuse
    * valid existing metadata.
@@ -214,6 +230,8 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
 
     // We need to only query those columns which may have stats; asking HMS for other
     // columns causes loadAllColumnStats() to return nothing.
+    // TODO(todd): this no longer seems to be true - asking for a non-existent column
+    // is just ignored, and the columns that do exist are returned.
     List<String> colNames = getColumnNamesWithHmsStats();
 
     try {
@@ -223,22 +241,7 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
       return;
     }
 
-    for (ColumnStatisticsObj stats: colStats) {
-      Column col = getColumn(stats.getColName());
-      Preconditions.checkNotNull(col);
-      if (!ColumnStats.isSupportedColType(col.getType())) {
-        LOG.warn(String.format("Statistics for %s, column %s are not supported as " +
-                "column has type %s", getFullName(), col.getName(), col.getType()));
-        continue;
-      }
-
-      if (!col.updateStats(stats.getStatsData())) {
-        LOG.warn(String.format("Failed to load column stats for %s, column %s. Stats " +
-            "may be incompatible with column type %s. Consider regenerating statistics " +
-            "for %s.", getFullName(), col.getName(), col.getType(), getFullName()));
-        continue;
-      }
-    }
+    FeCatalogUtils.injectColumnStats(colStats, this);
   }
 
   /**
@@ -386,6 +389,50 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
     return catalogObject;
   }
 
+  /**
+   * Return partial info about this table. This is called only on the catalogd to
+   * service GetPartialCatalogObject RPCs.
+   */
+  public TGetPartialCatalogObjectResponse getPartialInfo(
+      TGetPartialCatalogObjectRequest req) throws TableLoadingException {
+    Preconditions.checkState(isLoaded(), "unloaded table: %s", getFullName());
+    TTableInfoSelector selector = Preconditions.checkNotNull(req.table_info_selector,
+        "no table_info_selector");
+
+    TGetPartialCatalogObjectResponse resp = new TGetPartialCatalogObjectResponse();
+    resp.setObject_version_number(getCatalogVersion());
+    resp.table_info = new TPartialTableInfo();
+    if (selector.want_hms_table) {
+      // TODO(todd): the deep copy could be a bit expensive. Unfortunately if we took
+      // a reference to this object, and let it escape out of the lock, it would be
+      // racy since the TTable is modified in place by some DDLs (eg 'dropTableStats').
+      // We either need to ensure that TTable is cloned on every write, or we need to
+      // ensure that serialization of the GetPartialCatalogObjectResponse object
+      // is done while we continue to hold the table lock.
+      resp.table_info.setHms_table(getMetaStoreTable().deepCopy());
+    }
+    if (selector.want_stats_for_column_names != null) {
+      List<ColumnStatisticsObj> statsList = Lists.newArrayListWithCapacity(
+          selector.want_stats_for_column_names.size());
+      for (String colName: selector.want_stats_for_column_names) {
+        Column col = getColumn(colName);
+        if (col == null) continue;
+        // Ugly hack: if the catalogd has never gotten any stats from HMS, numDVs will
+        // be -1, and we'll have to send no stats to the impalad.
+        // TODO(todd): this breaks test_ddl.test_alter_set_column_stats.
+        if (!col.getStats().hasNumDistinctValues()) continue;
+
+        ColumnStatisticsData tstats = col.getStats().toHmsCompatibleThrift(col.getType());
+        if (tstats == null) continue;
+        // TODO(todd): it seems like the column type is not used? maybe worth not
+        // setting it here to save serialization.
+        statsList.add(new ColumnStatisticsObj(colName, col.getType().toString(), tstats));
+      }
+      resp.table_info.setColumn_stats(statsList);
+    }
+
+    return resp;
+  }
   /**
    * @see FeCatalogUtils#parseColumnType(FieldSchema, String)
    */
@@ -535,5 +582,9 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
   public static void updateTimestampProperty(
       org.apache.hadoop.hive.metastore.api.Table msTbl, String propertyKey) {
     msTbl.putToParameters(propertyKey, Long.toString(System.currentTimeMillis() / 1000));
+  }
+
+  public void refreshLastUsedTime() {
+    lastUsedTime_ = CatalogdTableInvalidator.nanoTime();
   }
 }

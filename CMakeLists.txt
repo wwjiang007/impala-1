@@ -19,8 +19,6 @@ cmake_minimum_required(VERSION 3.2.3)
 
 # This is a Kudu-specific flag that disables Kudu targets that are test-only.
 set(NO_TESTS 1)
-# Kudu-specific, disable NVM support so that libvmem is not a dependency.
-set(NO_NVM_SUPPORT 1)
 
 # Explicitly define project() to allow modifying the compiler before the project is
 # initialized.
@@ -88,6 +86,7 @@ set_dep_root(GLOG)
 set_dep_root(GPERFTOOLS)
 set_dep_root(GTEST)
 set_dep_root(LIBEV)
+set_dep_root(LIBUNWIND)
 set_dep_root(LLVM)
 set(LLVM_DEBUG_ROOT $ENV{IMPALA_TOOLCHAIN}/llvm-$ENV{IMPALA_LLVM_DEBUG_VERSION})
 set_dep_root(LZ4)
@@ -343,6 +342,14 @@ endif()
 
 ###################################################################
 
+## libunwind
+if (NOT APPLE)
+  find_package(LibUnwind REQUIRED)
+  include_directories(SYSTEM ${LIBUNWIND_INCLUDE_DIR})
+  IMPALA_ADD_THIRDPARTY_LIB(libunwind ${LIBUNWIND_INCLUDE_DIR} ${LIBUNWIND_STATIC_LIB}
+    ${LIBUNWIND_SHARED_LIB})
+endif()
+
 # Required for KRPC_GENERATE, which converts protobuf to stubs.
 find_package(KRPC REQUIRED)
 
@@ -351,11 +358,10 @@ add_definitions(-DKUDU_HEADERS_USE_GLOG)
 if(NOT $ENV{KUDU_CLIENT_DIR} EQUAL "")
   set(kuduClient_DIR "$ENV{KUDU_CLIENT_DIR}/usr/local/share/kuduClient/cmake")
 else()
-  set(kuduClient_DIR "$ENV{IMPALA_TOOLCHAIN}/kudu-$ENV{IMPALA_KUDU_VERSION}")
   if ("${CMAKE_BUILD_TYPE}" STREQUAL "DEBUG")
-    set(kuduClient_DIR "${kuduClient_DIR}/debug/share/kuduClient/cmake")
+    set(kuduClient_DIR "$ENV{IMPALA_KUDU_HOME}/debug/share/kuduClient/cmake")
   else()
-    set(kuduClient_DIR "${kuduClient_DIR}/release/share/kuduClient/cmake")
+    set(kuduClient_DIR "$ENV{IMPALA_KUDU_HOME}/release/share/kuduClient/cmake")
   endif()
 endif()
 # When KUDU_IS_SUPPORTED is false, the Kudu client is expected to be a non-functional

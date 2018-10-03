@@ -22,8 +22,8 @@ import java.util.List;
 import java.util.Set;
 
 import org.apache.impala.authorization.Privilege;
+import org.apache.impala.catalog.FeFsTable;
 import org.apache.impala.catalog.FeTable;
-import org.apache.impala.catalog.HdfsTable;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.planner.JoinNode.DistributionMode;
 import org.apache.impala.rewrite.ExprRewriter;
@@ -79,6 +79,7 @@ public class TableRef implements ParseNode {
 
   // Analysis registers privilege and/or audit requests based on this privilege.
   protected final Privilege priv_;
+  protected final boolean requireGrantOption_;
 
   // Optional TABLESAMPLE clause. Null if not specified.
   protected TableSampleClause sampleParams_;
@@ -135,15 +136,20 @@ public class TableRef implements ParseNode {
   }
 
   public TableRef(List<String> path, String alias, TableSampleClause tableSample) {
-    this(path, alias, tableSample, Privilege.SELECT);
+    this(path, alias, tableSample, Privilege.SELECT, false);
   }
 
   public TableRef(List<String> path, String alias, Privilege priv) {
-    this(path, alias, null, priv);
+    this(path, alias, null, priv, false);
+  }
+
+  public TableRef(List<String> path, String alias, Privilege priv,
+      boolean requireGrantOption) {
+    this(path, alias, null, priv, requireGrantOption);
   }
 
   public TableRef(List<String> path, String alias, TableSampleClause sampleParams,
-      Privilege priv) {
+      Privilege priv, boolean requireGrantOption) {
     rawPath_ = path;
     if (alias != null) {
       aliases_ = new String[] { alias.toLowerCase() };
@@ -153,6 +159,7 @@ public class TableRef implements ParseNode {
     }
     sampleParams_ = sampleParams;
     priv_ = priv;
+    requireGrantOption_ = requireGrantOption;
     isAnalyzed_ = false;
     replicaPreference_ = null;
     randomReplica_ = false;
@@ -168,6 +175,7 @@ public class TableRef implements ParseNode {
     hasExplicitAlias_ = other.hasExplicitAlias_;
     sampleParams_ = other.sampleParams_;
     priv_ = other.priv_;
+    requireGrantOption_ = other.requireGrantOption_;
     joinOp_ = other.joinOp_;
     joinHints_ = Lists.newArrayList(other.joinHints_);
     onClause_ = (other.onClause_ != null) ? other.onClause_.clone() : null;
@@ -274,6 +282,7 @@ public class TableRef implements ParseNode {
   }
   public TableSampleClause getSampleParams() { return sampleParams_; }
   public Privilege getPrivilege() { return priv_; }
+  public boolean requireGrantOption() { return requireGrantOption_; }
   public List<PlanHint> getJoinHints() { return joinHints_; }
   public List<PlanHint> getTableHints() { return tableHints_; }
   public Expr getOnClause() { return onClause_; }
@@ -353,7 +362,7 @@ public class TableRef implements ParseNode {
     if (sampleParams_ == null) return;
     sampleParams_.analyze(analyzer);
     if (!(this instanceof BaseTableRef)
-        || !(resolvedPath_.destTable() instanceof HdfsTable)) {
+        || !(resolvedPath_.destTable() instanceof FeFsTable)) {
       throw new AnalysisException(
           "TABLESAMPLE is only supported on HDFS tables: " + getUniqueAlias());
     }
@@ -376,7 +385,7 @@ public class TableRef implements ParseNode {
     // BaseTableRef will always have their path resolved at this point.
     Preconditions.checkState(getResolvedPath() != null);
     if (getResolvedPath().destTable() != null &&
-        !(getResolvedPath().destTable() instanceof HdfsTable)) {
+        !(getResolvedPath().destTable() instanceof FeFsTable)) {
       analyzer.addWarning("Table hints only supported for Hdfs tables");
     }
     for (PlanHint hint: tableHints_) {
@@ -572,17 +581,25 @@ public class TableRef implements ParseNode {
     return ToSqlUtils.getPathSql(path) + ((aliasSql != null) ? " " + aliasSql : "");
   }
 
+  protected String tableRefToSql(boolean rewritten) {
+    return tableRefToSql();
+  }
+
   @Override
   public String toSql() {
+    return toSql(false);
+  }
+
+  public String toSql(boolean rewritten) {
     if (joinOp_ == null) {
       // prepend "," if we're part of a sequence of table refs w/o an
       // explicit JOIN clause
-      return (leftTblRef_ != null ? ", " : "") + tableRefToSql();
+      return (leftTblRef_ != null ? ", " : "") + tableRefToSql(rewritten);
     }
 
     StringBuilder output = new StringBuilder(" " + joinOp_.toString() + " ");
     if(!joinHints_.isEmpty()) output.append(ToSqlUtils.getPlanHintsSql(joinHints_) + " ");
-    output.append(tableRefToSql());
+    output.append(tableRefToSql(rewritten));
     if (usingColNames_ != null) {
       output.append(" USING (").append(Joiner.on(", ").join(usingColNames_)).append(")");
     } else if (onClause_ != null) {

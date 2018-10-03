@@ -95,10 +95,13 @@ function boot_container() {
   # Update /etc/hosts to remove the entry for the unique docker hostname,
   # and instead point it to 127.0.0.1. Otherwise, HttpFS returns Location:
   # redirects to said hostname, but the relevant datanode isn't listening
-  # on the wildcard address.
-  sed -e /$(hostname)/d /etc/hosts -e /127.0.0.1/s,localhost,"localhost $(hostname)," \
-    > /tmp/hosts
+  # on the wildcard address. bootstrap_system.sh does this as well, but
+  # Docker creates a new /etc/hosts every time a container is created, so
+  # this needs to be done here as well.
+  #
   # "sed -i" in place doesn't work on Docker, because /etc/hosts is a bind mount.
+  sed -e /$(hostname)/d /etc/hosts > /tmp/hosts
+  echo "127.0.0.1 $(hostname -s) $(hostname)" >> /tmp/hosts
   sudo cp /tmp/hosts /etc/hosts
 
   echo Hostname: $(hostname)
@@ -349,27 +352,17 @@ function test_suite() {
   return $ret
 }
 
-# Ubuntu's tzdata package is very finnicky, and if you
-# mount /etc/localtime from the host to the container directly,
-# it fails to install. However, if you make it a symlink
-# and configure /etc/timezone to something that's not an
-# empty string, you'll get the right behavior.
-#
-# The post installation script is findable by looking for "tzdata.postinst"
-#
-# Use this command to reproduce the Ubuntu issue:
-#   docker run -v /etc/localtime:/mnt/localtime -ti ubuntu:16.04 bash -c '
-#     date
-#     ln -sf /mnt/localtime /etc/localtime
-#     date +%Z > /etc/timezone
-#     date
-#     apt-get update > /dev/null
-#     apt-get install tzdata
-#     date'
+# It's convenient (for log files to be legible) for the container
+# to have the host timezone. However, /etc/localtime is finnicky
+# (see localtime(5)) and mounting it to the host /etc/localtime or
+# symlinking it there doesn't always work. Instead, we expect
+# $LOCALTIME_LINK_TARGET to be set to a path in /usr/share/zoneinfo.
 function configure_timezone() {
-  if ! diff -q /etc/localtime /mnt/localtime 2> /dev/null; then
-    ln -sf /mnt/localtime /etc/localtime
+  if [ -e "${LOCALTIME_LINK_TARGET}" ]; then
+    ln -sf "${LOCALTIME_LINK_TARGET}" /etc/localtime
     date +%Z > /etc/timezone
+  else
+    echo '$LOCALTIME_LINK_TARGET not configured.' 1>&2
   fi
 }
 

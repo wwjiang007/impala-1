@@ -66,15 +66,16 @@ const TProtocolVersion::type MAX_SUPPORTED_HS2_VERSION =
 #define HS2_RETURN_ERROR(return_val, error_msg, error_state) \
   do { \
     return_val.status.__set_statusCode(thrift::TStatusCode::ERROR_STATUS); \
-    return_val.status.__set_errorMessage(error_msg); \
-    return_val.status.__set_sqlState(error_state); \
+    return_val.status.__set_errorMessage((error_msg)); \
+    return_val.status.__set_sqlState((error_state)); \
     return; \
   } while (false)
 
 #define HS2_RETURN_IF_ERROR(return_val, status, error_state) \
   do { \
-    if (UNLIKELY(!status.ok())) { \
-      HS2_RETURN_ERROR(return_val, status.GetDetail(), error_state); \
+    const Status& _status = (status); \
+    if (UNLIKELY(!_status.ok())) { \
+      HS2_RETURN_ERROR(return_val, _status.GetDetail(), (error_state)); \
       return; \
     } \
   } while (false)
@@ -265,9 +266,7 @@ Status ImpalaServer::TExecuteStatementReqToTQueryContext(
 // HiveServer2 API
 void ImpalaServer::OpenSession(TOpenSessionResp& return_val,
     const TOpenSessionReq& request) {
-  // DO NOT log this Thrift struct in its entirety, in case a bad client sets the
-  // password.
-  VLOG_QUERY << "OpenSession(): username=" << request.username;
+  HS2_RETURN_IF_ERROR(return_val, CheckNotShuttingDown(), SQLSTATE_GENERAL_ERROR);
 
   // Generate session ID and the secret
   TUniqueId session_id;
@@ -283,6 +282,12 @@ void ImpalaServer::OpenSession(TOpenSessionResp& return_val,
     return_val.__isset.sessionHandle = true;
     UUIDToTUniqueId(session_uuid, &session_id);
   }
+
+  // DO NOT log this Thrift struct in its entirety, in case a bad client sets the
+  // password.
+  VLOG_QUERY << "Opening session: " << PrintId(session_id) << " username: "
+             << request.username;
+
   // create a session state: initialize start time, session type, database and default
   // query options.
   // TODO: put secret in session state map and check it
@@ -328,7 +333,8 @@ void ImpalaServer::OpenSession(TOpenSessionResp& return_val,
             &state->set_query_options_mask);
         if (status.ok() && iequals(v.first, "idle_session_timeout")) {
           state->session_timeout = state->set_query_options.idle_session_timeout;
-          VLOG_QUERY << "OpenSession(): idle_session_timeout="
+          VLOG_QUERY << "OpenSession(): session: " << PrintId(session_id)
+                     <<" idle_session_timeout="
                      << PrettyPrinter::Print(state->session_timeout, TUnit::TIME_S);
         }
       }
@@ -359,6 +365,8 @@ void ImpalaServer::OpenSession(TOpenSessionResp& return_val,
   return_val.__isset.configuration = true;
   return_val.status.__set_statusCode(thrift::TStatusCode::SUCCESS_STATUS);
   return_val.serverProtocolVersion = state->hs2_version;
+  VLOG_QUERY << "Opened session: " << PrintId(session_id) << " username: "
+             << request.username;
 }
 
 void ImpalaServer::CloseSession(TCloseSessionResp& return_val,
@@ -377,6 +385,7 @@ void ImpalaServer::CloseSession(TCloseSessionResp& return_val,
 void ImpalaServer::GetInfo(TGetInfoResp& return_val,
     const TGetInfoReq& request) {
   VLOG_QUERY << "GetInfo(): request=" << ThriftDebugString(request);
+  HS2_RETURN_IF_ERROR(return_val, CheckNotShuttingDown(), SQLSTATE_GENERAL_ERROR);
 
   TUniqueId session_id;
   TUniqueId secret;
@@ -405,6 +414,7 @@ void ImpalaServer::GetInfo(TGetInfoResp& return_val,
 void ImpalaServer::ExecuteStatement(TExecuteStatementResp& return_val,
     const TExecuteStatementReq& request) {
   VLOG_QUERY << "ExecuteStatement(): request=" << ThriftDebugString(request);
+  HS2_RETURN_IF_ERROR(return_val, CheckNotShuttingDown(), SQLSTATE_GENERAL_ERROR);
   // We ignore the runAsync flag here: Impala's queries will always run asynchronously,
   // and will block on fetch. To the client, this looks like Hive's synchronous mode; the
   // difference is that rows are not available when ExecuteStatement() returns.
@@ -483,6 +493,7 @@ void ImpalaServer::ExecuteStatement(TExecuteStatementResp& return_val,
 void ImpalaServer::GetTypeInfo(TGetTypeInfoResp& return_val,
     const TGetTypeInfoReq& request) {
   VLOG_QUERY << "GetTypeInfo(): request=" << ThriftDebugString(request);
+  HS2_RETURN_IF_ERROR(return_val, CheckNotShuttingDown(), SQLSTATE_GENERAL_ERROR);
 
   TMetadataOpRequest req;
   req.__set_opcode(TMetadataOpcode::GET_TYPE_INFO);
@@ -501,6 +512,7 @@ void ImpalaServer::GetTypeInfo(TGetTypeInfoResp& return_val,
 void ImpalaServer::GetCatalogs(TGetCatalogsResp& return_val,
     const TGetCatalogsReq& request) {
   VLOG_QUERY << "GetCatalogs(): request=" << ThriftDebugString(request);
+  HS2_RETURN_IF_ERROR(return_val, CheckNotShuttingDown(), SQLSTATE_GENERAL_ERROR);
 
   TMetadataOpRequest req;
   req.__set_opcode(TMetadataOpcode::GET_CATALOGS);
@@ -519,6 +531,7 @@ void ImpalaServer::GetCatalogs(TGetCatalogsResp& return_val,
 void ImpalaServer::GetSchemas(TGetSchemasResp& return_val,
     const TGetSchemasReq& request) {
   VLOG_QUERY << "GetSchemas(): request=" << ThriftDebugString(request);
+  HS2_RETURN_IF_ERROR(return_val, CheckNotShuttingDown(), SQLSTATE_GENERAL_ERROR);
 
   TMetadataOpRequest req;
   req.__set_opcode(TMetadataOpcode::GET_SCHEMAS);
@@ -537,6 +550,7 @@ void ImpalaServer::GetSchemas(TGetSchemasResp& return_val,
 void ImpalaServer::GetTables(TGetTablesResp& return_val,
     const TGetTablesReq& request) {
   VLOG_QUERY << "GetTables(): request=" << ThriftDebugString(request);
+  HS2_RETURN_IF_ERROR(return_val, CheckNotShuttingDown(), SQLSTATE_GENERAL_ERROR);
 
   TMetadataOpRequest req;
   req.__set_opcode(TMetadataOpcode::GET_TABLES);
@@ -555,6 +569,7 @@ void ImpalaServer::GetTables(TGetTablesResp& return_val,
 void ImpalaServer::GetTableTypes(TGetTableTypesResp& return_val,
     const TGetTableTypesReq& request) {
   VLOG_QUERY << "GetTableTypes(): request=" << ThriftDebugString(request);
+  HS2_RETURN_IF_ERROR(return_val, CheckNotShuttingDown(), SQLSTATE_GENERAL_ERROR);
 
   TMetadataOpRequest req;
   req.__set_opcode(TMetadataOpcode::GET_TABLE_TYPES);
@@ -574,6 +589,7 @@ void ImpalaServer::GetTableTypes(TGetTableTypesResp& return_val,
 void ImpalaServer::GetColumns(TGetColumnsResp& return_val,
     const TGetColumnsReq& request) {
   VLOG_QUERY << "GetColumns(): request=" << ThriftDebugString(request);
+  HS2_RETURN_IF_ERROR(return_val, CheckNotShuttingDown(), SQLSTATE_GENERAL_ERROR);
 
   TMetadataOpRequest req;
   req.__set_opcode(TMetadataOpcode::GET_COLUMNS);
@@ -592,6 +608,7 @@ void ImpalaServer::GetColumns(TGetColumnsResp& return_val,
 void ImpalaServer::GetFunctions(TGetFunctionsResp& return_val,
     const TGetFunctionsReq& request) {
   VLOG_QUERY << "GetFunctions(): request=" << ThriftDebugString(request);
+  HS2_RETURN_IF_ERROR(return_val, CheckNotShuttingDown(), SQLSTATE_GENERAL_ERROR);
 
   TMetadataOpRequest req;
   req.__set_opcode(TMetadataOpcode::GET_FUNCTIONS);

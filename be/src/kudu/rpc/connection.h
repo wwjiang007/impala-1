@@ -25,17 +25,20 @@
 #include <set>
 #include <string>
 #include <unordered_map>
-#include <vector>
+#include <utility>
 
 #include <boost/intrusive/list.hpp>
+#include <boost/optional/optional.hpp>
 #include <ev++.h>
+#include <glog/logging.h>
 
 #include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
-#include "kudu/rpc/inbound_call.h"
-#include "kudu/rpc/outbound_call.h"
-#include "kudu/rpc/remote_user.h"
+#include "kudu/rpc/connection_id.h"
 #include "kudu/rpc/rpc_controller.h"
+#include "kudu/rpc/rpc_header.pb.h"
+#include "kudu/rpc/remote_user.h"
 #include "kudu/rpc/transfer.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/sockaddr.h"
@@ -44,10 +47,12 @@
 #include "kudu/util/status.h"
 
 namespace kudu {
+
 namespace rpc {
 
 class DumpRunningRpcsRequestPB;
-class ErrorStatusPB;
+class InboundCall;
+class OutboundCall;
 class RpcConnectionPB;
 class ReactorThread;
 class RpczStore;
@@ -117,7 +122,7 @@ class Connection : public RefCountedThreadSafe<Connection> {
   // marked failed. The caller is expected to check if 'call' has been cancelled
   // before making the call.
   // Takes ownership of the 'call' object regardless of whether it succeeds or fails.
-  void QueueOutboundCall(const std::shared_ptr<OutboundCall> &call);
+  void QueueOutboundCall(std::shared_ptr<OutboundCall> call);
 
   // Queue a call response back to the client on the server side.
   //
@@ -144,6 +149,13 @@ class Connection : public RefCountedThreadSafe<Connection> {
     DCHECK(outbound_connection_id_);
     return *outbound_connection_id_;
   }
+
+  bool is_confidential() const {
+    return is_confidential_;
+  }
+
+  // Set/unset the 'confidentiality' property for this connection.
+  void set_confidential(bool is_confidential);
 
   // Credentials policy to start connection negotiation.
   CredentialsPolicy credentials_policy() const { return credentials_policy_; }
@@ -363,6 +375,11 @@ class Connection : public RefCountedThreadSafe<Connection> {
 
   // Whether we completed connection negotiation.
   bool negotiation_complete_;
+
+  // Whether it's OK to pass confidential information over the connection.
+  // For example, an encrypted (but not necessarily authenticated) connection
+  // is considered confidential.
+  bool is_confidential_;
 
   // Whether the connection is scheduled for shutdown.
   bool scheduled_for_shutdown_;

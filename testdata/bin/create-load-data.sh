@@ -29,7 +29,8 @@
 # bin/load-data.py
 
 set -euo pipefail
-trap 'echo Error in $0 at line $LINENO: $(cd "'$PWD'" && awk "NR == $LINENO" $0)' ERR
+. $IMPALA_HOME/bin/report_build_error.sh
+setup_report_build_error
 
 . ${IMPALA_HOME}/bin/impala-config.sh > /dev/null 2>&1
 . ${IMPALA_HOME}/testdata/bin/run-step.sh
@@ -141,6 +142,10 @@ function start-impala {
     START_CLUSTER_ARGS_INT+=("--impalad_args=--abort_on_config_error=false -s 1")
   else
     START_CLUSTER_ARGS_INT+=("-s 3")
+  fi
+  if [[ "${ERASURE_CODING}" == true ]]; then
+    START_CLUSTER_ARGS="${START_CLUSTER_ARGS} \
+      --impalad_args=--default_query_options=allow_erasure_coded_files=true"
   fi
   START_CLUSTER_ARGS_INT+=("${START_CLUSTER_ARGS}")
   ${IMPALA_HOME}/bin/start-impala-cluster.py --log_dir=${IMPALA_DATA_LOADING_LOGS_DIR} \
@@ -305,19 +310,21 @@ function copy-and-load-dependent-tables {
   # temporary location for that table to use. Should find a better way to handle this.
   echo COPYING AND LOADING DATA FOR DEPENDENT TABLES
   hadoop fs -rm -r -f /test-warehouse/alltypesmixedformat \
-    /tmp/alltypes_rc /tmp/alltypes_seq
+    /tmp/alltypes_rc /tmp/alltypes_seq /tmp/alltypes_parquet
   hadoop fs -mkdir -p /tmp/alltypes_seq/year=2009 \
-    /tmp/alltypes_rc/year=2009
+    /tmp/alltypes_rc/year=2009 /tmp/alltypes_parquet/year=2009
 
   # The file written by hive to /test-warehouse will be strangely replicated rather than
   # erasure coded if EC is not set in /tmp
   if [[ -n "${HDFS_ERASURECODE_POLICY:-}" ]]; then
     hdfs ec -setPolicy -policy "${HDFS_ERASURECODE_POLICY}" -path "/tmp/alltypes_rc"
     hdfs ec -setPolicy -policy "${HDFS_ERASURECODE_POLICY}" -path "/tmp/alltypes_seq"
+    hdfs ec -setPolicy -policy "${HDFS_ERASURECODE_POLICY}" -path "/tmp/alltypes_parquet"
   fi
 
   hadoop fs -cp /test-warehouse/alltypes_seq/year=2009/month=2/ /tmp/alltypes_seq/year=2009
   hadoop fs -cp /test-warehouse/alltypes_rc/year=2009/month=3/ /tmp/alltypes_rc/year=2009
+  hadoop fs -cp /test-warehouse/alltypes_parquet/year=2009/month=4/ /tmp/alltypes_parquet/year=2009
 
   # Create a hidden file in AllTypesSmall
   hadoop fs -cp -f /test-warehouse/zipcode_incomes/DEC_00_SF3_P077_with_ann_noheader.csv \
@@ -341,7 +348,7 @@ function copy-and-load-dependent-tables {
   #
   # See: logs/data_loading/copy-and-load-dependent-tables.log)
   # See also: IMPALA-4345
-  hadoop fs -chmod -R 777 /tmp/alltypes_rc /tmp/alltypes_seq
+  hadoop fs -chmod -R 777 /tmp/alltypes_rc /tmp/alltypes_seq /tmp/alltypes_parquet
 
   # For tables that rely on loading data from local fs test-wareload-house
   # TODO: Find a good way to integrate this with the normal data loading scripts

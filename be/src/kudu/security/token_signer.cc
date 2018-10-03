@@ -18,6 +18,7 @@
 #include "kudu/security/token_signer.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -26,10 +27,11 @@
 #include <vector>
 
 #include <gflags/gflags.h>
+#include <glog/logging.h>
 
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/walltime.h"
-#include "kudu/security/openssl_util.h"
+#include "kudu/security/crypto.h"
 #include "kudu/security/token.pb.h"
 #include "kudu/security/token_signing_key.h"
 #include "kudu/security/token_verifier.h"
@@ -37,7 +39,7 @@
 #include "kudu/util/locks.h"
 #include "kudu/util/status.h"
 
-DEFINE_int32_hidden(tsk_num_rsa_bits, 2048,
+DEFINE_int32(tsk_num_rsa_bits, 2048,
              "Number of bits in RSA keys used for token signing.");
 TAG_FLAG(tsk_num_rsa_bits, experimental);
 
@@ -179,8 +181,8 @@ Status TokenSigner::CheckNeedKey(unique_ptr<TokenSigningPrivateKey>* tsk) const 
   unique_lock<RWMutex> l(lock_);
   if (tsk_deque_.empty()) {
     // No active key: need a new one.
-    const int64 key_seq_num = last_key_seq_num_ + 1;
-    const int64 key_expiration = now + key_validity_seconds_;
+    const int64_t key_seq_num = last_key_seq_num_ + 1;
+    const int64_t key_expiration = now + key_validity_seconds_;
     // Generation of cryptographically strong key takes many CPU cycles;
     // do not want to block other parallel activity.
     l.unlock();
@@ -211,8 +213,8 @@ Status TokenSigner::CheckNeedKey(unique_ptr<TokenSigningPrivateKey>* tsk) const 
   const auto key_creation_time = key->expire_time() - key_validity_seconds_;
   if (key_creation_time + key_rotation_seconds_ <= now) {
     // It's time to create and start propagating next key.
-    const int64 key_seq_num = last_key_seq_num_ + 1;
-    const int64 key_expiration = now + key_validity_seconds_;
+    const int64_t key_seq_num = last_key_seq_num_ + 1;
+    const int64_t key_expiration = now + key_validity_seconds_;
     // Generation of cryptographically strong key takes many CPU cycles:
     // do not want to block other parallel activity.
     l.unlock();

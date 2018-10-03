@@ -45,15 +45,18 @@ class Frontend {
   Status UpdateCatalogCache(const TUpdateCatalogCacheRequest& req,
       TUpdateCatalogCacheResponse *resp);
 
-  /// Request to update the Impalad frontend cluster membership snapshot.  The
-  /// TUpdateMembershipRequest contains the latest set of hosts.
-  Status UpdateMembership(const TUpdateMembershipRequest& req);
+  /// Request to update the Impalad frontend cluster membership snapshot of executors.
+  /// The TUpdateExecutorMembershipRequest contains the latest set of executor nodes.
+  Status UpdateExecutorMembership(const TUpdateExecutorMembershipRequest& req);
 
   /// Call FE to get explain plan
   Status GetExplainPlan(const TQueryCtx& query_ctx, std::string* explain_string);
 
   /// Call FE to get TExecRequest.
   Status GetExecRequest(const TQueryCtx& query_ctx, TExecRequest* result);
+
+  /// Get the metrics from the catalog used by this frontend.
+  Status GetCatalogMetrics(TGetCatalogMetricsResult* resp);
 
   /// Returns all matching table names, per Hive's "SHOW TABLES <pattern>". Each
   /// table name returned is unqualified.
@@ -89,8 +92,9 @@ class Frontend {
   /// Call FE to get the table/column stats.
   Status GetStats(const TShowStatsParams& params, TResultSet* result);
 
-  /// Call FE to get the privileges granted to a role.
-  Status GetRolePrivileges(const TShowGrantRoleParams& params, TResultSet* result);
+  /// Call FE to get the privileges granted to a principal.
+  Status GetPrincipalPrivileges(const TShowGrantPrincipalParams& params,
+      TResultSet* result);
 
   /// Return all functions of 'category' that match the optional argument 'pattern'.
   /// If pattern is NULL match all functions, otherwise match only those functions that
@@ -194,6 +198,7 @@ class Frontend {
   jmethodID check_config_id_; // JniFrontend.checkConfiguration()
   jmethodID update_catalog_cache_id_; // JniFrontend.updateCatalogCache(byte[][])
   jmethodID update_membership_id_; // JniFrontend.updateMembership()
+  jmethodID get_catalog_metrics_id_; // JniFrontend.getCatalogMetrics()
   jmethodID get_table_names_id_; // JniFrontend.getTableNames
   jmethodID describe_db_id_; // JniFrontend.describeDb
   jmethodID describe_table_id_; // JniFrontend.describeTable
@@ -204,7 +209,7 @@ class Frontend {
   jmethodID get_functions_id_; // JniFrontend.getFunctions
   jmethodID get_catalog_object_id_; // JniFrontend.getCatalogObject
   jmethodID show_roles_id_; // JniFrontend.getRoles
-  jmethodID get_role_privileges_id_; // JniFrontend.getRolePrivileges
+  jmethodID get_principal_privileges_id_; // JniFrontend.getPrincipalPrivileges
   jmethodID exec_hs2_metadata_op_id_; // JniFrontend.execHiveServer2MetadataOp
   jmethodID load_table_data_id_; // JniFrontend.loadTableData
   jmethodID set_catalog_is_ready_id_; // JniFrontend.setCatalogIsReady

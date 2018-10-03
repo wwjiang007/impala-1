@@ -112,17 +112,6 @@ def run_impala_shell_cmd_no_expect(shell_args, stdin_input=None):
   cmd = "%s %s" % (SHELL_CMD, shell_args)
   return result
 
-def move_shell_history(filepath):
-  """ Moves history file to given filepath.
-      If there is no history file, this function has no effect. """
-  if os.path.exists(SHELL_HISTORY_FILE):
-    shutil.move(SHELL_HISTORY_FILE, filepath)
-
-def restore_shell_history(filepath):
-  """ Moves back history file from given filepath.
-      If 'filepath' doesn't exist in the filesystem, this function has no effect. """
-  if os.path.exists(filepath): shutil.move(filepath, SHELL_HISTORY_FILE)
-
 class ImpalaShellResult(object):
   def __init__(self):
     self.rc = 0
@@ -146,6 +135,22 @@ class ImpalaShell(object):
     self.shell_process.stdin.flush()
     # Allow fluent-style chaining of commands
     return self
+
+  def wait_for_query_start(self):
+    """If this shell was started with the '-q' option, this mathod will block until the
+    query has started running"""
+    # readline() will block until a line is actually printed, so this loop should always
+    # read something like:
+    #   Starting Impala Shell without Kerberos authentication
+    #   Connected to localhost:21000
+    #   Server version: impalad version...
+    #   Query: select sleep(10)
+    #   Query submitted at:...
+    #   Query progress can be monitored at:...
+    # We stop at 10 iterations to prevent an infinite loop if somehting goes wrong.
+    iters = 0
+    while "Query progress" not in self.shell_process.stderr.readline() and iters < 10:
+      iters += 1
 
   def get_result(self, stdin_input=None):
     """Returns an ImpalaShellResult produced by the shell process on exit. After this

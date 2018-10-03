@@ -95,7 +95,7 @@ public class InlineViewRef extends TableRef {
    */
   public InlineViewRef(FeView view, TableRef origTblRef) {
     super(view.getTableName().toPath(), origTblRef.getExplicitAlias(),
-        origTblRef.getPrivilege());
+        origTblRef.getPrivilege(), origTblRef.requireGrantOption());
     queryStmt_ = view.getQueryStmt().clone();
     queryStmt_.reset();
     if (view.isLocalView()) queryStmt_.reset();
@@ -145,7 +145,7 @@ public class InlineViewRef extends TableRef {
     // Catalog views refs require special analysis settings for authorization.
     boolean isCatalogView = (view_ != null && !view_.isLocalView());
     if (isCatalogView) {
-      analyzer.registerAuthAndAuditEvent(view_, priv_);
+      analyzer.registerAuthAndAuditEvent(view_, priv_, requireGrantOption_);
       if (inlineViewAnalyzer_.isExplain()) {
         // If the user does not have privileges on the view's definition
         // then we report a masked authorization error so as not to reveal
@@ -307,6 +307,8 @@ public class InlineViewRef extends TableRef {
     return queryStmt_.getColLabels();
   }
 
+  public FeView getView() { return view_; }
+
   @Override
   protected TableRef clone() { return new InlineViewRef(this); }
 
@@ -322,6 +324,11 @@ public class InlineViewRef extends TableRef {
 
   @Override
   protected String tableRefToSql() {
+    return tableRefToSql(false);
+  }
+
+  @Override
+  protected String tableRefToSql(boolean rewritten) {
     // Enclose the alias in quotes if Hive cannot parse it without quotes.
     // This is needed for view compatibility between Impala and Hive.
     String aliasSql = null;
@@ -333,7 +340,7 @@ public class InlineViewRef extends TableRef {
     Preconditions.checkNotNull(aliasSql);
     StringBuilder sql = new StringBuilder()
         .append("(")
-        .append(queryStmt_.toSql())
+        .append(queryStmt_.toSql(rewritten))
         .append(") ")
         .append(aliasSql);
     // Add explicit col labels for debugging even though this syntax isn't supported.

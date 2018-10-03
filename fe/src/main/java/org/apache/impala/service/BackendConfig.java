@@ -87,6 +87,38 @@ public class BackendConfig {
     return !Strings.isNullOrEmpty(backendCfg_.authorized_proxy_group_config);
   }
 
+  public boolean isAuthorizationFileSet() {
+    return !Strings.isNullOrEmpty(backendCfg_.authorization_policy_file);
+  }
+
+  public boolean disableCatalogDataOpsDebugOnly() {
+    return backendCfg_.disable_catalog_data_ops_debug_only;
+  }
+
+  public boolean pullIncrementalStatistics() {
+    return backendCfg_.pull_incremental_statistics;
+  }
+
+  public int getInvalidateTablesTimeoutS() {
+    return backendCfg_.invalidate_tables_timeout_s;
+  }
+
+  public boolean invalidateTablesOnMemoryPressure() {
+    return backendCfg_.invalidate_tables_on_memory_pressure;
+  }
+
+  public double getInvalidateTablesGcOldGenFullThreshold() {
+    return backendCfg_.invalidate_tables_gc_old_gen_full_threshold;
+  }
+
+  public double getInvalidateTablesFractionOnMemoryPressure() {
+    return backendCfg_.invalidate_tables_fraction_on_memory_pressure;
+  }
+
+  public int getLocalCatalogMaxFetchRetries() {
+    return backendCfg_.local_catalog_max_fetch_retries;
+  }
+
   // Inits the auth_to_local configuration in the static KerberosName class.
   private static void initAuthToLocal() {
     // If auth_to_local is enabled, we read the configuration hadoop.security.auth_to_local

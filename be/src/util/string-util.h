@@ -40,6 +40,18 @@ Status TruncateUp(const std::string& str, int32_t max_length, std::string* resul
 /// Return true if the comma-separated string 'cs_list' contains 'item' as one of
 /// the comma-separated values.
 bool CommaSeparatedContains(const std::string& cs_list, const std::string& item);
+
+/// Return true if a given string 'full_str' ends with the characters in the
+/// 'end' string
+bool EndsWith(const std::string& full_string, const std::string& end);
+
+/// This function returns a pointer past the end of the longest C-style identifier
+/// that is a prefix of given string or NULL if the given string does not start with
+/// one.  A C-style identifier begins with an ASCII letter or underscore
+/// and continues with ASCII letters, digits, or underscores.  start and end means
+/// the given string is located at [start, end)
+const uint8_t* FindEndOfIdentifier(const uint8_t* start, const uint8_t* end);
+
 }
 
 #endif

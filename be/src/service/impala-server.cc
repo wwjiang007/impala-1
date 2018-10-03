@@ -46,13 +46,13 @@
 #include "common/version.h"
 #include "exec/external-data-source-executor.h"
 #include "exprs/timezone_db.h"
+#include "gen-cpp/CatalogService_constants.h"
 #include "rpc/authentication.h"
 #include "rpc/rpc-trace.h"
 #include "rpc/thrift-thread.h"
 #include "rpc/thrift-util.h"
 #include "runtime/client-cache.h"
 #include "runtime/coordinator.h"
-#include "runtime/data-stream-mgr.h"
 #include "runtime/exec-env.h"
 #include "runtime/lib-cache.h"
 #include "runtime/mem-tracker.h"
@@ -119,7 +119,6 @@ DECLARE_string(authorized_proxy_group_config);
 DECLARE_string(authorized_proxy_group_config_delimiter);
 DECLARE_bool(abort_on_config_error);
 DECLARE_bool(disk_spill_encryption);
-DECLARE_bool(use_krpc);
 DECLARE_bool(use_local_catalog);
 
 DEFINE_int32(beeswax_port, 21000, "port on which Beeswax client requests are served."
@@ -211,6 +210,19 @@ DEFINE_bool(is_coordinator, true, "If true, this Impala daemon can accept and co
 DEFINE_bool(is_executor, true, "If true, this Impala daemon will execute query "
     "fragments.");
 
+// TODO: can we automatically choose a startup grace period based on the max admission
+// control queue timeout + some margin for error?
+DEFINE_int64(shutdown_grace_period_s, 120, "Shutdown startup grace period in seconds. "
+    "When the shutdown process is started for this daemon, it will wait for at least the "
+    "startup grace period before shutting down. This gives time for updated cluster "
+    "membership information to propagate to all coordinators and for fragment instances "
+    "that were scheduled based on old cluster membership to start executing (and "
+    "therefore be reflected in the metrics used to detect quiescence).");
+
+DEFINE_int64(shutdown_deadline_s, 60 * 60, "Default time limit in seconds for the shut "
+    "down process. If this duration elapses after the shut down process is started, "
+    "the daemon shuts down regardless of any running queries.");
+
 #ifndef NDEBUG
   DEFINE_int64(stress_metadata_loading_pause_injection_ms, 0, "Simulates metadata loading"
       "for a given query by injecting a sleep equivalent to this configuration in "
@@ -241,6 +253,9 @@ const string HS2_SERVER_NAME = "hiveserver2-frontend";
 const char* ImpalaServer::SQLSTATE_SYNTAX_ERROR_OR_ACCESS_VIOLATION = "42000";
 const char* ImpalaServer::SQLSTATE_GENERAL_ERROR = "HY000";
 const char* ImpalaServer::SQLSTATE_OPTIONAL_FEATURE_NOT_IMPLEMENTED = "HYC00";
+
+// Interval between checks for query expiration.
+const int64_t EXPIRATION_CHECK_INTERVAL_MS = 1000L;
 
 // Work item for ImpalaServer::cancellation_thread_pool_.
 class CancellationWork {
@@ -361,15 +376,25 @@ ImpalaServer::ImpalaServer(ExecEnv* exec_env)
       this->MembershipCallback(state, topic_updates);
     };
     ABORT_IF_ERROR(exec_env->subscriber()->AddTopic(
-        Statestore::IMPALA_MEMBERSHIP_TOPIC, true, false, cb));
+        Statestore::IMPALA_MEMBERSHIP_TOPIC, /* is_transient=*/ true,
+        /* populate_min_subscriber_topic_version=*/ false,
+        /* filter_prefix=*/"", cb));
 
-    if (FLAGS_is_coordinator && !FLAGS_use_local_catalog) {
+    if (FLAGS_is_coordinator) {
       auto catalog_cb = [this] (const StatestoreSubscriber::TopicDeltaMap& state,
           vector<TTopicDelta>* topic_updates) {
         this->CatalogUpdateCallback(state, topic_updates);
       };
+      // The 'local-catalog' implementation only needs minimal metadata to
+      // trigger cache invalidations.
+      // The legacy implementation needs full metadata objects.
+      string filter_prefix = FLAGS_use_local_catalog ?
+        g_CatalogService_constants.CATALOG_TOPIC_V2_PREFIX :
+        g_CatalogService_constants.CATALOG_TOPIC_V1_PREFIX;
       ABORT_IF_ERROR(exec_env->subscriber()->AddTopic(
-          CatalogServer::IMPALA_CATALOG_TOPIC, true, true, catalog_cb));
+          CatalogServer::IMPALA_CATALOG_TOPIC, /* is_transient=*/ true,
+          /* populate_min_subscriber_topic_version=*/ true,
+          filter_prefix, catalog_cb));
     }
   }
 
@@ -625,6 +650,7 @@ void ImpalaServer::LogQueryEvents(const ClientRequestState& request_state) {
     case TStmtType::EXPLAIN:
     case TStmtType::LOAD:
     case TStmtType::SET:
+    case TStmtType::ADMIN_FN:
     default:
       break;
   }
@@ -947,11 +973,9 @@ Status ImpalaServer::ExecuteInternal(
 
   // start execution of query; also starts fragment status reports
   RETURN_IF_ERROR((*request_state)->Exec(&result));
-  if (result.stmt_type == TStmtType::DDL) {
-    Status status = UpdateCatalogMetrics();
-    if (!status.ok()) {
-      VLOG_QUERY << "Couldn't update catalog metrics: " << status.GetDetail();
-    }
+  Status status = UpdateCatalogMetrics();
+  if (!status.ok()) {
+    VLOG_QUERY << "Couldn't update catalog metrics: " << status.GetDetail();
   }
 
   if ((*request_state)->schedule() != nullptr) {
@@ -978,7 +1002,8 @@ void ImpalaServer::PrepareQueryContext(
   query_ctx->__set_pid(getpid());
   int64_t now_us = UnixMicros();
   const Timezone& utc_tz = TimezoneDatabase::GetUtcTimezone();
-  string local_tz_name = TimezoneDatabase::LocalZoneName();
+  string local_tz_name = query_ctx->client_request.query_options.timezone;
+  if (local_tz_name.empty()) local_tz_name = TimezoneDatabase::LocalZoneName();
   const Timezone* local_tz = TimezoneDatabase::FindTimezone(local_tz_name);
   if (local_tz != nullptr) {
     LOG(INFO) << "Found local timezone \"" << local_tz_name << "\".";
@@ -1062,7 +1087,10 @@ Status ImpalaServer::SetQueryInflight(shared_ptr<SessionState> session_state,
     idle_timeout_s = max(FLAGS_idle_query_timeout, idle_timeout_s);
   }
   int32_t exec_time_limit_s = request_state->query_options().exec_time_limit_s;
-  if (idle_timeout_s > 0 || exec_time_limit_s > 0) {
+  int64_t cpu_limit_s = request_state->query_options().cpu_limit_s;
+  int64_t scan_bytes_limit = request_state->query_options().scan_bytes_limit;
+  if (idle_timeout_s > 0 || exec_time_limit_s > 0 ||
+        cpu_limit_s > 0 || scan_bytes_limit > 0) {
     lock_guard<mutex> l2(query_expiration_lock_);
     int64_t now = UnixMillis();
     if (idle_timeout_s > 0) {
@@ -1076,6 +1104,18 @@ Status ImpalaServer::SetQueryInflight(shared_ptr<SessionState> session_state,
                  << PrettyPrinter::Print(exec_time_limit_s, TUnit::TIME_S);
       queries_by_timestamp_.emplace(ExpirationEvent{
           now + (1000L * exec_time_limit_s), query_id, ExpirationKind::EXEC_TIME_LIMIT});
+    }
+    if (cpu_limit_s > 0 || scan_bytes_limit > 0) {
+      if (cpu_limit_s > 0) {
+        VLOG_QUERY << "Query " << PrintId(query_id) << " has CPU limit of "
+                   << PrettyPrinter::Print(cpu_limit_s, TUnit::TIME_S);
+      }
+      if (scan_bytes_limit > 0) {
+        VLOG_QUERY << "Query " << PrintId(query_id) << " has scan bytes limit of "
+                   << PrettyPrinter::Print(scan_bytes_limit, TUnit::BYTES);
+      }
+      queries_by_timestamp_.emplace(ExpirationEvent{
+          now + EXPIRATION_CHECK_INTERVAL_MS, query_id, ExpirationKind::RESOURCE_LIMIT});
     }
   }
   return Status::OK();
@@ -1130,7 +1170,9 @@ Status ImpalaServer::UnregisterQuery(const TUniqueId& query_id, bool check_infli
     request_state->summary_profile()->AddInfoStringRedacted("ExecSummary", exec_summary);
     request_state->summary_profile()->AddInfoStringRedacted("Errors",
         request_state->GetCoordinator()->GetErrorLog());
+  }
 
+  if (request_state->schedule() != nullptr) {
     const PerBackendExecParams& per_backend_params =
         request_state->schedule()->per_backend_exec_params();
     if (!per_backend_params.empty()) {
@@ -1154,18 +1196,40 @@ Status ImpalaServer::UnregisterQuery(const TUniqueId& query_id, bool check_infli
 }
 
 Status ImpalaServer::UpdateCatalogMetrics() {
-  TGetDbsResult dbs;
-  RETURN_IF_ERROR(exec_env_->frontend()->GetDbs(nullptr, nullptr, &dbs));
-  ImpaladMetrics::CATALOG_NUM_DBS->SetValue(dbs.dbs.size());
-  ImpaladMetrics::CATALOG_NUM_TABLES->SetValue(0L);
-  for (const TDatabase& db: dbs.dbs) {
-    TGetTablesResult table_names;
-    RETURN_IF_ERROR(exec_env_->frontend()->GetTableNames(db.db_name, nullptr, nullptr,
-        &table_names));
-    ImpaladMetrics::CATALOG_NUM_TABLES->Increment(table_names.tables.size());
-  }
-
+  TGetCatalogMetricsResult metrics;
+  RETURN_IF_ERROR(exec_env_->frontend()->GetCatalogMetrics(&metrics));
+  ImpaladMetrics::CATALOG_NUM_DBS->SetValue(metrics.num_dbs);
+  ImpaladMetrics::CATALOG_NUM_TABLES->SetValue(metrics.num_tables);
+  if (!FLAGS_use_local_catalog) return Status::OK();
+  DCHECK(metrics.__isset.cache_eviction_count);
+  DCHECK(metrics.__isset.cache_hit_count);
+  DCHECK(metrics.__isset.cache_load_count);
+  DCHECK(metrics.__isset.cache_load_exception_count);
+  DCHECK(metrics.__isset.cache_load_success_count);
+  DCHECK(metrics.__isset.cache_miss_count);
+  DCHECK(metrics.__isset.cache_request_count);
+  DCHECK(metrics.__isset.cache_total_load_time);
+  DCHECK(metrics.__isset.cache_avg_load_time);
+  DCHECK(metrics.__isset.cache_hit_rate);
+  DCHECK(metrics.__isset.cache_load_exception_rate);
+  DCHECK(metrics.__isset.cache_miss_rate);
+  ImpaladMetrics::CATALOG_CACHE_EVICTION_COUNT->SetValue(metrics.cache_eviction_count);
+  ImpaladMetrics::CATALOG_CACHE_HIT_COUNT->SetValue(metrics.cache_hit_count);
+  ImpaladMetrics::CATALOG_CACHE_LOAD_COUNT->SetValue(metrics.cache_load_count);
+  ImpaladMetrics::CATALOG_CACHE_LOAD_EXCEPTION_COUNT->SetValue(
+      metrics.cache_load_exception_count);
+  ImpaladMetrics::CATALOG_CACHE_LOAD_SUCCESS_COUNT->SetValue(
+      metrics.cache_load_success_count);
+  ImpaladMetrics::CATALOG_CACHE_MISS_COUNT->SetValue(metrics.cache_miss_count);
+  ImpaladMetrics::CATALOG_CACHE_REQUEST_COUNT->SetValue(metrics.cache_request_count);
+  ImpaladMetrics::CATALOG_CACHE_TOTAL_LOAD_TIME->SetValue(metrics.cache_total_load_time);
+  ImpaladMetrics::CATALOG_CACHE_AVG_LOAD_TIME->SetValue(metrics.cache_avg_load_time);
+  ImpaladMetrics::CATALOG_CACHE_HIT_RATE->SetValue(metrics.cache_hit_rate);
+  ImpaladMetrics::CATALOG_CACHE_LOAD_EXCEPTION_RATE->SetValue(
+      metrics.cache_load_exception_rate);
+  ImpaladMetrics::CATALOG_CACHE_MISS_RATE->SetValue(metrics.cache_miss_rate);
   return Status::OK();
+
 }
 
 Status ImpalaServer::CancelInternal(const TUniqueId& query_id, bool check_inflight,
@@ -1181,6 +1245,8 @@ Status ImpalaServer::CancelInternal(const TUniqueId& query_id, bool check_inflig
 
 Status ImpalaServer::CloseSessionInternal(const TUniqueId& session_id,
     bool ignore_if_absent) {
+  VLOG_QUERY << "Closing session: " << PrintId(session_id);
+
   // Find the session_state and remove it from the map.
   shared_ptr<SessionState> session_state;
   {
@@ -1221,6 +1287,7 @@ Status ImpalaServer::CloseSessionInternal(const TUniqueId& session_id,
   }
   // Reconfigure the poll period of session_timeout_thread_ if necessary.
   UnregisterSessionTimeout(session_state->session_timeout);
+  VLOG_QUERY << "Closed session: " << PrintId(session_id);
   return Status::OK();
 }
 
@@ -1275,33 +1342,6 @@ void ImpalaServer::ReportExecStatus(
   request_state->UpdateBackendExecStatus(params).SetTStatus(&return_val);
 }
 
-void ImpalaServer::TransmitData(
-    TTransmitDataResult& return_val, const TTransmitDataParams& params) {
-  VLOG_ROW << "TransmitData(): instance_id=" << PrintId(params.dest_fragment_instance_id)
-           << " node_id=" << params.dest_node_id
-           << " #rows=" << params.row_batch.num_rows
-           << " sender_id=" << params.sender_id
-           << " eos=" << (params.eos ? "true" : "false");
-  // TODO: fix Thrift so we can simply take ownership of thrift_batch instead
-  // of having to copy its data
-  if (params.row_batch.num_rows > 0) {
-    Status status = exec_env_->ThriftStreamMgr()->AddData(
-        params.dest_fragment_instance_id, params.dest_node_id, params.row_batch,
-        params.sender_id);
-    status.SetTStatus(&return_val);
-    if (!status.ok()) {
-      // should we close the channel here as well?
-      return;
-    }
-  }
-
-  if (params.eos) {
-    exec_env_->ThriftStreamMgr()->CloseSender(
-        params.dest_fragment_instance_id, params.dest_node_id,
-        params.sender_id).SetTStatus(&return_val);
-  }
-}
-
 void ImpalaServer::InitializeConfigVariables() {
   // Set idle_session_timeout here to let the SET command return the value of
   // the command line option FLAGS_idle_session_timeout
@@ -1319,6 +1359,7 @@ void ImpalaServer::InitializeConfigVariables() {
   map<string, string> string_map;
   TQueryOptionsToMap(default_query_options_, &string_map);
   string_map["SUPPORT_START_OVER"] = "false";
+  string_map["TIMEZONE"] = TimezoneDatabase::LocalZoneName();
   PopulateQueryOptionLevels(&query_option_levels_);
   map<string, string>::const_iterator itr = string_map.begin();
   for (; itr != string_map.end(); ++itr) {
@@ -1662,8 +1703,13 @@ void ImpalaServer::MembershipCallback(
         VLOG(2) << "Error deserializing topic item with key: " << item.key;
         continue;
       }
-      // This is a new item - add it to the map of known backends.
-      known_backends_.insert(make_pair(item.key, backend_descriptor));
+      // This is a new or modified item - add it to the map of known backends.
+      auto it = known_backends_.find(item.key);
+      if (it != known_backends_.end()) {
+        it->second = backend_descriptor;
+      } else {
+        known_backends_.emplace_hint(it, item.key, backend_descriptor);
+      }
     }
 
     // Register the local backend in the statestore and update the list of known backends.
@@ -1674,18 +1720,19 @@ void ImpalaServer::MembershipCallback(
     // membership by network address.
     set<TNetworkAddress> current_membership;
     // Also reflect changes to the frontend. Initialized only if any_changes is true.
-    TUpdateMembershipRequest update_req;
+    // Only send the hostname and ip_address of the executors to the frontend.
+    TUpdateExecutorMembershipRequest update_req;
     bool any_changes = !delta.topic_entries.empty() || !delta.is_delta;
     for (const BackendDescriptorMap::value_type& backend: known_backends_) {
       current_membership.insert(backend.second.address);
-      if (any_changes) {
+      if (any_changes && backend.second.is_executor) {
         update_req.hostnames.insert(backend.second.address.hostname);
         update_req.ip_addresses.insert(backend.second.ip_address);
+        update_req.num_executors++;
       }
     }
     if (any_changes) {
-      update_req.num_nodes = known_backends_.size();
-      Status status = exec_env_->frontend()->UpdateMembership(update_req);
+      Status status = exec_env_->frontend()->UpdateExecutorMembership(update_req);
       if (!status.ok()) {
         LOG(WARNING) << "Error updating frontend membership snapshot: "
                      << status.GetDetail();
@@ -1752,7 +1799,14 @@ void ImpalaServer::MembershipCallback(
 void ImpalaServer::AddLocalBackendToStatestore(
     vector<TTopicDelta>* subscriber_topic_updates) {
   const string& local_backend_id = exec_env_->subscriber()->id();
-  if (known_backends_.find(local_backend_id) != known_backends_.end()) return;
+  bool is_quiescing = shutting_down_.Load() != 0;
+  auto it = known_backends_.find(local_backend_id);
+  // 'is_quiescing' can change during the lifetime of the Impalad - make sure that the
+  // membership reflects the current value.
+  if (it != known_backends_.end()
+      && is_quiescing == it->second.is_quiescing) {
+    return;
+  }
 
   TBackendDescriptor local_backend_descriptor;
   local_backend_descriptor.__set_is_coordinator(FLAGS_is_coordinator);
@@ -1761,11 +1815,11 @@ void ImpalaServer::AddLocalBackendToStatestore(
   local_backend_descriptor.ip_address = exec_env_->ip_address();
   local_backend_descriptor.__set_proc_mem_limit(
       exec_env_->process_mem_tracker()->limit());
-  if (FLAGS_use_krpc) {
-    const TNetworkAddress& krpc_address = exec_env_->krpc_address();
-    DCHECK(IsResolvedAddress(krpc_address));
-    local_backend_descriptor.__set_krpc_address(krpc_address);
-  }
+  local_backend_descriptor.__set_is_quiescing(is_quiescing);
+  const TNetworkAddress& krpc_address = exec_env_->krpc_address();
+  DCHECK(IsResolvedAddress(krpc_address));
+  local_backend_descriptor.__set_krpc_address(krpc_address);
+
   subscriber_topic_updates->emplace_back(TTopicDelta());
   TTopicDelta& update = subscriber_topic_updates->back();
   update.topic_name = Statestore::IMPALA_MEMBERSHIP_TOPIC;
@@ -1778,6 +1832,8 @@ void ImpalaServer::AddLocalBackendToStatestore(
     LOG(WARNING) << "Failed to serialize Impala backend descriptor for statestore topic:"
                  << " " << status.GetDetail();
     subscriber_topic_updates->pop_back();
+  } else if (it != known_backends_.end()) {
+    it->second.is_quiescing = is_quiescing;
   } else {
     known_backends_.insert(make_pair(item.key, local_backend_descriptor));
   }
@@ -1948,45 +2004,50 @@ void ImpalaServer::UnregisterSessionTimeout(int32_t session_timeout) {
       }
     }
 
-    lock_guard<mutex> map_lock(session_state_map_lock_);
     int64_t now = UnixMillis();
+    int expired_cnt = 0;
     VLOG(3) << "Session expiration thread waking up";
-    // TODO: If holding session_state_map_lock_ for the duration of this loop is too
-    // expensive, consider a priority queue.
-    for (SessionStateMap::value_type& session_state: session_state_map_) {
-      unordered_set<TUniqueId> inflight_queries;
-      {
-        lock_guard<mutex> state_lock(session_state.second->lock);
-        if (session_state.second->ref_count > 0) continue;
-        // A session closed by other means is in the process of being removed, and it's
-        // best not to interfere.
-        if (session_state.second->closed || session_state.second->expired) continue;
-        if (session_state.second->session_timeout == 0) continue;
+    {
+      // TODO: If holding session_state_map_lock_ for the duration of this loop is too
+      // expensive, consider a priority queue.
+      lock_guard<mutex> map_lock(session_state_map_lock_);
+      for (SessionStateMap::value_type& session_state: session_state_map_) {
+        unordered_set<TUniqueId> inflight_queries;
+        {
+          lock_guard<mutex> state_lock(session_state.second->lock);
+          if (session_state.second->ref_count > 0) continue;
+          // A session closed by other means is in the process of being removed, and it's
+          // best not to interfere.
+          if (session_state.second->closed || session_state.second->expired) continue;
+          if (session_state.second->session_timeout == 0) continue;
 
-        int64_t last_accessed_ms = session_state.second->last_accessed_ms;
-        int64_t session_timeout_ms = session_state.second->session_timeout * 1000;
-        if (now - last_accessed_ms <= session_timeout_ms) continue;
-        LOG(INFO) << "Expiring session: " << PrintId(session_state.first) << ", user:"
-                  << session_state.second->connected_user << ", last active: "
-                  << ToStringFromUnixMillis(last_accessed_ms);
-        session_state.second->expired = true;
-        ImpaladMetrics::NUM_SESSIONS_EXPIRED->Increment(1L);
-        // Since expired is true, no more queries will be added to the inflight list.
-        inflight_queries.insert(session_state.second->inflight_queries.begin(),
-            session_state.second->inflight_queries.end());
-      }
-      // Unregister all open queries from this session.
-      Status status("Session expired due to inactivity");
-      for (const TUniqueId& query_id: inflight_queries) {
-        cancellation_thread_pool_->Offer(CancellationWork(query_id, status, true));
+          int64_t last_accessed_ms = session_state.second->last_accessed_ms;
+          int64_t session_timeout_ms = session_state.second->session_timeout * 1000;
+          if (now - last_accessed_ms <= session_timeout_ms) continue;
+          LOG(INFO) << "Expiring session: " << PrintId(session_state.first) << ", user: "
+                    << session_state.second->connected_user << ", last active: "
+                    << ToStringFromUnixMillis(last_accessed_ms);
+          session_state.second->expired = true;
+          ++expired_cnt;
+          ImpaladMetrics::NUM_SESSIONS_EXPIRED->Increment(1L);
+          // Since expired is true, no more queries will be added to the inflight list.
+          inflight_queries.insert(session_state.second->inflight_queries.begin(),
+              session_state.second->inflight_queries.end());
+        }
+        // Unregister all open queries from this session.
+        Status status = Status::Expected("Session expired due to inactivity");
+        for (const TUniqueId& query_id: inflight_queries) {
+          cancellation_thread_pool_->Offer(CancellationWork(query_id, status, true));
+        }
       }
     }
+    LOG_IF(INFO, expired_cnt > 0) << "Expired sessions. Count: " << expired_cnt;
   }
 }
 
 [[noreturn]] void ImpalaServer::ExpireQueries() {
   while (true) {
-    // The following block accomplishes three things:
+    // The following block accomplishes four things:
     //
     // 1. Update the ordered list of queries by checking the 'idle_time' parameter in
     // client_request_state. We are able to avoid doing this for *every* query in flight
@@ -2001,6 +2062,8 @@ void ImpalaServer::UnregisterSessionTimeout(int32_t session_timeout) {
     // 3. Compute the next time a query *might* expire, so that the sleep at the end of
     // this loop has an accurate duration to wait. If the list of queries is empty, the
     // default sleep duration is half the idle query timeout.
+    //
+    // 4. Cancel queries with CPU and scan bytes constraints if limit is exceeded
     int64_t now;
     {
       lock_guard<mutex> l(query_expiration_lock_);
@@ -2010,24 +2073,38 @@ void ImpalaServer::UnregisterSessionTimeout(int32_t session_timeout) {
         // 'queries_by_timestamp_' is stored in ascending order of deadline so we can
         // break out of the loop and sleep as soon as we see a deadline in the future.
         if (expiration_event->deadline > now) break;
-        shared_ptr<ClientRequestState> query_state =
+        shared_ptr<ClientRequestState> crs =
             GetClientRequestState(expiration_event->query_id);
-        if (query_state == nullptr || query_state->is_expired()) {
+        if (crs == nullptr || crs->is_expired()) {
           // Query was deleted or expired already from a previous expiration event.
+          expiration_event = queries_by_timestamp_.erase(expiration_event);
+          continue;
+        }
+
+        // Check for CPU and scanned bytes limits
+        if (expiration_event->kind == ExpirationKind::RESOURCE_LIMIT) {
+          Status resource_status = CheckResourceLimits(crs.get());
+          if (resource_status.ok()) {
+            queries_by_timestamp_.emplace(
+                ExpirationEvent{now + EXPIRATION_CHECK_INTERVAL_MS,
+                    expiration_event->query_id, ExpirationKind::RESOURCE_LIMIT});
+          } else {
+            ExpireQuery(crs.get(), resource_status);
+          }
           expiration_event = queries_by_timestamp_.erase(expiration_event);
           continue;
         }
 
         // If the query time limit expired, we must cancel the query.
         if (expiration_event->kind == ExpirationKind::EXEC_TIME_LIMIT) {
-          int32_t exec_time_limit_s = query_state->query_options().exec_time_limit_s;
+          int32_t exec_time_limit_s = crs->query_options().exec_time_limit_s;
           VLOG_QUERY << "Expiring query " << PrintId(expiration_event->query_id)
                      << " due to execution time limit of " << exec_time_limit_s << "s.";
           const string& err_msg = Substitute(
               "Query $0 expired due to execution time limit of $1",
               PrintId(expiration_event->query_id),
               PrettyPrinter::Print(exec_time_limit_s, TUnit::TIME_S));
-          ExpireQuery(query_state.get(), Status::Expected(err_msg));
+          ExpireQuery(crs.get(), Status::Expected(err_msg));
           expiration_event = queries_by_timestamp_.erase(expiration_event);
           continue;
         }
@@ -2037,14 +2114,14 @@ void ImpalaServer::UnregisterSessionTimeout(int32_t session_timeout) {
         // Now check to see if the idle timeout has expired. We must check the actual
         // expiration time in case the query has updated 'last_active_ms' since the last
         // time we looked.
-        int32_t idle_timeout_s = query_state->query_options().query_timeout_s;
+        int32_t idle_timeout_s = crs->query_options().query_timeout_s;
         if (FLAGS_idle_query_timeout > 0 && idle_timeout_s > 0) {
           idle_timeout_s = min(FLAGS_idle_query_timeout, idle_timeout_s);
         } else {
           // Use a non-zero timeout, if one exists
           idle_timeout_s = max(FLAGS_idle_query_timeout, idle_timeout_s);
         }
-        int64_t expiration = query_state->last_active_ms() + (idle_timeout_s * 1000L);
+        int64_t expiration = crs->last_active_ms() + (idle_timeout_s * 1000L);
         if (now < expiration) {
           // If the real expiration date is in the future we may need to re-insert the
           // query's expiration event at its correct location.
@@ -2060,17 +2137,17 @@ void ImpalaServer::UnregisterSessionTimeout(int32_t session_timeout) {
             queries_by_timestamp_.emplace(ExpirationEvent{
                 expiration, query_id, ExpirationKind::IDLE_TIMEOUT});
           }
-        } else if (!query_state->is_active()) {
+        } else if (!crs->is_active()) {
           // Otherwise time to expire this query
           VLOG_QUERY
               << "Expiring query due to client inactivity: "
               << PrintId(expiration_event->query_id) << ", last activity was at: "
-              << ToStringFromUnixMillis(query_state->last_active_ms());
+              << ToStringFromUnixMillis(crs->last_active_ms());
           const string& err_msg = Substitute(
               "Query $0 expired due to client inactivity (timeout is $1)",
               PrintId(expiration_event->query_id),
               PrettyPrinter::Print(idle_timeout_s, TUnit::TIME_S));
-          ExpireQuery(query_state.get(), Status::Expected(err_msg));
+          ExpireQuery(crs.get(), Status::Expected(err_msg));
           expiration_event = queries_by_timestamp_.erase(expiration_event);
         } else {
           // Iterator is moved on in every other branch.
@@ -2082,8 +2159,38 @@ void ImpalaServer::UnregisterSessionTimeout(int32_t session_timeout) {
     // could expire is in 1s time. An existing query may expire sooner, but we are
     // comfortable with a maximum error of 1s as a trade-off for not frequently waking
     // this thread.
-    SleepForMs(1000L);
+    SleepForMs(EXPIRATION_CHECK_INTERVAL_MS);
   }
+}
+
+Status ImpalaServer::CheckResourceLimits(ClientRequestState* crs) {
+  Coordinator* coord = crs->GetCoordinator();
+  // Coordinator may be null if query has not started executing, check again later.
+  if (coord == nullptr) return Status::OK();
+  Coordinator::ResourceUtilization utilization = coord->ComputeQueryResourceUtilization();
+
+  // CPU time consumed by the query so far
+  int64_t cpu_time_ns = utilization.cpu_sys_ns + utilization.cpu_user_ns;
+  int64_t cpu_limit_s = crs->query_options().cpu_limit_s;
+  int64_t cpu_limit_ns = cpu_limit_s * 1000'000'000L;
+  if (cpu_limit_ns > 0 && cpu_time_ns > cpu_limit_ns) {
+    const string& err_msg = Substitute("Query $0 terminated due to CPU limit of $1",
+        PrintId(crs->query_id()), PrettyPrinter::Print(cpu_limit_s, TUnit::TIME_S));
+    VLOG_QUERY << err_msg;
+    return Status::Expected(err_msg);
+  }
+
+  int64_t scan_bytes = utilization.bytes_read;
+  int64_t scan_bytes_limit = crs->query_options().scan_bytes_limit;
+  if (scan_bytes_limit > 0 && scan_bytes > scan_bytes_limit) {
+    const string& err_msg = Substitute(
+        "Query $0 terminated due to scan bytes limit of $1", PrintId(crs->query_id()),
+        PrettyPrinter::Print(scan_bytes_limit, TUnit::BYTES));
+    VLOG_QUERY << err_msg;
+    return Status::Expected(err_msg);
+  }
+  // Query is within the resource limits, check again later.
+  return Status::OK();
 }
 
 void ImpalaServer::ExpireQuery(ClientRequestState* crs, const Status& status) {
@@ -2221,6 +2328,8 @@ Status ImpalaServer::Start(int32_t thrift_be_port, int32_t beeswax_port,
 }
 
 void ImpalaServer::Join() {
+  // The server shuts down by exiting the process, so just block here until the process
+  // exits.
   thrift_be_server_->Join();
   thrift_be_server_.reset();
 
@@ -2230,7 +2339,6 @@ void ImpalaServer::Join() {
     beeswax_server_.reset();
     hs2_server_.reset();
   }
-  shutdown_promise_.Get();
 }
 
 shared_ptr<ClientRequestState> ImpalaServer::GetClientRequestState(
@@ -2258,5 +2366,95 @@ void ImpalaServer::UpdateFilter(TUpdateFilterResult& result,
     return;
   }
   client_request_state->UpdateFilter(params);
+}
+
+Status ImpalaServer::CheckNotShuttingDown() const {
+  if (!IsShuttingDown()) return Status::OK();
+  return Status::Expected(ErrorMsg(
+      TErrorCode::SERVER_SHUTTING_DOWN, ShutdownStatusToString(GetShutdownStatus())));
+}
+
+TShutdownStatus ImpalaServer::GetShutdownStatus() const {
+  TShutdownStatus result;
+  int64_t shutdown_time = shutting_down_.Load();
+  DCHECK_GT(shutdown_time, 0);
+  int64_t shutdown_deadline = shutdown_deadline_.Load();
+  DCHECK_GT(shutdown_time, 0);
+  int64_t now = MonotonicMillis();
+  int64_t elapsed_ms = now - shutdown_time;
+  result.grace_remaining_ms =
+      max<int64_t>(0, FLAGS_shutdown_grace_period_s * 1000 - elapsed_ms);
+  result.deadline_remaining_ms =
+      max<int64_t>(0, shutdown_deadline - now);
+  result.finstances_executing =
+      ImpaladMetrics::IMPALA_SERVER_NUM_FRAGMENTS_IN_FLIGHT->GetValue();
+  result.client_requests_registered = ImpaladMetrics::NUM_QUERIES_REGISTERED->GetValue();
+  return result;
+}
+
+string ImpalaServer::ShutdownStatusToString(const TShutdownStatus& shutdown_status) {
+  return Substitute("startup grace period left: $0, deadline left: $1, "
+      "fragment instances: $2, queries registered: $3",
+      PrettyPrinter::Print(shutdown_status.grace_remaining_ms, TUnit::TIME_MS),
+      PrettyPrinter::Print(shutdown_status.deadline_remaining_ms, TUnit::TIME_MS),
+      shutdown_status.finstances_executing, shutdown_status.client_requests_registered);
+}
+
+Status ImpalaServer::StartShutdown(
+    int64_t relative_deadline_s, TShutdownStatus* shutdown_status) {
+  DCHECK_GE(relative_deadline_s, -1);
+  if (relative_deadline_s == -1) relative_deadline_s = FLAGS_shutdown_deadline_s;
+  int64_t now = MonotonicMillis();
+  int64_t new_deadline = now + relative_deadline_s * 1000L;
+
+  bool set_deadline = false;
+  bool set_grace = false;
+  int64_t curr_deadline = shutdown_deadline_.Load();
+  while (curr_deadline == 0 || curr_deadline > new_deadline) {
+    // Set the deadline - it was either unset or later than the new one.
+    if (shutdown_deadline_.CompareAndSwap(curr_deadline, new_deadline)) {
+      set_deadline = true;
+      break;
+    }
+    curr_deadline = shutdown_deadline_.Load();
+  }
+
+  while (shutting_down_.Load() == 0) {
+    if (!shutting_down_.CompareAndSwap(0, now)) continue;
+    unique_ptr<Thread> t;
+    Status status =
+        Thread::Create("shutdown", "shutdown", [this] { ShutdownThread(); }, &t, false);
+    if (!status.ok()) {
+      LOG(ERROR) << "Failed to create shutdown thread: " << status.GetDetail();
+      return status;
+    }
+    set_grace = true;
+    break;
+  }
+  *shutdown_status = GetShutdownStatus();
+  // Show the full grace/limit times to avoid showing confusing intermediate values
+  // to the person running the statement.
+  if (set_grace) {
+    shutdown_status->grace_remaining_ms = FLAGS_shutdown_grace_period_s * 1000L;
+  }
+  if (set_deadline) shutdown_status->deadline_remaining_ms = relative_deadline_s * 1000L;
+  return Status::OK();
+}
+
+[[noreturn]] void ImpalaServer::ShutdownThread() {
+  while (true) {
+    SleepForMs(1000);
+    TShutdownStatus shutdown_status = GetShutdownStatus();
+    LOG(INFO) << "Shutdown status: " << ShutdownStatusToString(shutdown_status);
+    if (shutdown_status.grace_remaining_ms <= 0
+        && shutdown_status.finstances_executing == 0
+        && shutdown_status.client_requests_registered == 0) {
+      break;
+    } else if (shutdown_status.deadline_remaining_ms <= 0) {
+      break;
+    }
+  }
+  LOG(INFO) << "Shutdown complete, going down.";
+  exit(0);
 }
 }

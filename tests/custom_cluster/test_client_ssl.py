@@ -32,11 +32,14 @@ from tests.shell.util import run_impala_shell_cmd, run_impala_shell_cmd_no_expec
 
 REQUIRED_MIN_OPENSSL_VERSION = 0x10001000L
 REQUIRED_MIN_PYTHON_VERSION_FOR_TLSV12 = (2,7,9)
-SKIP_SSL_MSG = "Legacy OpenSSL module detected"
-HAS_LEGACY_OPENSSL = getattr(ssl, "OPENSSL_VERSION_NUMBER", None)
-if HAS_LEGACY_OPENSSL is not None:
+_openssl_version_number = getattr(ssl, "OPENSSL_VERSION_NUMBER", None)
+if _openssl_version_number is None:
+  SKIP_SSL_MSG = "Legacy OpenSSL module detected"
+elif _openssl_version_number < REQUIRED_MIN_OPENSSL_VERSION:
   SKIP_SSL_MSG = "Only have OpenSSL version %X, but test requires %X" % (
     ssl.OPENSSL_VERSION_NUMBER, REQUIRED_MIN_OPENSSL_VERSION)
+else:
+  SKIP_SSL_MSG = None
 
 class TestClientSsl(CustomClusterTestSuite):
   """Tests for a client using SSL (particularly, the Impala Shell) """
@@ -107,6 +110,25 @@ class TestClientSsl(CustomClusterTestSuite):
     assert "Query Status: Cancelled" in result.stdout
     assert impalad.wait_for_num_in_flight_queries(0)
 
+  # Test that the shell can connect to a ECDH only cluster.
+  TLS_ECDH_ARGS = ("--ssl_client_ca_certificate=%s/server-cert.pem "
+                  "--ssl_server_certificate=%s/server-cert.pem "
+                  "--ssl_private_key=%s/server-key.pem "
+                  "--hostname=localhost "  # Required to match hostname in certificate"
+                  "--ssl_cipher_list=ECDHE-RSA-AES128-GCM-SHA256 "
+                  % (CERT_DIR, CERT_DIR, CERT_DIR))
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(impalad_args=TLS_ECDH_ARGS,
+                                    statestored_args=TLS_ECDH_ARGS,
+                                    catalogd_args=TLS_ECDH_ARGS)
+  @pytest.mark.skipif(SKIP_SSL_MSG is not None, reason=SKIP_SSL_MSG)
+  @pytest.mark.skipif(sys.version_info < REQUIRED_MIN_PYTHON_VERSION_FOR_TLSV12,
+      reason="Working around IMPALA-7628. TODO: is the right workaround?")
+  def test_tls_ecdh(self, vector):
+    self._verify_negative_cases()
+    self._validate_positive_cases("%s/server-cert.pem" % self.CERT_DIR)
+
   # Test that the shell can connect to a TLS1.2 only cluster, and for good measure
   # restrict the cipher suite to just one choice.
   TLS_V12_ARGS = ("--ssl_client_ca_certificate=%s/server-cert.pem "
@@ -121,7 +143,7 @@ class TestClientSsl(CustomClusterTestSuite):
   @CustomClusterTestSuite.with_args(impalad_args=TLS_V12_ARGS,
                                     statestored_args=TLS_V12_ARGS,
                                     catalogd_args=TLS_V12_ARGS)
-  @pytest.mark.skipif(HAS_LEGACY_OPENSSL, reason=SKIP_SSL_MSG)
+  @pytest.mark.skipif(SKIP_SSL_MSG is not None, reason=SKIP_SSL_MSG)
   @pytest.mark.skipif(sys.version_info < REQUIRED_MIN_PYTHON_VERSION_FOR_TLSV12, \
       reason="Python version too old to allow Thrift client to use TLSv1.2")
   def test_tls_v12(self, vector):
@@ -131,7 +153,7 @@ class TestClientSsl(CustomClusterTestSuite):
   @CustomClusterTestSuite.with_args(impalad_args=SSL_WILDCARD_ARGS,
                                     statestored_args=SSL_WILDCARD_ARGS,
                                     catalogd_args=SSL_WILDCARD_ARGS)
-  @pytest.mark.skipif(HAS_LEGACY_OPENSSL, reason=SKIP_SSL_MSG)
+  @pytest.mark.skipif(SKIP_SSL_MSG is not None, reason=SKIP_SSL_MSG)
   @pytest.mark.xfail(run=True, reason="Inconsistent wildcard support on target platforms")
   def test_wildcard_ssl(self, vector):
     """ Test for IMPALA-3159: Test with a certificate which has a wildcard for the
@@ -145,7 +167,7 @@ class TestClientSsl(CustomClusterTestSuite):
   @CustomClusterTestSuite.with_args(impalad_args=SSL_WILDCARD_SAN_ARGS,
                                     statestored_args=SSL_WILDCARD_SAN_ARGS,
                                     catalogd_args=SSL_WILDCARD_SAN_ARGS)
-  @pytest.mark.skipif(HAS_LEGACY_OPENSSL, reason=SKIP_SSL_MSG)
+  @pytest.mark.skipif(SKIP_SSL_MSG is not None, reason=SKIP_SSL_MSG)
   @pytest.mark.xfail(run=True, reason="Inconsistent wildcard support on target platforms")
   def test_wildcard_san_ssl(self, vector):
     """ Test for IMPALA-3159: Test with a certificate which has a wildcard as a SAN. """

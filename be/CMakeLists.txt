@@ -63,8 +63,6 @@ SET(CXX_COVERAGE_FLAGS "-fprofile-arcs -ftest-coverage")
 #        makes extra calls to clang which may have extra includes (-I) that are unused.
 #   -fcolor-diagnostics: ensure clang generates colorized output, which is necessary
 #        when using ccache as clang thinks it is not called from a terminal.
-#   -Wno-mismatched-tags: ignore harmless class/struct mismatch for forward declarations.
-#        Disabling to be consistent with gcc, which doesn't have this warning.
 #   -Wno-zero-as-null-pointer-constant: We are slowly moving towards the use of nullptr,
 #        but till we switch to it completely, we will ignore the warnings due to use of
 #        NULL as a null pointer constant.
@@ -75,10 +73,10 @@ SET(CXX_COVERAGE_FLAGS "-fprofile-arcs -ftest-coverage")
 #        destructors with 'override' which is enforced by clang by not recommended by c++
 #        core guidelines (read C.128).
 SET(CXX_CLANG_FLAGS "-Qunused-arguments -fcolor-diagnostics -Wno-unused-local-typedef")
-SET(CXX_CLANG_FLAGS "${CXX_CLANG_FLAGS} -Wno-mismatched-tags")
 SET(CXX_CLANG_FLAGS "${CXX_CLANG_FLAGS} -Wno-zero-as-null-pointer-constant")
 SET(CXX_CLANG_FLAGS "${CXX_CLANG_FLAGS} -Wno-c++17-extensions")
 SET(CXX_CLANG_FLAGS "${CXX_CLANG_FLAGS} -Wno-inconsistent-missing-destructor-override")
+SET(CXX_CLANG_FLAGS "${CXX_CLANG_FLAGS} -Wno-return-type-c-linkage")
 # For any gcc builds:
 #   -g: Enable symbols for profiler tools
 #   -Wno-unused-local-typedefs: Do not warn for local typedefs that are unused.
@@ -104,15 +102,21 @@ endif()
 # Debug information is stored as dwarf2 to be as compatible as possible
 SET(CXX_FLAGS_DEBUG "${CXX_GCC_FLAGS} -ggdb -gdwarf-2")
 # -Werror: compile warnings should be errors when using the toolchain compiler.
-#   Only enable for debug builds because this is what we test in pre-commit tests.
+#   Enabled for DEBUG, ASAN, TSAN and UBSAN builds which are built pre-commit.
 SET(CXX_FLAGS_DEBUG "${CXX_FLAGS_DEBUG} -Werror")
 SET(CXX_FLAGS_RELEASE "${CXX_GCC_FLAGS} -O3 -DNDEBUG -gdwarf-2")
 SET(CXX_FLAGS_ADDRESS_SANITIZER
-  "${CXX_CLANG_FLAGS} -O1 -g -fsanitize=address -fno-omit-frame-pointer -DADDRESS_SANITIZER")
+  "${CXX_CLANG_FLAGS} -Werror -O1 -g -fsanitize=address -fno-omit-frame-pointer -DADDRESS_SANITIZER")
 
 # Set the flags to the undefined behavior sanitizer, also known as "ubsan"
 # Turn on sanitizer and debug symbols to get stack traces:
-SET(CXX_FLAGS_UBSAN "${CXX_CLANG_FLAGS} -ggdb3 -fno-omit-frame-pointer -fsanitize=undefined -DUNDEFINED_SANITIZER")
+SET(CXX_FLAGS_UBSAN "${CXX_CLANG_FLAGS} -Werror -ggdb3 -fno-omit-frame-pointer -fsanitize=undefined")
+# Set preprocessor macros to facilitate initialization the relevant configuration.
+SET(CXX_FLAGS_UBSAN "${CXX_FLAGS_UBSAN} -DUNDEFINED_SANITIZER")
+# Calling getenv() in __ubsan_default_options doesn't work, likely because of
+# initialization ordering. We need to double-quote to create a macro that expands
+# to a string-literal.
+SET(CXX_FLAGS_UBSAN "${CXX_FLAGS_UBSAN} -DUNDEFINED_SANITIZER_SUPPRESSIONS=\\\"$ENV{IMPALA_HOME}/bin/ubsan-suppressions.txt\\\"")
 # Add flags to enable symbol resolution in the stack traces:
 SET(CXX_FLAGS_UBSAN "${CXX_FLAGS_UBSAN} -rtlib=compiler-rt -lgcc_s")
 # Ignore a number of noisy errors with too many false positives:
@@ -125,7 +129,7 @@ SET(CXX_FLAGS_UBSAN "${CXX_FLAGS_UBSAN} -O0")
 
 # Set the flags to the thread sanitizer, also known as "tsan"
 # Turn on sanitizer and debug symbols to get stack traces:
-SET(CXX_FLAGS_TSAN "${CXX_CLANG_FLAGS} -O1 -ggdb3 -fno-omit-frame-pointer")
+SET(CXX_FLAGS_TSAN "${CXX_CLANG_FLAGS} -Werror -O1 -ggdb3 -fno-omit-frame-pointer")
 SET(CXX_FLAGS_TSAN "${CXX_FLAGS_TSAN} -fsanitize=thread -DTHREAD_SANITIZER")
 
 SET(CXX_FLAGS_TIDY "${CXX_CLANG_FLAGS}")
@@ -227,6 +231,13 @@ set(CLANG_IR_CXX_FLAGS "${CLANG_IR_CXX_FLAGS}" "-Werror")
 
 if ("${CMAKE_BUILD_TYPE}" STREQUAL "ADDRESS_SANITIZER")
   SET(CLANG_IR_CXX_FLAGS "${CLANG_IR_CXX_FLAGS}" "-DADDRESS_SANITIZER")
+endif()
+
+if (UBSAN_CODEGEN)
+  set(CLANG_IR_CXX_FLAGS "${CLANG_IR_CXX_FLAGS}" "-DUNDEFINED_SANITIZER"
+    "-fno-omit-frame-pointer" "-fsanitize=undefined" "-fno-wrapv" "-ggdb3"
+    "-fno-sanitize=alignment,function,vptr,float-divide-by-zero,float-cast-overflow"
+    "-DUNDEFINED_SANITIZER_SUPPRESSIONS=\\\"$ENV{IMPALA_HOME}/bin/ubsan-suppressions.txt\\\"")
 endif()
 
 IF($ENV{ENABLE_IMPALA_IR_DEBUG_INFO} STREQUAL "true")
@@ -345,12 +356,6 @@ CHECK_FUNCTION_EXISTS(preadv HAVE_PREADV)
 INCLUDE(CheckIncludeFiles)
 CHECK_INCLUDE_FILES(linux/magic.h HAVE_MAGIC_H)
 
-include(CheckLibraryExists)
-CHECK_LIBRARY_EXISTS("krb5" krb5_is_config_principal
-  ${KERBEROS_LIBRARY} HAVE_KRB5_IS_CONFIG_PRINCIPAL)
-CHECK_LIBRARY_EXISTS("krb5" krb5_get_init_creds_opt_set_out_ccache
-  ${KERBEROS_LIBRARY} HAVE_KRB5_GET_INIT_CREDS_OPT_SET_OUT_CCACHE)
-
 # Used to check if we're using krb-1.6 or lower.
 CHECK_LIBRARY_EXISTS("krb5" krb5_get_init_creds_opt_set_fast_ccache_name
   ${KERBEROS_LIBRARY} HAVE_KRB5_GET_INIT_CREDS_OPT_SET_FAST_CCACHE_NAME)
@@ -443,6 +448,7 @@ set (IMPALA_DEPENDENCIES
   gflags
   krb5
   libev
+  libunwind
   pprof
   breakpad_client
   hdfs

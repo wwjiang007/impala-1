@@ -21,11 +21,9 @@ import java.util.List;
 
 import org.apache.impala.authorization.Privilege;
 import org.apache.impala.catalog.AggregateFunction;
-import org.apache.impala.catalog.Catalog;
-import org.apache.impala.catalog.Db;
+import org.apache.impala.catalog.BuiltinsDb;
 import org.apache.impala.catalog.FeDb;
 import org.apache.impala.catalog.Function;
-import org.apache.impala.catalog.ImpaladCatalog;
 import org.apache.impala.catalog.ScalarFunction;
 import org.apache.impala.catalog.ScalarType;
 import org.apache.impala.catalog.Type;
@@ -36,6 +34,7 @@ import org.apache.impala.thrift.TColumnType;
 import org.apache.impala.thrift.TExprNode;
 import org.apache.impala.thrift.TExprNodeType;
 import org.apache.impala.thrift.TFunctionBinaryType;
+import org.apache.impala.thrift.TQueryOptions;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Objects;
@@ -82,9 +81,10 @@ public class FunctionCallExpr extends Expr {
 
   /**
    * Returns an Expr that evaluates the function call <fnName>(<params>). The returned
-   * Expr is not necessarily a FunctionCallExpr (example: DECODE())
+   * Expr is not necessarily a FunctionCallExpr (example: DECODE()).
    */
-  public static Expr createExpr(FunctionName fnName, FunctionParams params) {
+  public static Expr createExpr(FunctionName fnName, FunctionParams params,
+      TQueryOptions options) {
     FunctionCallExpr functionCallExpr = new FunctionCallExpr(fnName, params);
     if (functionNameEqualsBuiltin(fnName, "decode")) {
       return new CaseExpr(functionCallExpr);
@@ -105,6 +105,14 @@ public class FunctionCallExpr extends Expr {
           new NullLiteral() // NULL
       ));
     }
+    // "mod" and "%" are equivalent in DECIMAL V2 mode.
+    Preconditions.checkArgument(options != null);
+    if (options.isDecimal_v2() && functionNameEqualsBuiltin(fnName, "mod")) {
+      List<Expr> plist = Lists.newArrayList(params.exprs());
+      Preconditions.checkArgument(plist.size() == 2);
+      return new ArithmeticExpr(ArithmeticExpr.Operator.MOD,
+          plist.get(0), plist.get(1));
+    }
     return functionCallExpr;
   }
 
@@ -113,7 +121,7 @@ public class FunctionCallExpr extends Expr {
     return fnName.getFnNamePath().size() == 1
            && fnName.getFnNamePath().get(0).equalsIgnoreCase(name)
         || fnName.getFnNamePath().size() == 2
-           && fnName.getFnNamePath().get(0).equals(ImpaladCatalog.BUILTINS_DB)
+           && fnName.getFnNamePath().get(0).equals(BuiltinsDb.NAME)
            && fnName.getFnNamePath().get(1).equalsIgnoreCase(name);
   }
 

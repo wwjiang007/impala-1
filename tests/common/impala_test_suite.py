@@ -79,7 +79,6 @@ from thrift.protocol import TBinaryProtocol
 
 # Initializing the logger before conditional imports, since we will need it
 # for them.
-logging.basicConfig(level=logging.INFO, format='-- %(message)s')
 LOG = logging.getLogger('impala_test_suite')
 
 # The ADLS python client isn't downloaded when ADLS isn't the target FS, so do a
@@ -155,6 +154,10 @@ class ImpalaTestSuite(BaseTestSuite):
       cls.filesystem_client = S3Client(S3_BUCKET_NAME)
     elif IS_ADLS:
       cls.filesystem_client = ADLSClient(ADLS_STORE_NAME)
+
+    # Override the shell history path so that commands run by any tests
+    # don't write any history into the developer's file.
+    os.environ['IMPALA_HISTFILE'] = '/dev/null'
 
   @classmethod
   def teardown_class(cls):
@@ -530,23 +533,29 @@ class ImpalaTestSuite(BaseTestSuite):
 
   @classmethod
   @execute_wrapper
-  def execute_query_expect_success(cls, impalad_client, query, query_options=None):
+  def execute_query_expect_success(cls, impalad_client, query, query_options=None,
+      user=None):
     """Executes a query and asserts if the query fails"""
-    result = cls.__execute_query(impalad_client, query, query_options)
+    result = cls.__execute_query(impalad_client, query, query_options, user)
     assert result.success
     return result
 
   @execute_wrapper
-  def execute_query_expect_failure(self, impalad_client, query, query_options=None):
+  def execute_query_expect_failure(self, impalad_client, query, query_options=None,
+      user=None):
     """Executes a query and asserts if the query succeeds"""
     result = None
     try:
-      result = self.__execute_query(impalad_client, query, query_options)
+      result = self.__execute_query(impalad_client, query, query_options, user)
     except Exception, e:
       return e
 
     assert not result.success, "No failure encountered for query %s" % query
     return result
+
+  @execute_wrapper
+  def execute_query_unchecked(self, impalad_client, query, query_options=None, user=None):
+    return self.__execute_query(impalad_client, query, query_options, user)
 
   @execute_wrapper
   def execute_query(self, query, query_options=None):

@@ -37,7 +37,7 @@ DEFINE_string(hostname, "", "Hostname to use for this daemon, also used as part 
 
 DEFINE_int32(be_port, 22000,
     "port on which thrift based ImpalaInternalService is exported");
-DEFINE_int32_hidden(krpc_port, 27000,
+DEFINE_int32(krpc_port, 27000,
     "port on which KRPC based ImpalaInternalService is exported");
 
 // Kerberos is enabled if and only if principal is set.
@@ -47,6 +47,8 @@ DEFINE_string(principal, "", "Kerberos principal. If set, both client and backen
 DEFINE_string(be_principal, "", "Kerberos principal for backend network connections only,"
     "overriding --principal if set. Must not be set if --principal is not set.");
 DEFINE_string(keytab_file, "", "Absolute path to Kerberos keytab file");
+DEFINE_string(krb5_ccname, "/tmp/krb5cc_impala_internal", "Absolute path to the file "
+    "based credentials cache that we pass to the KRB5CCNAME environment variable.");
 DEFINE_string(krb5_conf, "", "Absolute path to Kerberos krb5.conf if in a non-standard "
     "location. Does not normally need to be set.");
 DEFINE_string(krb5_debug_file, "", "Turn on Kerberos debugging and output to this file");
@@ -199,6 +201,44 @@ DEFINE_string(reserved_words_version, "3.0.0", "Reserved words compatibility ver
     " version from which the reserved word list is taken. The value must be one of "
     "[\"2.11.0\", \"3.0.0\"].");
 
+DEFINE_bool_hidden(disable_catalog_data_ops_debug_only, false,
+    "Disable catalog operations that require access to file-system data blocks. "
+    "Examples are when catalog reads data blocks to load avro schemas and copy jars."
+    "Use only for testing/debugging, not in deployed clusters.");
+
+// TODO: this flag and others, since it requires multiple daemons to be set the
+// same way, is error prone. One fix for this flag is to set it only on
+// catalogd, propagate the setting as a property of the Catalog object, and let
+// impalad uses act on this setting.
+DEFINE_bool(pull_incremental_statistics, false,
+    "When set, impalad coordinators pull incremental statistics from catalogd on-demand "
+    "and catalogd does not broadcast incremental statistics via statestored to "
+    "coordinators. If used, the flag must be set on both catalogd and all impalad "
+    "coordinators.");
+
+DEFINE_int32(invalidate_tables_timeout_s, 0, "If a table has not been referenced in a "
+    "SQL statement for more than the configured amount of time, the catalog server will "
+    "automatically evict its cached metadata about this table. This has the same effect "
+    "as a user-initiated \"INVALIDATE METADATA\" statement on the table. Configuring "
+    "this to 0 disables time-based automatic invalidation of tables. This is independent "
+    "from memory-based invalidation configured by invalidate_tables_on_memory_pressure. "
+    "To enable this feature, a non-zero flag must be applied to both catalogd and "
+    "impalad.");
+
+DEFINE_bool(invalidate_tables_on_memory_pressure, false, "Configure catalogd to "
+    "invalidate recently unused tables when the old GC generation is almost full. This "
+    "is independent from time-based invalidation configured by "
+    "invalidate_table_timeout_s. To enable this feature, a true flag must be applied to "
+    "both catalogd and impalad.");
+
+DEFINE_double_hidden(invalidate_tables_gc_old_gen_full_threshold, 0.6, "The threshold "
+    "above which CatalogdTableInvalidator would consider the old generation to be almost "
+    "full and trigger an invalidation on recently unused tables");
+
+DEFINE_double_hidden(invalidate_tables_fraction_on_memory_pressure, 0.1,
+    "The fraction of tables to invalidate when CatalogdTableInvalidator considers the "
+    "old GC generation to be almost full.");
+
 // ++========================++
 // || Startup flag graveyard ||
 // ++========================++
@@ -258,3 +298,4 @@ REMOVED_FLAG(use_statestore);
 REMOVED_FLAG(use_kudu_kinit);
 REMOVED_FLAG(disable_admission_control);
 REMOVED_FLAG(disable_mem_pools);
+REMOVED_FLAG(use_krpc);

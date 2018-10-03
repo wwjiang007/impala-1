@@ -21,6 +21,7 @@ import static java.lang.String.format;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -31,7 +32,7 @@ import org.apache.impala.analysis.FunctionCallExpr;
 import org.apache.impala.analysis.InsertStmt;
 import org.apache.impala.analysis.KuduPartitionExpr;
 import org.apache.impala.analysis.LiteralExpr;
-import org.apache.impala.catalog.KuduTable;
+import org.apache.impala.catalog.FeKuduTable;
 import org.apache.impala.catalog.ScalarType;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
@@ -59,7 +60,6 @@ import org.apache.kudu.client.RangePartitionBound;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
 
 public class KuduUtil {
 
@@ -72,7 +72,8 @@ public class KuduUtil {
   private static int KUDU_CLIENT_WORKER_THREAD_COUNT = 5;
 
   // Maps lists of master addresses to KuduClients, for sharing clients across the FE.
-  private static Map<String, KuduClient> kuduClients_ = Maps.newHashMap();
+  private static Map<String, KuduClient> kuduClients_ =
+      new ConcurrentHashMap<String, KuduClient>();
 
   /**
    * Gets a KuduClient for the specified Kudu master addresses (as a comma-separated
@@ -84,14 +85,16 @@ public class KuduUtil {
    * fetching tablet metadata.
    */
   public static KuduClient getKuduClient(String kuduMasters) {
-    if (!kuduClients_.containsKey(kuduMasters)) {
+    KuduClient client = kuduClients_.get(kuduMasters);
+    if (client == null) {
       KuduClientBuilder b = new KuduClient.KuduClientBuilder(kuduMasters);
       b.defaultAdminOperationTimeoutMs(BackendConfig.INSTANCE.getKuduClientTimeoutMs());
       b.defaultOperationTimeoutMs(BackendConfig.INSTANCE.getKuduClientTimeoutMs());
       b.workerCount(KUDU_CLIENT_WORKER_THREAD_COUNT);
-      kuduClients_.put(kuduMasters, b.build());
+      client = b.build();
+      kuduClients_.put(kuduMasters, client);
     }
-    return kuduClients_.get(kuduMasters);
+    return client;
   }
 
   /**
@@ -450,9 +453,9 @@ public class KuduUtil {
    */
   public static Expr createPartitionExpr(InsertStmt insertStmt, Analyzer analyzer)
       throws AnalysisException {
-    Preconditions.checkState(insertStmt.getTargetTable() instanceof KuduTable);
+    Preconditions.checkState(insertStmt.getTargetTable() instanceof FeKuduTable);
     Expr kuduPartitionExpr = new KuduPartitionExpr(DescriptorTable.TABLE_SINK_ID,
-        (KuduTable) insertStmt.getTargetTable(),
+        (FeKuduTable) insertStmt.getTargetTable(),
         Lists.newArrayList(insertStmt.getPartitionKeyExprs()),
         insertStmt.getPartitionColPos());
     kuduPartitionExpr.analyze(analyzer);

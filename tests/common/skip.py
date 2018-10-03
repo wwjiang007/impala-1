@@ -86,12 +86,9 @@ class SkipIf:
       reason="Kudu is not supported")
   not_s3 = pytest.mark.skipif(not IS_S3, reason="S3 Filesystem needed")
   not_hdfs = pytest.mark.skipif(not IS_HDFS, reason="HDFS Filesystem needed")
+  not_ec = pytest.mark.skipif(not IS_EC, reason="Erasure Coding needed")
   no_secondary_fs = pytest.mark.skipif(not SECONDARY_FILESYSTEM,
       reason="Secondary filesystem needed")
-  not_krpc = pytest.mark.skipif(pytest.config.option.test_no_krpc,
-      reason="Test is only supported when using KRPC.")
-  not_thrift = pytest.mark.skipif(not pytest.config.option.test_no_krpc,
-      reason="Test is only supported when using Thrift RPC.")
 
 class SkipIfIsilon:
   caching = pytest.mark.skipif(IS_ISILON, reason="SET CACHED not implemented for Isilon")
@@ -150,3 +147,4 @@ class SkipIfEC:
       "features relying on local read do not work.")
   oom = pytest.mark.skipif(IS_EC, reason="Probably broken by HDFS-13540.")
   fix_later = pytest.mark.skipif(IS_EC, reason="It should work but doesn't.")
+  scheduling = pytest.mark.skipif(IS_EC, reason="Scheduling is different on EC")

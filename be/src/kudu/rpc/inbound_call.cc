@@ -17,9 +17,15 @@
 
 #include "kudu/rpc/inbound_call.h"
 
-#include <glog/stl_logging.h>
+#include <cstdint>
 #include <memory>
+#include <ostream>
 
+#include <glog/logging.h>
+#include <google/protobuf/message.h>
+#include <google/protobuf/message_lite.h>
+
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/connection.h"
 #include "kudu/rpc/rpc_introspection.pb.h"
@@ -27,13 +33,22 @@
 #include "kudu/rpc/rpcz_store.h"
 #include "kudu/rpc/serialization.h"
 #include "kudu/rpc/service_if.h"
+#include "kudu/rpc/transfer.h"
 #include "kudu/util/debug/trace_event.h"
 #include "kudu/util/metrics.h"
+#include "kudu/util/net/sockaddr.h"
 #include "kudu/util/trace.h"
 
+namespace google {
+namespace protobuf {
+class FieldDescriptor;
+}
+}
+
 using google::protobuf::FieldDescriptor;
-using google::protobuf::io::CodedOutputStream;
+using google::protobuf::Message;
 using google::protobuf::MessageLite;
+using std::string;
 using std::unique_ptr;
 using std::vector;
 using strings::Substitute;
@@ -44,7 +59,8 @@ namespace rpc {
 InboundCall::InboundCall(Connection* conn)
   : conn_(conn),
     trace_(new Trace),
-    method_info_(nullptr) {
+    method_info_(nullptr),
+    deadline_(MonoTime::Max()) {
   RecordCallReceived();
 }
 
@@ -64,6 +80,11 @@ Status InboundCall::ParseFrom(gscoped_ptr<InboundTransfer> transfer) {
                               header_.remote_method().InitializationErrorString());
   }
   remote_method_.FromPB(header_.remote_method());
+
+  // Compute and cache the call deadline.
+  if (header_.has_timeout_millis() && header_.timeout_millis() != 0) {
+    deadline_ = timing_.time_received + MonoDelta::FromMilliseconds(header_.timeout_millis());
+  }
 
   if (header_.sidecar_offsets_size() > TransferLimits::kMaxSidecars) {
     return Status::Corruption(strings::Substitute(
@@ -261,7 +282,7 @@ void InboundCall::RecordCallReceived() {
   timing_.time_received = MonoTime::Now();
 }
 
-void InboundCall::RecordHandlingStarted(scoped_refptr<Histogram> incoming_queue_time) {
+void InboundCall::RecordHandlingStarted(Histogram* incoming_queue_time) {
   DCHECK(incoming_queue_time != nullptr);
   DCHECK(!timing_.time_handled.Initialized());  // Protect against multiple calls.
   timing_.time_handled = MonoTime::Now();
@@ -286,20 +307,7 @@ void InboundCall::RecordHandlingCompleted() {
 }
 
 bool InboundCall::ClientTimedOut() const {
-  if (!header_.has_timeout_millis() || header_.timeout_millis() == 0) {
-    return false;
-  }
-
-  MonoTime now = MonoTime::Now();
-  int total_time = (now - timing_.time_received).ToMilliseconds();
-  return total_time > header_.timeout_millis();
-}
-
-MonoTime InboundCall::GetClientDeadline() const {
-  if (!header_.has_timeout_millis() || header_.timeout_millis() == 0) {
-    return MonoTime::Max();
-  }
-  return timing_.time_received + MonoDelta::FromMilliseconds(header_.timeout_millis());
+  return MonoTime::Now() >= deadline_;
 }
 
 MonoTime InboundCall::GetTimeReceived() const {

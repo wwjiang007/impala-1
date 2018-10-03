@@ -17,8 +17,15 @@
 
 package org.apache.impala.planner;
 
+import static org.junit.Assert.assertEquals;
+
+import java.util.ArrayList;
+
 import org.apache.impala.catalog.Catalog;
+import org.apache.impala.catalog.ColumnStats;
 import org.apache.impala.catalog.Db;
+import org.apache.impala.catalog.FeHBaseTable;
+import org.apache.impala.catalog.HBaseColumn;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.RuntimeEnv;
@@ -72,6 +79,31 @@ public class PlannerTest extends PlannerTestBase {
   @Test
   public void testDistinct() {
     runPlannerTestFile("distinct");
+  }
+
+  @Test
+  public void testMultipleDistinct() {
+    // TODO: Multiple distinct with count(distinct a,b,c) variants.
+    // TODO: Multiple distinct in subplan.
+    // TODO: Multiple distinct in subqueries.
+    // TODO: Multiple distinct lineage tests.
+    // TODO: Multiple distinct and SHUFFLE_DISTINCT_EXPRS tests
+    runPlannerTestFile("multiple-distinct");
+  }
+
+  @Test
+  public void testMultipleDistinctMaterialization() {
+    runPlannerTestFile("multiple-distinct-materialization");
+  }
+
+  @Test
+  public void testMultipleDistinctPredicates() {
+    runPlannerTestFile("multiple-distinct-predicates");
+  }
+
+  @Test
+  public void testMultipleDistinctLimit() {
+    runPlannerTestFile("multiple-distinct-limit");
   }
 
   @Test
@@ -228,7 +260,9 @@ public class PlannerTest extends PlannerTestBase {
 
   @Test
   public void testTpch() {
-    runPlannerTestFile("tpch-all", "tpch");
+    runPlannerTestFile("tpch-all", "tpch",
+        ImmutableSet.of(PlannerTestOption.INCLUDE_RESOURCE_HEADER,
+            PlannerTestOption.VALIDATE_RESOURCES));
   }
 
   @Test
@@ -246,7 +280,9 @@ public class PlannerTest extends PlannerTestBase {
 
   @Test
   public void testTpchNested() {
-    runPlannerTestFile("tpch-nested", "tpch_nested_parquet");
+    runPlannerTestFile("tpch-nested", "tpch_nested_parquet",
+        ImmutableSet.of(PlannerTestOption.INCLUDE_RESOURCE_HEADER,
+            PlannerTestOption.VALIDATE_RESOURCES));
   }
 
   @Test
@@ -254,7 +290,9 @@ public class PlannerTest extends PlannerTestBase {
     // Uses ss_sold_date_sk as the partition key of store_sales to allow static partition
     // pruning. The original predicates were rephrased in terms of the ss_sold_date_sk
     // partition key, with the query semantics identical to the original queries.
-    runPlannerTestFile("tpcds-all", "tpcds");
+    runPlannerTestFile("tpcds-all", "tpcds",
+        ImmutableSet.of(PlannerTestOption.INCLUDE_RESOURCE_HEADER,
+            PlannerTestOption.VALIDATE_RESOURCES));
   }
 
   @Test
@@ -321,6 +359,15 @@ public class PlannerTest extends PlannerTestBase {
   }
 
   @Test
+  public void testParquetFilteringDisabled() {
+    TQueryOptions options = new TQueryOptions();
+    options.setParquet_dictionary_filtering(false);
+    options.setParquet_read_statistics(false);
+    runPlannerTestFile("parquet-filtering-disabled", options,
+        ImmutableSet.of(PlannerTestOption.EXTENDED_EXPLAIN));
+  }
+
+  @Test
   public void testKudu() {
     Assume.assumeTrue(RuntimeEnv.INSTANCE.isKuduSupported());
     addTestDb("kudu_planner_test", "Test DB for Kudu Planner.");
@@ -358,7 +405,9 @@ public class PlannerTest extends PlannerTestBase {
   @Test
   public void testKuduTpch() {
     Assume.assumeTrue(RuntimeEnv.INSTANCE.isKuduSupported());
-    runPlannerTestFile("tpch-kudu");
+    runPlannerTestFile("tpch-kudu", ImmutableSet.of(
+        PlannerTestOption.INCLUDE_RESOURCE_HEADER,
+        PlannerTestOption.VALIDATE_RESOURCES));
   }
 
   @Test
@@ -590,5 +639,54 @@ public class PlannerTest extends PlannerTestBase {
         tblName, colDefs, storedAs, tblLocation, tblProps));
     query = "select id from functional_parquet.cardinality_overflow t, t.int_array";
     checkCardinality(query, 0, Long.MAX_VALUE);
+  }
+
+  @Test
+  public void testHBaseScanNodeMemEstimates() {
+    // Single key non-string column
+    HBaseColumn intCol = new HBaseColumn("", FeHBaseTable.Util.ROW_KEY_COLUMN_FAMILY, "",
+        false, Type.INT, "", 1);
+    assertEquals(
+        HBaseScanNode.memoryEstimateForFetchingColumns(Lists.newArrayList(intCol)), 8);
+
+    // Single key string column without max length stat.
+    HBaseColumn stringColWithoutStats = new HBaseColumn("",
+        FeHBaseTable.Util.ROW_KEY_COLUMN_FAMILY, "", false, Type.STRING, "", 1);
+    assertEquals(HBaseScanNode.memoryEstimateForFetchingColumns(Lists
+        .newArrayList(stringColWithoutStats)), 64 * 1024);
+
+    // Single key string column with max length stat.
+    HBaseColumn stringColwithSmallMaxSize = new HBaseColumn("",
+        FeHBaseTable.Util.ROW_KEY_COLUMN_FAMILY, "", false, Type.STRING, "", 1);
+    stringColwithSmallMaxSize.getStats().update(ColumnStats.StatsKey.MAX_SIZE,
+        Long.valueOf(50));
+    assertEquals(HBaseScanNode.memoryEstimateForFetchingColumns(Lists
+        .newArrayList(stringColwithSmallMaxSize)), 128);
+
+    // Case that triggers the upper bound if some columns have stats are missing.
+    HBaseColumn stringColwithLargeMaxSize = new HBaseColumn("",
+        FeHBaseTable.Util.ROW_KEY_COLUMN_FAMILY, "", false, Type.STRING, "", 1);
+    stringColwithLargeMaxSize.getStats().update(ColumnStats.StatsKey.MAX_SIZE,
+        Long.valueOf(128 * 1024 * 1024));
+    assertEquals(HBaseScanNode.memoryEstimateForFetchingColumns(Lists.newArrayList(
+        stringColwithLargeMaxSize, stringColWithoutStats)), 128 * 1024 * 1024);
+
+    // Single non-key non-string column.
+    HBaseColumn intNonKeyCol = new HBaseColumn("", "columnFamily", "columnQualifier",
+        false, Type.INT, "", 1);
+    assertEquals(
+        HBaseScanNode.memoryEstimateForFetchingColumns(Lists.newArrayList(intNonKeyCol)),
+        64);
+
+    // Case with a string key and non-key int column.
+    assertEquals(HBaseScanNode.memoryEstimateForFetchingColumns(Lists.newArrayList(
+        stringColwithLargeMaxSize, intNonKeyCol)), 512 * 1024 * 1024);
+
+    // Case with a huge number of string columns.
+    ArrayList<HBaseColumn> largeColumnList = new ArrayList<HBaseColumn>();
+    largeColumnList.add(stringColwithSmallMaxSize);
+    for (int i = 0; i < 100; i++) largeColumnList.add(stringColWithoutStats);
+    assertEquals(HBaseScanNode.memoryEstimateForFetchingColumns(largeColumnList),
+        8 * 1024 * 1024);
   }
 }

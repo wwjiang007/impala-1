@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef IMPALA_EXEC_KUDU_SCAN_NODE_BASE_H_
-#define IMPALA_EXEC_KUDU_SCAN_NODE_BASE_H_
+#pragma once
 
 #include <gtest/gtest.h>
 #include <kudu/client/client.h>
@@ -39,12 +38,12 @@ class KuduScanNodeBase : public ScanNode {
   KuduScanNodeBase(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs);
   ~KuduScanNodeBase();
 
-  virtual Status Prepare(RuntimeState* state);
-  virtual Status Open(RuntimeState* state);
-  virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) = 0;
-
+  virtual Status Prepare(RuntimeState* state) override;
+  virtual Status Open(RuntimeState* state) override;
+  virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos)
+      override = 0;
  protected:
-  virtual void DebugString(int indentation_level, std::stringstream* out) const;
+  virtual void DebugString(int indentation_level, std::stringstream* out) const override;
 
   /// Returns the total number of scan tokens
   int NumScanTokens() { return scan_tokens_.size(); }
@@ -55,6 +54,8 @@ class KuduScanNodeBase : public ScanNode {
   /// Returns the next scan token. Returns NULL if there are no more scan tokens.
   /// Not thread safe, access must be synchronized.
   const std::string* GetNextScanToken();
+
+  const TupleDescriptor* tuple_desc() const { return tuple_desc_; }
 
  private:
   friend class KuduScanner;
@@ -83,11 +84,7 @@ class KuduScanNodeBase : public ScanNode {
   static const std::string KUDU_ROUND_TRIPS;
   static const std::string KUDU_REMOTE_TOKENS;
 
-  const TupleDescriptor* tuple_desc() const { return tuple_desc_; }
   kudu::client::KuduClient* kudu_client() { return client_; }
   RuntimeProfile::Counter* kudu_round_trips() const { return kudu_round_trips_; }
 };
-
 }
-
-#endif

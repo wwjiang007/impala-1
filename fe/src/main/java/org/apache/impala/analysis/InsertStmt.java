@@ -19,18 +19,19 @@ package org.apache.impala.analysis;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
 import org.apache.impala.authorization.Privilege;
 import org.apache.impala.authorization.PrivilegeRequestBuilder;
 import org.apache.impala.catalog.Column;
+import org.apache.impala.catalog.FeFsTable;
+import org.apache.impala.catalog.FeHBaseTable;
+import org.apache.impala.catalog.FeKuduTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.FeView;
-import org.apache.impala.catalog.HBaseTable;
-import org.apache.impala.catalog.HdfsTable;
 import org.apache.impala.catalog.KuduColumn;
-import org.apache.impala.catalog.KuduTable;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.catalog.View;
 import org.apache.impala.common.AnalysisException;
@@ -282,7 +283,7 @@ public class InsertStmt extends StatementBase {
     // Also checks if the target table is missing.
     analyzeTargetTable(analyzer);
 
-    boolean isHBaseTable = (table_ instanceof HBaseTable);
+    boolean isHBaseTable = (table_ instanceof FeHBaseTable);
     int numClusteringCols = isHBaseTable ? 0 : table_.getNumClusteringCols();
 
     // Analysis of the INSERT statement from this point is basically the act of matching
@@ -377,6 +378,10 @@ public class InsertStmt extends StatementBase {
       }
     }
 
+    // Check that we can write to the target table/partition. This must be
+    // done after the partition expression has been analyzed above.
+    analyzeWriteAccess();
+
     // Populate partitionKeyExprs from partitionKeyValues and selectExprTargetColumns
     prepareExpressions(selectExprTargetColumns, selectListExprs, table_, analyzer);
 
@@ -440,7 +445,7 @@ public class InsertStmt extends StatementBase {
 
     // Perform operation-specific analysis.
     if (isUpsert_) {
-      if (!(table_ instanceof KuduTable)) {
+      if (!(table_ instanceof FeKuduTable)) {
         throw new AnalysisException("UPSERT is only supported for Kudu tables");
       }
     } else {
@@ -458,7 +463,7 @@ public class InsertStmt extends StatementBase {
    * - Overwrite is invalid for HBase and Kudu tables
    */
   private void analyzeTableForInsert(Analyzer analyzer) throws AnalysisException {
-    boolean isHBaseTable = (table_ instanceof HBaseTable);
+    boolean isHBaseTable = (table_ instanceof FeHBaseTable);
     int numClusteringCols = isHBaseTable ? 0 : table_.getNumClusteringCols();
 
     if (partitionKeyValues_ != null && numClusteringCols == 0) {
@@ -473,28 +478,23 @@ public class InsertStmt extends StatementBase {
       }
     }
 
-    if (table_ instanceof HdfsTable) {
-      HdfsTable hdfsTable = (HdfsTable) table_;
-      if (!hdfsTable.hasWriteAccess()) {
-        throw new AnalysisException(String.format("Unable to INSERT into target table " +
-            "(%s) because Impala does not have WRITE access to at least one HDFS path" +
-            ": %s", targetTableName_, hdfsTable.getFirstLocationWithoutWriteAccess()));
-      }
+    if (table_ instanceof FeFsTable) {
+      FeFsTable fsTable = (FeFsTable) table_;
       StringBuilder error = new StringBuilder();
-      hdfsTable.parseSkipHeaderLineCount(error);
+      fsTable.parseSkipHeaderLineCount(error);
       if (error.length() > 0) throw new AnalysisException(error.toString());
       try {
-        if (!FileSystemUtil.isImpalaWritableFilesystem(hdfsTable.getLocation())) {
+        if (!FileSystemUtil.isImpalaWritableFilesystem(fsTable.getLocation())) {
           throw new AnalysisException(String.format("Unable to INSERT into target " +
               "table (%s) because %s is not a supported filesystem.", targetTableName_,
-              hdfsTable.getLocation()));
+              fsTable.getLocation()));
         }
       } catch (IOException e) {
         throw new AnalysisException(String.format("Unable to INSERT into target " +
             "table (%s): %s.", targetTableName_, e.getMessage()), e);
       }
       for (int colIdx = 0; colIdx < numClusteringCols; ++colIdx) {
-        Column col = hdfsTable.getColumns().get(colIdx);
+        Column col = fsTable.getColumns().get(colIdx);
         // Hive 1.x has a number of issues handling BOOLEAN partition columns (see HIVE-6590).
         // Instead of working around the Hive bugs, INSERT is disabled for BOOLEAN
         // partitions in Impala when built against Hive 1. HIVE-6590 is currently resolved,
@@ -507,7 +507,7 @@ public class InsertStmt extends StatementBase {
       }
     }
 
-    if (table_ instanceof KuduTable) {
+    if (table_ instanceof FeKuduTable) {
       if (overwrite_) {
         throw new AnalysisException("INSERT OVERWRITE not supported for Kudu tables.");
       }
@@ -520,6 +520,25 @@ public class InsertStmt extends StatementBase {
     if (isHBaseTable && overwrite_) {
       throw new AnalysisException("HBase doesn't have a way to perform INSERT OVERWRITE");
     }
+  }
+
+  private void analyzeWriteAccess() throws AnalysisException {
+    if (!(table_ instanceof FeFsTable)) return;
+    FeFsTable fsTable = (FeFsTable) table_;
+
+    FeFsTable.Utils.checkWriteAccess(fsTable,
+        hasStaticPartitionTarget() ? partitionKeyValues_ : null, "INSERT");
+  }
+
+  private boolean hasStaticPartitionTarget() {
+    if (partitionKeyValues_ == null) return false;
+
+    // If the partition target is fully static, then check for write access against
+    // the specific partition. Otherwise, check the whole table.
+    for (PartitionKeyValue pkv : partitionKeyValues_) {
+      if (pkv.isDynamic()) return false;
+    }
+    return true;
   }
 
   /**
@@ -536,9 +555,9 @@ public class InsertStmt extends StatementBase {
       // We've already ruled out too many columns in the permutation and partition clauses
       // by checking that there are no duplicates and that every column mentioned actually
       // exists. So all columns aren't mentioned in the query.
-      if (table_ instanceof KuduTable) {
+      if (table_ instanceof FeKuduTable) {
         checkRequiredKuduColumns(mentionedColumnNames);
-      } else if (table_ instanceof HBaseTable) {
+      } else if (table_ instanceof FeHBaseTable) {
         checkRequiredHBaseColumns(mentionedColumnNames);
       } else if (table_.getNumClusteringCols() > 0) {
         checkRequiredPartitionedColumns(mentionedColumnNames);
@@ -578,8 +597,8 @@ public class InsertStmt extends StatementBase {
    */
   private void checkRequiredKuduColumns(Set<String> mentionedColumnNames)
       throws AnalysisException {
-    Preconditions.checkState(table_ instanceof KuduTable);
-    List<String> keyColumns = ((KuduTable) table_).getPrimaryKeyColumnNames();
+    Preconditions.checkState(table_ instanceof FeKuduTable);
+    List<String> keyColumns = ((FeKuduTable) table_).getPrimaryKeyColumnNames();
     List<String> missingKeyColumnNames = Lists.newArrayList();
     for (Column column : table_.getColumns()) {
       if (!mentionedColumnNames.contains(column.getName())
@@ -604,7 +623,7 @@ public class InsertStmt extends StatementBase {
    */
   private void checkRequiredHBaseColumns(Set<String> mentionedColumnNames)
       throws AnalysisException {
-    Preconditions.checkState(table_ instanceof HBaseTable);
+    Preconditions.checkState(table_ instanceof FeHBaseTable);
     Column column = table_.getColumns().get(0);
     if (!mentionedColumnNames.contains(column.getName())) {
       throw new AnalysisException("Row-key column '" + column.getName() +
@@ -659,11 +678,12 @@ public class InsertStmt extends StatementBase {
     List<Expr> tmpPartitionKeyExprs = new ArrayList<Expr>();
     List<String> tmpPartitionKeyNames = new ArrayList<String>();
 
-    int numClusteringCols = (tbl instanceof HBaseTable) ? 0 : tbl.getNumClusteringCols();
-    boolean isKuduTable = table_ instanceof KuduTable;
+    int numClusteringCols = (tbl instanceof FeHBaseTable) ? 0
+        : tbl.getNumClusteringCols();
+    boolean isKuduTable = table_ instanceof FeKuduTable;
     Set<String> kuduPartitionColumnNames = null;
     if (isKuduTable) {
-      kuduPartitionColumnNames = ((KuduTable) table_).getPartitionColumnNames();
+      kuduPartitionColumnNames = getKuduPartitionColumnNames((FeKuduTable) table_);
     }
 
     // Check dynamic partition columns for type compatibility.
@@ -759,14 +779,14 @@ public class InsertStmt extends StatementBase {
       }
       // Store exprs for Kudu key columns.
       if (matchFound && isKuduTable) {
-        KuduTable kuduTable = (KuduTable) table_;
-        if (kuduTable.isPrimaryKeyColumn(tblColumn.getName())) {
+        FeKuduTable kuduTable = (FeKuduTable) table_;
+        if (kuduTable.getPrimaryKeyColumnNames().contains(tblColumn.getName())) {
           primaryKeyExprs_.add(Iterables.getLast(resultExprs_));
         }
       }
     }
 
-    if (table_ instanceof KuduTable) {
+    if (table_ instanceof FeKuduTable) {
       Preconditions.checkState(!primaryKeyExprs_.isEmpty());
     }
 
@@ -783,13 +803,21 @@ public class InsertStmt extends StatementBase {
     }
   }
 
+  private static Set<String> getKuduPartitionColumnNames(FeKuduTable table) {
+    Set<String> ret = new HashSet<String>();
+    for (KuduPartitionParam partitionParam : table.getPartitionBy()) {
+      ret.addAll(partitionParam.getColumnNames());
+    }
+    return ret;
+  }
+
   /**
    * Analyzes the 'sort.columns' table property if it is set, and populates
    * sortColumns_ and sortExprs_. If there are errors during the analysis, this will throw
    * an AnalysisException.
    */
   private void analyzeSortColumns() throws AnalysisException {
-    if (!(table_ instanceof HdfsTable)) return;
+    if (!(table_ instanceof FeFsTable)) return;
 
     sortColumns_ = AlterTableSetTblProperties.analyzeSortColumns(table_,
         table_.getMetaStoreTable().getParameters());
@@ -800,7 +828,7 @@ public class InsertStmt extends StatementBase {
 
   private void analyzePlanHints(Analyzer analyzer) throws AnalysisException {
     if (planHints_.isEmpty()) return;
-    if (table_ instanceof HBaseTable) {
+    if (table_ instanceof FeHBaseTable) {
       throw new AnalysisException(String.format("INSERT hints are only supported for " +
           "inserting into Hdfs and Kudu tables: %s", getTargetTableName()));
     }
@@ -895,10 +923,10 @@ public class InsertStmt extends StatementBase {
   }
 
   @Override
-  public String toSql() {
+  public String toSql(boolean rewritten) {
     StringBuilder strBuilder = new StringBuilder();
 
-    if (withClause_ != null) strBuilder.append(withClause_.toSql() + " ");
+    if (withClause_ != null) strBuilder.append(withClause_.toSql(rewritten) + " ");
 
     strBuilder.append(getOpName());
     if (!planHints_.isEmpty() && hintLoc_ == HintLocation.Start) {
@@ -927,7 +955,7 @@ public class InsertStmt extends StatementBase {
       strBuilder.append(" " + ToSqlUtils.getPlanHintsSql(getPlanHints()));
     }
     if (!needsGeneratedQueryStatement_) {
-      strBuilder.append(" " + queryStmt_.toSql());
+      strBuilder.append(" " + queryStmt_.toSql(rewritten));
     }
     return strBuilder.toString();
   }

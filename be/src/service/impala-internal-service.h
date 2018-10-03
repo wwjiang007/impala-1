@@ -37,12 +37,12 @@ class ImpalaInternalService : public ImpalaInternalServiceIf {
       const TCancelQueryFInstancesParams& params);
   virtual void ReportExecStatus(TReportExecStatusResult& return_val,
       const TReportExecStatusParams& params);
-  virtual void TransmitData(TTransmitDataResult& return_val,
-      const TTransmitDataParams& params);
   virtual void UpdateFilter(TUpdateFilterResult& return_val,
       const TUpdateFilterParams& params);
   virtual void PublishFilter(TPublishFilterResult& return_val,
       const TPublishFilterParams& params);
+  virtual void RemoteShutdown(TRemoteShutdownResult& return_val,
+      const TRemoteShutdownParams& params);
 
  private:
   ImpalaServer* impala_server_;

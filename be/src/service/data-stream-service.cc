@@ -71,17 +71,23 @@ Status DataStreamService::Init() {
   return Status::OK();
 }
 
+bool DataStreamService::Authorize(const google::protobuf::Message* req,
+    google::protobuf::Message* resp, RpcContext* context) {
+  return ExecEnv::GetInstance()->rpc_mgr()->Authorize("DataStreamService", context,
+      mem_tracker());
+}
+
 void DataStreamService::EndDataStream(const EndDataStreamRequestPB* request,
     EndDataStreamResponsePB* response, RpcContext* rpc_context) {
   // CloseSender() is guaranteed to eventually respond to this RPC so we don't do it here.
-  ExecEnv::GetInstance()->KrpcStreamMgr()->CloseSender(request, response, rpc_context);
+  ExecEnv::GetInstance()->stream_mgr()->CloseSender(request, response, rpc_context);
 }
 
 void DataStreamService::TransmitData(const TransmitDataRequestPB* request,
     TransmitDataResponsePB* response, RpcContext* rpc_context) {
   FAULT_INJECTION_RPC_DELAY(RPC_TRANSMITDATA);
   // AddData() is guaranteed to eventually respond to this RPC so we don't do it here.
-  ExecEnv::GetInstance()->KrpcStreamMgr()->AddData(request, response, rpc_context);
+  ExecEnv::GetInstance()->stream_mgr()->AddData(request, response, rpc_context);
 }
 
 template<typename ResponsePBType>

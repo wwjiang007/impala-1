@@ -18,10 +18,13 @@
 # Superclass for all tests that need a custom cluster.
 # TODO: Configure cluster size and other parameters.
 
+import logging
 import os
 import os.path
+import pipes
 import pytest
 import re
+import subprocess
 from subprocess import check_call
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.impala_cluster import ImpalaCluster
@@ -38,6 +41,16 @@ STATESTORED_ARGS = 'state_store_args'
 CATALOGD_ARGS = 'catalogd_args'
 # Additional args passed to the start-impala-cluster script.
 START_ARGS = 'start_args'
+SENTRY_CONFIG = 'sentry_config'
+# Default query options passed to the impala daemon command line. Handled separately from
+# other impala daemon arguments to allow merging multiple defaults into a single list.
+DEFAULT_QUERY_OPTIONS = 'default_query_options'
+LOG_DIR = 'log_dir'
+
+# Run with fast topic updates by default to reduce time to first query running.
+DEFAULT_STATESTORE_ARGS = '--statestore_update_frequency_ms=50 \
+    --statestore_priority_update_frequency_ms=50 \
+    --statestore_heartbeat_frequency_ms=50'
 
 class CustomClusterTestSuite(ImpalaTestSuite):
   """Every test in a test suite deriving from this class gets its own Impala cluster.
@@ -82,18 +95,28 @@ class CustomClusterTestSuite(ImpalaTestSuite):
     pass
 
   @staticmethod
-  def with_args(impalad_args=None, statestored_args=None, catalogd_args=None, start_args=None):
+  def with_args(impalad_args=None, statestored_args=None, catalogd_args=None,
+      start_args=None, sentry_config=None, default_query_options=None, log_dir=None):
     """Records arguments to be passed to a cluster by adding them to the decorated
     method's func_dict"""
     def decorate(func):
       if impalad_args is not None:
         func.func_dict[IMPALAD_ARGS] = impalad_args
-      if statestored_args is not None:
-        func.func_dict[STATESTORED_ARGS] = statestored_args
+      if statestored_args is None:
+        func.func_dict[STATESTORED_ARGS] = DEFAULT_STATESTORE_ARGS
+      else:
+        func.func_dict[STATESTORED_ARGS] = \
+            DEFAULT_STATESTORE_ARGS + " " + statestored_args
       if catalogd_args is not None:
         func.func_dict[CATALOGD_ARGS] = catalogd_args
       if start_args is not None:
         func.func_dict[START_ARGS] = start_args
+      if sentry_config is not None:
+        func.func_dict[SENTRY_CONFIG] = sentry_config
+      if default_query_options is not None:
+        func.func_dict[DEFAULT_QUERY_OPTIONS] = default_query_options
+      if log_dir is not None:
+        func.func_dict[LOG_DIR] = log_dir
       return func
     return decorate
 
@@ -105,8 +128,16 @@ class CustomClusterTestSuite(ImpalaTestSuite):
     if START_ARGS in method.func_dict:
       cluster_args.append(method.func_dict[START_ARGS])
 
+    if SENTRY_CONFIG in method.func_dict:
+      self._start_sentry_service(method.func_dict[SENTRY_CONFIG])
     # Start a clean new cluster before each test
-    self._start_impala_cluster(cluster_args)
+    if LOG_DIR in method.func_dict:
+      self._start_impala_cluster(cluster_args,
+          default_query_options=method.func_dict.get(DEFAULT_QUERY_OPTIONS),
+          log_dir=method.func_dict[LOG_DIR])
+    else:
+      self._start_impala_cluster(cluster_args,
+          default_query_options=method.func_dict.get(DEFAULT_QUERY_OPTIONS))
     super(CustomClusterTestSuite, self).setup_class()
 
   def teardown_method(self, method):
@@ -121,9 +152,22 @@ class CustomClusterTestSuite(ImpalaTestSuite):
     sleep(2)
 
   @classmethod
+  def _start_sentry_service(cls, sentry_service_config):
+    sentry_env = dict(os.environ)
+    sentry_env['SENTRY_SERVICE_CONFIG'] = sentry_service_config
+    call = subprocess.Popen(
+        ['/bin/bash', '-c', os.path.join(IMPALA_HOME,
+        'testdata/bin/run-sentry-service.sh')],
+        env=sentry_env)
+    call.wait()
+    if call.returncode != 0:
+      raise RuntimeError("unable to start sentry")
+
+  @classmethod
   def _start_impala_cluster(cls, options, log_dir=os.getenv('LOG_DIR', "/tmp/"),
       cluster_size=CLUSTER_SIZE, num_coordinators=NUM_COORDINATORS,
-      use_exclusive_coordinators=False, log_level=1, expected_num_executors=CLUSTER_SIZE):
+      use_exclusive_coordinators=False, log_level=1, expected_num_executors=CLUSTER_SIZE,
+      default_query_options=None):
     cls.impala_log_dir = log_dir
     # We ignore TEST_START_CLUSTER_ARGS here. Custom cluster tests specifically test that
     # certain custom startup arguments work and we want to keep them independent of dev
@@ -137,9 +181,28 @@ class CustomClusterTestSuite(ImpalaTestSuite):
     if use_exclusive_coordinators:
       cmd.append("--use_exclusive_coordinators")
 
-    if pytest.config.option.test_no_krpc:
-      cmd.append("--disable_krpc")
+    if pytest.config.option.use_local_catalog:
+      cmd.append("--impalad_args=--use_local_catalog=1")
+      cmd.append("--catalogd_args=--catalog_topic_mode=minimal")
 
+    if pytest.config.option.pull_incremental_statistics:
+      cmd.append("--impalad_args=%s --catalogd_args=%s" %
+                 ("--pull_incremental_statistcs", "--pull_incremental_statistics"))
+
+    default_query_option_kvs = []
+    # Put any defaults first, then any arguments after that so they can override defaults.
+    if os.environ.get("ERASURE_CODING") == "true":
+      default_query_option_kvs.append(("allow_erasure_coded_files", "true"))
+    if default_query_options is not None:
+      default_query_option_kvs.extend(default_query_options)
+    # Add the default query options after any arguments. This will override any default
+    # options set in --impalad_args by design to force tests to pass default_query_options
+    # into this function directly.
+    options.append("--impalad_args=--default_query_options={0}".format(
+        ','.join(["{0}={1}".format(k, v) for k, v in default_query_option_kvs])))
+
+    logging.info("Starting cluster with command: %s" %
+                 " ".join(pipes.quote(arg) for arg in cmd + options))
     try:
       check_call(cmd + options, close_fds=True)
     finally:
@@ -159,21 +222,38 @@ class CustomClusterTestSuite(ImpalaTestSuite):
 
   def assert_impalad_log_contains(self, level, line_regex, expected_count=1):
     """
-    Assert that impalad log with specified level (e.g. ERROR, WARNING, INFO) contains
-    expected_count lines with a substring matching the regex. When using this method to
-    check log files of running processes, the caller should make sure that log buffering
-    has been disabled, for example by adding '-logbuflevel=-1' to the daemon startup
-    options.
+    Convenience wrapper around assert_log_contains for impalad logs.
+    """
+    self.assert_log_contains("impalad", level, line_regex, expected_count)
+
+  def assert_catalogd_log_contains(self, level, line_regex, expected_count=1):
+    """
+    Convenience wrapper around assert_log_contains for catalogd logs.
+    """
+    self.assert_log_contains("catalogd", level, line_regex, expected_count)
+
+  def assert_log_contains(self, daemon, level, line_regex, expected_count=1):
+    """
+    Assert that the daemon log with specified level (e.g. ERROR, WARNING, INFO) contains
+    expected_count lines with a substring matching the regex. When expected_count is -1,
+    at least one match is expected.
+    When using this method to check log files of running processes, the caller should
+    make sure that log buffering has been disabled, for example by adding
+    '-logbuflevel=-1' to the daemon startup options.
     """
     pattern = re.compile(line_regex)
     found = 0
-    log_file_path = os.path.join(self.impala_log_dir, "impalad." + level)
+    log_file_path = os.path.join(self.impala_log_dir, daemon + "." + level)
     # Resolve symlinks to make finding the file easier.
     log_file_path = os.path.realpath(log_file_path)
     with open(log_file_path) as log_file:
       for line in log_file:
         if pattern.search(line):
           found += 1
-    assert found == expected_count, ("Expected %d lines in file %s matching regex '%s'"
-        + ", but found %d lines. Last line was: \n%s") % (expected_count, log_file_path,
-                                                          line_regex, found, line)
+    if expected_count == -1:
+      assert found > 0, "Expected at least one line in file %s matching regex '%s'"\
+        ", but found none." % (log_file_path, line_regex)
+    else:
+      assert found == expected_count, "Expected %d lines in file %s matching regex '%s'"\
+        ", but found %d lines. Last line was: \n%s" %\
+        (expected_count, log_file_path, line_regex, found, line)

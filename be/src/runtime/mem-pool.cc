@@ -37,12 +37,13 @@ const char* MemPool::LLVM_CLASS_NAME = "class.impala::MemPool";
 const int MemPool::DEFAULT_ALIGNMENT;
 uint32_t MemPool::zero_length_region_ alignas(std::max_align_t) = MEM_POOL_POISON;
 
-MemPool::MemPool(MemTracker* mem_tracker)
+MemPool::MemPool(MemTracker* mem_tracker, bool enforce_binary_chunk_sizes)
   : current_chunk_idx_(-1),
     next_chunk_size_(INITIAL_CHUNK_SIZE),
     total_allocated_bytes_(0),
     total_reserved_bytes_(0),
-    mem_tracker_(mem_tracker) {
+    mem_tracker_(mem_tracker),
+    enforce_binary_chunk_sizes_(enforce_binary_chunk_sizes) {
   DCHECK(mem_tracker != NULL);
   DCHECK_EQ(zero_length_region_, MEM_POOL_POISON);
 }
@@ -128,6 +129,7 @@ bool MemPool::FindChunk(int64_t min_size, bool check_limits) noexcept {
   DCHECK_LE(next_chunk_size_, MAX_CHUNK_SIZE);
   DCHECK_GE(next_chunk_size_, INITIAL_CHUNK_SIZE);
   chunk_size = max<int64_t>(min_size, next_chunk_size_);
+  if (enforce_binary_chunk_sizes_) chunk_size = BitUtil::RoundUpToPowerOfTwo(chunk_size);
   if (check_limits) {
     if (!mem_tracker_->TryConsume(chunk_size)) return false;
   } else {
@@ -186,8 +188,10 @@ void MemPool::AcquireData(MemPool* src, bool keep_current) {
 
   src->mem_tracker_->TransferTo(mem_tracker_, total_transfered_bytes);
 
-  // insert new chunks after current_chunk_idx_
-  vector<ChunkInfo>::iterator insert_chunk = chunks_.begin() + current_chunk_idx_ + 1;
+  // insert new chunks after current_chunk_idx_. We must calculate current_chunk_idx_ + 1
+  // before finding the offset from chunks_.begin() because current_chunk_idx_ can be -1
+  // and adding a negative number to chunks_.begin() is undefined behavior in C++.
+  vector<ChunkInfo>::iterator insert_chunk = chunks_.begin() + (current_chunk_idx_ + 1);
   chunks_.insert(insert_chunk, src->chunks_.begin(), end_chunk);
   src->chunks_.erase(src->chunks_.begin(), end_chunk);
   current_chunk_idx_ += num_acquired_chunks;

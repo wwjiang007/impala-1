@@ -25,10 +25,11 @@ import org.apache.impala.authorization.AuthorizationConfig;
 import org.apache.impala.authorization.PrivilegeRequest;
 import org.apache.impala.authorization.User;
 import org.apache.impala.catalog.AuthorizationException;
+import org.apache.impala.catalog.PrincipalPrivilege;
 import org.apache.impala.catalog.Role;
-import org.apache.impala.catalog.RolePrivilege;
 import org.apache.impala.catalog.ScalarFunction;
 import org.apache.impala.catalog.Type;
+import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FrontendTestBase;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.RuntimeEnv;
@@ -38,13 +39,15 @@ import org.apache.impala.thrift.TColumnValue;
 import org.apache.impala.thrift.TDescribeOutputStyle;
 import org.apache.impala.thrift.TDescribeResult;
 import org.apache.impala.thrift.TFunctionBinaryType;
+import org.apache.impala.thrift.TPrincipalType;
 import org.apache.impala.thrift.TPrivilege;
 import org.apache.impala.thrift.TPrivilegeLevel;
 import org.apache.impala.thrift.TPrivilegeScope;
+import org.apache.impala.thrift.TQueryOptions;
 import org.apache.impala.thrift.TResultRow;
 import org.apache.impala.thrift.TTableName;
 import org.apache.impala.util.SentryPolicyService;
-import org.apache.sentry.provider.db.service.thrift.TSentryRole;
+import org.apache.sentry.api.service.thrift.TSentryRole;
 import org.junit.AfterClass;
 import org.junit.Before;
 import org.junit.BeforeClass;
@@ -65,7 +68,7 @@ import static org.junit.Assert.fail;
  */
 public class AuthorizationStmtTest extends FrontendTestBase {
   private static final String SENTRY_SERVER = "server1";
-  private final static User USER = new User(System.getProperty("user.name"));
+  private static final User USER = new User(System.getProperty("user.name"));
   private final AnalysisContext analysisContext_;
   private final SentryPolicyService sentryService_;
   private final ImpaladTestCatalog authzCatalog_;
@@ -297,6 +300,45 @@ public class AuthorizationStmtTest extends FrontendTestBase {
     verifyPrivilegeReqs("drop view functional.alltypes_view", expectedAuthorizables);
     verifyPrivilegeReqs(createAnalysisCtx("functional"), "drop view alltypes_view",
         expectedAuthorizables);
+
+    // Update table.
+    expectedAuthorizables = Sets.newHashSet(
+        "functional_kudu.alltypes",
+        "functional_kudu.alltypes.id",
+        "functional_kudu.alltypes.int_col");
+    verifyPrivilegeReqs("update functional_kudu.alltypes set int_col = 1",
+        expectedAuthorizables);
+    verifyPrivilegeReqs(createAnalysisCtx("functional_kudu"),
+        "update alltypes set int_col = 1", expectedAuthorizables);
+
+    // Upsert table.
+    expectedAuthorizables = Sets.newHashSet("functional_kudu.alltypes");
+    verifyPrivilegeReqs("upsert into table functional_kudu.alltypes(id, int_col) " +
+        "values(1, 1)", expectedAuthorizables);
+    verifyPrivilegeReqs(createAnalysisCtx("functional_kudu"),
+        "upsert into table alltypes(id, int_col) values(1, 1)", expectedAuthorizables);
+
+    // Delete table.
+    expectedAuthorizables = Sets.newHashSet(
+        "functional_kudu.alltypes",
+        "functional_kudu.alltypes.id");
+    verifyPrivilegeReqs("delete from functional_kudu.alltypes", expectedAuthorizables);
+    verifyPrivilegeReqs(createAnalysisCtx("functional_kudu"), "delete from alltypes",
+        expectedAuthorizables);
+
+    // Alter table.
+    expectedAuthorizables = Sets.newHashSet("functional.alltypes");
+    verifyPrivilegeReqs("alter table functional.alltypes add columns(c1 int)",
+        expectedAuthorizables);
+    verifyPrivilegeReqs(createAnalysisCtx("functional"), "alter table alltypes " +
+        "add columns(c1 int)", expectedAuthorizables);
+
+    // Alter view.
+    expectedAuthorizables = Sets.newHashSet("functional.alltypes_view");
+    verifyPrivilegeReqs("alter view functional.alltypes_view as select 1",
+        expectedAuthorizables);
+    verifyPrivilegeReqs(createAnalysisCtx("functional"), "alter view alltypes_view as " +
+        "select 1", expectedAuthorizables);
   }
 
   @Test
@@ -306,57 +348,72 @@ public class AuthorizationStmtTest extends FrontendTestBase {
         authorize("select id from functional.alltypes"),
         // With clause with select.
         authorize("with t as (select id from functional.alltypes) select * from t")}) {
-      authzTest.ok(onServer(TPrivilegeLevel.ALL))
+      authzTest
           .ok(onServer(TPrivilegeLevel.ALL))
+          .ok(onServer(TPrivilegeLevel.OWNER))
           .ok(onServer(TPrivilegeLevel.SELECT))
           .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+          .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
           .ok(onDatabase("functional", TPrivilegeLevel.SELECT))
           .ok(onTable("functional", "alltypes", TPrivilegeLevel.ALL))
+          .ok(onTable("functional", "alltypes", TPrivilegeLevel.OWNER))
           .ok(onTable("functional", "alltypes", TPrivilegeLevel.SELECT))
           .ok(onColumn("functional", "alltypes", "id", TPrivilegeLevel.SELECT))
           .error(selectError("functional.alltypes"))
           .error(selectError("functional.alltypes"), onServer(allExcept(
-              TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
+              TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.SELECT)))
           .error(selectError("functional.alltypes"), onDatabase("functional",
-              allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
+              allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+              TPrivilegeLevel.SELECT)))
           .error(selectError("functional.alltypes"), onTable("functional",
-              "alltypes", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)));
+              "alltypes", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+              TPrivilegeLevel.SELECT)));
     }
 
 
     // Select without referencing a column.
     authorize("select 1 from functional.alltypes")
         .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
         .ok(onServer(TPrivilegeLevel.SELECT))
         .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
         .ok(onDatabase("functional", TPrivilegeLevel.SELECT))
         .ok(onTable("functional", "alltypes", TPrivilegeLevel.ALL))
+        .ok(onTable("functional", "alltypes", TPrivilegeLevel.OWNER))
         .ok(onTable("functional", "alltypes", TPrivilegeLevel.SELECT))
         .error(selectError("functional.alltypes"))
         .error(selectError("functional.alltypes"), onServer(allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.SELECT)))
         .error(selectError("functional.alltypes"), onDatabase("functional",
-            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)))
         .error(selectError("functional.alltypes"), onTable("functional", "alltypes",
-            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)));
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)));
 
 
     // Select a specific column on a view.
     // Column-level privileges on views are not currently supported.
     authorize("select id from functional.alltypes_view")
         .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
         .ok(onServer(TPrivilegeLevel.SELECT))
         .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
         .ok(onDatabase("functional", TPrivilegeLevel.SELECT))
         .ok(onTable("functional", "alltypes_view", TPrivilegeLevel.ALL))
+        .ok(onTable("functional", "alltypes_view", TPrivilegeLevel.OWNER))
         .ok(onTable("functional", "alltypes_view", TPrivilegeLevel.SELECT))
         .error(selectError("functional.alltypes_view"))
         .error(selectError("functional.alltypes_view"), onServer(allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.SELECT)))
         .error(selectError("functional.alltypes_view"), onDatabase("functional",
-            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)))
         .error(selectError("functional.alltypes_view"), onTable("functional",
-            "alltypes_view", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)));
+            "alltypes_view", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)));
 
     // Constant select.
     authorize("select 1").ok();
@@ -365,43 +422,77 @@ public class AuthorizationStmtTest extends FrontendTestBase {
     authorize("select a.id from functional.view_view a " +
         "join functional.alltypesagg b ON (a.id = b.id)")
         .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
         .ok(onServer(TPrivilegeLevel.SELECT))
         .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
         .ok(onDatabase("functional", TPrivilegeLevel.SELECT))
         .ok(onTable("functional", "view_view", TPrivilegeLevel.ALL),
             onTable("functional", "alltypesagg", TPrivilegeLevel.ALL))
+        .ok(onTable("functional", "view_view", TPrivilegeLevel.OWNER),
+            onTable("functional", "alltypesagg", TPrivilegeLevel.OWNER))
         .ok(onTable("functional", "view_view", TPrivilegeLevel.ALL),
+            onTable("functional", "alltypesagg", TPrivilegeLevel.SELECT))
+        .ok(onTable("functional", "view_view", TPrivilegeLevel.OWNER),
             onTable("functional", "alltypesagg", TPrivilegeLevel.SELECT))
         .ok(onTable("functional", "view_view", TPrivilegeLevel.SELECT),
             onTable("functional", "alltypesagg", TPrivilegeLevel.ALL))
+        .ok(onTable("functional", "view_view", TPrivilegeLevel.SELECT),
+            onTable("functional", "alltypesagg", TPrivilegeLevel.OWNER))
         .ok(onTable("functional", "view_view", TPrivilegeLevel.SELECT),
             onTable("functional", "alltypesagg", TPrivilegeLevel.SELECT))
         .error(selectError("functional.view_view"))
         .error(selectError("functional.view_view"), onServer(allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.SELECT)))
         .error(selectError("functional.view_view"), onDatabase("functional",
-            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)))
         .error(selectError("functional.view_view"), onTable("functional", "view_view",
-            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)), onTable("functional",
-            "alltypesagg", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)));
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)), onTable("functional", "alltypesagg",
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)));
 
     // Tests authorization after a statement has been rewritten (IMPALA-3915).
     authorize("select * from functional_seq_snap.subquery_view")
         .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
         .ok(onServer(TPrivilegeLevel.SELECT))
         .ok(onDatabase("functional_seq_snap", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional_seq_snap", TPrivilegeLevel.OWNER))
         .ok(onDatabase("functional_seq_snap", TPrivilegeLevel.SELECT))
         .ok(onTable("functional_seq_snap", "subquery_view", TPrivilegeLevel.ALL))
+        .ok(onTable("functional_seq_snap", "subquery_view", TPrivilegeLevel.OWNER))
         .ok(onTable("functional_seq_snap", "subquery_view", TPrivilegeLevel.SELECT))
         .error(selectError("functional_seq_snap.subquery_view"))
         .error(selectError("functional_seq_snap.subquery_view"), onServer(
-            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
-        .error(selectError("functional_seq_snap.subquery_view"),
-            onDatabase("functional_seq_snap", allExcept(TPrivilegeLevel.ALL,
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
             TPrivilegeLevel.SELECT)))
         .error(selectError("functional_seq_snap.subquery_view"),
+            onDatabase("functional_seq_snap", allExcept(TPrivilegeLevel.ALL,
+            TPrivilegeLevel.OWNER, TPrivilegeLevel.SELECT)))
+        .error(selectError("functional_seq_snap.subquery_view"),
             onTable("functional_seq_snap", "subquery_view", allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)));
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.SELECT)));
+
+    // Select a UDF.
+    ScalarFunction fn = addFunction("functional", "f");
+    try {
+      authorize("select functional.f()")
+          .ok(onServer(TPrivilegeLevel.ALL))
+          .ok(onServer(TPrivilegeLevel.OWNER))
+          .ok(onServer(viewMetadataPrivileges()))
+          .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+          .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
+          .ok(onDatabase("functional", viewMetadataPrivileges()))
+          .error(accessError("functional"))
+          .error(accessError("functional"), onServer(allExcept(
+              viewMetadataPrivileges())))
+          .error(accessError("functional"), onDatabase("functional", allExcept(
+              viewMetadataPrivileges())));
+    } finally {
+      removeFunction(fn);
+    }
 
     // Select from non-existent database.
     authorize("select 1 from nodb.alltypes")
@@ -414,75 +505,96 @@ public class AuthorizationStmtTest extends FrontendTestBase {
     // Select with inline view.
     authorize("select a.* from (select * from functional.alltypes) a")
         .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
         .ok(onServer(TPrivilegeLevel.SELECT))
         .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
         .ok(onDatabase("functional", TPrivilegeLevel.SELECT))
         .ok(onTable("functional", "alltypes", TPrivilegeLevel.ALL))
+        .ok(onTable("functional", "alltypes", TPrivilegeLevel.OWNER))
         .ok(onTable("functional", "alltypes", TPrivilegeLevel.SELECT))
         .ok(onColumn("functional", "alltypes", ALLTYPES_COLUMNS, TPrivilegeLevel.SELECT))
         .error(selectError("functional.alltypes"))
         .error(selectError("functional.alltypes"), onServer(allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.SELECT)))
         .error(selectError("functional.alltypes"), onDatabase("functional",
-            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)))
         .error(selectError("functional.alltypes"), onTable("functional", "alltypes",
-            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)));
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)));
 
     // Select with columns referenced in function, where clause and group by.
     authorize("select count(id), int_col from functional.alltypes where id = 10 " +
         "group by id, int_col")
         .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
         .ok(onServer(TPrivilegeLevel.SELECT))
         .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
         .ok(onDatabase("functional", TPrivilegeLevel.SELECT))
         .ok(onTable("functional", "alltypes", TPrivilegeLevel.ALL))
+        .ok(onTable("functional", "alltypes", TPrivilegeLevel.OWNER))
         .ok(onTable("functional", "alltypes", TPrivilegeLevel.SELECT))
         .ok(onColumn("functional", "alltypes", new String[]{"id", "int_col"},
             TPrivilegeLevel.SELECT))
         .error(selectError("functional.alltypes"))
         .error(selectError("functional.alltypes"), onServer(allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.SELECT)))
         .error(selectError("functional.alltypes"), onDatabase("functional",
-            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)))
         .error(selectError("functional.alltypes"), onTable("functional", "alltypes",
-            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)));
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)));
 
     // Select on tables with complex types.
     authorize("select a.int_struct_col.f1 from functional.allcomplextypes a " +
         "where a.id = 1")
         .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
         .ok(onServer(TPrivilegeLevel.SELECT))
         .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
         .ok(onDatabase("functional", TPrivilegeLevel.SELECT))
         .ok(onTable("functional", "allcomplextypes", TPrivilegeLevel.ALL))
+        .ok(onTable("functional", "allcomplextypes", TPrivilegeLevel.OWNER))
         .ok(onTable("functional", "allcomplextypes", TPrivilegeLevel.SELECT))
         .ok(onColumn("functional", "allcomplextypes",
             new String[]{"id", "int_struct_col"}, TPrivilegeLevel.SELECT))
         .error(selectError("functional.allcomplextypes"))
         .error(selectError("functional.allcomplextypes"), onServer(
-            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)))
         .error(selectError("functional.allcomplextypes"), onDatabase("functional",
-            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)))
         .error(selectError("functional.allcomplextypes"), onTable("functional",
-            "allcomplextypes", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)));
+            "allcomplextypes", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)));
 
     authorize("select key, pos, item.f1, f2 from functional.allcomplextypes t, " +
         "t.struct_array_col, functional.allcomplextypes.int_map_col")
         .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
         .ok(onServer(TPrivilegeLevel.SELECT))
         .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
         .ok(onDatabase("functional", TPrivilegeLevel.SELECT))
         .ok(onTable("functional", "allcomplextypes", TPrivilegeLevel.ALL))
+        .ok(onTable("functional", "allcomplextypes", TPrivilegeLevel.OWNER))
         .ok(onTable("functional", "allcomplextypes", TPrivilegeLevel.SELECT))
         .ok(onColumn("functional", "allcomplextypes",
             new String[]{"struct_array_col", "int_map_col"}, TPrivilegeLevel.SELECT))
         .error(selectError("functional.allcomplextypes"))
         .error(selectError("functional.allcomplextypes"), onServer(allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.SELECT)))
         .error(selectError("functional.allcomplextypes"), onDatabase("functional",
-            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)))
         .error(selectError("functional.allcomplextypes"), onTable("functional",
-            "allcomplextypes", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)));
+            "allcomplextypes", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)));
 
     for (AuthzTest authzTest: new AuthzTest[]{
         // Select with cross join.
@@ -492,14 +604,22 @@ public class AuthorizationStmtTest extends FrontendTestBase {
         authorize("select * from functional.alltypes a cross join " +
             "functional.alltypessmall b")}) {
       authzTest.ok(onServer(TPrivilegeLevel.ALL))
+          .ok(onServer(TPrivilegeLevel.OWNER))
           .ok(onServer(TPrivilegeLevel.SELECT))
           .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+          .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
           .ok(onDatabase("functional", TPrivilegeLevel.SELECT))
           .ok(onTable("functional", "alltypes", TPrivilegeLevel.ALL),
               onTable("functional", "alltypessmall", TPrivilegeLevel.ALL))
+          .ok(onTable("functional", "alltypes", TPrivilegeLevel.OWNER),
+              onTable("functional", "alltypessmall", TPrivilegeLevel.OWNER))
           .ok(onTable("functional", "alltypes", TPrivilegeLevel.SELECT),
               onTable("functional", "alltypessmall", TPrivilegeLevel.ALL))
+          .ok(onTable("functional", "alltypes", TPrivilegeLevel.SELECT),
+              onTable("functional", "alltypessmall", TPrivilegeLevel.OWNER))
           .ok(onTable("functional", "alltypes", TPrivilegeLevel.ALL),
+              onTable("functional", "alltypessmall", TPrivilegeLevel.SELECT))
+          .ok(onTable("functional", "alltypes", TPrivilegeLevel.OWNER),
               onTable("functional", "alltypessmall", TPrivilegeLevel.SELECT))
           .ok(onTable("functional", "alltypes", TPrivilegeLevel.SELECT),
               onTable("functional", "alltypessmall", TPrivilegeLevel.SELECT))
@@ -508,12 +628,15 @@ public class AuthorizationStmtTest extends FrontendTestBase {
               ALLTYPES_COLUMNS, TPrivilegeLevel.SELECT))
           .error(selectError("functional.alltypes"))
           .error(selectError("functional.alltypes"), onServer(
-              allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
+              allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+              TPrivilegeLevel.SELECT)))
           .error(selectError("functional.alltypes"), onDatabase("functional",
-              allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
+              allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+              TPrivilegeLevel.SELECT)))
           .error(selectError("functional.alltypes"), onTable("functional", "alltypes",
-              allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)),
-              onTable("functional", "alltypessmall", allExcept(TPrivilegeLevel.ALL,
+              allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+              TPrivilegeLevel.SELECT)), onTable("functional", "alltypessmall",
+              allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
               TPrivilegeLevel.SELECT)))
           .error(selectError("functional.alltypessmall"), onColumn("functional",
               "alltypes", ALLTYPES_COLUMNS, TPrivilegeLevel.SELECT))
@@ -526,23 +649,30 @@ public class AuthorizationStmtTest extends FrontendTestBase {
     authorize("select id from functional.alltypes_view union all " +
         "select x from functional.alltypes_view_sub")
         .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
         .ok(onServer(TPrivilegeLevel.SELECT))
         .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
         .ok(onDatabase("functional", TPrivilegeLevel.SELECT))
         .ok(onTable("functional", "alltypes_view", TPrivilegeLevel.ALL),
             onTable("functional", "alltypes_view_sub", TPrivilegeLevel.ALL))
+        .ok(onTable("functional", "alltypes_view", TPrivilegeLevel.OWNER),
+            onTable("functional", "alltypes_view_sub", TPrivilegeLevel.OWNER))
         .ok(onTable("functional", "alltypes_view", TPrivilegeLevel.SELECT),
             onTable("functional", "alltypes_view_sub", TPrivilegeLevel.SELECT))
         .error(selectError("functional.alltypes_view"))
         .error(selectError("functional.alltypes_view"), onServer(allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.SELECT)))
         .error(selectError("functional.alltypes_view"), onDatabase("functional",
-            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)))
         .error(selectError("functional.alltypes_view"), onTable("functional",
-            "alltypes_view", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)),
+            "alltypes_view", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)),
             onTable("functional", "alltypes_view_sub", TPrivilegeLevel.SELECT))
         .error(selectError("functional.alltypes_view_sub"), onTable("functional",
-            "alltypes_view_sub", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)),
+            "alltypes_view_sub", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)),
             onTable("functional", "alltypes_view", TPrivilegeLevel.SELECT));
 
     // Union from non-existent databases.
@@ -557,20 +687,29 @@ public class AuthorizationStmtTest extends FrontendTestBase {
   @Test
   public void testInsert() throws ImpalaException {
     // Basic insert into a table.
-    authorize("insert into functional.zipcode_incomes(id) values('123')")
-        .ok(onServer(TPrivilegeLevel.ALL))
-        .ok(onServer(TPrivilegeLevel.INSERT))
-        .ok(onDatabase("functional", TPrivilegeLevel.ALL))
-        .ok(onDatabase("functional", TPrivilegeLevel.INSERT))
-        .ok(onTable("functional", "zipcode_incomes", TPrivilegeLevel.ALL))
-        .ok(onTable("functional", "zipcode_incomes", TPrivilegeLevel.INSERT))
-        .error(insertError("functional.zipcode_incomes"))
-        .error(insertError("functional.zipcode_incomes"), onServer(allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.INSERT)))
-        .error(insertError("functional.zipcode_incomes"), onDatabase("functional",
-            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.INSERT)))
-        .error(insertError("functional.zipcode_incomes"), onTable("functional",
-            "zipcode_incomes", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.INSERT)));
+    for (AuthzTest test: new AuthzTest[]{
+        authorize("insert into functional.zipcode_incomes(id) values('123')"),
+        // Explain insert.
+        authorize("explain insert into functional.zipcode_incomes(id) values('123')")}) {
+      test.ok(onServer(TPrivilegeLevel.ALL))
+          .ok(onServer(TPrivilegeLevel.OWNER))
+          .ok(onServer(TPrivilegeLevel.INSERT))
+          .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+          .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
+          .ok(onDatabase("functional", TPrivilegeLevel.INSERT))
+          .ok(onTable("functional", "zipcode_incomes", TPrivilegeLevel.ALL))
+          .ok(onTable("functional", "zipcode_incomes", TPrivilegeLevel.OWNER))
+          .ok(onTable("functional", "zipcode_incomes", TPrivilegeLevel.INSERT))
+          .error(insertError("functional.zipcode_incomes"))
+          .error(insertError("functional.zipcode_incomes"), onServer(allExcept(
+              TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.INSERT)))
+          .error(insertError("functional.zipcode_incomes"), onDatabase("functional",
+              allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+              TPrivilegeLevel.INSERT)))
+          .error(insertError("functional.zipcode_incomes"), onTable("functional",
+              "zipcode_incomes", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+              TPrivilegeLevel.INSERT)));
+    }
 
     for (AuthzTest test: new AuthzTest[]{
         // With clause with insert.
@@ -581,11 +720,15 @@ public class AuthorizationStmtTest extends FrontendTestBase {
         authorize("insert into functional.alltypes partition(month, year) " +
             "select * from functional.alltypestiny where id < 100")}) {
       test.ok(onServer(TPrivilegeLevel.ALL))
+          .ok(onServer(TPrivilegeLevel.OWNER))
           .ok(onServer(TPrivilegeLevel.INSERT, TPrivilegeLevel.SELECT))
           .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+          .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
           .ok(onDatabase("functional", TPrivilegeLevel.INSERT, TPrivilegeLevel.SELECT))
           .ok(onTable("functional", "alltypes", TPrivilegeLevel.ALL),
               onTable("functional", "alltypestiny", TPrivilegeLevel.ALL))
+          .ok(onTable("functional", "alltypes", TPrivilegeLevel.OWNER),
+              onTable("functional", "alltypestiny", TPrivilegeLevel.OWNER))
           .ok(onTable("functional", "alltypes", TPrivilegeLevel.INSERT),
               onTable("functional", "alltypestiny", TPrivilegeLevel.SELECT))
           .ok(onTable("functional", "alltypes", TPrivilegeLevel.INSERT),
@@ -593,16 +736,19 @@ public class AuthorizationStmtTest extends FrontendTestBase {
               TPrivilegeLevel.SELECT))
           .error(selectError("functional.alltypestiny"))
           .error(selectError("functional.alltypestiny"), onServer(allExcept(
-              TPrivilegeLevel.ALL, TPrivilegeLevel.INSERT, TPrivilegeLevel.SELECT)))
-          .error(selectError("functional.alltypestiny"), onDatabase("functional",
-              allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.INSERT,
+              TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.INSERT,
               TPrivilegeLevel.SELECT)))
+          .error(selectError("functional.alltypestiny"), onDatabase("functional",
+              allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+              TPrivilegeLevel.INSERT, TPrivilegeLevel.SELECT)))
           .error(insertError("functional.alltypes"), onTable("functional",
               "alltypestiny", TPrivilegeLevel.SELECT), onTable("functional",
-              "alltypes", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.INSERT)))
+              "alltypes", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+              TPrivilegeLevel.INSERT)))
           .error(selectError("functional.alltypestiny"), onTable("functional",
-              "alltypestiny", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)),
-              onTable("functional", "alltypes", TPrivilegeLevel.INSERT));
+              "alltypestiny", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+              TPrivilegeLevel.SELECT)), onTable("functional", "alltypes",
+              TPrivilegeLevel.INSERT));
     }
 
     // Insert with select on a target view.
@@ -610,24 +756,31 @@ public class AuthorizationStmtTest extends FrontendTestBase {
     authorize("insert into functional.alltypes partition(month, year) " +
         "select * from functional.alltypes_view where id < 100")
         .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
         .ok(onServer(TPrivilegeLevel.INSERT, TPrivilegeLevel.SELECT))
         .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
         .ok(onDatabase("functional", TPrivilegeLevel.INSERT, TPrivilegeLevel.SELECT))
         .ok(onTable("functional", "alltypes", TPrivilegeLevel.ALL),
             onTable("functional", "alltypes_view", TPrivilegeLevel.ALL))
+        .ok(onTable("functional", "alltypes", TPrivilegeLevel.OWNER),
+            onTable("functional", "alltypes_view", TPrivilegeLevel.OWNER))
         .ok(onTable("functional", "alltypes", TPrivilegeLevel.INSERT),
             onTable("functional", "alltypes_view", TPrivilegeLevel.SELECT))
         .error(selectError("functional.alltypes_view"))
         .error(selectError("functional.alltypes_view"), onServer(allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.INSERT, TPrivilegeLevel.SELECT)))
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.INSERT,
+            TPrivilegeLevel.SELECT)))
         .error(selectError("functional.alltypes_view"), onDatabase("functional",
-            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.INSERT,
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.INSERT,
             TPrivilegeLevel.SELECT)))
         .error(insertError("functional.alltypes"), onTable("functional",
             "alltypes_view", TPrivilegeLevel.SELECT), onTable("functional",
-            "alltypes", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.INSERT)))
+            "alltypes", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.INSERT)))
         .error(selectError("functional.alltypes_view"), onTable("functional",
-            "alltypes_view", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)),
+            "alltypes_view", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)),
             onTable("functional", "alltypes", TPrivilegeLevel.INSERT));
 
     // Insert with inline view.
@@ -635,31 +788,41 @@ public class AuthorizationStmtTest extends FrontendTestBase {
         "select b.* from functional.alltypesagg a join (select * from " +
         "functional.alltypestiny) b on (a.int_col = b.int_col)")
         .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
         .ok(onServer(TPrivilegeLevel.INSERT, TPrivilegeLevel.SELECT))
         .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
         .ok(onDatabase("functional", TPrivilegeLevel.INSERT, TPrivilegeLevel.SELECT))
         .ok(onTable("functional", "alltypes", TPrivilegeLevel.ALL),
             onTable("functional", "alltypesagg", TPrivilegeLevel.ALL),
             onTable("functional", "alltypestiny", TPrivilegeLevel.ALL))
+        .ok(onTable("functional", "alltypes", TPrivilegeLevel.OWNER),
+            onTable("functional", "alltypesagg", TPrivilegeLevel.OWNER),
+            onTable("functional", "alltypestiny", TPrivilegeLevel.OWNER))
         .ok(onTable("functional", "alltypes", TPrivilegeLevel.INSERT),
             onTable("functional", "alltypesagg", TPrivilegeLevel.SELECT),
             onTable("functional", "alltypestiny", TPrivilegeLevel.SELECT))
         .error(selectError("functional.alltypesagg"))
         .error(selectError("functional.alltypesagg"), onServer(allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.INSERT, TPrivilegeLevel.SELECT)))
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.INSERT,
+            TPrivilegeLevel.SELECT)))
         .error(selectError("functional.alltypesagg"), onDatabase("functional", allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.INSERT, TPrivilegeLevel.SELECT)))
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.INSERT,
+            TPrivilegeLevel.SELECT)))
         .error(insertError("functional.alltypes"), onTable("functional",
             "alltypesagg", TPrivilegeLevel.SELECT), onTable("functional",
             "alltypestiny", TPrivilegeLevel.SELECT), onTable("functional",
-            "alltypes", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.INSERT)))
+            "alltypes", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.INSERT)))
         .error(selectError("functional.alltypesagg"), onTable("functional",
-            "alltypesagg", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)),
+            "alltypesagg", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)),
             onTable("functional", "alltypestiny", TPrivilegeLevel.SELECT),
             onTable("functional", "alltypes", TPrivilegeLevel.INSERT))
         .error(selectError("functional.alltypestiny"), onTable("functional",
             "alltypesagg", TPrivilegeLevel.SELECT), onTable("functional",
-            "alltypestiny", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)),
+            "alltypestiny", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)),
             onTable("functional", "alltypes", TPrivilegeLevel.INSERT));
 
     // Inserting into a view is not allowed.
@@ -701,18 +864,22 @@ public class AuthorizationStmtTest extends FrontendTestBase {
     // Truncate a table.
     authorize("truncate table functional.alltypes")
         .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
         .ok(onServer(TPrivilegeLevel.INSERT))
         .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
         .ok(onDatabase("functional", TPrivilegeLevel.INSERT))
         .ok(onTable("functional", "alltypes", TPrivilegeLevel.ALL))
+        .ok(onTable("functional", "alltypes", TPrivilegeLevel.OWNER))
         .ok(onTable("functional", "alltypes", TPrivilegeLevel.INSERT))
         .error(insertError("functional.alltypes"))
         .error(insertError("functional.alltypes"), onServer(allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.INSERT)))
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.INSERT)))
         .error(insertError("functional.alltypes"), onDatabase("functional", allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.INSERT)))
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.INSERT)))
         .error(insertError("functional.alltypes"), onTable("functional", "alltypes",
-            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.INSERT)));
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.INSERT)));
 
     // Truncate a non-existent database.
     authorize("truncate table nodb.alltypes")
@@ -733,18 +900,31 @@ public class AuthorizationStmtTest extends FrontendTestBase {
     authorize("load data inpath 'hdfs://localhost:20500/test-warehouse/tpch.lineitem' " +
         "into table functional.alltypes partition(month=10, year=2009)")
       .ok(onServer(TPrivilegeLevel.ALL))
+      .ok(onServer(TPrivilegeLevel.OWNER))
       .ok(onDatabase("functional", TPrivilegeLevel.ALL),
+          onUri("hdfs://localhost:20500/test-warehouse/tpch.lineitem",
+          TPrivilegeLevel.ALL))
+      .ok(onDatabase("functional", TPrivilegeLevel.OWNER),
+          onUri("hdfs://localhost:20500/test-warehouse/tpch.lineitem",
+          TPrivilegeLevel.OWNER))
+      .ok(onDatabase("functional", TPrivilegeLevel.INSERT),
           onUri("hdfs://localhost:20500/test-warehouse/tpch.lineitem",
           TPrivilegeLevel.ALL))
       .ok(onDatabase("functional", TPrivilegeLevel.INSERT),
           onUri("hdfs://localhost:20500/test-warehouse/tpch.lineitem",
-          TPrivilegeLevel.ALL))
+          TPrivilegeLevel.OWNER))
       .ok(onTable("functional", "alltypes", TPrivilegeLevel.ALL),
+          onUri("hdfs://localhost:20500/test-warehouse/tpch.lineitem",
+          TPrivilegeLevel.ALL))
+      .ok(onTable("functional", "alltypes", TPrivilegeLevel.OWNER),
+          onUri("hdfs://localhost:20500/test-warehouse/tpch.lineitem",
+          TPrivilegeLevel.OWNER))
+      .ok(onTable("functional", "alltypes", TPrivilegeLevel.INSERT),
           onUri("hdfs://localhost:20500/test-warehouse/tpch.lineitem",
           TPrivilegeLevel.ALL))
       .ok(onTable("functional", "alltypes", TPrivilegeLevel.INSERT),
           onUri("hdfs://localhost:20500/test-warehouse/tpch.lineitem",
-          TPrivilegeLevel.ALL))
+          TPrivilegeLevel.OWNER))
       .error(insertError("functional.alltypes"))
       .error(accessError("hdfs://localhost:20500/test-warehouse/tpch.lineitem"),
           onDatabase("functional", TPrivilegeLevel.INSERT))
@@ -752,7 +932,10 @@ public class AuthorizationStmtTest extends FrontendTestBase {
           onTable("functional", "alltypes", TPrivilegeLevel.INSERT))
       .error(insertError("functional.alltypes"),
           onUri("hdfs://localhost:20500/test-warehouse/tpch.lineitem",
-          TPrivilegeLevel.ALL));
+          TPrivilegeLevel.ALL))
+      .error(insertError("functional.alltypes"),
+          onUri("hdfs://localhost:20500/test-warehouse/tpch.lineitem",
+          TPrivilegeLevel.OWNER));
 
     // Load from non-existent URI.
     authorize("load data inpath 'hdfs://localhost:20500/test-warehouse/nouri' " +
@@ -768,14 +951,18 @@ public class AuthorizationStmtTest extends FrontendTestBase {
         "into table nodb.alltypes partition(month=10, year=2009)")
         .error(insertError("nodb.alltypes"))
         .error(insertError("nodb.alltypes"), onUri(
-            "hdfs://localhost:20500/test-warehouse/tpch.nouri", TPrivilegeLevel.ALL));
+            "hdfs://localhost:20500/test-warehouse/tpch.nouri", TPrivilegeLevel.ALL))
+        .error(insertError("nodb.alltypes"), onUri(
+            "hdfs://localhost:20500/test-warehouse/tpch.nouri", TPrivilegeLevel.OWNER));
 
     // Load into non-existent table.
     authorize("load data inpath 'hdfs://localhost:20500/test-warehouse/tpch.lineitem' " +
         "into table functional.notbl partition(month=10, year=2009)")
         .error(insertError("functional.notbl"))
         .error(insertError("functional.notbl"), onUri(
-            "hdfs://localhost:20500/test-warehouse/tpch.nouri", TPrivilegeLevel.ALL));
+            "hdfs://localhost:20500/test-warehouse/tpch.nouri", TPrivilegeLevel.ALL))
+        .error(insertError("functional.notbl"), onUri(
+            "hdfs://localhost:20500/test-warehouse/tpch.nouri", TPrivilegeLevel.OWNER));
 
     // Load into a view is not supported.
     authorize("load data inpath 'hdfs://localhost:20500/test-warehouse/tpch.lineitem' " +
@@ -788,6 +975,7 @@ public class AuthorizationStmtTest extends FrontendTestBase {
     // Invalidate metadata on server.
     authorize("invalidate metadata")
         .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
         .ok(onServer(TPrivilegeLevel.REFRESH))
         .error(refreshError("server"));
 
@@ -797,28 +985,33 @@ public class AuthorizationStmtTest extends FrontendTestBase {
           authorize("invalidate metadata functional." + name),
           authorize("refresh functional." + name)}) {
         test.ok(onServer(TPrivilegeLevel.ALL))
+            .ok(onServer(TPrivilegeLevel.OWNER))
             .ok(onServer(TPrivilegeLevel.REFRESH))
             .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+            .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
             .ok(onDatabase("functional", TPrivilegeLevel.REFRESH))
             .ok(onTable("functional", name, TPrivilegeLevel.ALL))
+            .ok(onTable("functional", name, TPrivilegeLevel.OWNER))
             .ok(onTable("functional", name, TPrivilegeLevel.REFRESH))
             .error(refreshError("functional." + name))
             .error(refreshError("functional." + name), onDatabase("functional", allExcept(
-                TPrivilegeLevel.ALL, TPrivilegeLevel.REFRESH)))
+                TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.REFRESH)))
             .error(refreshError("functional." + name), onTable("functional", name,
-                allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.REFRESH)));
+                allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+                TPrivilegeLevel.REFRESH)));
       }
     }
 
     authorize("refresh functions functional")
         .ok(onServer(TPrivilegeLevel.REFRESH))
         .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
         .ok(onDatabase("functional", TPrivilegeLevel.REFRESH))
         .error(refreshError("functional"))
         .error(refreshError("functional"), onServer(allExcept(TPrivilegeLevel.ALL,
-            TPrivilegeLevel.REFRESH)))
+            TPrivilegeLevel.OWNER, TPrivilegeLevel.REFRESH)))
         .error(refreshError("functional"), onDatabase("functional", allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.REFRESH)));
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.REFRESH)));
 
     // Reset metadata in non-existent database.
     authorize("invalidate metadata nodb").error(refreshError("default.nodb"));
@@ -899,10 +1092,23 @@ public class AuthorizationStmtTest extends FrontendTestBase {
     authorize("show roles").ok();
 
     // Show role grant group should always be allowed.
-    authorize(String.format("show role grant group %s", USER.getName())).ok();
+    authorize(String.format("show role grant group `%s`", USER.getName())).ok();
 
-    // Show grant role should always be allowed.
-    authorize(String.format("show grant role authz_test_role")).ok();
+    // Show grant role/user should always be allowed.
+    try {
+      authzCatalog_.addRole("test_role");
+      authzCatalog_.addUser("test_user");
+      for (String type : new String[]{"role test_role", "user test_user"}) {
+        authorize(String.format("show grant %s", type)).ok();
+        authorize(String.format("show grant %s on server", type)).ok();
+        authorize(String.format("show grant %s on database functional", type)).ok();
+        authorize(String.format("show grant %s on table functional.alltypes", type)).ok();
+        authorize(String.format("show grant %s on uri '/test-warehouse'", type)).ok();
+      }
+    } finally {
+      authzCatalog_.removeRole("test_role");
+      authzCatalog_.removeUser("test_user");
+    }
 
     // Show create table.
     test = authorize("show create table functional.alltypes");
@@ -931,6 +1137,30 @@ public class AuthorizationStmtTest extends FrontendTestBase {
     authorize("show create view nodb.alltypes").error(accessError("nodb.alltypes"));
     // Show create view on non-existent table.
     authorize("show create view functional.notbl").error(accessError("functional.notbl"));
+
+    // IMPALA-7325: show create view that references built-in function(s) should not
+    // require access to the _impala_builtins database this is because reading metadata
+    // in system database should always be allowed.
+    addTestView(authzCatalog_, "create view functional.test_view as " +
+        "select count(*) from functional.alltypes");
+    test = authorize("show create view functional.test_view");
+    for (TPrivilegeLevel privilege: viewMetadataPrivileges()) {
+      test.ok(onServer(privilege, TPrivilegeLevel.SELECT))
+          .ok(onDatabase("functional", privilege, TPrivilegeLevel.SELECT))
+          .ok(onTable("functional", "test_view", privilege),
+              onTable("functional", "alltypes", privilege, TPrivilegeLevel.SELECT));
+    }
+    test.error(accessError("functional.test_view"))
+        .error(accessError("functional.test_view"), onServer(
+            allExcept(viewMetadataPrivileges())))
+        .error(accessError("functional.test_view"), onDatabase("functional",
+            allExcept(viewMetadataPrivileges())))
+        .error(accessError("functional.test_view"), onTable("functional", "test_view",
+            allExcept(viewMetadataPrivileges())), onTable("functional", "alltypes",
+                TPrivilegeLevel.SELECT))
+        .error(viewDefError("functional.test_view"), onTable("functional", "test_view",
+            TPrivilegeLevel.SELECT), onTable("functional", "alltypes", allExcept(
+                viewMetadataPrivileges())));
 
     // Show create function.
     ScalarFunction fn = addFunction("functional", "f");
@@ -980,53 +1210,57 @@ public class AuthorizationStmtTest extends FrontendTestBase {
     TTableName tableName = new TTableName("functional", "alltypes");
     TDescribeOutputStyle style = TDescribeOutputStyle.MINIMAL;
     authzTest = authorize("describe functional.alltypes");
-    for (TPrivilegeLevel privilege: new TPrivilegeLevel[]{
-        TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT}) {
-      authzTest.okDescribe(tableName, style, ALLTYPES_COLUMNS, null, onServer(privilege))
-          .okDescribe(tableName, style, ALLTYPES_COLUMNS, null, onDatabase("functional",
-              privilege))
-          .okDescribe(tableName, style, ALLTYPES_COLUMNS, null, onTable("functional",
-              "alltypes", privilege));
+    for (TPrivilegeLevel privilege: viewMetadataPrivileges()) {
+      authzTest
+          .okDescribe(tableName, describeOutput(style).includeStrings(ALLTYPES_COLUMNS),
+              onServer(privilege))
+          .okDescribe(tableName, describeOutput(style).includeStrings(ALLTYPES_COLUMNS),
+              onDatabase("functional", privilege))
+          .okDescribe(tableName, describeOutput(style).includeStrings(ALLTYPES_COLUMNS),
+              onTable("functional", "alltypes", privilege));
     }
-    authzTest.okDescribe(tableName, style, null, ALLTYPES_COLUMNS, onServer(allExcept(
-        TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
-        .okDescribe(tableName, style, null, ALLTYPES_COLUMNS, onDatabase("functional",
-            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
-        .okDescribe(tableName, style, null, ALLTYPES_COLUMNS, onTable("functional",
-            "alltypes", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
+    authzTest
+        .okDescribe(tableName, describeOutput(style).excludeStrings(ALLTYPES_COLUMNS),
+            onServer(allExcept(viewMetadataPrivileges())))
+        .okDescribe(tableName, describeOutput(style).excludeStrings(ALLTYPES_COLUMNS),
+            onDatabase("functional",allExcept(viewMetadataPrivileges())))
+        .okDescribe(tableName, describeOutput(style).excludeStrings(ALLTYPES_COLUMNS),
+            onTable("functional", "alltypes", allExcept(viewMetadataPrivileges())))
         // In this test, since we only have column level privileges on "id", then
         // only the "id" column should show and the others should not.
-        .okDescribe(tableName, style, new String[]{"id"}, ALLTYPES_COLUMNS_WITHOUT_ID,
-            onColumn("functional", "alltypes", "id", TPrivilegeLevel.SELECT))
+        .okDescribe(tableName, describeOutput(style).includeStrings(new String[]{"id"})
+            .excludeStrings(ALLTYPES_COLUMNS_WITHOUT_ID), onColumn("functional",
+            "alltypes", "id", TPrivilegeLevel.SELECT))
         .error(accessError("functional.alltypes"));
 
     // Describe table extended.
     tableName = new TTableName("functional", "alltypes");
     style = TDescribeOutputStyle.EXTENDED;
-    String[] locationString = new String[]{"Location:"};
     String[] checkStrings = (String[]) ArrayUtils.addAll(ALLTYPES_COLUMNS,
-        locationString);
+        new String[]{"Location:"});
     authzTest = authorize("describe functional.alltypes");
-    for (TPrivilegeLevel privilege: new TPrivilegeLevel[]{
-        TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT}) {
-      authzTest.okDescribe(tableName, style, checkStrings, null, onServer(privilege))
-          .okDescribe(tableName, style, checkStrings, null, onDatabase("functional",
-              privilege))
-          .okDescribe(tableName, style, checkStrings, null, onTable("functional",
-              "alltypes", privilege));
+    for (TPrivilegeLevel privilege: viewMetadataPrivileges()) {
+      authzTest
+          .okDescribe(tableName, describeOutput(style).includeStrings(checkStrings),
+              onServer(privilege))
+          .okDescribe(tableName, describeOutput(style).includeStrings(checkStrings),
+              onDatabase("functional", privilege))
+          .okDescribe(tableName, describeOutput(style).includeStrings(checkStrings),
+              onTable("functional", "alltypes", privilege));
     }
-    authzTest.okDescribe(tableName, style, locationString, ALLTYPES_COLUMNS,
-        onServer(allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
-        .okDescribe(tableName, style, locationString, ALLTYPES_COLUMNS,
-            onDatabase("functional", allExcept(TPrivilegeLevel.ALL,
-            TPrivilegeLevel.SELECT)))
-        .okDescribe(tableName, style, locationString, ALLTYPES_COLUMNS,
-            onTable("functional", "alltypes", allExcept(TPrivilegeLevel.ALL,
-            TPrivilegeLevel.SELECT)))
+    // Describe table without VIEW_METADATA privilege should not show all columns and
+    // location.
+    authzTest
+        .okDescribe(tableName, describeOutput(style).excludeStrings(ALLTYPES_COLUMNS),
+            onServer(allExcept(viewMetadataPrivileges())))
+        .okDescribe(tableName, describeOutput(style).excludeStrings(ALLTYPES_COLUMNS),
+            onDatabase("functional", allExcept(viewMetadataPrivileges())))
+        .okDescribe(tableName, describeOutput(style).excludeStrings(ALLTYPES_COLUMNS),
+            onTable("functional", "alltypes", allExcept(viewMetadataPrivileges())))
         // Location should not appear with only column level auth.
-        .okDescribe(tableName, style, new String[]{"id"},
-            (String[]) ArrayUtils.addAll(ALLTYPES_COLUMNS_WITHOUT_ID,
-            new String[]{"Location:"}), onColumn("functional", "alltypes", "id",
+        .okDescribe(tableName, describeOutput(style).includeStrings(new String[]{"id"})
+            .excludeStrings((String[]) ArrayUtils.addAll(ALLTYPES_COLUMNS_WITHOUT_ID,
+            new String[]{"Location:"})), onColumn("functional", "alltypes", "id",
             TPrivilegeLevel.SELECT))
         .error(accessError("functional.alltypes"));
 
@@ -1034,20 +1268,20 @@ public class AuthorizationStmtTest extends FrontendTestBase {
     tableName = new TTableName("functional", "alltypes_view");
     style = TDescribeOutputStyle.MINIMAL;
     authzTest = authorize("describe functional.alltypes_view");
-    for (TPrivilegeLevel privilege: new TPrivilegeLevel[]{
-        TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT}) {
-      authzTest.okDescribe(tableName, style, ALLTYPES_COLUMNS, null, onServer(privilege))
-          .okDescribe(tableName, style, ALLTYPES_COLUMNS, null, onDatabase("functional",
-              privilege))
-          .okDescribe(tableName, style, ALLTYPES_COLUMNS, null, onTable("functional",
-              "alltypes_view", privilege));
+    for (TPrivilegeLevel privilege: viewMetadataPrivileges()) {
+      authzTest
+          .okDescribe(tableName, describeOutput(style).includeStrings(ALLTYPES_COLUMNS),
+              onServer(privilege))
+          .okDescribe(tableName, describeOutput(style).includeStrings(ALLTYPES_COLUMNS),
+              onDatabase("functional", privilege))
+          .okDescribe(tableName, describeOutput(style).includeStrings(ALLTYPES_COLUMNS),
+              onTable("functional", "alltypes_view", privilege));
     }
-    authzTest.okDescribe(tableName, style, null, ALLTYPES_COLUMNS, onServer(allExcept(
-        TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
-        .okDescribe(tableName, style, null, ALLTYPES_COLUMNS, onDatabase("functional",
-            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
-        .okDescribe(tableName, style, null, ALLTYPES_COLUMNS, onTable("functional",
-            "alltypes_view", TPrivilegeLevel.INSERT))
+    authzTest
+        .okDescribe(tableName, describeOutput(style).excludeStrings(ALLTYPES_COLUMNS),
+            onServer(allExcept(viewMetadataPrivileges())))
+        .okDescribe(tableName, describeOutput(style).excludeStrings(ALLTYPES_COLUMNS),
+            onDatabase("functional",allExcept(viewMetadataPrivileges())))
         .error(accessError("functional.alltypes_view"));
 
     // Describe view extended.
@@ -1057,20 +1291,20 @@ public class AuthorizationStmtTest extends FrontendTestBase {
     String[] viewStrings = new String[]{"View Original Text:", "View Expanded Text:"};
     checkStrings = (String[]) ArrayUtils.addAll(ALLTYPES_COLUMNS, viewStrings);
     authzTest = authorize("describe functional.alltypes_view");
-    for (TPrivilegeLevel privilege: new TPrivilegeLevel[]{
-        TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT}) {
-      authzTest.okDescribe(tableName, style, checkStrings, null, onServer(privilege))
-          .okDescribe(tableName, style, checkStrings, null, onDatabase("functional",
-              privilege))
-          .okDescribe(tableName, style, checkStrings, null, onTable("functional",
-              "alltypes_view", privilege));
+    for (TPrivilegeLevel privilege: viewMetadataPrivileges()) {
+      authzTest
+          .okDescribe(tableName, describeOutput(style).includeStrings(checkStrings),
+              onServer(privilege))
+          .okDescribe(tableName, describeOutput(style).includeStrings(checkStrings),
+              onDatabase("functional", privilege))
+          .okDescribe(tableName, describeOutput(style).includeStrings(checkStrings),
+              onTable("functional", "alltypes_view", privilege));
     }
-    authzTest.okDescribe(tableName, style, null, ALLTYPES_COLUMNS, onServer(allExcept(
-        TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
-        .okDescribe(tableName, style, null, ALLTYPES_COLUMNS, onDatabase("functional",
-            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
-        .okDescribe(tableName, style, viewStrings, ALLTYPES_COLUMNS, onTable("functional",
-            "alltypes_view", TPrivilegeLevel.INSERT))
+    authzTest
+        .okDescribe(tableName, describeOutput(style).excludeStrings(ALLTYPES_COLUMNS),
+            onServer(allExcept(viewMetadataPrivileges())))
+        .okDescribe(tableName, describeOutput(style).excludeStrings(ALLTYPES_COLUMNS),
+            onDatabase("functional",allExcept(viewMetadataPrivileges())))
         .error(accessError("functional.alltypes_view"));
 
     // Describe specific column on a table.
@@ -1098,38 +1332,84 @@ public class AuthorizationStmtTest extends FrontendTestBase {
 
   @Test
   public void testStats() throws ImpalaException {
-    for (String statsType: new String[]{"compute", "drop"}) {
-      authorize(String.format("%s stats functional.alltypes", statsType))
-          .ok(onServer(TPrivilegeLevel.ALL))
-          .ok(onServer(TPrivilegeLevel.ALTER))
-          .ok(onDatabase("functional", TPrivilegeLevel.ALL))
-          .ok(onDatabase("functional", TPrivilegeLevel.ALTER))
-          .ok(onTable("functional", "alltypes", TPrivilegeLevel.ALL))
-          .ok(onTable("functional", "alltypes", TPrivilegeLevel.ALTER))
-          .error(alterError("functional.alltypes"))
-          .error(alterError("functional.alltypes"), onServer(allExcept(
-              TPrivilegeLevel.ALL, TPrivilegeLevel.ALTER)))
-          .error(alterError("functional.alltypes"), onDatabase("functional",
-              allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.ALTER)))
-          .error(alterError("functional.alltypes"), onTable("functional", "alltypes",
-              allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.ALTER)));
+    // Compute stats.
+    authorize("compute stats functional.alltypes")
+        .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
+        .ok(onServer(TPrivilegeLevel.ALTER, TPrivilegeLevel.SELECT))
+        .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
+        .ok(onDatabase("functional", TPrivilegeLevel.ALTER, TPrivilegeLevel.SELECT))
+        .ok(onTable("functional", "alltypes", TPrivilegeLevel.ALL))
+        .ok(onTable("functional", "alltypes", TPrivilegeLevel.OWNER))
+        .ok(onTable("functional", "alltypes", TPrivilegeLevel.ALTER,
+            TPrivilegeLevel.SELECT))
+        .error(alterError("functional.alltypes"))
+        .error(alterError("functional.alltypes"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER,
+            TPrivilegeLevel.SELECT)))
+        .error(alterError("functional.alltypes"), onDatabase("functional",
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER,
+                TPrivilegeLevel.SELECT)))
+        .error(alterError("functional.alltypes"), onTable("functional", "alltypes",
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER,
+                TPrivilegeLevel.SELECT)));
 
-      // Database does not exist.
-      authorize(String.format("%s stats nodb.notbl", statsType))
-          .error(alterError("nodb.notbl"))
-          .error(alterError("nodb.notbl"), onServer(allExcept(
-              TPrivilegeLevel.ALL, TPrivilegeLevel.ALTER)))
-          .error(alterError("default.nodb"), onDatabase("nodb", allExcept(
-              TPrivilegeLevel.ALL, TPrivilegeLevel.ALL)));
+    // Compute stats on database that does not exist.
+    authorize("compute stats nodb.notbl")
+        .error(alterError("nodb.notbl"))
+        .error(alterError("nodb.notbl"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER,
+            TPrivilegeLevel.SELECT)))
+        .error(alterError("nodb.notbl"), onDatabase("nodb", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER,
+            TPrivilegeLevel.SELECT)));
 
-      // Table does not exist.
-      authorize(String.format("%s stats functional.notbl", statsType))
-          .error(alterError("functional.notbl"))
-          .error(alterError("functional.notbl"), onServer(allExcept(
-              TPrivilegeLevel.ALL, TPrivilegeLevel.ALTER)))
-          .error(alterError("default.functional"), onDatabase("functional", allExcept(
-              TPrivilegeLevel.ALL, TPrivilegeLevel.ALL)));
-    }
+    // Compute stats on table that does not exist.
+    authorize("compute stats functional.notbl")
+        .error(alterError("functional.notbl"))
+        .error(alterError("functional.notbl"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER,
+            TPrivilegeLevel.SELECT)))
+        .error(alterError("functional.notbl"), onDatabase("functional", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER,
+            TPrivilegeLevel.SELECT)));
+
+    // Drop stats.
+    authorize("drop stats functional.alltypes")
+        .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
+        .ok(onServer(TPrivilegeLevel.ALTER))
+        .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
+        .ok(onDatabase("functional", TPrivilegeLevel.ALTER))
+        .ok(onTable("functional", "alltypes", TPrivilegeLevel.ALL))
+        .ok(onTable("functional", "alltypes", TPrivilegeLevel.OWNER))
+        .ok(onTable("functional", "alltypes", TPrivilegeLevel.ALTER))
+        .error(alterError("functional.alltypes"))
+        .error(alterError("functional.alltypes"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER)))
+        .error(alterError("functional.alltypes"), onDatabase("functional",
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER)))
+        .error(alterError("functional.alltypes"), onTable("functional", "alltypes",
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.ALTER)));
+
+    // Drop stats on database that does not exist.
+    authorize("drop stats nodb.notbl")
+        .error(alterError("nodb.notbl"))
+        .error(alterError("nodb.notbl"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER)))
+        .error(alterError("nodb.notbl"), onDatabase("nodb", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER)));
+
+    // Drop stats on table that does not exist.
+    authorize("drop stats functional.notbl")
+        .error(alterError("functional.notbl"))
+        .error(alterError("functional.notbl"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER)))
+        .error(alterError("functional.notbl"), onDatabase("functional", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER)));
   }
 
   @Test
@@ -1138,22 +1418,29 @@ public class AuthorizationStmtTest extends FrontendTestBase {
         authorize("create database newdb"),
         authorize("create database if not exists newdb")}) {
       test.ok(onServer(TPrivilegeLevel.ALL))
+          .ok(onServer(TPrivilegeLevel.OWNER))
           .ok(onServer(TPrivilegeLevel.CREATE))
           .error(createError("newdb"))
           .error(createError("newdb"), onServer(allExcept(TPrivilegeLevel.ALL,
-              TPrivilegeLevel.CREATE)));
+              TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)));
     }
 
     // Create a database with a specific location.
     authorize("create database newdb location " +
         "'hdfs://localhost:20500/test-warehouse/new_location'")
         .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
         .ok(onServer(TPrivilegeLevel.CREATE), onUri(
             "hdfs://localhost:20500/test-warehouse/new_location", TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.CREATE), onUri(
+            "hdfs://localhost:20500/test-warehouse/new_location", TPrivilegeLevel.OWNER))
         .error(createError("newdb"))
         .error(createError("newdb"), onServer(allExcept(TPrivilegeLevel.ALL,
-            TPrivilegeLevel.CREATE)), onUri(
+            TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)), onUri(
             "hdfs://localhost:20500/test-warehouse/new_location", TPrivilegeLevel.ALL))
+        .error(createError("newdb"), onServer(allExcept(TPrivilegeLevel.ALL,
+            TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)), onUri(
+            "hdfs://localhost:20500/test-warehouse/new_location", TPrivilegeLevel.OWNER))
         .error(accessError("hdfs://localhost:20500/test-warehouse/new_location"),
             onServer(TPrivilegeLevel.CREATE));
 
@@ -1163,11 +1450,12 @@ public class AuthorizationStmtTest extends FrontendTestBase {
         authorize("create database if not exists functional")}) {
       test.error(createError("functional"))
           .error(createError("functional"), onServer(allExcept(
-              TPrivilegeLevel.ALL, TPrivilegeLevel.CREATE)));
+              TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)));
     }
 
     authorize("create database if not exists _impala_builtins")
-        .error(systemDbError(), onServer(TPrivilegeLevel.ALL));
+        .error(systemDbError(), onServer(TPrivilegeLevel.ALL))
+        .error(systemDbError(), onServer(TPrivilegeLevel.OWNER));
   }
 
   @Test
@@ -1176,20 +1464,24 @@ public class AuthorizationStmtTest extends FrontendTestBase {
         authorize("create table functional.new_table(i int)"),
         authorize("create external table functional.new_table(i int)")}) {
       test.ok(onServer(TPrivilegeLevel.ALL))
+          .ok(onServer(TPrivilegeLevel.OWNER))
           .ok(onServer(TPrivilegeLevel.CREATE))
           .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+          .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
           .ok(onDatabase("functional", TPrivilegeLevel.CREATE))
-          .error(createError("functional.new_table"), onServer(allExcept(
-              TPrivilegeLevel.ALL, TPrivilegeLevel.CREATE)))
-          .error(createError("functional.new_table"), onDatabase("functional", allExcept(
-              TPrivilegeLevel.ALL, TPrivilegeLevel.CREATE)));
+          .error(createError("functional"), onServer(allExcept(
+              TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)))
+          .error(createError("functional"), onDatabase("functional", allExcept(
+              TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)));
     }
 
     // Create table like.
     authorize("create table functional.new_table like functional.alltypes")
         .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
         .ok(onServer(join(viewMetadataPrivileges(), TPrivilegeLevel.CREATE)))
         .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
         .ok(onDatabase("functional", join(viewMetadataPrivileges(),
             TPrivilegeLevel.CREATE)))
         .ok(onDatabase("functional"), onDatabase("functional", TPrivilegeLevel.CREATE),
@@ -1197,10 +1489,11 @@ public class AuthorizationStmtTest extends FrontendTestBase {
         .error(accessError("functional.alltypes"))
         .error(accessError("functional.alltypes"), onServer(allExcept(
             join(viewMetadataPrivileges(), TPrivilegeLevel.CREATE))))
-        .error(createError("functional.new_table"), onDatabase("functional", allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.CREATE, TPrivilegeLevel.SELECT)))
-        .error(createError("functional.new_table"), onDatabase("functional", allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.CREATE)), onTable(
+        .error(createError("functional"), onDatabase("functional", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE,
+            TPrivilegeLevel.SELECT)))
+        .error(createError("functional"), onDatabase("functional", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)), onTable(
                 "functional", "alltypes", viewMetadataPrivileges()))
         .error(accessError("functional.alltypes"), onDatabase("functional",
             TPrivilegeLevel.CREATE), onTable("functional", "alltypes", allExcept(
@@ -1210,53 +1503,72 @@ public class AuthorizationStmtTest extends FrontendTestBase {
     for (AuthzTest test : new AuthzTest[]{
         authorize("create table functional.alltypes(i int)"),
         authorize("create table if not exists functional.alltypes(i int)")}) {
-      test.error(createError("functional.alltypes"))
-          .error(createError("functional.alltypes"), onServer(allExcept(
-          TPrivilegeLevel.ALL, TPrivilegeLevel.CREATE)))
-          .error(createError("functional.alltypes"), onDatabase("functional", allExcept(
-              TPrivilegeLevel.ALL, TPrivilegeLevel.CREATE)));
+      test.error(createError("functional"))
+          .error(createError("functional"), onServer(allExcept(
+          TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)))
+          .error(createError("functional"), onDatabase("functional", allExcept(
+              TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)));
     }
 
     // CTAS.
-    authorize("create table functional.new_table as " +
-        "select int_col from functional.alltypes")
-        .ok(onServer(TPrivilegeLevel.ALL))
-        .ok(onServer(TPrivilegeLevel.CREATE, TPrivilegeLevel.INSERT,
-            TPrivilegeLevel.SELECT))
-        .ok(onDatabase("functional", TPrivilegeLevel.ALL))
-        .ok(onDatabase("functional", TPrivilegeLevel.CREATE, TPrivilegeLevel.INSERT,
-            TPrivilegeLevel.SELECT))
-        .ok(onDatabase("functional"), onDatabase("functional", TPrivilegeLevel.CREATE,
-            TPrivilegeLevel.INSERT), onTable("functional", "alltypes",
-            TPrivilegeLevel.SELECT))
-        .ok(onDatabase("functional"), onDatabase("functional", TPrivilegeLevel.CREATE,
-            TPrivilegeLevel.INSERT), onColumn("functional", "alltypes", "int_col",
-            TPrivilegeLevel.ALL))
-        .error(createError("functional.new_table"))
-        .error(createError("functional.new_table"), onServer(allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.CREATE, TPrivilegeLevel.INSERT,
-            TPrivilegeLevel.SELECT)))
-        .error(createError("functional.new_table"), onDatabase("functional", allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.CREATE, TPrivilegeLevel.INSERT,
-            TPrivilegeLevel.SELECT)))
-        .error(createError("functional.new_table"), onDatabase("functional", allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.CREATE, TPrivilegeLevel.INSERT)),
-            onTable("functional", "alltypes", TPrivilegeLevel.SELECT))
-        .error(selectError("functional.alltypes"), onDatabase("functional",
-            TPrivilegeLevel.CREATE, TPrivilegeLevel.INSERT), onTable("functional",
-            "alltypes", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)));
+    for (AuthzTest test: new AuthzTest[]{
+        authorize("create table functional.new_table as " +
+            "select int_col from functional.alltypes"),
+        // Explain CTAS.
+        authorize("explain create table functional.new_table as " +
+            "select int_col from functional.alltypes")}) {
+      test.ok(onServer(TPrivilegeLevel.ALL))
+          .ok(onServer(TPrivilegeLevel.OWNER))
+          .ok(onServer(TPrivilegeLevel.CREATE, TPrivilegeLevel.INSERT,
+              TPrivilegeLevel.SELECT))
+          .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+          .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
+          .ok(onDatabase("functional", TPrivilegeLevel.CREATE, TPrivilegeLevel.INSERT,
+              TPrivilegeLevel.SELECT))
+          .ok(onDatabase("functional"), onDatabase("functional", TPrivilegeLevel.CREATE,
+              TPrivilegeLevel.INSERT), onTable("functional", "alltypes",
+              TPrivilegeLevel.SELECT))
+          .ok(onDatabase("functional"), onDatabase("functional", TPrivilegeLevel.CREATE,
+              TPrivilegeLevel.INSERT), onColumn("functional", "alltypes", "int_col",
+              TPrivilegeLevel.ALL))
+          .ok(onDatabase("functional"), onDatabase("functional", TPrivilegeLevel.CREATE,
+              TPrivilegeLevel.INSERT), onColumn("functional", "alltypes", "int_col",
+              TPrivilegeLevel.OWNER))
+          .error(createError("functional"))
+          .error(createError("functional"), onServer(allExcept(
+              TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE,
+              TPrivilegeLevel.INSERT, TPrivilegeLevel.SELECT)))
+          .error(createError("functional"), onDatabase("functional", allExcept(
+              TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE,
+              TPrivilegeLevel.INSERT, TPrivilegeLevel.SELECT)))
+          .error(createError("functional"), onDatabase("functional", allExcept(
+              TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE,
+              TPrivilegeLevel.INSERT)),
+              onTable("functional", "alltypes", TPrivilegeLevel.SELECT))
+          .error(selectError("functional"), onDatabase("functional",
+              TPrivilegeLevel.CREATE, TPrivilegeLevel.INSERT), onTable("functional",
+              "alltypes", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+              TPrivilegeLevel.SELECT)));
+    }
 
     // Table with a specific location.
     authorize("create table functional.new_table(i int) location " +
         "'hdfs://localhost:20500/test-warehouse/new_table'")
         .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
         .ok(onServer(TPrivilegeLevel.CREATE),
             onUri("hdfs://localhost:20500/test-warehouse/new_table", TPrivilegeLevel.ALL))
-        .error(createError("functional.new_table"), onServer(allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.CREATE)))
-        .error(createError("functional.new_table"), onDatabase("functional", allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.CREATE)), onUri(
+        .ok(onServer(TPrivilegeLevel.CREATE),
+            onUri("hdfs://localhost:20500/test-warehouse/new_table",
+            TPrivilegeLevel.OWNER))
+        .error(createError("functional"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)))
+        .error(createError("functional"), onDatabase("functional", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)), onUri(
                 "hdfs://localhost:20500/test-warehouse/new_table", TPrivilegeLevel.ALL))
+        .error(createError("functional"), onDatabase("functional", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)), onUri(
+                "hdfs://localhost:20500/test-warehouse/new_table", TPrivilegeLevel.OWNER))
         .error(accessError("hdfs://localhost:20500/test-warehouse/new_table"),
             onDatabase("functional", TPrivilegeLevel.CREATE));
 
@@ -1264,65 +1576,93 @@ public class AuthorizationStmtTest extends FrontendTestBase {
     authorize("create external table functional.new_table(i int) location " +
         "'hdfs://localhost:20500/test-warehouse/UPPER_CASE/test'")
         .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
         .ok(onServer(TPrivilegeLevel.CREATE),
             onUri("hdfs://localhost:20500/test-warehouse/UPPER_CASE/test",
                 TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.CREATE),
+            onUri("hdfs://localhost:20500/test-warehouse/UPPER_CASE/test",
+                TPrivilegeLevel.OWNER))
         // Wrong case letters on URI.
         .error(accessError("hdfs://localhost:20500/test-warehouse/UPPER_CASE/test"),
             onServer(TPrivilegeLevel.CREATE),
             onUri("hdfs://localhost:20500/test-warehouse/upper_case/test",
                 TPrivilegeLevel.ALL))
-        .error(createError("functional.new_table"), onServer(allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.CREATE)))
-        .error(createError("functional.new_table"), onDatabase("functional", allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.CREATE)), onUri(
+        .error(accessError("hdfs://localhost:20500/test-warehouse/UPPER_CASE/test"),
+            onServer(TPrivilegeLevel.CREATE),
+            onUri("hdfs://localhost:20500/test-warehouse/upper_case/test",
+                TPrivilegeLevel.OWNER))
+        .error(createError("functional"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)))
+        .error(createError("functional"), onDatabase("functional", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)), onUri(
             "hdfs://localhost:20500/test-warehouse/UPPER_CASE/test", TPrivilegeLevel.ALL))
+        .error(createError("functional"), onDatabase("functional", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)), onUri(
+            "hdfs://localhost:20500/test-warehouse/UPPER_CASE/test",
+            TPrivilegeLevel.OWNER))
         .error(accessError("hdfs://localhost:20500/test-warehouse/UPPER_CASE/test"),
             onDatabase("functional", TPrivilegeLevel.CREATE));
 
     authorize("create table functional.new_table like parquet "
         + "'hdfs://localhost:20500/test-warehouse/schemas/alltypestiny.parquet'")
         .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
         .ok(onServer(TPrivilegeLevel.CREATE),
             onUri("hdfs://localhost:20500/test-warehouse/schemas/alltypestiny.parquet",
                 TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.CREATE),
+            onUri("hdfs://localhost:20500/test-warehouse/schemas/alltypestiny.parquet",
+                TPrivilegeLevel.OWNER))
         .error(accessError(
             "hdfs://localhost:20500/test-warehouse/schemas/alltypestiny.parquet"),
-            onServer(allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.CREATE)))
-        .error(createError("functional.new_table"), onDatabase("functional", allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.CREATE)), onUri(
+            onServer(allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+                TPrivilegeLevel.CREATE)))
+        .error(createError("functional"), onDatabase("functional", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)), onUri(
             "hdfs://localhost:20500/test-warehouse/schemas/alltypestiny.parquet",
             TPrivilegeLevel.ALL))
+        .error(createError("functional"), onDatabase("functional", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)), onUri(
+            "hdfs://localhost:20500/test-warehouse/schemas/alltypestiny.parquet",
+            TPrivilegeLevel.OWNER))
         .error(accessError(
             "hdfs://localhost:20500/test-warehouse/schemas/alltypestiny.parquet"),
             onDatabase("functional", TPrivilegeLevel.CREATE));
 
     authorize("create table if not exists _impala_builtins.new_table(i int)")
-        .error(systemDbError(), onServer(TPrivilegeLevel.ALL));
+        .error(systemDbError(), onServer(TPrivilegeLevel.ALL))
+        .error(systemDbError(), onServer(TPrivilegeLevel.OWNER));
 
-    // IMPALA-4000: Only users with ALL privileges on SERVER may create external Kudu
-    // tables.
+    // IMPALA-4000: Only users with ALL/OWNER privileges on SERVER may create external
+    // Kudu tables.
     authorize("create external table functional.kudu_tbl stored as kudu " +
         "tblproperties ('kudu.master_addresses'='127.0.0.1', 'kudu.table_name'='tbl')")
         .ok(onServer(TPrivilegeLevel.ALL))
-        .error(createError("functional.kudu_tbl"))
-        .error(accessError("server1"), onServer(allExcept(TPrivilegeLevel.ALL)))
-        .error(accessError("server1"), onDatabase("functional", TPrivilegeLevel.ALL));
+        .ok(onServer(TPrivilegeLevel.OWNER))
+        .error(createError("functional"))
+        .error(accessError("server1"), onServer(allExcept(TPrivilegeLevel.ALL,
+            TPrivilegeLevel.OWNER)))
+        .error(accessError("server1"), onDatabase("functional", TPrivilegeLevel.ALL))
+        .error(accessError("server1"), onDatabase("functional", TPrivilegeLevel.OWNER));
 
-    // IMPALA-4000: ALL privileges on SERVER are not required to create managed tables.
+    // IMPALA-4000: ALL/OWNER privileges on SERVER are not required to create managed
+    // tables.
     authorize("create table functional.kudu_tbl (i int, j int, primary key (i))" +
         " partition by hash (i) partitions 9 stored as kudu")
         .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
         .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
         .ok(onDatabase("functional", TPrivilegeLevel.CREATE))
-        .error(createError("functional.kudu_tbl"))
-        .error(createError("functional.kudu_tbl"), onServer(allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.CREATE)))
-        .error(createError("functional.kudu_tbl"), onDatabase("functional", allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.CREATE)));
+        .error(createError("functional"))
+        .error(createError("functional"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)))
+        .error(createError("functional"), onDatabase("functional", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)));
 
     // IMPALA-6451: CTAS for Kudu tables on non-external tables and without
-    // TBLPROPERTIES ('kudu.master_addresses') should not require ALL privileges
+    // TBLPROPERTIES ('kudu.master_addresses') should not require ALL/OWNER privileges
     // on SERVER.
     // The statement below causes the SQL statement to be rewritten.
     authorize("create table functional.kudu_tbl primary key (bigint_col) " +
@@ -1331,22 +1671,24 @@ public class AuthorizationStmtTest extends FrontendTestBase {
         "from functional.alltypes " +
         "where exists (select 1 from functional.alltypes)")
       .ok(onServer(TPrivilegeLevel.ALL))
+      .ok(onServer(TPrivilegeLevel.OWNER))
       .ok(onDatabase("functional", TPrivilegeLevel.CREATE, TPrivilegeLevel.INSERT,
           TPrivilegeLevel.SELECT))
-      .error(createError("functional.kudu_tbl"))
-      .error(createError("functional.kudu_tbl"), onServer(allExcept(TPrivilegeLevel.ALL,
-          TPrivilegeLevel.CREATE, TPrivilegeLevel.INSERT, TPrivilegeLevel.SELECT)))
-      .error(createError("functional.kudu_tbl"), onDatabase("functional", allExcept(
-          TPrivilegeLevel.ALL, TPrivilegeLevel.CREATE, TPrivilegeLevel.INSERT,
-          TPrivilegeLevel.SELECT)));
+      .error(createError("functional"))
+      .error(createError("functional"), onServer(allExcept(TPrivilegeLevel.ALL,
+          TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE, TPrivilegeLevel.INSERT,
+          TPrivilegeLevel.SELECT)))
+      .error(createError("functional"), onDatabase("functional", allExcept(
+          TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE,
+          TPrivilegeLevel.INSERT, TPrivilegeLevel.SELECT)));
 
     // Database does not exist.
     authorize("create table nodb.new_table(i int)")
-        .error(createError("nodb.new_table"))
-        .error(createError("nodb.new_table"), onServer(allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.CREATE)))
-        .error(createError("nodb.new_table"), onDatabase("functional", allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.CREATE)));
+        .error(createError("nodb"))
+        .error(createError("nodb"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)))
+        .error(createError("nodb"), onDatabase("functional", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)));
   }
 
   @Test
@@ -1357,35 +1699,44 @@ public class AuthorizationStmtTest extends FrontendTestBase {
         authorize("create view functional.new_view(a) as " +
             "select int_col from functional.alltypes")}) {
       test.ok(onServer(TPrivilegeLevel.ALL))
+          .ok(onServer(TPrivilegeLevel.OWNER))
           .ok(onServer(TPrivilegeLevel.CREATE, TPrivilegeLevel.SELECT))
           .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+          .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
           .ok(onDatabase("functional", TPrivilegeLevel.CREATE, TPrivilegeLevel.SELECT))
           .ok(onDatabase("functional", TPrivilegeLevel.CREATE), onTable(
               "functional", "alltypes", TPrivilegeLevel.SELECT))
           .ok(onDatabase("functional", TPrivilegeLevel.CREATE), onColumn(
               "functional", "alltypes", "int_col", TPrivilegeLevel.ALL))
+          .ok(onDatabase("functional", TPrivilegeLevel.CREATE), onColumn(
+              "functional", "alltypes", "int_col", TPrivilegeLevel.OWNER))
           .error(selectError("functional.alltypes"))
           .error(selectError("functional.alltypes"), onServer(allExcept(
-              TPrivilegeLevel.ALL, TPrivilegeLevel.CREATE, TPrivilegeLevel.SELECT)))
-          .error(createError("functional.new_view"), onDatabase("functional", allExcept(
-              TPrivilegeLevel.ALL, TPrivilegeLevel.CREATE)))
+              TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE,
+              TPrivilegeLevel.SELECT)))
+          .error(createError("functional"), onDatabase("functional", allExcept(
+              TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)))
           .error(selectError("functional.alltypes"), onDatabase("functional", allExcept(
-              TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
+              TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.SELECT)))
           .error(selectError("functional.alltypes"), onTable("functional", "alltypes",
-              allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)));
+              allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+              TPrivilegeLevel.SELECT)));
     }
 
     // View with constant select.
     authorize("create view functional.new_view as select 1")
         .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
         .ok(onServer(TPrivilegeLevel.CREATE))
         .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
         .ok(onDatabase("functional", TPrivilegeLevel.CREATE))
-        .error(createError("functional.new_view"))
-        .error(createError("functional.new_view"), onServer(allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.CREATE, TPrivilegeLevel.SELECT)))
-        .error(createError("functional.new_view"), onDatabase("functional", allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.CREATE)));
+        .error(createError("functional"))
+        .error(createError("functional"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE,
+            TPrivilegeLevel.SELECT)))
+        .error(createError("functional"), onDatabase("functional", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)));
 
     // View already exists.
     for (AuthzTest test: new AuthzTest[]{
@@ -1395,25 +1746,28 @@ public class AuthorizationStmtTest extends FrontendTestBase {
             "select int_col from functional.alltypes")}) {
       test.error(selectError("functional.alltypes"))
           .error(selectError("functional.alltypes"), onServer(allExcept(
-              TPrivilegeLevel.ALL, TPrivilegeLevel.CREATE, TPrivilegeLevel.SELECT)))
-          .error(createError("functional.alltypes_view"), onDatabase("functional", allExcept(
-              TPrivilegeLevel.ALL, TPrivilegeLevel.CREATE)))
+              TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE,
+              TPrivilegeLevel.SELECT)))
+          .error(createError("functional"), onDatabase("functional", allExcept(
+              TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)))
           .error(selectError("functional.alltypes"), onDatabase("functional", allExcept(
-              TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)))
+              TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.SELECT)))
           .error(selectError("functional.alltypes"), onTable("functional", "alltypes",
-              allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT)));
+              allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+              TPrivilegeLevel.SELECT)));
     }
 
     authorize("create view if not exists _impala_builtins.new_view as select 1")
-        .error(systemDbError(), onServer(TPrivilegeLevel.ALL));
+        .error(systemDbError(), onServer(TPrivilegeLevel.ALL))
+        .error(systemDbError(), onServer(TPrivilegeLevel.OWNER));
 
     // Database does not exist.
     authorize("create view nodb.new_view as select 1")
-        .error(createError("nodb.new_view"))
-        .error(createError("nodb.new_view"), onServer(allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.CREATE)))
-        .error(createError("nodb.new_view"), onDatabase("functional", allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.CREATE)));
+        .error(createError("nodb"))
+        .error(createError("nodb"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)))
+        .error(createError("nodb"), onDatabase("functional", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)));
   }
 
   @Test
@@ -1423,14 +1777,17 @@ public class AuthorizationStmtTest extends FrontendTestBase {
         authorize("drop database functional cascade"),
         authorize("drop database functional restrict")}) {
       test.ok(onServer(TPrivilegeLevel.ALL))
+          .ok(onServer(TPrivilegeLevel.OWNER))
           .ok(onServer(TPrivilegeLevel.DROP))
           .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+          .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
           .ok(onDatabase("functional", TPrivilegeLevel.DROP))
           .error(dropError("functional"))
           .error(dropError("functional"), onServer(allExcept(
-              TPrivilegeLevel.ALL, TPrivilegeLevel.DROP)))
+              TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.DROP)))
           .error(dropError("functional"), onDatabase("functional",
-              allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.DROP)));
+              allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+              TPrivilegeLevel.DROP)));
     }
 
     // Database does not exist.
@@ -1440,7 +1797,8 @@ public class AuthorizationStmtTest extends FrontendTestBase {
         authorize("drop database nodb restrict")}) {
       test.error(dropError("nodb"))
           .error(dropError("nodb"), onServer(
-              allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.DROP)));
+              allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+              TPrivilegeLevel.DROP)));
     }
 
     // Database does not exist but with if exists clause.
@@ -1449,117 +1807,833 @@ public class AuthorizationStmtTest extends FrontendTestBase {
         authorize("drop database if exists nodb cascade"),
         authorize("drop database if exists nodb restrict")}) {
       test.ok(onServer(TPrivilegeLevel.ALL))
+          .ok(onServer(TPrivilegeLevel.OWNER))
           .ok(onServer(TPrivilegeLevel.DROP))
           .error(dropError("nodb"))
           .error(dropError("nodb"), onServer(allExcept(
-              TPrivilegeLevel.ALL, TPrivilegeLevel.DROP)));
+              TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.DROP)));
     }
 
-    // Dropping system database is not allowed even if with ALL privilege on server.
+    // Dropping system database is not allowed even if with ALL/OWNER privilege on server.
     authorize("drop database _impala_builtins")
-        .error(systemDbError(), onServer(TPrivilegeLevel.ALL));
+        .error(systemDbError(), onServer(TPrivilegeLevel.ALL))
+        .error(systemDbError(), onServer(TPrivilegeLevel.OWNER));
   }
 
   @Test
   public void testDropTable() throws ImpalaException {
     authorize("drop table functional.alltypes")
         .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
         .ok(onServer(TPrivilegeLevel.DROP))
         .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
         .ok(onDatabase("functional", TPrivilegeLevel.DROP))
         .ok(onTable("functional", "alltypes", TPrivilegeLevel.ALL))
+        .ok(onTable("functional", "alltypes", TPrivilegeLevel.OWNER))
         .ok(onTable("functional", "alltypes", TPrivilegeLevel.DROP))
         .error(dropError("functional.alltypes"))
         .error(dropError("functional.alltypes"), onServer(allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.DROP)))
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.DROP)))
         .error(dropError("functional.alltypes"), onDatabase("functional",
-            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.DROP)))
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.DROP)))
         .error(dropError("functional.alltypes"), onTable("functional", "alltypes",
-            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.DROP)));
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.DROP)));
 
     // Database/Table does not exist.
     authorize("drop table nodb.notbl")
         .error(dropError("nodb.notbl"))
         .error(dropError("nodb.notbl"), onServer(allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.DROP)))
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.DROP)))
         .error(dropError("nodb.notbl"), onDatabase("functional",
-            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.DROP)));
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.DROP)));
 
     // Table does not exist.
     authorize("drop table functional.notbl")
         .error(dropError("functional.notbl"))
         .error(dropError("functional.notbl"), onServer(allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.DROP)))
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.DROP)))
         .error(dropError("functional.notbl"), onDatabase("functional",
-            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.DROP)));
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.DROP)));
 
     // Table does not exist but with if exists clause.
     authorize("drop table if exists functional.notbl")
         .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
         .ok(onServer(TPrivilegeLevel.DROP))
         .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
         .ok(onDatabase("functional", TPrivilegeLevel.DROP))
         .error(dropError("functional.notbl"))
         .error(dropError("functional.notbl"), onServer(allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.DROP)))
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.DROP)))
         .error(dropError("functional.notbl"), onDatabase("functional",
-            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.DROP)));
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.DROP)));
 
-    // Dropping any tables in the system database is not allowed even with ALL privilege
-    // on server.
+    // Dropping any tables in the system database is not allowed even with ALL/OWNER
+    // privilege on server.
     authorize("drop table _impala_builtins.tbl")
-        .error(systemDbError(), onServer(TPrivilegeLevel.ALL));
+        .error(systemDbError(), onServer(TPrivilegeLevel.ALL))
+        .error(systemDbError(), onServer(TPrivilegeLevel.OWNER));
   }
 
   @Test
   public void testDropView() throws ImpalaException {
     authorize("drop view functional.alltypes_view")
         .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
         .ok(onServer(TPrivilegeLevel.DROP))
         .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
         .ok(onDatabase("functional", TPrivilegeLevel.DROP))
         .ok(onTable("functional", "alltypes_view", TPrivilegeLevel.ALL))
+        .ok(onTable("functional", "alltypes_view", TPrivilegeLevel.OWNER))
         .ok(onTable("functional", "alltypes_view", TPrivilegeLevel.DROP))
         .error(dropError("functional.alltypes_view"))
         .error(dropError("functional.alltypes_view"), onServer(allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.DROP)))
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.DROP)))
         .error(dropError("functional.alltypes_view"), onDatabase("functional",
-            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.DROP)))
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.DROP)))
         .error(dropError("functional.alltypes_view"), onTable("functional",
-            "alltypes_view", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.DROP)));
+            "alltypes_view", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.DROP)));
 
     // Database does not exist.
     authorize("drop view nodb.noview")
         .error(dropError("nodb.noview"))
         .error(dropError("nodb.noview"), onServer(allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.DROP)))
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.DROP)))
         .error(dropError("nodb.noview"), onDatabase("functional",
-            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.DROP)));
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.DROP)));
 
     // View does not exist.
     authorize("drop table functional.noview")
         .error(dropError("functional.noview"))
         .error(dropError("functional.noview"), onServer(allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.DROP)))
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.DROP)))
         .error(dropError("functional.noview"), onDatabase("functional",
-            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.DROP)));
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.DROP)));
 
     // View does not exist but with if exists clause.
     authorize("drop table if exists functional.noview")
         .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
         .ok(onServer(TPrivilegeLevel.DROP))
         .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
         .ok(onDatabase("functional", TPrivilegeLevel.DROP))
         .error(dropError("functional.noview"))
         .error(dropError("functional.noview"), onServer(allExcept(
-            TPrivilegeLevel.ALL, TPrivilegeLevel.DROP)))
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.DROP)))
         .error(dropError("functional.noview"), onDatabase("functional",
-            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.DROP)));
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.DROP)));
 
-    // Dropping any views in the system database is not allowed even with ALL privilege
-    // on server.
+    // Dropping any views in the system database is not allowed even with ALL/OWNER
+    // privilege on server.
     authorize("drop table _impala_builtins.v")
-        .error(systemDbError(), onServer(TPrivilegeLevel.ALL));
+        .error(systemDbError(), onServer(TPrivilegeLevel.ALL))
+        .error(systemDbError(), onServer(TPrivilegeLevel.OWNER));
+  }
+
+  @Test
+  public void testAlterTable() throws ImpalaException {
+    for (AuthzTest test: new AuthzTest[]{
+        authorize("alter table functional.alltypes add columns(c1 int)"),
+        authorize("alter table functional.alltypes replace columns(c1 int)"),
+        authorize("alter table functional.alltypes change int_col c1 int"),
+        authorize("alter table functional.alltypes drop int_col"),
+        authorize("alter table functional.alltypes set fileformat parquet"),
+        authorize("alter table functional.alltypes set tblproperties('a'='b')"),
+        authorize("alter table functional.alltypes partition(year=2009) " +
+            "set tblproperties('a'='b')"),
+        authorize("alter table functional.alltypes set cached in 'testPool'"),
+        authorize("alter table functional.alltypes partition(year=2009) set cached " +
+            "in 'testPool'"),
+        authorize("alter table functional.alltypes sort by (id)"),
+        authorize("alter table functional.alltypes set column stats int_col " +
+            "('numNulls'='1')"),
+        authorize("alter table functional.alltypes recover partitions"),
+        authorize("alter table functional.alltypes set row format delimited fields " +
+            "terminated by ' '"),
+        authorize("alter table functional.alltypes partition(year=2009) set row format " +
+            "delimited fields terminated by ' '"),
+        authorize("alter table functional.alltypes add partition(year=1, month=1)"),
+        authorize("alter table functional.alltypes drop partition(" +
+            "year=2009, month=1)")}) {
+      test.ok(onServer(TPrivilegeLevel.ALL))
+          .ok(onServer(TPrivilegeLevel.OWNER))
+          .ok(onServer(TPrivilegeLevel.ALTER))
+          .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+          .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
+          .ok(onDatabase("functional", TPrivilegeLevel.ALTER))
+          .ok(onTable("functional", "alltypes", TPrivilegeLevel.ALL))
+          .ok(onTable("functional", "alltypes", TPrivilegeLevel.OWNER))
+          .ok(onTable("functional", "alltypes", TPrivilegeLevel.ALTER))
+          .error(alterError("functional.alltypes"))
+          .error(alterError("functional.alltypes"), onServer(allExcept(
+              TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER)))
+          .error(alterError("functional.alltypes"), onDatabase("functional", allExcept(
+              TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER)))
+          .error(alterError("functional.alltypes"), onTable("functional", "alltypes",
+              allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+              TPrivilegeLevel.ALTER)));
+    }
+
+    try {
+      // We cannot set an owner to a role that doesn't exist
+      authzCatalog_.addRole("foo_owner");
+      // Alter table set owner.
+      for (AuthzTest test: new AuthzTest[]{
+          authorize("alter table functional.alltypes set owner user foo_owner"),
+          authorize("alter table functional.alltypes set owner role foo_owner")}) {
+        test.ok(onServer(true, TPrivilegeLevel.ALL))
+            .ok(onServer(true, TPrivilegeLevel.OWNER))
+            .ok(onDatabase(true, "functional", TPrivilegeLevel.ALL))
+            .ok(onDatabase(true, "functional", TPrivilegeLevel.OWNER))
+            .ok(onTable(true, "functional", "alltypes", TPrivilegeLevel.ALL))
+            .ok(onTable(true, "functional", "alltypes", TPrivilegeLevel.OWNER))
+            .error(accessError(true, "functional.alltypes"), onServer(
+                TPrivilegeLevel.values()))
+            .error(accessError(true, "functional.alltypes"), onDatabase("functional",
+                TPrivilegeLevel.values()))
+            .error(accessError(true, "functional.alltypes"), onTable("functional",
+                "alltypes", TPrivilegeLevel.values()))
+            .error(accessError(true, "functional.alltypes"))
+            .error(accessError(true, "functional.alltypes"), onServer(true, allExcept(
+                TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER)))
+            .error(accessError(true, "functional.alltypes"), onDatabase(true,
+                "functional", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER)))
+            .error(accessError(true, "functional.alltypes"),
+                onTable(true, "functional", "alltypes", allExcept(
+                TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER)));
+      }
+    } finally {
+      authzCatalog_.removeRole("foo_owner");
+    }
+
+    boolean exceptionThrown = false;
+    try {
+      parseAndAnalyze("alter table functional.alltypes set owner role foo_owner",
+          analysisContext_ , frontend_);
+    } catch (AnalysisException e) {
+      exceptionThrown = true;
+      assertEquals("Role 'foo_owner' does not exist.", e.getLocalizedMessage());
+    }
+    assertTrue(exceptionThrown);
+
+    // Alter table rename.
+    authorize("alter table functional.alltypes rename to functional_parquet.new_table")
+        .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
+        .ok(onDatabase("functional", TPrivilegeLevel.ALL),
+            onDatabase("functional_parquet", TPrivilegeLevel.CREATE))
+        .ok(onDatabase("functional_parquet", TPrivilegeLevel.CREATE),
+            onTable("functional", "alltypes", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER),
+            onDatabase("functional_parquet", TPrivilegeLevel.CREATE))
+        .ok(onDatabase("functional_parquet", TPrivilegeLevel.CREATE),
+            onTable("functional", "alltypes", TPrivilegeLevel.OWNER))
+        .error(accessError("functional.alltypes"))
+        .error(accessError("functional.alltypes"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)))
+        .error(accessError("functional.alltypes"), onDatabase("functional", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER)), onDatabase("functional_parquet",
+            TPrivilegeLevel.CREATE))
+        .error(createError("functional_parquet"), onDatabase("functional",
+            TPrivilegeLevel.ALL), onDatabase("functional_parquet", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)))
+        .error(accessError("functional.alltypes"), onDatabase("functional",
+            TPrivilegeLevel.CREATE), onTable("functional", "alltypes", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER)))
+        .error(createError("functional_parquet"), onDatabase("functional", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)),
+            onTable("functional", "alltypes", TPrivilegeLevel.ALL));
+
+    // Only for Kudu tables.
+    for (AuthzTest test: new AuthzTest[]{
+        authorize("alter table functional_kudu.testtbl alter column " +
+            "name drop default"),
+        authorize("alter table functional_kudu.testtbl alter column name " +
+            "set default null"),
+        authorize("alter table functional_kudu.testtbl add range partition " +
+            "1 < values < 2"),
+        authorize("alter table functional_kudu.testtbl drop range partition " +
+            "1 < values < 2")}) {
+      test.ok(onServer(TPrivilegeLevel.ALL))
+          .ok(onServer(TPrivilegeLevel.OWNER))
+          .ok(onServer(TPrivilegeLevel.ALTER))
+          .ok(onDatabase("functional_kudu", TPrivilegeLevel.ALL))
+          .ok(onDatabase("functional_kudu", TPrivilegeLevel.OWNER))
+          .ok(onDatabase("functional_kudu", TPrivilegeLevel.ALTER))
+          .ok(onTable("functional_kudu", "testtbl", TPrivilegeLevel.ALL))
+          .ok(onTable("functional_kudu", "testtbl", TPrivilegeLevel.OWNER))
+          .ok(onTable("functional_kudu", "testtbl", TPrivilegeLevel.ALTER))
+          .error(alterError("functional_kudu.testtbl"))
+          .error(alterError("functional_kudu.testtbl"), onServer(allExcept(
+              TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER)))
+          .error(alterError("functional_kudu.testtbl"), onDatabase("functional_kudu",
+              allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+              TPrivilegeLevel.ALTER)))
+          .error(alterError("functional_kudu.testtbl"), onTable("functional_kudu",
+              "testtbl", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+              TPrivilegeLevel.ALTER)));
+    }
+
+    // Alter table set location.
+    for (AuthzTest test: new AuthzTest[] {
+        authorize("alter table functional.alltypes set location " +
+            "'hdfs://localhost:20500/test-warehouse/new_table'"),
+        authorize("alter table functional.alltypes partition(year=2009, month=1) " +
+            "set location 'hdfs://localhost:20500/test-warehouse/new_table'")}) {
+      test.ok(onServer(TPrivilegeLevel.ALL))
+          .ok(onServer(TPrivilegeLevel.OWNER))
+          .ok(onServer(TPrivilegeLevel.ALTER), onUri(
+              "hdfs://localhost:20500/test-warehouse/new_table", TPrivilegeLevel.ALL))
+          .ok(onServer(TPrivilegeLevel.ALTER), onUri(
+              "hdfs://localhost:20500/test-warehouse/new_table", TPrivilegeLevel.OWNER))
+          .ok(onDatabase("functional", TPrivilegeLevel.ALL), onUri(
+              "hdfs://localhost:20500/test-warehouse/new_table", TPrivilegeLevel.ALL))
+          .ok(onDatabase("functional", TPrivilegeLevel.OWNER), onUri(
+              "hdfs://localhost:20500/test-warehouse/new_table", TPrivilegeLevel.OWNER))
+          .ok(onDatabase("functional", TPrivilegeLevel.ALTER), onUri(
+              "hdfs://localhost:20500/test-warehouse/new_table", TPrivilegeLevel.ALL))
+          .ok(onDatabase("functional", TPrivilegeLevel.ALTER), onUri(
+              "hdfs://localhost:20500/test-warehouse/new_table", TPrivilegeLevel.OWNER))
+          .ok(onTable("functional", "alltypes", TPrivilegeLevel.ALL), onUri(
+              "hdfs://localhost:20500/test-warehouse/new_table", TPrivilegeLevel.ALL))
+          .ok(onTable("functional", "alltypes", TPrivilegeLevel.OWNER), onUri(
+              "hdfs://localhost:20500/test-warehouse/new_table", TPrivilegeLevel.OWNER))
+          .ok(onTable("functional", "alltypes", TPrivilegeLevel.ALTER), onUri(
+              "hdfs://localhost:20500/test-warehouse/new_table", TPrivilegeLevel.ALL))
+          .ok(onTable("functional", "alltypes", TPrivilegeLevel.ALTER), onUri(
+              "hdfs://localhost:20500/test-warehouse/new_table", TPrivilegeLevel.OWNER))
+          .error(alterError("functional.alltypes"))
+          .error(alterError("functional.alltypes"),
+              onServer(allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+              TPrivilegeLevel.ALTER)),
+              onUri("hdfs://localhost:20500/test-warehouse/new_table"))
+          .error(alterError("functional.alltypes"), onDatabase("functional", allExcept(
+              TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER)),
+              onUri("hdfs://localhost:20500/test-warehouse/new_table"))
+          .error(alterError("functional.alltypes"), onTable("functional", "alltypes",
+              allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+              TPrivilegeLevel.ALTER)),
+              onUri("hdfs://localhost:20500/test-warehouse/new_table"))
+          .error(accessError("hdfs://localhost:20500/test-warehouse/new_table"),
+              onDatabase("functional", TPrivilegeLevel.ALTER))
+          .error(accessError("hdfs://localhost:20500/test-warehouse/new_table"),
+              onTable("functional", "alltypes", TPrivilegeLevel.ALTER));
+    }
+
+    // Database does not exist.
+    authorize("alter table nodb.alltypes add columns(c1 int)")
+        .error(alterError("nodb"))
+        .error(alterError("nodb"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER)));
+
+    // Table does not exist.
+    authorize("alter table functional.notbl add columns(c1 int)")
+        .error(alterError("functional.notbl"))
+        .error(alterError("functional.notbl"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER)))
+        .error(alterError("functional.notbl"), onDatabase("functional", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER)));
+  }
+
+  @Test
+  public void testAlterView() throws ImpalaException {
+    for (AuthzTest test: new AuthzTest[] {
+        authorize("alter view functional.alltypes_view as " +
+            "select int_col from functional.alltypes"),
+        authorize("alter view functional.alltypes_view(a) as " +
+            "select int_col from functional.alltypes")}) {
+      test.ok(onServer(TPrivilegeLevel.ALL))
+          .ok(onServer(TPrivilegeLevel.OWNER))
+          .ok(onServer(TPrivilegeLevel.ALTER), onTable("functional", "alltypes",
+              TPrivilegeLevel.SELECT))
+          .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+          .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
+          .ok(onDatabase("functional", TPrivilegeLevel.ALL, TPrivilegeLevel.ALTER,
+              TPrivilegeLevel.SELECT))
+          .ok(onDatabase("functional", TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER,
+              TPrivilegeLevel.SELECT))
+          .ok(onTable("functional", "alltypes_view", TPrivilegeLevel.ALTER),
+              onTable("functional", "alltypes", TPrivilegeLevel.SELECT))
+          .error(selectError("functional.alltypes"))
+          .error(selectError("functional.alltypes"), onServer(allExcept(
+              TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER,
+              TPrivilegeLevel.SELECT)))
+          .error(selectError("functional.alltypes"), onDatabase("functional",
+              allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER,
+                  TPrivilegeLevel.SELECT)))
+          .error(alterError("functional.alltypes_view"), onTable("functional", "alltypes",
+              TPrivilegeLevel.SELECT), onTable("functional", "alltypes_view", allExcept(
+              TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER)))
+          .error(selectError("functional.alltypes"), onTable("functional", "alltypes",
+              allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+              TPrivilegeLevel.SELECT)),
+              onTable("functional", "alltypes_view", TPrivilegeLevel.ALTER));
+    }
+
+    // Alter view rename.
+    authorize("alter view functional.alltypes_view rename to functional_parquet.new_view")
+        .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
+        .ok(onDatabase("functional", TPrivilegeLevel.ALL),
+            onDatabase("functional_parquet", TPrivilegeLevel.CREATE))
+        .ok(onDatabase("functional_parquet", TPrivilegeLevel.CREATE),
+            onTable("functional", "alltypes_view", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER),
+            onDatabase("functional_parquet", TPrivilegeLevel.CREATE))
+        .ok(onDatabase("functional_parquet", TPrivilegeLevel.CREATE),
+            onTable("functional", "alltypes_view", TPrivilegeLevel.OWNER))
+        .error(accessError("functional.alltypes_view"))
+        .error(accessError("functional.alltypes_view"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)))
+        .error(accessError("functional.alltypes_view"), onDatabase("functional",
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER)),
+            onDatabase("functional_parquet", TPrivilegeLevel.CREATE))
+        .error(createError("functional_parquet"), onDatabase("functional",
+            TPrivilegeLevel.ALL), onDatabase("functional_parquet", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)))
+        .error(accessError("functional.alltypes_view"), onDatabase("functional",
+            TPrivilegeLevel.CREATE), onTable("functional", "alltypes_view", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER)))
+        .error(createError("functional_parquet"), onDatabase("functional", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.CREATE)),
+            onTable("functional", "alltypes_view", TPrivilegeLevel.ALL));
+
+    // Alter view with constant select.
+    authorize("alter view functional.alltypes_view as select 1")
+        .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
+        .ok(onServer(TPrivilegeLevel.ALTER))
+        .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
+        .ok(onDatabase("functional", TPrivilegeLevel.ALTER))
+        .ok(onTable("functional", "alltypes_view", TPrivilegeLevel.ALL))
+        .ok(onTable("functional", "alltypes_view", TPrivilegeLevel.OWNER))
+        .ok(onTable("functional", "alltypes_view", TPrivilegeLevel.ALTER))
+        .error(alterError("functional.alltypes_view"))
+        .error(alterError("functional.alltypes_view"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER)))
+        .error(alterError("functional.alltypes_view"), onDatabase("functional", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER)))
+        .error(alterError("functional.alltypes_view"), onTable("functional",
+            "alltypes_view", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.ALTER)));
+
+
+    try {
+      // We cannot set an owner to a role that doesn't exist
+      authzCatalog_.addRole("foo_owner");
+      // Alter view set owner.
+      for (AuthzTest test: new AuthzTest[]{
+          authorize("alter view functional.alltypes_view set owner user foo_owner"),
+          authorize("alter view functional.alltypes_view set owner role foo_owner")}) {
+        test.ok(onServer(true, TPrivilegeLevel.ALL))
+            .ok(onServer(true, TPrivilegeLevel.OWNER))
+            .ok(onDatabase(true, "functional", TPrivilegeLevel.ALL))
+            .ok(onDatabase(true, "functional", TPrivilegeLevel.OWNER))
+            .ok(onTable(true, "functional", "alltypes_view", TPrivilegeLevel.ALL))
+            .ok(onTable(true, "functional", "alltypes_view", TPrivilegeLevel.OWNER))
+            .error(accessError(true, "functional.alltypes_view"), onServer(
+                TPrivilegeLevel.values()))
+            .error(accessError(true, "functional.alltypes_view"), onDatabase("functional",
+                TPrivilegeLevel.values()))
+            .error(accessError(true, "functional.alltypes_view"), onTable("functional",
+                "alltypes_view", TPrivilegeLevel.values()))
+            .error(accessError(true, "functional.alltypes_view"))
+            .error(accessError(true, "functional.alltypes_view"), onServer(allExcept(
+                TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER)))
+            .error(accessError(true, "functional.alltypes_view"), onDatabase("functional",
+                allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER)))
+            .error(accessError(true, "functional.alltypes_view"), onTable("functional",
+                "alltypes_view", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER)));
+      }
+    } finally {
+      authzCatalog_.removeRole("foo_owner");
+    }
+
+    // Database does not exist.
+    authorize("alter view nodb.alltypes_view as select 1")
+        .error(alterError("nodb"))
+        .error(alterError("nodb"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER)));
+
+    // View does not exist.
+    authorize("alter view functional.noview as select 1")
+        .error(alterError("functional.noview"))
+        .error(alterError("functional.noview"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER)))
+        .error(alterError("functional.noview"), onDatabase("functional", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER)));
+  }
+
+  @Test
+  public void testAlterDatabase() throws ImpalaException {
+    try {
+      // We cannot set an owner to a role that doesn't exist
+      authzCatalog_.addRole("foo");
+      // Alter database set owner.
+      for (String ownerType: new String[]{"user", "role"}) {
+        authorize(String.format("alter database functional set owner %s foo", ownerType))
+            .ok(onServer(true, TPrivilegeLevel.ALL))
+            .ok(onServer(true, TPrivilegeLevel.OWNER))
+            .ok(onDatabase(true, "functional", TPrivilegeLevel.ALL))
+            .ok(onDatabase(true, "functional", TPrivilegeLevel.OWNER))
+            .error(accessError(true, "functional"), onServer(TPrivilegeLevel.values()))
+            .error(accessError(true, "functional"), onDatabase("functional",
+                TPrivilegeLevel.values()))
+            .error(accessError(true, "functional"))
+            .error(accessError(true, "functional"), onServer(true, allExcept(
+                TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER)))
+            .error(accessError(true, "functional"), onDatabase(true, "functional",
+                allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER)));
+
+        // Database does not exist.
+        authorize(String.format("alter database nodb set owner %s foo", ownerType))
+            .error(accessError(true, "nodb"))
+            .error(accessError(true, "nodb"), onServer(true, allExcept(
+                TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER)));
+      }
+    } finally {
+      authzCatalog_.removeRole("foo");
+    }
+    boolean exceptionThrown = false;
+    try {
+      parseAndAnalyze("alter database functional set owner role foo",
+          analysisContext_ , frontend_);
+    } catch (AnalysisException e) {
+      exceptionThrown = true;
+      assertEquals("Role 'foo' does not exist.", e.getLocalizedMessage());
+    }
+    assertTrue(exceptionThrown);
+
+  }
+
+  @Test
+  public void testUpdate() throws ImpalaException {
+    // Update is only supported on Kudu tables.
+    for (AuthzTest test: new AuthzTest[]{
+        authorize("update functional_kudu.alltypes set int_col = 1"),
+        // Explain update.
+        authorize("explain update functional_kudu.alltypes set int_col = 1")}) {
+      test.ok(onServer(TPrivilegeLevel.ALL))
+          .ok(onServer(TPrivilegeLevel.OWNER))
+          .error(accessError("functional_kudu.alltypes"))
+          .error(accessError("functional_kudu.alltypes"), onServer(allExcept(
+              TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER)));
+    }
+
+    // Database does not exist.
+    authorize("update nodb.alltypes set int_col = 1")
+        .error(selectError("nodb"))
+        .error(selectError("nodb"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.SELECT)));
+
+    // Table does not exist.
+    authorize("update functional_kudu.notbl set int_col = 1")
+        .error(selectError("functional_kudu.notbl"))
+        .error(selectError("functional_kudu.notbl"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.SELECT)))
+        .error(selectError("functional_kudu.notbl"), onDatabase("functional_kudu",
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)));
+  }
+
+  @Test
+  public void testUpsert() throws ImpalaException {
+    // Upsert is only supported on Kudu tables.
+    for (AuthzTest test: new AuthzTest[]{
+        authorize("upsert into table functional_kudu.testtbl(id, name) values(1, 'a')"),
+        // Upsert with clause.
+        authorize("with t1 as (select 1, 'a', 2) upsert into functional_kudu.testtbl " +
+            "select * from t1"),
+        // Explain upsert.
+        authorize("explain upsert into table functional_kudu.testtbl(id, name) " +
+            "values(1, 'a')")}) {
+      test.ok(onServer(TPrivilegeLevel.ALL))
+          .ok(onServer(TPrivilegeLevel.OWNER))
+          .error(accessError("functional_kudu.testtbl"))
+          .error(accessError("functional_kudu.testtbl"), onServer(allExcept(
+              TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER)));
+    }
+
+    // Upsert select.
+    authorize("upsert into table functional_kudu.testtbl(id) " +
+        "select int_col from functional.alltypes")
+        .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
+        .error(selectError("functional.alltypes"))
+        .error(accessError("functional_kudu.testtbl"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER)));
+
+    // Database does not exist.
+    authorize("upsert into table nodb.testtbl(id, name) values(1, 'a')")
+        .error(accessError("nodb.testtbl"))
+        .error(accessError("nodb.testtbl"), onServer(allExcept(TPrivilegeLevel.ALL,
+            TPrivilegeLevel.OWNER)));
+
+    // Table does not exist.
+    authorize("upsert into table functional_kudu.notbl(id, name) values(1, 'a')")
+        .error(accessError("functional_kudu.notbl"))
+        .error(accessError("functional_kudu.notbl"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER)))
+        .error(accessError("functional_kudu.notbl"), onDatabase("functional_kudu",
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER)));
+  }
+
+  @Test
+  public void testDelete() throws ImpalaException {
+    // Delete is only supported on Kudu tables.
+    for (AuthzTest test: new AuthzTest[]{
+        authorize("delete from functional_kudu.alltypes"),
+        authorize("explain delete from functional_kudu.alltypes")}) {
+      test.ok(onServer(TPrivilegeLevel.ALL))
+          .ok(onServer(TPrivilegeLevel.OWNER))
+          .error(accessError("functional_kudu.alltypes"))
+          .error(accessError("functional_kudu.alltypes"), onServer(allExcept(
+              TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER)));
+    }
+
+    // Database does not exist.
+    authorize("delete from nodb.alltypes")
+        .error(selectError("nodb"))
+        .error(selectError("nodb"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.SELECT)));
+
+    // Table does not exist.
+    authorize("delete from functional_kudu.notbl")
+        .error(selectError("functional_kudu.notbl"))
+        .error(selectError("functional_kudu.notbl"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.SELECT)))
+        .error(selectError("functional_kudu.notbl"), onDatabase("functional_kudu",
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.SELECT)));
+  }
+
+  @Test
+  public void testCommentOn() throws ImpalaException {
+    // Comment on database.
+    authorize("comment on database functional is 'comment'")
+        .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
+        .ok(onServer(TPrivilegeLevel.ALTER))
+        .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
+        .ok(onDatabase("functional", TPrivilegeLevel.ALTER))
+        .error(alterError("functional"))
+        .error(alterError("functional"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER)))
+        .error(alterError("functional"), onDatabase("functional", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER)));
+
+    // Comment on table.
+    authorize("comment on table functional.alltypes is 'comment'")
+        .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
+        .ok(onServer(TPrivilegeLevel.ALTER))
+        .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
+        .ok(onDatabase("functional", TPrivilegeLevel.ALTER))
+        .ok(onTable("functional", "alltypes", TPrivilegeLevel.ALL))
+        .ok(onTable("functional", "alltypes", TPrivilegeLevel.OWNER))
+        .ok(onTable("functional", "alltypes", TPrivilegeLevel.ALTER))
+        .error(alterError("functional.alltypes"))
+        .error(alterError("functional.alltypes"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER)))
+        .error(alterError("functional.alltypes"), onDatabase("functional", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER)))
+        .error(alterError("functional.alltypes"), onTable("functional", "alltypes",
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.ALTER)));
+
+    // Comment on view.
+    authorize("comment on view functional.alltypes_view is 'comment'")
+        .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
+        .ok(onServer(TPrivilegeLevel.ALTER))
+        .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
+        .ok(onDatabase("functional", TPrivilegeLevel.ALTER))
+        .ok(onTable("functional", "alltypes_view", TPrivilegeLevel.ALL))
+        .ok(onTable("functional", "alltypes_view", TPrivilegeLevel.OWNER))
+        .ok(onTable("functional", "alltypes_view", TPrivilegeLevel.ALTER))
+        .error(alterError("functional.alltypes_view"))
+        .error(alterError("functional.alltypes_view"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER)))
+        .error(alterError("functional.alltypes_view"), onDatabase("functional", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER)))
+        .error(alterError("functional.alltypes_view"), onTable("functional",
+            "alltypes_view", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.ALTER)));
+
+    // Comment on table column.
+    authorize("comment on column functional.alltypes.id is 'comment'")
+        .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
+        .ok(onServer(TPrivilegeLevel.ALTER))
+        .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
+        .ok(onDatabase("functional", TPrivilegeLevel.ALTER))
+        .ok(onTable("functional", "alltypes", TPrivilegeLevel.ALL))
+        .ok(onTable("functional", "alltypes", TPrivilegeLevel.OWNER))
+        .ok(onTable("functional", "alltypes", TPrivilegeLevel.ALTER))
+        .error(alterError("functional.alltypes"))
+        .error(alterError("functional.alltypes"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER)))
+        .error(alterError("functional.alltypes"), onDatabase("functional", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER)))
+        .error(alterError("functional.alltypes"), onTable("functional", "alltypes",
+            allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.ALTER)));
+
+    // Comment on view column.
+    authorize("comment on column functional.alltypes_view.id is 'comment'")
+        .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
+        .ok(onServer(TPrivilegeLevel.ALTER))
+        .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
+        .ok(onDatabase("functional", TPrivilegeLevel.ALTER))
+        .ok(onTable("functional", "alltypes_view", TPrivilegeLevel.ALL))
+        .ok(onTable("functional", "alltypes_view", TPrivilegeLevel.OWNER))
+        .ok(onTable("functional", "alltypes_view", TPrivilegeLevel.ALTER))
+        .error(alterError("functional.alltypes_view"))
+        .error(alterError("functional.alltypes_view"), onServer(allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER)))
+        .error(alterError("functional.alltypes_view"), onDatabase("functional", allExcept(
+            TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.ALTER)))
+        .error(alterError("functional.alltypes_view"), onTable("functional",
+            "alltypes_view", allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+            TPrivilegeLevel.ALTER)));
+  }
+
+  @Test
+  public void testFunction() throws ImpalaException {
+    // Create function.
+    authorize("create function functional.f() returns int location " +
+        "'/test-warehouse/libTestUdfs.so' symbol='NoArgs'")
+        .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
+        .ok(onServer(TPrivilegeLevel.CREATE), onUri("/test-warehouse/libTestUdfs.so",
+            TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.CREATE), onUri("/test-warehouse/libTestUdfs.so",
+            TPrivilegeLevel.OWNER))
+        .ok(onDatabase("functional", TPrivilegeLevel.ALL),
+            onUri("/test-warehouse/libTestUdfs.so", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER),
+            onUri("/test-warehouse/libTestUdfs.so", TPrivilegeLevel.OWNER))
+        .ok(onDatabase("functional", TPrivilegeLevel.CREATE),
+            onUri("/test-warehouse/libTestUdfs.so", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.CREATE),
+            onUri("/test-warehouse/libTestUdfs.so", TPrivilegeLevel.OWNER))
+        .error(createFunctionError("functional.f()"))
+        .error(accessError("hdfs://localhost:20500/test-warehouse/libTestUdfs.so"),
+            onServer(allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER)))
+        .error(createFunctionError("functional.f()"),
+            onUri("/test-warehouse/libTestUdfs.so", TPrivilegeLevel.ALL))
+        .error(createFunctionError("functional.f()"),
+            onUri("/test-warehouse/libTestUdfs.so", TPrivilegeLevel.OWNER));
+
+    // Create a function name that has the same name as built-in function is OK.
+    authorize("create function functional.sin() returns int location " +
+        "'/test-warehouse/libTestUdfs.so' symbol='NoArgs'")
+        .ok(onServer(TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.OWNER))
+        .ok(onServer(TPrivilegeLevel.CREATE), onUri("/test-warehouse/libTestUdfs.so",
+            TPrivilegeLevel.ALL))
+        .ok(onServer(TPrivilegeLevel.CREATE), onUri("/test-warehouse/libTestUdfs.so",
+            TPrivilegeLevel.OWNER))
+        .ok(onDatabase("functional", TPrivilegeLevel.ALL),
+            onUri("/test-warehouse/libTestUdfs.so", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.OWNER),
+            onUri("/test-warehouse/libTestUdfs.so", TPrivilegeLevel.OWNER))
+        .ok(onDatabase("functional", TPrivilegeLevel.CREATE),
+            onUri("/test-warehouse/libTestUdfs.so", TPrivilegeLevel.ALL))
+        .ok(onDatabase("functional", TPrivilegeLevel.CREATE),
+            onUri("/test-warehouse/libTestUdfs.so", TPrivilegeLevel.OWNER))
+        .error(createFunctionError("functional.sin()"))
+        .error(accessError("hdfs://localhost:20500/test-warehouse/libTestUdfs.so"),
+            onServer(allExcept(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER)))
+        .error(createFunctionError("functional.sin()"),
+            onUri("/test-warehouse/libTestUdfs.so", TPrivilegeLevel.ALL))
+        .error(createFunctionError("functional.sin()"),
+            onUri("/test-warehouse/libTestUdfs.so", TPrivilegeLevel.OWNER));
+
+    // Creating a function in the system database even with ALL/OWNER privilege on SERVER
+    // is not allowed.
+    for (AuthzTest test: new AuthzTest[] {
+        authorize("create function _impala_builtins.sin() returns int location " +
+            "'/test-warehouse/libTestUdfs.so' symbol='NoArgs'"),
+        authorize("create function _impala_builtins.f() returns int location " +
+            "'/test-warehouse/libTestUdfs.so' symbol='NoArgs'")}) {
+      test.error(systemDbError(), onServer(TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER));
+    }
+
+    ScalarFunction fn = addFunction("functional", "f");
+    try {
+      authorize("drop function functional.f()")
+          .ok(onServer(TPrivilegeLevel.ALL))
+          .ok(onServer(TPrivilegeLevel.OWNER))
+          .ok(onServer(TPrivilegeLevel.DROP))
+          .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+          .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
+          .ok(onDatabase("functional", TPrivilegeLevel.DROP))
+          .error(dropFunctionError("functional.f()"))
+          .error(dropFunctionError("functional.f()"), onServer(allExcept(
+              TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.DROP)));
+
+      // Function does not exist but with if exists clause.
+      authorize("drop function if exists functional.g()")
+          .error(dropFunctionError("functional.g()"))
+          .error(dropFunctionError("functional.g()"), onServer(allExcept(
+              TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER, TPrivilegeLevel.DROP)));
+    } finally {
+      removeFunction(fn);
+    }
+
+    // IMPALA-6086: Make sure use of a permanent function requires SELECT (or higher)
+    // privilege on the database, and expr rewrite/constant-folding preserves
+    // privilege requests for functions.
+    ArrayList<Type> argTypes = new ArrayList<Type>();
+    argTypes.add(Type.STRING);
+    fn = addFunction("functional", "to_lower", argTypes, Type.STRING,
+        "/test-warehouse/libTestUdf.so",
+        "_Z7ToLowerPN10impala_udf15FunctionContextERKNS_9StringValE");
+    try {
+      TQueryOptions options = new TQueryOptions();
+      options.setEnable_expr_rewrites(true);
+      for (AuthzTest test: new AuthzTest[] {
+          authorize("select functional.to_lower('ABCDEF')"),
+          // Also test with expression rewrite enabled.
+          authorize(createAnalysisCtx(options),
+              "select functional.to_lower('ABCDEF')")}) {
+        test.ok(onServer(TPrivilegeLevel.SELECT))
+            .ok(onDatabase("functional", TPrivilegeLevel.ALL))
+            .ok(onDatabase("functional", TPrivilegeLevel.OWNER))
+            .ok(onDatabase("functional", viewMetadataPrivileges()))
+            .error(accessError("functional"))
+            .error(accessError("functional"), onDatabase("functional",
+                allExcept(viewMetadataPrivileges())));
+      }
+    } finally {
+      removeFunction(fn);
+    }
+  }
+
+  @Test
+  public void testShutdown() throws ImpalaException {
+    // Requires ALL privilege on server.
+    authorize(": shutdown()")
+        .ok(onServer(TPrivilegeLevel.ALL))
+        .error(accessError("server"))
+        .error(accessError("server"), onServer(TPrivilegeLevel.REFRESH))
+        .error(accessError("server"), onServer(TPrivilegeLevel.SELECT))
+        .error(accessError("server"), onDatabase("functional", TPrivilegeLevel.ALL))
+        .error(accessError("server"),
+            onTable("functional", "alltypes", TPrivilegeLevel.ALL));
   }
 
   // Convert TDescribeResult to list of strings.
@@ -1594,7 +2668,12 @@ public class AuthorizationStmtTest extends FrontendTestBase {
   }
 
   private static String accessError(String object) {
-    return "User '%s' does not have privileges to access: " + object;
+    return accessError(false, object);
+  }
+
+  private static String accessError(boolean grantOption, String object) {
+    return "User '%s' does not have privileges" +
+        (grantOption ? " with 'GRANT OPTION'" : "") + " to access: " + object;
   }
 
   private static String refreshError(String object) {
@@ -1606,12 +2685,30 @@ public class AuthorizationStmtTest extends FrontendTestBase {
     return "Cannot modify system database.";
   }
 
-  private ScalarFunction addFunction(String db, String fnName) {
-    ScalarFunction fn = ScalarFunction.createForTesting(db, fnName,
-        new ArrayList<Type>(), Type.INT, "/dummy", "dummy.class", null,
-        null, TFunctionBinaryType.NATIVE);
+  private static String viewDefError(String object) {
+    return "User '%s' does not have privileges to see the definition of view '" +
+        object + "'.";
+  }
+
+  private static String createFunctionError(String object) {
+    return "User '%s' does not have privileges to CREATE functions in: " + object;
+  }
+
+  private static String dropFunctionError(String object) {
+    return "User '%s' does not have privileges to DROP functions in: " + object;
+  }
+
+  private ScalarFunction addFunction(String db, String fnName, ArrayList<Type> argTypes,
+      Type retType, String uriPath, String symbolName) {
+    ScalarFunction fn = ScalarFunction.createForTesting(db, fnName, argTypes, retType,
+        uriPath, symbolName, null, null, TFunctionBinaryType.NATIVE);
     authzCatalog_.addFunction(fn);
     return fn;
+  }
+
+  private ScalarFunction addFunction(String db, String fnName) {
+    return addFunction(db, fnName, new ArrayList<Type>(), Type.INT, "/dummy",
+        "dummy.class");
   }
 
   private void removeFunction(ScalarFunction fn) {
@@ -1631,8 +2728,8 @@ public class AuthorizationStmtTest extends FrontendTestBase {
   }
 
   private TPrivilegeLevel[] viewMetadataPrivileges() {
-    return new TPrivilegeLevel[]{TPrivilegeLevel.ALL, TPrivilegeLevel.SELECT,
-        TPrivilegeLevel.INSERT, TPrivilegeLevel.REFRESH};
+    return new TPrivilegeLevel[]{TPrivilegeLevel.ALL, TPrivilegeLevel.OWNER,
+        TPrivilegeLevel.SELECT, TPrivilegeLevel.INSERT, TPrivilegeLevel.REFRESH};
   }
 
   private static TPrivilegeLevel[] allExcept(TPrivilegeLevel... excludedPrivLevels) {
@@ -1646,10 +2743,108 @@ public class AuthorizationStmtTest extends FrontendTestBase {
     return privLevels.toArray(new TPrivilegeLevel[0]);
   }
 
+  private static abstract class WithPrincipal {
+    protected final AuthzTest test_;
+
+    public WithPrincipal(AuthzTest test) { test_ = test; }
+
+    public abstract void create(TPrivilege[]... privileges) throws ImpalaException;
+    public abstract void drop() throws ImpalaException;
+    public abstract String getName();
+  }
+
+  private static class WithUser extends WithPrincipal {
+    public WithUser(AuthzTest test) { super(test); }
+
+    @Override
+    public void create(TPrivilege[]... privileges) throws ImpalaException {
+      test_.createUser(privileges);
+    }
+
+    @Override
+    public void drop() throws ImpalaException { test_.dropUser(); }
+
+    @Override
+    public String getName() { return test_.user_; }
+  }
+
+  private static class WithRole extends WithPrincipal {
+    public WithRole(AuthzTest test) { super(test); }
+
+    @Override
+    public void create(TPrivilege[]... privileges) throws ImpalaException {
+      test_.createRole(privileges);
+    }
+
+    @Override
+    public void drop() throws ImpalaException { test_.dropRole(); }
+
+    @Override
+    public String getName() { return test_.role_; }
+  }
+
+
+  private class DescribeOutput {
+    private String[] excludedStrings_ = new String[0];
+    private String[] includedStrings_ = new String[0];
+    private final TDescribeOutputStyle outputStyle_;
+
+    public DescribeOutput(TDescribeOutputStyle style) {
+      outputStyle_ = style;
+    }
+
+    /**
+     * Indicates which strings must not appear in the output of the describe statement.
+     * During validation, if one of these strings exists, an assertion is thrown.
+     *
+     * @param excluded - Array of strings that must not exist in the output.
+     * @return DescribeOutput instance.
+     */
+    public DescribeOutput excludeStrings(String[] excluded) {
+      excludedStrings_ = excluded;
+      return this;
+    }
+
+    /**
+     * Indicates which strings are required to appear in the output of the describe
+     * statement.  During validation, if any one of these strings does not exist, an
+     * assertion is thrown.
+     *
+     * @param included - Array of strings that must exist in the output.
+     * @return DescribeOutput instance.
+     */
+    public DescribeOutput includeStrings(String[] included) {
+      includedStrings_ = included;
+      return this;
+    }
+
+    public void validate(TTableName table) throws ImpalaException {
+      Preconditions.checkArgument(includedStrings_.length != 0 ||
+          excludedStrings_.length != 0,
+          "One or both of included or excluded strings must be defined.");
+      List<String> result = resultToStringList(authzFrontend_.describeTable(table,
+          outputStyle_, USER));
+      for (String str: includedStrings_) {
+        assertTrue(String.format("\"%s\" is not in the describe output.\n" +
+            "Expected : %s\n Actual   : %s", str, Arrays.toString(includedStrings_),
+            result), result.contains(str));
+      }
+      for (String str: excludedStrings_) {
+        assertTrue(String.format("\"%s\" should not be in the describe output.", str),
+            !result.contains(str));
+      }
+    }
+  }
+
+  private DescribeOutput describeOutput(TDescribeOutputStyle style) {
+    return new DescribeOutput(style);
+  }
+
   private class AuthzTest {
     private final AnalysisContext context_;
     private final String stmt_;
     private final String role_ = "authz_test_role";
+    private final String user_ = USER.getName();
 
     public AuthzTest(String stmt) {
       this(null, stmt);
@@ -1666,8 +2861,20 @@ public class AuthorizationStmtTest extends FrontendTestBase {
       authzCatalog_.addRoleGrantGroup(role_, USER.getName());
       for (TPrivilege[] privs: privileges) {
         for (TPrivilege privilege: privs) {
-          privilege.setRole_id(role.getId());
+          privilege.setPrincipal_id(role.getId());
+          privilege.setPrincipal_type(TPrincipalType.ROLE);
           authzCatalog_.addRolePrivilege(role_, privilege);
+        }
+      }
+    }
+
+    private void createUser(TPrivilege[]... privileges) throws ImpalaException {
+      org.apache.impala.catalog.User user = authzCatalog_.addUser(user_);
+      for (TPrivilege[] privs: privileges) {
+        for (TPrivilege privilege: privs) {
+          privilege.setPrincipal_id(user.getId());
+          privilege.setPrincipal_type(TPrincipalType.USER);
+          authzCatalog_.addUserPrivilege(user_, privilege);
         }
       }
     }
@@ -1676,85 +2883,82 @@ public class AuthorizationStmtTest extends FrontendTestBase {
       authzCatalog_.removeRole(role_);
     }
 
+    private void dropUser() throws ImpalaException {
+      authzCatalog_.removeUser(user_);
+    }
+
     /**
-     * This method runs with the specified privileges.
+     * This method runs with the specified privileges for the role and then for the user.
      *
-     * A new temporary role will be created and assigned to the specified privileges
-     * into the new role. The new role will be dropped once this method finishes.
+     * A new temporary role/user will be created and assigned to the specified privileges
+     * into the new role/user. The new role/user will be dropped once this method
+     * finishes.
      */
     public AuthzTest ok(TPrivilege[]... privileges) throws ImpalaException {
-      try {
-        createRole(privileges);
-        if (context_ != null) {
-          authzOk(context_, stmt_);
-        } else {
-          authzOk(stmt_);
+      for (WithPrincipal withPrincipal: new WithPrincipal[]{
+          new WithRole(this), new WithUser(this)}) {
+        try {
+          withPrincipal.create(privileges);
+          if (context_ != null) {
+            authzOk(context_, stmt_, withPrincipal);
+          } else {
+            authzOk(stmt_, withPrincipal);
+          }
+        } finally {
+          withPrincipal.drop();
         }
-      } catch (AuthorizationException ae) {
-        // Because the same test can be called from multiple statements
-        // it is useful to know which statement caused the exception.
-        throw new AuthorizationException(stmt_ + ": " + ae.getMessage(), ae);
-      } finally {
-        dropRole();
       }
       return this;
     }
 
     /**
-     * This method runs with the specified privileges and checks describe output.
+     * This method runs with the specified privileges and checks describe output for the
+     * role and then the user.
      *
-     * A new temporary role will be created and assigned to the specified privileges
-     * into the new role. The new role will be dropped once this method finishes.
+     * A new temporary role/user will be created and assigned to the specified privileges
+     * into the new role/user. The new role/user will be dropped once this method
+     * finishes.
      */
-    public AuthzTest okDescribe(TTableName table, TDescribeOutputStyle style,
-        String[] requiredStrings, String[] excludedStrings, TPrivilege[]... privileges)
-        throws ImpalaException {
-      try {
-        createRole(privileges);
-        if (context_ != null) {
-          authzOk(context_, stmt_);
-        } else {
-          authzOk(stmt_);
-        }
-        List<String> result = resultToStringList(authzFrontend_.describeTable(table,
-            style, USER));
-        if (requiredStrings != null) {
-          for (String str: requiredStrings) {
-            assertTrue(String.format("\"%s\" is not in the describe output.\n" +
-                "Expected : %s\n" +
-                "Actual   : %s", str, Arrays.toString(requiredStrings), result),
-                result.contains(str));
+    public AuthzTest okDescribe(TTableName table, DescribeOutput output,
+        TPrivilege[]... privileges) throws ImpalaException {
+      for (WithPrincipal withPrincipal: new WithPrincipal[]{
+          new WithRole(this), new WithUser(this)}) {
+        try {
+          withPrincipal.create(privileges);
+          if (context_ != null) {
+            authzOk(context_, stmt_, withPrincipal);
+          } else {
+            authzOk(stmt_, withPrincipal);
           }
+          output.validate(table);
+        } finally {
+          withPrincipal.drop();
         }
-        if (excludedStrings != null) {
-          for (String str: excludedStrings) {
-            assertTrue(String.format("\"%s\" should not be in the describe output.", str),
-                !result.contains(str));
-          }
-        }
-      } finally {
-        dropRole();
       }
       return this;
     }
 
     /**
-     * This method runs with the specified privileges.
+     * This method runs with the specified privileges for the user and then the role.
      *
-     * A new temporary role will be created and assigned to the specified privileges
-     * into the new role. The new role will be dropped once this method finishes.
+     * A new temporary role/user will be created and assigned to the specified privileges
+     * into the new role/user. The new role/user will be dropped once this method
+     * finishes.
      */
     public AuthzTest error(String expectedError, TPrivilege[]... privileges)
         throws ImpalaException {
-      try {
-        createRole(privileges);
-        if (context_ != null) {
-          authzError(context_, stmt_, expectedError);
-        } else {
-          authzError(stmt_, expectedError);
+      for (WithPrincipal withPrincipal: new WithPrincipal[]{
+          new WithRole(this), new WithUser(this)}) {
+        try {
+          withPrincipal.create(privileges);
+          if (context_ != null) {
+            authzError(context_, stmt_, expectedError, withPrincipal);
+          } else {
+            authzError(stmt_, expectedError, withPrincipal);
+          }
+        } finally {
+          withPrincipal.drop();
         }
-      } finally {
-        dropRole();
       }
       return this;
     }
@@ -1769,37 +2973,48 @@ public class AuthorizationStmtTest extends FrontendTestBase {
   }
 
   private TPrivilege[] onServer(TPrivilegeLevel... levels) {
+    return onServer(false, levels);
+  }
+
+  private TPrivilege[] onServer(boolean grantOption, TPrivilegeLevel... levels) {
     TPrivilege[] privileges = new TPrivilege[levels.length];
     for (int i = 0; i < levels.length; i++) {
-      privileges[i] = new TPrivilege("", levels[i], TPrivilegeScope.SERVER, false);
+      privileges[i] = new TPrivilege(levels[i], TPrivilegeScope.SERVER, false);
       privileges[i].setServer_name(SENTRY_SERVER);
-      privileges[i].setPrivilege_name(RolePrivilege.buildRolePrivilegeName(
-          privileges[i]));
+      privileges[i].setHas_grant_opt(grantOption);
     }
     return privileges;
   }
 
   private TPrivilege[] onDatabase(String db, TPrivilegeLevel... levels) {
+    return onDatabase(false, db, levels);
+  }
+
+  private TPrivilege[] onDatabase(boolean grantOption, String db,
+      TPrivilegeLevel... levels) {
     TPrivilege[] privileges = new TPrivilege[levels.length];
     for (int i = 0; i < levels.length; i++) {
-      privileges[i] = new TPrivilege("", levels[i], TPrivilegeScope.DATABASE, false);
+      privileges[i] = new TPrivilege(levels[i], TPrivilegeScope.DATABASE, false);
       privileges[i].setServer_name(SENTRY_SERVER);
       privileges[i].setDb_name(db);
-      privileges[i].setPrivilege_name(RolePrivilege.buildRolePrivilegeName(
-          privileges[i]));
+      privileges[i].setHas_grant_opt(grantOption);
     }
     return privileges;
   }
 
   private TPrivilege[] onTable(String db, String table, TPrivilegeLevel... levels) {
+    return onTable(false, db, table, levels);
+  }
+
+  private TPrivilege[] onTable(boolean grantOption, String db, String table,
+      TPrivilegeLevel... levels) {
     TPrivilege[] privileges = new TPrivilege[levels.length];
     for (int i = 0; i < levels.length; i++) {
-      privileges[i] = new TPrivilege("", levels[i], TPrivilegeScope.TABLE, false);
+      privileges[i] = new TPrivilege(levels[i], TPrivilegeScope.TABLE, false);
       privileges[i].setServer_name(SENTRY_SERVER);
       privileges[i].setDb_name(db);
       privileges[i].setTable_name(table);
-      privileges[i].setPrivilege_name(RolePrivilege.buildRolePrivilegeName(
-          privileges[i]));
+      privileges[i].setHas_grant_opt(grantOption);
     }
     return privileges;
   }
@@ -1809,20 +3024,29 @@ public class AuthorizationStmtTest extends FrontendTestBase {
     return onColumn(db, table, new String[]{column}, levels);
   }
 
+  private TPrivilege[] onColumn(boolean grantOption, String db, String table,
+      String column, TPrivilegeLevel... levels) {
+    return onColumn(grantOption, db, table, new String[]{column}, levels);
+  }
+
   private TPrivilege[] onColumn(String db, String table, String[] columns,
       TPrivilegeLevel... levels) {
+    return onColumn(false, db, table, columns, levels);
+  }
+
+  private TPrivilege[] onColumn(boolean grantOption, String db, String table,
+      String[] columns, TPrivilegeLevel... levels) {
     int size = columns.length * levels.length;
     TPrivilege[] privileges = new TPrivilege[size];
     int idx = 0;
     for (int i = 0; i < levels.length; i++) {
       for (String column: columns) {
-        privileges[idx] = new TPrivilege("", levels[i], TPrivilegeScope.COLUMN, false);
+        privileges[idx] = new TPrivilege(levels[i], TPrivilegeScope.COLUMN, false);
         privileges[idx].setServer_name(SENTRY_SERVER);
         privileges[idx].setDb_name(db);
         privileges[idx].setTable_name(table);
         privileges[idx].setColumn_name(column);
-        privileges[idx].setPrivilege_name(RolePrivilege.buildRolePrivilegeName(
-            privileges[idx]));
+        privileges[idx].setHas_grant_opt(grantOption);
         idx++;
       }
     }
@@ -1830,52 +3054,64 @@ public class AuthorizationStmtTest extends FrontendTestBase {
   }
 
   private TPrivilege[] onUri(String uri, TPrivilegeLevel... levels) {
+    return onUri(false, uri, levels);
+  }
+
+  private TPrivilege[] onUri(boolean grantOption, String uri, TPrivilegeLevel... levels) {
     TPrivilege[] privileges = new TPrivilege[levels.length];
     for (int i = 0; i < levels.length; i++) {
-      privileges[i] = new TPrivilege("", levels[i], TPrivilegeScope.URI, false);
+      privileges[i] = new TPrivilege(levels[i], TPrivilegeScope.URI, false);
       privileges[i].setServer_name(SENTRY_SERVER);
       privileges[i].setUri(uri);
-      privileges[i].setPrivilege_name(RolePrivilege.buildRolePrivilegeName(
-          privileges[i]));
+      privileges[i].setHas_grant_opt(grantOption);
     }
     return privileges;
   }
 
-  private void authzOk(String stmt) throws ImpalaException {
-    authzOk(analysisContext_, stmt);
+  private void authzOk(String stmt, WithPrincipal withPrincipal) throws ImpalaException {
+    authzOk(analysisContext_, stmt, withPrincipal);
   }
 
-  private void authzOk(AnalysisContext context, String stmt) throws ImpalaException {
-    authzOk(authzFrontend_, context, stmt);
-  }
-
-  private void authzOk(Frontend fe, AnalysisContext context, String stmt)
+  private void authzOk(AnalysisContext context, String stmt, WithPrincipal withPrincipal)
       throws ImpalaException {
-    parseAndAnalyze(stmt, context, fe);
+    authzOk(authzFrontend_, context, stmt, withPrincipal);
+  }
+
+  private void authzOk(Frontend fe, AnalysisContext context, String stmt,
+      WithPrincipal withPrincipal) throws ImpalaException {
+    try {
+      parseAndAnalyze(stmt, context, fe);
+    } catch (AuthorizationException e) {
+      // Because the same test can be called from multiple statements
+      // it is useful to know which statement caused the exception.
+      throw new AuthorizationException(String.format(
+          "\nPrincipal: %s\nStatement: %s\nError: %s", withPrincipal.getName(),
+          stmt, e.getMessage(), e));
+    }
   }
 
   /**
    * Verifies that a given statement fails authorization and the expected error
    * string matches.
    */
-  private void authzError(String stmt, String expectedError, Matcher matcher)
-      throws ImpalaException {
-    authzError(analysisContext_, stmt, expectedError, matcher);
+  private void authzError(String stmt, String expectedError, Matcher matcher,
+      WithPrincipal withPrincipal) throws ImpalaException {
+    authzError(analysisContext_, stmt, expectedError, matcher, withPrincipal);
   }
 
-  private void authzError(String stmt, String expectedError)
+  private void authzError(String stmt, String expectedError, WithPrincipal withPrincipal)
       throws ImpalaException {
-    authzError(analysisContext_, stmt, expectedError, startsWith());
+    authzError(analysisContext_, stmt, expectedError, startsWith(), withPrincipal);
   }
 
   private void authzError(AnalysisContext ctx, String stmt, String expectedError,
-      Matcher matcher) throws ImpalaException {
-    authzError(authzFrontend_, ctx, stmt, expectedError, matcher);
+      Matcher matcher, WithPrincipal withPrincipal) throws ImpalaException {
+    authzError(authzFrontend_, ctx, stmt, expectedError, matcher, withPrincipal);
   }
 
-  private void authzError(AnalysisContext ctx, String stmt, String expectedError)
-      throws ImpalaException {
-    authzError(authzFrontend_, ctx, stmt, expectedError, startsWith());
+  private void authzError(AnalysisContext ctx, String stmt, String expectedError,
+      WithPrincipal withPrincipal) throws ImpalaException {
+    authzError(authzFrontend_, ctx, stmt, expectedError, startsWith(), withPrincipal);
   }
 
   private interface Matcher {
@@ -1900,8 +3136,8 @@ public class AuthorizationStmtTest extends FrontendTestBase {
     };
   }
 
-  private void authzError(Frontend fe, AnalysisContext ctx,
-      String stmt, String expectedErrorString, Matcher matcher)
+  private void authzError(Frontend fe, AnalysisContext ctx, String stmt,
+      String expectedErrorString, Matcher matcher, WithPrincipal withPrincipal)
       throws ImpalaException {
     Preconditions.checkNotNull(expectedErrorString);
     try {
@@ -1915,7 +3151,8 @@ public class AuthorizationStmtTest extends FrontendTestBase {
           matcher.match(errorString, expectedErrorString));
       return;
     }
-    fail("Stmt didn't result in authorization error: " + stmt);
+    fail(String.format("Statement did not result in authorization error.\n" +
+        "Principal: %s\nStatement: %s", withPrincipal.getName(), stmt));
   }
 
   private void verifyPrivilegeReqs(String stmt, Set<String> expectedPrivilegeNames)

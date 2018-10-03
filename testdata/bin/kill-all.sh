@@ -18,7 +18,11 @@
 # under the License.
 
 set -euo pipefail
-trap 'echo Error in $0 at line $LINENO: $(cd "'$PWD'" && awk "NR == $LINENO" $0)' ERR
+. $IMPALA_HOME/bin/report_build_error.sh
+setup_report_build_error
+
+# Shutdown Impala if it is alive
+${IMPALA_HOME}/bin/start-impala-cluster.py --kill
 
 # Kill HBase, then MiniLlama (which includes a MiniDfs, a Yarn RM several NMs).
 $IMPALA_HOME/testdata/bin/kill-sentry-service.sh

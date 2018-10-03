@@ -40,6 +40,28 @@ using namespace rapidjson;
 using namespace strings;
 
 DEFINE_int32(catalog_service_port, 26000, "port where the CatalogService is running");
+DEFINE_string(catalog_topic_mode, "full",
+    "The type of data that the catalog service will publish into the Catalog "
+    "StateStore topic. Valid values are 'full', 'mixed', or 'minimal'.\n"
+    "\n"
+    "In 'full' mode, complete catalog objects are published any time a new "
+    "version is available. In 'minimal' mode, only a minimal object is published "
+    "when a new version of a catalog object is available. In 'mixed' mode, both types "
+    "of topic entries are published.\n"
+    "\n"
+    "When all impalad coordinators are configured with --use_local_catalog disabled "
+    "(the default), 'full' mode should be used. If all impalad coordinators are "
+    "configured with --use_local_catalog enabled, 'minimal' mode should be used. "
+    "When some impalads are configured with --use_local_catalog disabled and others "
+    "configured with it enabled, then 'mixed' mode is required.");
+
+DEFINE_validator(catalog_topic_mode, [](const char* name, const string& val) {
+  if (val == "full" || val == "mixed" || val == "minimal") return true;
+  LOG(ERROR) << "Invalid value for --" << name << ": must be one of "
+      << "'full', 'mixed', or 'minimal'";
+  return false;
+});
+
 DECLARE_string(state_store_host);
 DECLARE_int32(state_store_subscriber_port);
 DECLARE_int32(state_store_port);
@@ -66,7 +88,7 @@ class CatalogServiceThriftIf : public CatalogServiceIf {
   }
 
   // Executes a TDdlExecRequest and returns details on the result of the operation.
-  virtual void ExecDdl(TDdlExecResponse& resp, const TDdlExecRequest& req) {
+  void ExecDdl(TDdlExecResponse& resp, const TDdlExecRequest& req) override {
     VLOG_RPC << "ExecDdl(): request=" << ThriftDebugString(req);
     Status status = catalog_server_->catalog()->ExecDdl(req, &resp);
     if (!status.ok()) LOG(ERROR) << status.GetDetail();
@@ -77,8 +99,8 @@ class CatalogServiceThriftIf : public CatalogServiceIf {
   }
 
   // Executes a TResetMetadataRequest and returns details on the result of the operation.
-  virtual void ResetMetadata(TResetMetadataResponse& resp,
-      const TResetMetadataRequest& req) {
+  void ResetMetadata(TResetMetadataResponse& resp, const TResetMetadataRequest& req)
+      override {
     VLOG_RPC << "ResetMetadata(): request=" << ThriftDebugString(req);
     Status status = catalog_server_->catalog()->ResetMetadata(req, &resp);
     if (!status.ok()) LOG(ERROR) << status.GetDetail();
@@ -90,8 +112,8 @@ class CatalogServiceThriftIf : public CatalogServiceIf {
 
   // Executes a TUpdateCatalogRequest and returns details on the result of the
   // operation.
-  virtual void UpdateCatalog(TUpdateCatalogResponse& resp,
-      const TUpdateCatalogRequest& req) {
+  void UpdateCatalog(TUpdateCatalogResponse& resp, const TUpdateCatalogRequest& req)
+      override {
     VLOG_RPC << "UpdateCatalog(): request=" << ThriftDebugString(req);
     Status status = catalog_server_->catalog()->UpdateCatalog(req, &resp);
     if (!status.ok()) LOG(ERROR) << status.GetDetail();
@@ -103,8 +125,8 @@ class CatalogServiceThriftIf : public CatalogServiceIf {
 
   // Gets functions in the Catalog based on the parameters of the
   // TGetFunctionsRequest.
-  virtual void GetFunctions(TGetFunctionsResponse& resp,
-      const TGetFunctionsRequest& req) {
+  void GetFunctions(TGetFunctionsResponse& resp, const TGetFunctionsRequest& req)
+      override {
     VLOG_RPC << "GetFunctions(): request=" << ThriftDebugString(req);
     Status status = catalog_server_->catalog()->GetFunctions(req, &resp);
     if (!status.ok()) LOG(ERROR) << status.GetDetail();
@@ -115,8 +137,8 @@ class CatalogServiceThriftIf : public CatalogServiceIf {
   }
 
   // Gets a TCatalogObject based on the parameters of the TGetCatalogObjectRequest.
-  virtual void GetCatalogObject(TGetCatalogObjectResponse& resp,
-      const TGetCatalogObjectRequest& req) {
+  void GetCatalogObject(TGetCatalogObjectResponse& resp,
+      const TGetCatalogObjectRequest& req) override {
     VLOG_RPC << "GetCatalogObject(): request=" << ThriftDebugString(req);
     Status status = catalog_server_->catalog()->GetCatalogObject(req.object_desc,
         &resp.catalog_object);
@@ -124,11 +146,40 @@ class CatalogServiceThriftIf : public CatalogServiceIf {
     VLOG_RPC << "GetCatalogObject(): response=" << ThriftDebugString(resp);
   }
 
+  void GetPartialCatalogObject(TGetPartialCatalogObjectResponse& resp,
+      const TGetPartialCatalogObjectRequest& req) override {
+    // TODO(todd): capture detailed metrics on the types of inbound requests, lock
+    // wait times, etc.
+    // TODO(todd): add some kind of limit on the number of concurrent requests here
+    // to avoid thread exhaustion -- eg perhaps it would be best to use a trylock
+    // on the catalog locks, or defer these calls to a separate (bounded) queue,
+    // so a heavy query workload against a table undergoing a slow refresh doesn't
+    // end up taking down the catalog by creating thousands of threads.
+    VLOG_RPC << "GetPartialCatalogObject(): request=" << ThriftDebugString(req);
+    Status status = catalog_server_->catalog()->GetPartialCatalogObject(req, &resp);
+    if (!status.ok()) LOG(ERROR) << status.GetDetail();
+    TStatus thrift_status;
+    status.ToThrift(&thrift_status);
+    resp.__set_status(thrift_status);
+    VLOG_RPC << "GetPartialCatalogObject(): response=" << ThriftDebugString(resp);
+  }
+
+  void GetPartitionStats(TGetPartitionStatsResponse& resp,
+      const TGetPartitionStatsRequest& req) override {
+    VLOG_RPC << "GetPartitionStats(): request=" << ThriftDebugString(req);
+    Status status = catalog_server_->catalog()->GetPartitionStats(req, &resp);
+    if (!status.ok()) LOG(ERROR) << status.GetDetail();
+    TStatus thrift_status;
+    status.ToThrift(&thrift_status);
+    resp.__set_status(thrift_status);
+    VLOG_RPC << "GetPartitionStats(): response=" << ThriftDebugString(resp);
+  }
+
   // Prioritizes the loading of metadata for one or more catalog objects. Currently only
   // used for loading tables/views because they are the only type of object that is loaded
   // lazily.
-  virtual void PrioritizeLoad(TPrioritizeLoadResponse& resp,
-      const TPrioritizeLoadRequest& req) {
+  void PrioritizeLoad(TPrioritizeLoadResponse& resp, const TPrioritizeLoadRequest& req)
+      override {
     VLOG_RPC << "PrioritizeLoad(): request=" << ThriftDebugString(req);
     Status status = catalog_server_->catalog()->PrioritizeLoad(req);
     if (!status.ok()) LOG(ERROR) << status.GetDetail();
@@ -138,8 +189,8 @@ class CatalogServiceThriftIf : public CatalogServiceIf {
     VLOG_RPC << "PrioritizeLoad(): response=" << ThriftDebugString(resp);
   }
 
-  virtual void SentryAdminCheck(TSentryAdminCheckResponse& resp,
-      const TSentryAdminCheckRequest& req) {
+  void SentryAdminCheck(TSentryAdminCheckResponse& resp,
+      const TSentryAdminCheckRequest& req) override {
     VLOG_RPC << "SentryAdminCheck(): request=" << ThriftDebugString(req);
     Status status = catalog_server_->catalog()->SentryAdminCheck(req);
     if (!status.ok()) LOG(ERROR) << status.GetDetail();
@@ -147,6 +198,13 @@ class CatalogServiceThriftIf : public CatalogServiceIf {
     status.ToThrift(&thrift_status);
     resp.__set_status(thrift_status);
     VLOG_RPC << "SentryAdminCheck(): response=" << ThriftDebugString(resp);
+  }
+
+  void UpdateTableUsage(TUpdateTableUsageResponse& resp,
+      const TUpdateTableUsageRequest& req) override {
+    VLOG_RPC << "UpdateTableUsage(): request=" << ThriftDebugString(req);
+    Status status = catalog_server_->catalog()->UpdateTableUsage(req);
+    if (!status.ok()) LOG(WARNING) << status.GetDetail();
   }
 
  private:
@@ -186,7 +244,14 @@ Status CatalogServer::Start() {
 
   StatestoreSubscriber::UpdateCallback cb =
       bind<void>(mem_fn(&CatalogServer::UpdateCatalogTopicCallback), this, _1, _2);
-  status = statestore_subscriber_->AddTopic(IMPALA_CATALOG_TOPIC, false, false, cb);
+  // The catalogd never needs to read any entries from the topic. It only publishes
+  // entries. So, we set a prefix to some random character that we know won't be a
+  // prefix of any key. This saves a bit of network communication from the statestore
+  // back to the catalog.
+  string filter_prefix = "!";
+  status = statestore_subscriber_->AddTopic(IMPALA_CATALOG_TOPIC,
+      /* is_transient=*/ false, /* populate_min_subscriber_topic_version=*/ false,
+      filter_prefix, cb);
   if (!status.ok()) {
     status.AddDetail("CatalogService failed to start");
     return status;

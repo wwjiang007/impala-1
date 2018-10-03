@@ -388,7 +388,8 @@ visible_functions = [
    '_ZN6impala13MathFunctions13LeastGreatestILb0EEEN10impala_udf9StringValEPNS2_15FunctionContextEiPKS3_'],
   [['greatest'], 'DECIMAL', ['DECIMAL', '...'],
    '_ZN6impala13MathFunctions13LeastGreatestILb0EEEN10impala_udf10DecimalValEPNS2_15FunctionContextEiPKS3_'],
-
+  [['width_bucket'], 'BIGINT', ['DECIMAL', 'DECIMAL', 'DECIMAL', 'INT'],
+    '_ZN6impala13MathFunctions11WidthBucketEPN10impala_udf15FunctionContextERKNS1_10DecimalValES6_S6_RKNS1_6IntValE'],
   # Decimal Functions
   # TODO: oracle has decimal support for transcendental functions (e.g. sin()) to very
   # high precisions. Do we need them? It's unclear if other databases do the same.
@@ -510,6 +511,8 @@ visible_functions = [
   [['btrim'], 'STRING', ['STRING', 'STRING'], 'impala::StringFunctions::BTrimString',
    '_ZN6impala15StringFunctions11TrimPrepareEPN10impala_udf15FunctionContextENS2_18FunctionStateScopeE',
    '_ZN6impala15StringFunctions9TrimCloseEPN10impala_udf15FunctionContextENS2_18FunctionStateScopeE'],
+  [['get_json_object'], 'STRING', ['STRING', 'STRING'],
+   'impala::StringFunctions::GetJsonObject'],
 
   # Conditional Functions
   # Some of these have empty symbols because the BE special-cases them based on the
@@ -576,10 +579,12 @@ visible_functions = [
   [['current_database', 'current_catalog'], 'STRING', [], 'impala::UtilityFunctions::CurrentDatabase'],
   [['current_session', 'current_sid'], 'STRING', [], 'impala::UtilityFunctions::CurrentSession'],
   [['user', 'session_user'], 'STRING', [], 'impala::UtilityFunctions::User'],
-  [['effective_user', 'current_user'], 'STRING', [], 'impala::UtilityFunctions::EffectiveUser'],
+  [['effective_user', 'current_user', 'logged_in_user'], 'STRING', [],
+      'impala::UtilityFunctions::EffectiveUser'],
   [['sleep'], 'BOOLEAN', ['INT'], 'impala::UtilityFunctions::Sleep'],
   [['pid'], 'INT', [], 'impala::UtilityFunctions::Pid'],
   [['version'], 'STRING', [], 'impala::UtilityFunctions::Version'],
+  [['coordinator'], 'STRING', [], 'impala::UtilityFunctions::Coordinator'],
   [['typeOf'], 'STRING', ['BOOLEAN'], '_ZN6impala16UtilityFunctions6TypeOfIN10impala_udf10BooleanValEEENS2_9StringValEPNS2_15FunctionContextERKT_'],
   [['typeOf'], 'STRING', ['TINYINT'], '_ZN6impala16UtilityFunctions6TypeOfIN10impala_udf10TinyIntValEEENS2_9StringValEPNS2_15FunctionContextERKT_'],
   [['typeOf'], 'STRING', ['SMALLINT'], '_ZN6impala16UtilityFunctions6TypeOfIN10impala_udf11SmallIntValEEENS2_9StringValEPNS2_15FunctionContextERKT_'],

@@ -259,18 +259,26 @@ public class AuditingTest extends FrontendTestBase {
         "ALTER TABLE functional_seq_snap.alltypes RENAME TO functional_seq_snap.t1");
     Assert.assertEquals(accessEvents, Sets.newHashSet(
         new TAccessEvent(
-            "functional_seq_snap.alltypes", TCatalogObjectType.TABLE, "ALTER"),
+            "functional_seq_snap.alltypes", TCatalogObjectType.TABLE, "ALL"),
         new TAccessEvent("functional_seq_snap.t1", TCatalogObjectType.TABLE, "CREATE")));
   }
 
   @Test
   public void TestAlterView() throws AnalysisException, AuthorizationException {
     Set<TAccessEvent> accessEvents = AnalyzeAccessEvents(
+        "ALTER VIEW functional_seq_snap.alltypes_view AS " +
+        "SELECT * FROM functional.alltypes");
+    Assert.assertEquals(accessEvents, Sets.newHashSet(
+        new TAccessEvent(
+            "functional_seq_snap.alltypes_view", TCatalogObjectType.VIEW, "ALTER"),
+        new TAccessEvent("functional.alltypes", TCatalogObjectType.TABLE, "SELECT")));
+
+    accessEvents = AnalyzeAccessEvents(
         "ALTER VIEW functional_seq_snap.alltypes_view " +
         "rename to functional_seq_snap.v1");
     Assert.assertEquals(accessEvents, Sets.newHashSet(
         new TAccessEvent(
-            "functional_seq_snap.alltypes_view", TCatalogObjectType.VIEW, "ALTER"),
+            "functional_seq_snap.alltypes_view", TCatalogObjectType.VIEW, "ALL"),
         new TAccessEvent("functional_seq_snap.v1", TCatalogObjectType.VIEW, "CREATE")));
   }
 
@@ -280,7 +288,9 @@ public class AuditingTest extends FrontendTestBase {
         "COMPUTE STATS functional_seq_snap.alltypes");
     Assert.assertEquals(accessEvents, Sets.newHashSet(
         new TAccessEvent(
-            "functional_seq_snap.alltypes", TCatalogObjectType.TABLE, "ALTER")));
+            "functional_seq_snap.alltypes", TCatalogObjectType.TABLE, "ALTER"),
+        new TAccessEvent(
+            "functional_seq_snap.alltypes", TCatalogObjectType.TABLE, "SELECT")));
   }
 
   @Test
@@ -443,7 +453,8 @@ public class AuditingTest extends FrontendTestBase {
     // Compute stats
     accessEvents = AnalyzeAccessEvents("compute stats functional_kudu.testtbl");
     Assert.assertEquals(accessEvents, Sets.newHashSet(
-        new TAccessEvent("functional_kudu.testtbl", TCatalogObjectType.TABLE, "ALTER")));
+        new TAccessEvent("functional_kudu.testtbl", TCatalogObjectType.TABLE, "ALTER"),
+        new TAccessEvent("functional_kudu.testtbl", TCatalogObjectType.TABLE, "SELECT")));
 
     // Describe
     accessEvents = AnalyzeAccessEvents("describe functional_kudu.testtbl");

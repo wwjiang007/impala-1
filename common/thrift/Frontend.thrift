@@ -98,6 +98,26 @@ struct TGetTableMetricsResponse {
   1: required string metrics
 }
 
+// Response from a call to getCatalogMetrics.
+struct TGetCatalogMetricsResult {
+  1: required i32 num_dbs
+  2: required i32 num_tables
+  // Following cache metrics are set only in local catalog mode. These map to Guava's
+  // CacheStats. Accounts for all the cache requests since the process boot time.
+  3: optional i64 cache_eviction_count
+  4: optional i64 cache_hit_count
+  5: optional i64 cache_load_count
+  6: optional i64 cache_load_exception_count
+  7: optional i64 cache_load_success_count
+  8: optional i64 cache_miss_count
+  9: optional i64 cache_request_count
+  10: optional i64 cache_total_load_time
+  11: optional double cache_avg_load_time
+  12: optional double cache_hit_rate
+  13: optional double cache_load_exception_rate
+  14: optional double cache_miss_rate
+}
+
 // Arguments to getDbs, which returns a list of dbs that match an optional pattern
 struct TGetDbsParams {
   // If not set, match every database
@@ -259,20 +279,23 @@ struct TShowRolesResult {
   1: required list<string> role_names
 }
 
-// Parameters for SHOW GRANT ROLE commands
-struct TShowGrantRoleParams {
+// Parameters for SHOW GRANT ROLE/USER commands
+struct TShowGrantPrincipalParams {
   // The effective user who submitted this request.
   1: optional string requesting_user
 
-  // The target role name.
-  2: required string role_name
+  // The target name.
+  2: required string name
+
+  // The principal type.
+  3: required CatalogObjects.TPrincipalType principal_type;
 
   // True if this operation requires admin privileges on the Sentry Service (when
   // the requesting user has not been granted the target role name).
-  3: required bool is_admin_op
+  4: required bool is_admin_op
 
   // An optional filter to show grants that match a specific privilege spec.
-  4: optional CatalogObjects.TPrivilege privilege
+  5: optional CatalogObjects.TPrivilege privilege
 }
 
 // Arguments to getFunctions(), which returns a list of non-qualified function
@@ -430,7 +453,7 @@ enum TCatalogOpType {
   SHOW_CREATE_TABLE,
   SHOW_DATA_SRCS,
   SHOW_ROLES,
-  SHOW_GRANT_ROLE,
+  SHOW_GRANT_PRINCIPAL,
   SHOW_FILES,
   SHOW_CREATE_FUNCTION
 }
@@ -467,8 +490,8 @@ struct TCatalogOpRequest {
   // Parameters for SHOW ROLES
   10: optional TShowRolesParams show_roles_params
 
-  // Parameters for SHOW GRANT ROLE
-  11: optional TShowGrantRoleParams show_grant_role_params
+  // Parameters for SHOW GRANT ROLE/USER
+  11: optional TShowGrantPrincipalParams show_grant_principal_params
 
   // Parameters for DDL requests executed using the CatalogServer
   // such as CREATE, ALTER, and DROP. See CatalogService.TDdlExecRequest
@@ -502,6 +525,31 @@ struct TSetQueryOptionRequest {
   2: optional string value
   // Set true for "SET ALL"
   3: optional bool is_set_all
+}
+
+struct TShutdownParams {
+  // Set if a backend was specified as an argument to the shutdown function. If not set,
+  // the current impala daemon will be shut down. If the port was specified, it is set
+  // in 'backend'. If it was not specified, it is 0 and the port configured for this
+  // Impala daemon is assumed.
+  1: optional Types.TNetworkAddress backend
+
+  // Deadline in seconds for shutting down.
+  2: optional i64 deadline_s
+}
+
+// The type of administrative function to be executed.
+enum TAdminRequestType {
+  SHUTDOWN
+}
+
+// Parameters for administrative function statement. This is essentially a tagged union
+// that contains parameters for the type of administrative statement to be executed.
+struct TAdminRequest {
+  1: required TAdminRequestType type
+
+  // The below member corresponding to 'type' should be set.
+  2: optional TShutdownParams shutdown_params
 }
 
 // HiveServer2 Metadata operations (JniFrontend.hiveServer2MetadataOperation)
@@ -592,6 +640,9 @@ struct TExecRequest {
   // profile. For example, a user can't access the runtime profile of a query
   // that has a view for which the user doesn't have access to the underlying tables.
   12: optional bool user_has_profile_access
+
+  // Set iff stmt_type is ADMIN_FN.
+  13: optional TAdminRequest admin_request
 }
 
 // Parameters to FeSupport.cacheJar().
@@ -705,12 +756,18 @@ struct TUpdateCatalogCacheResponse {
   3: required i64 new_catalog_version
 }
 
-// Sent from the impalad BE to FE with the latest cluster membership snapshot resulting
-// from the Membership heartbeat.
-struct TUpdateMembershipRequest {
+// Sent from the impalad BE to FE with the latest membership snapshot of the
+// executors on the cluster resulting from the Membership heartbeat.
+struct TUpdateExecutorMembershipRequest {
+  // The hostnames of the executor nodes.
   1: required set<string> hostnames
+
+  // The ip addresses of the executor nodes.
   2: required set<string> ip_addresses
-  3: i32 num_nodes
+
+  // The number of executors on a cluster, needed since there can be multiple
+  // impalads running on the same host.
+  3: i32 num_executors
 }
 
 // Contains all interesting statistics from a single 'memory pool' in the JVM.
@@ -745,20 +802,23 @@ struct TJvmMemoryPool {
   9: required string name
 }
 
-// Request to get one or all sets of memory pool metrics.
-struct TGetJvmMetricsRequest {
-  // If set, return all pools
-  1: required bool get_all
-
-  // If get_all is false, this must be set to the name of the memory pool to return.
-  2: optional string memory_pool
-}
-
-// Response from JniUtil::GetJvmMetrics()
-struct TGetJvmMetricsResponse {
+// Response from JniUtil::GetJvmMemoryMetrics()
+struct TGetJvmMemoryMetricsResponse {
   // One entry for every pool tracked by the Jvm, plus a synthetic aggregate pool called
   // 'total'
   1: required list<TJvmMemoryPool> memory_pools
+
+  // Metrics from JvmPauseMonitor, measuring how much time is spend
+  // pausing, presumably because of Garbage Collection. These
+  // names are consistent with Hadoop's metric names.
+  2: required i64 gc_num_warn_threshold_exceeded
+  3: required i64 gc_num_info_threshold_exceeded
+  4: required i64 gc_total_extra_sleep_time_millis
+
+  // Metrics for JVM Garbage Collection, from the management beans;
+  // these are cumulative across all types of GCs.
+  5: required i64 gc_count
+  6: required i64 gc_time_millis
 }
 
 // Contains information about a JVM thread
@@ -804,6 +864,11 @@ struct TGetJvmThreadsInfoResponse {
   // Information about JVM threads. It is not included when
   // TGetJvmThreadsInfoRequest.get_complete_info is false.
   4: optional list<TJvmThreadInfo> threads
+}
+
+struct TGetJMXJsonResponse {
+  // JMX of the JVM serialized to a json string.
+  1: required string jmx_json
 }
 
 struct TGetHadoopConfigRequest {

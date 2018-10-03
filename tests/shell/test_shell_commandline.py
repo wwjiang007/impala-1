@@ -23,12 +23,13 @@ import re
 import signal
 import shlex
 import socket
+import tempfile
 
 from subprocess import call, Popen
 from tests.common.impala_service import ImpaladService
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.skip import SkipIf
-from time import sleep
+from time import sleep, time
 from util import IMPALAD, SHELL_CMD
 from util import assert_var_substitution, run_impala_shell_cmd, ImpalaShell
 
@@ -37,6 +38,20 @@ QUERY_FILE_PATH = os.path.join(os.environ['IMPALA_HOME'], 'tests', 'shell')
 
 RUSSIAN_CHARS = (u"А, Б, В, Г, Д, Е, Ё, Ж, З, И, Й, К, Л, М, Н, О, П, Р,"
                  u"С, Т, У, Ф, Х, Ц,Ч, Ш, Щ, Ъ, Ы, Ь, Э, Ю, Я")
+
+
+def find_query_option(key, string, strip_brackets=True):
+  """
+  Parses 'string' for 'key': value pairs, and returns value. It is assumed
+  that the 'string' contains the pair exactly once.
+
+  If 'strip_brackets' is true, enclosing [] are stripped (this is used to mark
+  query options that have their default value).
+  """
+  pattern = r'^\s*%s: (.*)\s*$' % key
+  values = re.findall(pattern, string, re.MULTILINE)
+  assert len(values) == 1
+  return values[0].strip("[]") if strip_brackets else values[0]
 
 @pytest.fixture
 def empty_table(unique_database, request):
@@ -325,7 +340,7 @@ class TestImpalaShell(ImpalaTestSuite):
     query = "set num_nodes=1; set mt_dop=1; set batch_size=1; \
              select sleep(10) from functional_parquet.alltypesagg"
     p = ImpalaShell('-q "{0}"'.format(query))
-    sleep(6)
+    p.wait_for_query_start()
     os.kill(p.pid(), signal.SIGINT)
     result = p.get_result()
 
@@ -650,3 +665,70 @@ class TestImpalaShell(ImpalaTestSuite):
       self._validate_expected_socket_connected(args2, s)
     finally:
       s.close()
+
+  def test_malformed_query(self):
+    """Test that malformed queries are handled by the commandline shell"""
+    args = " -q \"with foo as (select bar from temp where temp.a='\""
+    result = run_impala_shell_cmd(args, expect_success=False)
+    assert "Encountered: EOF" in result.stderr
+    args = "-q \"with v as (select 1) \;\""
+    result = run_impala_shell_cmd(args, expect_success=False)
+    assert "Encountered: Unexpected character" in result.stderr
+
+  def test_large_sql(self, unique_database):
+    # In this test, we are only interested in the performance of Impala shell and not
+    # the performance of Impala in general. So, this test will execute a large query
+    # from a non-existent table since this will make the query execution time negligible.
+    sql_file, sql_path = tempfile.mkstemp()
+    num_cols = 10000
+    os.write(sql_file, "select \n")
+    for i in xrange(num_cols):
+      if i < num_cols:
+        os.write(sql_file, "col_{0} as a{1},\n".format(i, i))
+        os.write(sql_file, "col_{0} as b{1},\n".format(i, i))
+        os.write(sql_file, "col_{0} as c{1}{2}\n".format(
+            i, i, "," if i < num_cols - 1 else ""))
+    os.write(sql_file, "from non_existence_large_table;")
+    os.close(sql_file)
+
+    try:
+      args = "-q -f {0} -d {1}".format(sql_path, unique_database)
+      start_time = time()
+      run_impala_shell_cmd(args, False)
+      end_time = time()
+      time_limit_s = 10
+      actual_time_s = end_time - start_time
+      assert actual_time_s <= time_limit_s, (
+          "It took {0} seconds to execute the query. Time limit is {1} seconds.".format(
+              actual_time_s, time_limit_s))
+    finally:
+      os.remove(sql_path)
+
+  def test_default_timezone(self):
+    """Test that the default TIMEZONE query option is a valid timezone.
+
+       It would be nice to check that the default timezone is the system's timezone,
+       but doing this reliably on different Linux distributions is quite hard.
+    """
+    result_set = run_impala_shell_cmd('-q "set;"')
+    tzname = find_query_option("TIMEZONE", result_set.stdout)
+    assert os.path.isfile("/usr/share/zoneinfo/" + tzname)
+
+  def test_find_query_option(self):
+    """Test utility function find_query_option()."""
+    test_input = """
+        not_an_option
+        default: [default]
+        non_default: non_default
+        has_space: has space
+        duplicate: d
+        duplicate: d
+        empty: """
+    assert find_query_option("default", test_input) == "default"
+    assert find_query_option("non_default", test_input) == "non_default"
+    assert find_query_option("has_space", test_input) == "has space"
+    assert find_query_option("empty", test_input) == ""
+    with pytest.raises(AssertionError):
+      find_query_option("duplicate", test_input)
+    with pytest.raises(AssertionError):
+      find_query_option("not_an_option", test_input)

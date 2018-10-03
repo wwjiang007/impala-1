@@ -28,8 +28,9 @@
 #include "service/frontend.h"
 #include "service/impala-server.h"
 #include "service/hs2-util.h"
-#include "util/string-parser.h"
 #include "util/runtime-profile-counters.h"
+#include "util/string-parser.h"
+#include "util/test-info.h"
 #include "gen-cpp/CatalogService.h"
 #include "gen-cpp/CatalogService_types.h"
 #include "gen-cpp/CatalogObjects_types.h"
@@ -43,6 +44,7 @@ using namespace impala;
 using namespace apache::hive::service::cli::thrift;
 using namespace apache::thrift;
 
+DECLARE_bool(use_local_catalog);
 DECLARE_int32(catalog_service_port);
 DECLARE_string(catalog_service_host);
 
@@ -283,6 +285,21 @@ Status CatalogOpExecutor::GetCatalogObject(const TCatalogObject& object_desc,
   return Status::OK();
 }
 
+Status CatalogOpExecutor::GetPartialCatalogObject(
+    const TGetPartialCatalogObjectRequest& req,
+    TGetPartialCatalogObjectResponse* resp) {
+  DCHECK(FLAGS_use_local_catalog || TestInfo::is_test());
+  const TNetworkAddress& address =
+      MakeNetworkAddress(FLAGS_catalog_service_host, FLAGS_catalog_service_port);
+  Status status;
+  CatalogServiceConnection client(env_->catalogd_client_cache(), address, &status);
+  RETURN_IF_ERROR(status);
+  RETURN_IF_ERROR(
+      client.DoRpc(&CatalogServiceClientWrapper::GetPartialCatalogObject, req, resp));
+  return Status::OK();
+}
+
+
 Status CatalogOpExecutor::PrioritizeLoad(const TPrioritizeLoadRequest& req,
     TPrioritizeLoadResponse* result) {
   const TNetworkAddress& address =
@@ -292,6 +309,18 @@ Status CatalogOpExecutor::PrioritizeLoad(const TPrioritizeLoadRequest& req,
   RETURN_IF_ERROR(status);
   RETURN_IF_ERROR(
       client.DoRpc(&CatalogServiceClientWrapper::PrioritizeLoad, req, result));
+  return Status::OK();
+}
+
+Status CatalogOpExecutor::GetPartitionStats(
+    const TGetPartitionStatsRequest& req, TGetPartitionStatsResponse* result) {
+  const TNetworkAddress& address =
+      MakeNetworkAddress(FLAGS_catalog_service_host, FLAGS_catalog_service_port);
+  Status status;
+  CatalogServiceConnection client(env_->catalogd_client_cache(), address, &status);
+  RETURN_IF_ERROR(status);
+  RETURN_IF_ERROR(
+      client.DoRpc(&CatalogServiceClientWrapper::GetPartitionStats, req, result));
   return Status::OK();
 }
 
@@ -305,4 +334,16 @@ Status CatalogOpExecutor::SentryAdminCheck(const TSentryAdminCheckRequest& req) 
   RETURN_IF_ERROR(
       client.DoRpc(&CatalogServiceClientWrapper::SentryAdminCheck, req, &resp));
   return Status(resp.status);
+}
+
+Status CatalogOpExecutor::UpdateTableUsage(const TUpdateTableUsageRequest& req,
+  TUpdateTableUsageResponse* resp) {
+  const TNetworkAddress& address =
+      MakeNetworkAddress(FLAGS_catalog_service_host, FLAGS_catalog_service_port);
+  Status cnxn_status;
+  CatalogServiceConnection client(env_->catalogd_client_cache(), address, &cnxn_status);
+  RETURN_IF_ERROR(cnxn_status);
+  RETURN_IF_ERROR(
+      client.DoRpc(&CatalogServiceClientWrapper::UpdateTableUsage, req, resp));
+  return Status::OK();
 }

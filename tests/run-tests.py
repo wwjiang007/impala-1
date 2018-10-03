@@ -24,6 +24,7 @@
 # All additional command line options are passed to py.test.
 from tests.common.impala_cluster import ImpalaCluster
 from tests.common.impala_service import ImpaladService
+from tests.conftest import configure_logging
 import itertools
 import json
 import multiprocessing
@@ -36,7 +37,7 @@ from _pytest.config import FILE_OR_DIR
 # We whitelist valid test directories. If a new test directory is added, update this.
 VALID_TEST_DIRS = ['failure', 'query_test', 'stress', 'unittests', 'aux_query_tests',
                    'shell', 'hs2', 'catalog_service', 'metadata', 'data_errors',
-                   'statestore', 'infra']
+                   'statestore', 'infra', 'observability']
 
 TEST_DIR = os.path.join(os.environ['IMPALA_HOME'], 'tests')
 RESULT_DIR = os.path.join(os.environ['IMPALA_EE_TEST_LOGS_DIR'], 'results')
@@ -224,6 +225,8 @@ def print_metrics(substring):
 
 
 if __name__ == "__main__":
+  # Ensure that logging is configured for the 'run-test.py' wrapper itself.
+  configure_logging()
   exit_on_error = '-x' in sys.argv or '--exitfirst' in sys.argv
   skip_serial = '--skip-serial' in sys.argv
   if skip_serial:

@@ -18,11 +18,16 @@
 package org.apache.impala.util;
 
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
-import org.apache.sentry.provider.db.service.thrift.SentryPolicyServiceClient;
-import org.apache.sentry.provider.db.service.thrift.TSentryGrantOption;
-import org.apache.sentry.provider.db.service.thrift.TSentryPrivilege;
-import org.apache.sentry.provider.db.service.thrift.TSentryRole;
+import org.apache.impala.catalog.Principal;
+import org.apache.impala.thrift.TPrincipalType;
+import org.apache.sentry.api.service.thrift.SentryPolicyServiceClient;
+import org.apache.sentry.api.service.thrift.TSentryGrantOption;
+import org.apache.sentry.api.service.thrift.TSentryPrivilege;
+import org.apache.sentry.api.service.thrift.TSentryRole;
+import org.apache.sentry.core.common.exception.SentryUserException;
 import org.apache.sentry.service.thrift.SentryServiceClientFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -31,13 +36,11 @@ import org.apache.impala.analysis.PrivilegeSpec;
 import org.apache.impala.authorization.SentryConfig;
 import org.apache.impala.authorization.User;
 import org.apache.impala.catalog.AuthorizationException;
-import org.apache.impala.catalog.RolePrivilege;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.thrift.TPrivilege;
 import org.apache.impala.thrift.TPrivilegeLevel;
 import org.apache.impala.thrift.TPrivilegeScope;
-import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
@@ -55,7 +58,7 @@ public class SentryPolicyService {
    * TODO: When SENTRY-296 is resolved we can more easily cache connections instead of
    * opening a new connection for each request.
    */
-  class SentryServiceClient {
+  class SentryServiceClient implements AutoCloseable {
     private final SentryPolicyServiceClient client_;
 
     /**
@@ -237,7 +240,7 @@ public class SentryPolicyService {
    *
    * @param requestingUser - The requesting user.
    * @param roleName - The role to grant privileges to (case insensitive).
-   * @param privilege - The privilege to grant.
+   * @param privileges - The privileges to grant.
    * @throws ImpalaException - On any error
    */
   public void grantRolePrivileges(User requestingUser, String roleName,
@@ -308,7 +311,7 @@ public class SentryPolicyService {
    *
    * @param requestingUser - The requesting user.
    * @param roleName - The role to revoke privileges from (case insensitive).
-   * @param privilege - The privilege to revoke.
+   * @param privileges - The privileges to revoke.
    * @throws ImpalaException - On any error
    */
   public void revokeRolePrivileges(User requestingUser, String roleName,
@@ -334,7 +337,8 @@ public class SentryPolicyService {
       switch (scope) {
         case SERVER:
           client.get().revokeServerPrivilege(requestingUser.getShortName(), roleName,
-              privilege.getServer_name(), privilege.getPrivilege_level().toString());
+              privilege.getServer_name(), privilege.getPrivilege_level().toString(),
+              /* grant option */ null);
           break;
         case DATABASE:
           client.get().revokeDatabasePrivilege(requestingUser.getShortName(), roleName,
@@ -430,9 +434,63 @@ public class SentryPolicyService {
   }
 
   /**
+   * Returns a map of all roles with their associated privileges.
+   */
+  public Map<String, Set<TSentryPrivilege>> listAllRolesPrivileges(User requestingUser)
+      throws ImpalaException {
+    return listAllPrincipalsPrivileges(requestingUser, TPrincipalType.ROLE);
+  }
+
+  /**
+   * Returns a map of all users with their associated privileges.
+   */
+  public Map<String, Set<TSentryPrivilege>> listAllUsersPrivileges(User requestingUser)
+      throws ImpalaException {
+    return listAllPrincipalsPrivileges(requestingUser, TPrincipalType.USER);
+  }
+
+  private Map<String, Set<TSentryPrivilege>> listAllPrincipalsPrivileges(
+      User requestingUser, TPrincipalType type) throws ImpalaException {
+    SentryServiceClient client = new SentryServiceClient();
+    try {
+      return type == TPrincipalType.ROLE ?
+          client.get().listAllRolesPrivileges(requestingUser.getShortName()) :
+          client.get().listAllUsersPrivileges(requestingUser.getShortName());
+    } catch (Exception e) {
+      if (SentryUtil.isSentryAccessDenied(e)) {
+        throw new AuthorizationException(String.format(ACCESS_DENIED_ERROR_MSG,
+            requestingUser.getName(),
+            type == TPrincipalType.ROLE ?
+                "LIST_ALL_ROLES_PRIVILEGES" : "LIST_ALL_USERS_PRIVILEGES"));
+      }
+      throw new InternalException(String.format("Error making '%s' RPC to " +
+          "Sentry Service: ",
+          type == TPrincipalType.ROLE ?
+              "listAllRolesPrivileges" :
+              "listAllUsersPrivileges"), e);
+    } finally {
+      client.close();
+    }
+  }
+
+  /**
+   * Returns the configuration value for the specified key.  Will return an empty string
+   * if no value is set.
+   */
+  public String getConfigValue(String key) throws ImpalaException {
+    try (SentryServiceClient client = new SentryServiceClient()) {
+      return client.get().getConfigValue(key, "");
+    } catch (SentryUserException e) {
+      throw new InternalException("Error making 'getConfigValue' RPC to Sentry Service: ",
+          e);
+    }
+  }
+
+  /**
    * Utility function that converts a TSentryPrivilege to an Impala TPrivilege object.
    */
-  public static TPrivilege sentryPrivilegeToTPrivilege(TSentryPrivilege sentryPriv) {
+  public static TPrivilege sentryPrivilegeToTPrivilege(TSentryPrivilege sentryPriv,
+      Principal principal) {
     TPrivilege privilege = new TPrivilege();
     privilege.setServer_name(sentryPriv.getServerName());
     if (sentryPriv.isSetDbName()) privilege.setDb_name(sentryPriv.getDbName());
@@ -449,7 +507,6 @@ public class SentryPolicyService {
       privilege.setPrivilege_level(Enum.valueOf(TPrivilegeLevel.class,
           sentryPriv.getAction().toUpperCase()));
     }
-    privilege.setPrivilege_name(RolePrivilege.buildRolePrivilegeName(privilege));
     privilege.setCreate_time_ms(sentryPriv.getCreateTime());
     if (sentryPriv.isSetGrantOption() &&
         sentryPriv.getGrantOption() == TSentryGrantOption.TRUE) {
@@ -457,6 +514,8 @@ public class SentryPolicyService {
     } else {
       privilege.setHas_grant_opt(false);
     }
+    privilege.setPrincipal_id(principal.getId());
+    privilege.setPrincipal_type(principal.getPrincipalType());
     return privilege;
   }
 }

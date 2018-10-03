@@ -323,7 +323,7 @@ inline bool FunctionContextImpl::CheckAllocResult(const char* fn_name,
 inline void FunctionContextImpl::CheckMemLimit(const char* fn_name, int64_t byte_size) {
 #ifndef IMPALA_UDF_SDK_BUILD
   MemTracker* mem_tracker = udf_pool_->mem_tracker();
-  if (mem_tracker->AnyLimitExceeded()) {
+  if (mem_tracker->AnyLimitExceeded(MemLimit::HARD)) {
     ErrorMsg msg = ErrorMsg(TErrorCode::UDF_MEM_LIMIT_EXCEEDED, string(fn_name));
     state_->SetMemLimitExceeded(mem_tracker, byte_size, &msg);
   }
@@ -518,7 +518,7 @@ StringVal::StringVal(FunctionContext* context, int str_len) noexcept : len(str_l
 StringVal StringVal::CopyFrom(FunctionContext* ctx, const uint8_t* buf, size_t len) noexcept {
   StringVal result(ctx, len);
   if (LIKELY(!result.is_null)) {
-    memcpy(result.ptr, buf, len);
+    std::copy(buf, buf + len, result.ptr);
   }
   return result;
 }

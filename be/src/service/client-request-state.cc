@@ -21,6 +21,7 @@
 #include <limits>
 #include <gutil/strings/substitute.h>
 
+#include "runtime/backend-client.h"
 #include "runtime/coordinator.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/row-batch.h"
@@ -51,6 +52,7 @@ using namespace apache::thrift;
 using namespace beeswax;
 using namespace strings;
 
+DECLARE_int32(be_port);
 DECLARE_int32(catalog_service_port);
 DECLARE_string(catalog_service_host);
 DECLARE_int64(max_result_cache_size);
@@ -180,6 +182,10 @@ Status ClientRequestState::Exec(TExecRequest* exec_request) {
       reset_req.reset_metadata_params.__set_is_refresh(true);
       reset_req.reset_metadata_params.__set_table_name(
           exec_request_.load_data_request.table_name);
+      if (exec_request_.load_data_request.__isset.partition_spec) {
+        reset_req.reset_metadata_params.__set_partition_spec(
+            exec_request_.load_data_request.partition_spec);
+      }
       reset_req.reset_metadata_params.__set_sync_ddl(
           exec_request_.query_options.sync_ddl);
       catalog_op_executor_.reset(
@@ -216,6 +222,9 @@ Status ClientRequestState::Exec(TExecRequest* exec_request) {
       }
       break;
     }
+    case TStmtType::ADMIN_FN:
+      DCHECK(exec_request_.admin_request.type == TAdminRequestType::SHUTDOWN);
+      return ExecShutdownRequest();
     default:
       stringstream errmsg;
       errmsg << "Unknown exec request stmt type: " << exec_request_.stmt_type;
@@ -342,8 +351,8 @@ Status ClientRequestState::ExecLocalCatalogOp(
       SetResultSet(result.role_names);
       return Status::OK();
     }
-    case TCatalogOpType::SHOW_GRANT_ROLE: {
-      const TShowGrantRoleParams& params = catalog_op.show_grant_role_params;
+    case TCatalogOpType::SHOW_GRANT_PRINCIPAL: {
+      const TShowGrantPrincipalParams& params = catalog_op.show_grant_principal_params;
       if (params.is_admin_op) {
         // Verify the user has privileges to perform this operation by checking against
         // the Sentry Service (via the Catalog Server).
@@ -357,7 +366,7 @@ Status ClientRequestState::ExecLocalCatalogOp(
       }
 
       TResultSet response;
-      RETURN_IF_ERROR(frontend_->GetRolePrivileges(params, &response));
+      RETURN_IF_ERROR(frontend_->GetPrincipalPrivileges(params, &response));
       // Set the result set and its schema from the response.
       request_result_set_.reset(new vector<TResultRow>(response.rows));
       result_metadata_ = response.schema;
@@ -599,6 +608,44 @@ Status ClientRequestState::ExecDdlRequest() {
   return Status::OK();
 }
 
+Status ClientRequestState::ExecShutdownRequest() {
+  const TShutdownParams& request = exec_request_.admin_request.shutdown_params;
+  int port = request.__isset.backend && request.backend.port != 0 ? request.backend.port :
+                                                                    FLAGS_be_port;
+  // Use the local shutdown code path if the host is unspecified or if it exactly matches
+  // the configured host/port. This avoids the possibility of RPC errors preventing
+  // shutdown.
+  if (!request.__isset.backend
+      || (request.backend.hostname == FLAGS_hostname && port == FLAGS_be_port)) {
+    TShutdownStatus shutdown_status;
+    int64_t deadline_s = request.__isset.deadline_s ? request.deadline_s : -1;
+    RETURN_IF_ERROR(parent_server_->StartShutdown(deadline_s, &shutdown_status));
+    SetResultSet({ImpalaServer::ShutdownStatusToString(shutdown_status)});
+    return Status::OK();
+  }
+  TNetworkAddress addr = MakeNetworkAddress(request.backend.hostname, port);
+
+  TRemoteShutdownParams params;
+  if (request.__isset.deadline_s) params.__set_deadline_s(request.deadline_s);
+  TRemoteShutdownResult resp;
+  VLOG_QUERY << "Sending Shutdown RPC to " << TNetworkAddressToString(addr);
+  ImpalaBackendConnection::RpcStatus rpc_status = ImpalaBackendConnection::DoRpcWithRetry(
+      ExecEnv::GetInstance()->impalad_client_cache(), addr,
+      &ImpalaBackendClient::RemoteShutdown, params,
+      [this]() { return DebugAction(query_options(), "CRS_SHUTDOWN_RPC"); }, &resp);
+  if (!rpc_status.status.ok()) {
+    VLOG_QUERY << "RemoteShutdown query_id= " << PrintId(query_id())
+               << " failed to send RPC to " << TNetworkAddressToString(addr) << " :"
+               << rpc_status.status.msg().msg();
+    return rpc_status.status;
+  }
+
+  Status shutdown_status(resp.status);
+  RETURN_IF_ERROR(shutdown_status);
+  SetResultSet({ImpalaServer::ShutdownStatusToString(resp.shutdown_status)});
+  return Status::OK();
+}
+
 void ClientRequestState::Done() {
   MarkActive();
   // Make sure we join on wait_thread_ before we finish (and especially before this object
@@ -647,8 +694,10 @@ Status ClientRequestState::Exec(const TMetadataOpRequest& exec_request) {
 }
 
 Status ClientRequestState::WaitAsync() {
+  // TODO: IMPALA-7396: thread creation fault inject is disabled because it is not
+  // handled correctly.
   return Thread::Create("query-exec-state", "wait-thread",
-      &ClientRequestState::Wait, this, &wait_thread_, true);
+      &ClientRequestState::Wait, this, &wait_thread_, false);
 }
 
 void ClientRequestState::BlockOnWait() {

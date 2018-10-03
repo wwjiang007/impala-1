@@ -18,7 +18,8 @@
 # under the License.
 
 set -euo pipefail
-trap 'echo Error in $0 at line $LINENO: $(cd "'$PWD'" && awk "NR == $LINENO" $0)' ERR
+. $IMPALA_HOME/bin/report_build_error.sh
+setup_report_build_error
 
 if [[ $# -eq 1 && "$1" == -format ]]; then
   SHOULD_FORMAT=true
@@ -40,9 +41,6 @@ fi
 set +e
 $IMPALA_HOME/testdata/cluster/admin start_cluster
 if [[ $? != 0 ]]; then
-  # Don't issue Java version warning when not running Hadoop 3.
-  [[ $IMPALA_MINICLUSTER_PROFILE != 3 ]] && exit 1
-
   # Only issue Java version warning when running Java 7.
   $JAVA -version 2>&1 | grep -q 'java version "1.7' || exit 1
 

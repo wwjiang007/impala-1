@@ -215,13 +215,9 @@ class TestAdmissionController(TestAdmissionControllerBase, HS2TestSuite):
         rhs = re.split(": ", line)[1]
         confs = re.split(",", rhs)
         break
-    assert len(confs) == len(expected_query_options)
-    confs = map(str.lower, confs)
-    for expected in expected_query_options:
-      if expected.lower() not in confs:
-        expected = ",".join(sorted(expected_query_options))
-        actual = ",".join(sorted(confs))
-        assert False, "Expected query options %s, got %s." % (expected, actual)
+    expected_set = set([x.lower() for x in expected_query_options])
+    confs_set = set([x.lower() for x in confs])
+    assert expected_set.issubset(confs_set)
 
   def __check_hs2_query_opts(self, pool_name, mem_limit=None, expected_options=None):
     """ Submits a query via HS2 (optionally with a mem_limit in the confOverlay)
@@ -283,8 +279,8 @@ class TestAdmissionController(TestAdmissionControllerBase, HS2TestSuite):
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
-      impalad_args=impalad_admission_ctrl_config_args(\
-          "-default_query_options=mem_limit=200000000"),
+      impalad_args=impalad_admission_ctrl_config_args(),
+      default_query_options=[('mem_limit', 200000000)],
       statestored_args=_STATESTORED_ARGS)
   @needs_session(conf_overlay={'batch_size': '100'})
   def test_set_request_pool(self):
@@ -500,6 +496,9 @@ class TestAdmissionController(TestAdmissionControllerBase, HS2TestSuite):
           "node is greater than process mem limit 2.00 GB of \S+", str(e)), str(e)
     # Exercise queuing checks in admission controller.
     try:
+      # Wait for previous queries to finish to avoid flakiness.
+      for impalad in self.cluster.impalads:
+        impalad.service.wait_for_metric_value("impala-server.num-fragments-in-flight", 0)
       impalad_with_2g_mem = self.cluster.impalads[2].service.create_beeswax_client()
       impalad_with_2g_mem.set_configuration_option('mem_limit', '1G')
       impalad_with_2g_mem.execute_async("select sleep(1000)")
@@ -660,6 +659,48 @@ class TestAdmissionController(TestAdmissionControllerBase, HS2TestSuite):
     """Return a list of the 'Admission Queue details' strings found in 'profiles'"""
     matches = [re.search(INITIAL_QUEUE_REASON_REGEX, profile) for profile in profiles]
     return [match.group(0) for match in matches if match is not None]
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+    impalad_args=impalad_admission_ctrl_flags(max_requests=1, max_queued=10,
+        pool_max_mem=1024 * 1024 * 1024),
+    statestored_args=_STATESTORED_ARGS)
+  def test_query_locations_correctness(self, vector):
+    """Regression test for IMPALA-7516: Test to make sure query locations and in-flight
+    queries are correct for different admission results that can affect it."""
+    # Choose a query that runs on all 3 backends.
+    query = "select * from functional.alltypesagg A, (select sleep(10000)) B limit 1"
+    # Case 1: When a query runs succesfully.
+    handle = self.client.execute_async(query)
+    self.__assert_num_queries_accounted(1)
+    self.close_query(handle)
+    self.__assert_num_queries_accounted(0)
+    # Case 2: When a query is queued then cancelled
+    handle_running = self.client.execute_async(query)
+    self.client.wait_for_admission_control(handle_running)
+    handle_queued = self.client.execute_async(query)
+    self.impalad_test_service.wait_for_metric_value(
+      "admission-controller.total-queued.default-pool", 1)
+    self.__assert_num_queries_accounted(2)
+    # First close the queued query
+    self.close_query(handle_queued)
+    self.close_query(handle_running)
+    self.__assert_num_queries_accounted(0)
+    # Case 3: When a query gets rejected
+    exec_options = copy(vector.get_value('exec_option'))
+    exec_options['mem_limit'] = "1b"
+    self.execute_query_expect_failure(self.client, query, exec_options)
+    self.__assert_num_queries_accounted(0)
+
+  def __assert_num_queries_accounted(self, expected_num):
+    """Checks if the num of queries accounted by query_locations and in-flight are as
+    expected"""
+    # Wait for queries to start/un-register.
+    self.impalad_test_service.wait_for_num_in_flight_queries(expected_num)
+    query_locations = self.impalad_test_service.get_query_locations()
+    for host, num_q in query_locations.items():
+      assert num_q == expected_num, "There should be {0} running queries on either " \
+                                    "impalads: {0}".format(query_locations)
 
 
 class TestAdmissionControllerStress(TestAdmissionControllerBase):

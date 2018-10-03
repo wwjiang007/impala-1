@@ -49,7 +49,6 @@ import org.apache.impala.analysis.TupleDescriptor;
 import org.apache.impala.analysis.TupleId;
 import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.ColumnStats;
-import org.apache.impala.catalog.FeCatalogUtils;
 import org.apache.impala.catalog.HdfsCompression;
 import org.apache.impala.catalog.FeFsPartition;
 import org.apache.impala.catalog.FeFsTable;
@@ -83,7 +82,7 @@ import org.apache.impala.thrift.TScanRangeLocationList;
 import org.apache.impala.thrift.TScanRangeSpec;
 import org.apache.impala.thrift.TTableStats;
 import org.apache.impala.util.BitUtil;
-import org.apache.impala.util.MembershipSnapshot;
+import org.apache.impala.util.ExecutorMembershipSnapshot;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -357,7 +356,6 @@ public class HdfsScanNode extends ScanNode {
     checkForSupportedFileFormats();
 
     assignCollectionConjuncts(analyzer);
-    computeDictionaryFilterConjuncts(analyzer);
 
     // compute scan range locations with optional sampling
     computeScanRangeLocations(analyzer);
@@ -376,7 +374,16 @@ public class HdfsScanNode extends ScanNode {
     }
 
     if (fileFormats_.contains(HdfsFileFormat.PARQUET)) {
-      computeMinMaxTupleAndConjuncts(analyzer);
+      // Compute min-max conjuncts only if the PARQUET_READ_STATISTICS query option is
+      // set to true.
+      if (analyzer.getQueryOptions().parquet_read_statistics) {
+        computeMinMaxTupleAndConjuncts(analyzer);
+      }
+      // Compute dictionary conjuncts only if the PARQUET_DICTIONARY_FILTERING query
+      // option is set to true.
+      if (analyzer.getQueryOptions().parquet_dictionary_filtering) {
+        computeDictionaryFilterConjuncts(analyzer);
+      }
     }
 
     if (canApplyParquetCountStarOptimization(analyzer, fileFormats_)) {
@@ -749,7 +756,8 @@ public class HdfsScanNode extends ScanNode {
       // Pass a minimum sample size of 0 because users cannot set a minimum sample size
       // for scans directly. For compute stats, a minimum sample size can be set, and
       // the sampling percent is adjusted to reflect it.
-      sampledFiles = tbl_.getFilesSample(partitions_, percentBytes, 0, randomSeed);
+      sampledFiles = FeFsTable.Utils.getFilesSample(tbl_, partitions_, percentBytes, 0,
+          randomSeed);
     }
 
     long scanRangeBytesLimit = analyzer.getQueryCtx().client_request.getQuery_options()
@@ -799,6 +807,12 @@ public class HdfsScanNode extends ScanNode {
       totalBytes_ += partitionBytes;
       totalFiles_ += fileDescs.size();
       for (FileDescriptor fileDesc: fileDescs) {
+        if (!analyzer.getQueryOptions().isAllow_erasure_coded_files() &&
+            fileDesc.getIsEc()) {
+          throw new ImpalaRuntimeException(String.format(
+              "Scanning of HDFS erasure-coded file (%s/%s) is not supported",
+              partition.getLocation(), fileDesc.getFileName()));
+        }
         if (!fsHasBlocks) {
           Preconditions.checkState(fileDesc.getNumFileBlocks() == 0);
           generateScanRangeSpecs(partition, fileDesc, scanRangeBytesLimit);
@@ -984,7 +998,7 @@ public class HdfsScanNode extends ScanNode {
    */
   private void computeCardinalities() {
     // Choose between the extrapolated row count and the one based on stored stats.
-    extrapolatedNumRows_ = tbl_.getExtrapolatedNumRows(totalBytes_);
+    extrapolatedNumRows_ = FeFsTable.Utils.getExtrapolatedNumRows(tbl_, totalBytes_);
     long statsNumRows = getStatsNumRows();
     if (extrapolatedNumRows_ != -1) {
       // The extrapolated row count is based on the 'totalBytes_' which already accounts
@@ -1086,7 +1100,7 @@ public class HdfsScanNode extends ScanNode {
    */
   protected void computeNumNodes(Analyzer analyzer, long cardinality) {
     Preconditions.checkNotNull(scanRangeSpecs_);
-    MembershipSnapshot cluster = MembershipSnapshot.getCluster();
+    ExecutorMembershipSnapshot cluster = ExecutorMembershipSnapshot.getCluster();
     HashSet<TNetworkAddress> localHostSet = Sets.newHashSet();
     int totalNodes = 0;
     int numLocalRanges = 0;
@@ -1121,21 +1135,21 @@ public class HdfsScanNode extends ScanNode {
         // hosts that hold block replica for those ranges.
         int numLocalNodes = Math.min(numLocalRanges, localHostSet.size());
         // The remote ranges are round-robined across all the impalads.
-        int numRemoteNodes = Math.min(numRemoteRanges, cluster.numNodes());
+        int numRemoteNodes = Math.min(numRemoteRanges, cluster.numExecutors());
         // The local and remote assignments may overlap, but we don't know by how much so
         // conservatively assume no overlap.
-        totalNodes = Math.min(numLocalNodes + numRemoteNodes, cluster.numNodes());
+        totalNodes = Math.min(numLocalNodes + numRemoteNodes, cluster.numExecutors());
         // Exit early if all hosts have a scan range assignment, to avoid extraneous work
         // in case the number of scan ranges dominates the number of nodes.
-        if (totalNodes == cluster.numNodes()) break;
+        if (totalNodes == cluster.numExecutors()) break;
       }
     }
     // Handle the generated range specifications.
-    if (totalNodes < cluster.numNodes() && scanRangeSpecs_.isSetSplit_specs()) {
+    if (totalNodes < cluster.numExecutors() && scanRangeSpecs_.isSetSplit_specs()) {
       Preconditions.checkState(
           generatedScanRangeCount_ >= scanRangeSpecs_.getSplit_specsSize());
       numRemoteRanges += generatedScanRangeCount_;
-      totalNodes = Math.min(numRemoteRanges, cluster.numNodes());
+      totalNodes = Math.min(numRemoteRanges, cluster.numExecutors());
     }
     // Tables can reside on 0 nodes (empty table), but a plan node must always be
     // executed on at least one node.
@@ -1145,7 +1159,7 @@ public class HdfsScanNode extends ScanNode {
           + (scanRangeSpecs_.getConcrete_rangesSize() + generatedScanRangeCount_)
           + " localRanges=" + numLocalRanges + " remoteRanges=" + numRemoteRanges
           + " localHostSet.size=" + localHostSet.size()
-          + " clusterNodes=" + cluster.numNodes());
+          + " executorNodes=" + cluster.numExecutors());
     }
   }
 
@@ -1228,7 +1242,7 @@ public class HdfsScanNode extends ScanNode {
       output.append(getStatsExplainString(detailPrefix));
       output.append("\n");
       String extrapRows = String.valueOf(extrapolatedNumRows_);
-      if (!tbl_.isStatsExtrapolationEnabled()) {
+      if (!FeFsTable.Utils.isStatsExtrapolationEnabled(tbl_)) {
         extrapRows = "disabled";
       } else if (extrapolatedNumRows_ == -1) {
         extrapRows = "unavailable";
@@ -1352,18 +1366,24 @@ public class HdfsScanNode extends ScanNode {
       columnReservations = computeMinColumnMemReservations();
     }
 
-    int perHostScanRanges;
-    HdfsFileFormat majorityFormat = FeCatalogUtils.getMajorityFormat(partitions_);
-    if (majorityFormat == HdfsFileFormat.PARQUET
-        || majorityFormat == HdfsFileFormat.ORC) {
-      Preconditions.checkNotNull(columnReservations);
-      // For the purpose of this estimation, the number of per-host scan ranges for
-      // Parquet/ORC files are equal to the number of columns read from the file. I.e.
-      // excluding partition columns and columns that are populated from file metadata.
-      perHostScanRanges = columnReservations.size();
-    } else {
-      perHostScanRanges = (int) Math.ceil(
-          ((double) scanRangeSize / (double) numNodes_) * SCAN_RANGE_SKEW_FACTOR);
+    int perHostScanRanges = 0;
+    for (HdfsFileFormat format : fileFormats_) {
+      int partitionScanRange = 0;
+      if ((format == HdfsFileFormat.PARQUET) || (format == HdfsFileFormat.ORC)) {
+        Preconditions.checkNotNull(columnReservations);
+        // For the purpose of this estimation, the number of per-host scan ranges for
+        // Parquet/ORC files are equal to the number of columns read from the file. I.e.
+        // excluding partition columns and columns that are populated from file metadata.
+        partitionScanRange = columnReservations.size();
+      } else {
+        partitionScanRange = (int) Math.ceil(
+            ((double) scanRangeSize / (double) numNodes_) * SCAN_RANGE_SKEW_FACTOR);
+      }
+      // From the resource management purview, we want to conservatively estimate memory
+      // consumption based on the partition with the highest memory requirements.
+      if (partitionScanRange > perHostScanRanges) {
+        perHostScanRanges = partitionScanRange;
+      }
     }
 
     // The non-MT scan node requires at least one scanner thread.

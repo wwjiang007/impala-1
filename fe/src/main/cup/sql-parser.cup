@@ -52,8 +52,10 @@ import org.apache.impala.thrift.TFunctionCategory;
 import org.apache.impala.thrift.THdfsFileFormat;
 import org.apache.impala.thrift.TOwnerType;
 import org.apache.impala.thrift.TPrivilegeLevel;
+import org.apache.impala.thrift.TQueryOptions;
 import org.apache.impala.thrift.TShowStatsOp;
 import org.apache.impala.thrift.TTablePropertyType;
+import org.apache.impala.thrift.TPrincipalType;
 
 parser code {:
   private Symbol errorToken_;
@@ -66,6 +68,10 @@ parser code {:
   // list of expected tokens ids from current parsing state
   // for generating syntax error message
   private final List<Integer> expectedTokenIds_ = new ArrayList<Integer>();
+
+  // Currently used to tell if it's decimal V1 or V2 mode.
+  // TODO: remove when V1 code is dropped.
+  private TQueryOptions queryOptions;
 
   // to avoid reporting trivial tokens as expected tokens in error messages
   private boolean reportExpectedToken(Integer tokenId, int numExpectedTokens) {
@@ -93,6 +99,14 @@ parser code {:
         break;
     }
     return msg;
+  }
+
+  public void setQueryOptions(TQueryOptions options) {
+    queryOptions = options;
+  }
+
+  public TQueryOptions getQueryOptions() {
+    return queryOptions;
   }
 
   // override to save error token
@@ -356,6 +370,7 @@ nonterminal String alias_clause;
 nonterminal ArrayList<String> ident_list, primary_keys;
 nonterminal ArrayList<String> opt_ident_list, opt_sort_cols;
 nonterminal TableName table_name;
+nonterminal ColumnName column_name;
 nonterminal FunctionName function_name;
 nonterminal Expr where_clause;
 nonterminal Expr predicate, bool_test_expr;
@@ -496,7 +511,8 @@ nonterminal Map<Option, Object> column_options_map;
 
 // For GRANT/REVOKE/AUTH DDL statements
 nonterminal ShowRolesStmt show_roles_stmt;
-nonterminal ShowGrantRoleStmt show_grant_role_stmt;
+nonterminal ShowGrantPrincipalStmt show_grant_principal_stmt;
+nonterminal TPrincipalType principal_type;
 nonterminal CreateDropRoleStmt create_drop_role_stmt;
 nonterminal GrantRevokeRoleStmt grant_role_stmt;
 nonterminal GrantRevokeRoleStmt revoke_role_stmt;
@@ -533,6 +549,9 @@ nonterminal CreateUdaStmt create_uda_stmt;
 nonterminal ShowFunctionsStmt show_functions_stmt;
 nonterminal DropFunctionStmt drop_function_stmt;
 nonterminal TFunctionCategory opt_function_category;
+
+// Admin statements.
+nonterminal AdminFnStmt admin_fn_stmt;
 
 precedence left KW_OR;
 precedence left KW_AND;
@@ -654,8 +673,8 @@ stmt ::=
   {: RESULT = set; :}
   | show_roles_stmt:show_roles
   {: RESULT = show_roles; :}
-  | show_grant_role_stmt:show_grant_role
-  {: RESULT = show_grant_role; :}
+  | show_grant_principal_stmt:show_grant_principal
+  {: RESULT = show_grant_principal; :}
   | create_drop_role_stmt:create_drop_role
   {: RESULT = create_drop_role; :}
   | grant_role_stmt:grant_role
@@ -668,6 +687,8 @@ stmt ::=
   {: RESULT = revoke_privilege; :}
   | comment_on_stmt:comment_on
   {: RESULT = comment_on; :}
+  | admin_fn_stmt:shutdown
+  {: RESULT = shutdown; :}
   | stmt:s SEMICOLON
   {: RESULT = s; :}
   ;
@@ -902,29 +923,31 @@ show_roles_stmt ::=
   {: RESULT = new ShowRolesStmt(true, null); :}
   ;
 
-show_grant_role_stmt ::=
-  KW_SHOW KW_GRANT KW_ROLE ident_or_default:role
-  {: RESULT = new ShowGrantRoleStmt(role, null); :}
-  | KW_SHOW KW_GRANT KW_ROLE ident_or_default:role KW_ON server_ident:server_kw
+show_grant_principal_stmt ::=
+  KW_SHOW KW_GRANT principal_type:type ident_or_default:name
+  {: RESULT = new ShowGrantPrincipalStmt(name, type, null); :}
+  | KW_SHOW KW_GRANT principal_type:type ident_or_default:name KW_ON
+  server_ident:server_kw
   {:
-    RESULT = new ShowGrantRoleStmt(role,
+    RESULT = new ShowGrantPrincipalStmt(name, type,
         PrivilegeSpec.createServerScopedPriv(TPrivilegeLevel.ALL));
   :}
-  | KW_SHOW KW_GRANT KW_ROLE ident_or_default:role KW_ON
+  | KW_SHOW KW_GRANT principal_type:type ident_or_default:name KW_ON
     KW_DATABASE ident_or_default:db_name
   {:
-    RESULT = new ShowGrantRoleStmt(role,
+    RESULT = new ShowGrantPrincipalStmt(name, type,
         PrivilegeSpec.createDbScopedPriv(TPrivilegeLevel.ALL, db_name));
   :}
-  | KW_SHOW KW_GRANT KW_ROLE ident_or_default:role KW_ON KW_TABLE table_name:tbl_name
+  | KW_SHOW KW_GRANT principal_type:type ident_or_default:name KW_ON KW_TABLE
+  table_name:tbl_name
   {:
-    RESULT = new ShowGrantRoleStmt(role,
+    RESULT = new ShowGrantPrincipalStmt(name, type,
         PrivilegeSpec.createTableScopedPriv(TPrivilegeLevel.ALL, tbl_name));
   :}
-  | KW_SHOW KW_GRANT KW_ROLE ident_or_default:role KW_ON uri_ident:uri_kw
+  | KW_SHOW KW_GRANT principal_type:type ident_or_default:name KW_ON uri_ident:uri_kw
     STRING_LITERAL:uri
   {:
-    RESULT = new ShowGrantRoleStmt(role,
+    RESULT = new ShowGrantPrincipalStmt(name, type,
         PrivilegeSpec.createUriScopedPriv(TPrivilegeLevel.ALL, new HdfsUri(uri)));
   :}
   ;
@@ -990,6 +1013,16 @@ privilege ::=
   {: RESULT = TPrivilegeLevel.ALL; :}
   ;
 
+principal_type ::=
+  KW_ROLE
+  {: RESULT = TPrincipalType.ROLE; :}
+  | IDENT:user
+  {:
+    parser.checkIdentKeyword("USER", user);
+    RESULT = TPrincipalType.USER;
+  :}
+  ;
+
 opt_grantopt_for ::=
   KW_GRANT option_ident:option KW_FOR
   {: RESULT = true; :}
@@ -1034,6 +1067,8 @@ comment_on_stmt ::=
   {: RESULT = new CommentOnTableStmt(table, comment); :}
   | KW_COMMENT KW_ON KW_VIEW table_name:table KW_IS nullable_comment_val:comment
   {: RESULT = new CommentOnViewStmt(table, comment); :}
+  | KW_COMMENT KW_ON KW_COLUMN column_name:column KW_IS nullable_comment_val:comment
+  {: RESULT = new CommentOnColumnStmt(column, comment); :}
   ;
 
 // Introducing OWNER and USER keywords has a potential to be a breaking change,
@@ -1055,6 +1090,9 @@ alter_db_stmt ::=
   :}
   ;
 
+// In some places, the opt_partition_set is used to avoid conflicts even though
+// a partition clause does not make sense for this stmt. If a partition
+// is given, manually throw a parse error.
 alter_tbl_stmt ::=
   KW_ALTER KW_TABLE table_name:table replace_existing_cols_val:replace KW_COLUMNS
   LPAREN column_def_list:col_defs RPAREN
@@ -1104,9 +1142,7 @@ alter_tbl_stmt ::=
   | KW_ALTER KW_TABLE table_name:table opt_partition_set:partition KW_SET
     KW_COLUMN KW_STATS ident_or_default:col LPAREN properties_map:map RPAREN
   {:
-    // The opt_partition_set is used to avoid conflicts even though
-    // a partition clause does not make sense for this stmt. If a partition
-    // is given, manually throw a parse error.
+    // See above for special partition clause handling.
     if (partition != null) parser.parseError("set", SqlParserSymbols.KW_SET);
     RESULT = new AlterTableSetColumnStats(table, col, map);
   :}
@@ -1131,6 +1167,23 @@ alter_tbl_stmt ::=
   | KW_ALTER KW_TABLE table_name:table KW_ALTER opt_kw_column ident_or_default:col_name
     KW_DROP KW_DEFAULT
   {: RESULT = AlterTableAlterColStmt.createDropDefaultStmt(table, col_name); :}
+  | KW_ALTER KW_TABLE table_name:table opt_partition_set:partitions KW_SET IDENT:owner_id
+    IDENT:user_id ident_or_default:user
+  {:
+    // See above for special partition clause handling.
+    if (partitions != null) parser.parseError("set", SqlParserSymbols.KW_SET);
+    parser.checkIdentKeyword("OWNER", owner_id);
+    parser.checkIdentKeyword("USER", user_id);
+    RESULT = new AlterTableSetOwnerStmt(table, new Owner(TOwnerType.USER, user));
+  :}
+  | KW_ALTER KW_TABLE table_name:table opt_partition_set:partitions KW_SET IDENT:owner_id
+    KW_ROLE ident_or_default:role
+  {:
+    // See above for special partition clause handling.
+    if (partitions != null) parser.parseError("set", SqlParserSymbols.KW_SET);
+    parser.checkIdentKeyword("OWNER", owner_id);
+    RESULT = new AlterTableSetOwnerStmt(table, new Owner(TOwnerType.ROLE, role));
+  :}
   ;
 
 table_property_type ::=
@@ -1869,10 +1922,23 @@ view_column_def ::=
   ;
 
 alter_view_stmt ::=
-  KW_ALTER KW_VIEW table_name:table KW_AS query_stmt:view_def
-  {: RESULT = new AlterViewStmt(table, view_def); :}
+  KW_ALTER KW_VIEW table_name:table view_column_defs:col_defs KW_AS
+  query_stmt:view_def
+  {: RESULT = new AlterViewStmt(table, col_defs, view_def); :}
   | KW_ALTER KW_VIEW table_name:before_table KW_RENAME KW_TO table_name:new_table
   {: RESULT = new AlterTableOrViewRenameStmt(before_table, new_table, false); :}
+  | KW_ALTER KW_VIEW table_name:table KW_SET IDENT:owner_id IDENT:user_id
+    ident_or_default:user
+  {:
+    parser.checkIdentKeyword("OWNER", owner_id);
+    parser.checkIdentKeyword("USER", user_id);
+    RESULT = new AlterViewSetOwnerStmt(table, new Owner(TOwnerType.USER, user));
+  :}
+  | KW_ALTER KW_VIEW table_name:table KW_SET IDENT:owner_id KW_ROLE ident_or_default:role
+  {:
+    parser.checkIdentKeyword("OWNER", owner_id);
+    RESULT = new AlterViewSetOwnerStmt(table, new Owner(TOwnerType.ROLE, role));
+  :}
   ;
 
 cascade_val ::=
@@ -2465,6 +2531,14 @@ set_stmt ::=
   {: RESULT = new SetStmt(null, null, false); :}
   ;
 
+// Top-level function call, e.g. ": shutdown()", used for admin commands, etc.
+admin_fn_stmt ::=
+    COLON ident_or_default:fn_name LPAREN RPAREN
+  {: RESULT = new AdminFnStmt(fn_name, Collections.<Expr>emptyList()); :}
+  | COLON ident_or_default:fn_name LPAREN expr_list:params RPAREN
+  {: RESULT = new AdminFnStmt(fn_name, params); :}
+  ;
+
 select_list ::=
   select_list_item:item
   {:
@@ -2511,6 +2585,13 @@ table_name ::=
   {: RESULT = new TableName(null, tbl); :}
   | ident_or_default:db DOT ident_or_default:tbl
   {: RESULT = new TableName(db, tbl); :}
+  ;
+
+column_name ::=
+  | ident_or_default:tbl DOT ident_or_default:col
+  {: RESULT = new ColumnName(new TableName(null, tbl), col); :}
+  | ident_or_default:db DOT ident_or_default:tbl DOT ident_or_default:col
+  {: RESULT = new ColumnName(new TableName(db, tbl), col); :}
   ;
 
 function_name ::=
@@ -2904,10 +2985,10 @@ function_call_expr ::=
   function_name:fn_name LPAREN RPAREN
   {:
     RESULT = FunctionCallExpr.createExpr(
-        fn_name, new FunctionParams(new ArrayList<Expr>()));
+        fn_name, new FunctionParams(new ArrayList<Expr>()), parser.getQueryOptions());
   :}
   | function_name:fn_name LPAREN function_params:params RPAREN
-  {: RESULT = FunctionCallExpr.createExpr(fn_name, params); :}
+  {: RESULT = FunctionCallExpr.createExpr(fn_name, params, parser.getQueryOptions()); :}
   // Below is a special case for EXTRACT. Idents are used to avoid adding new keywords.
   | function_name:fn_name LPAREN ident_or_default:u KW_FROM expr:t RPAREN
   {:  RESULT = new ExtractFromExpr(fn_name, u, t); :}

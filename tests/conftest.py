@@ -27,13 +27,14 @@ import logging
 import os
 import pytest
 
+from tests.common.environ import specific_build_type_timeout
 from common.test_result_verifier import QueryTestResult
 from tests.common.patterns import is_valid_impala_identifier
 from tests.comparison.db_connection import ImpalaConnection
 from tests.util.filesystem_utils import FILESYSTEM, ISILON_WEBHDFS_PORT
 
-logging.basicConfig(level=logging.INFO, format='%(threadName)s: %(message)s')
 LOG = logging.getLogger('test_configuration')
+LOG_FORMAT = "-- %(asctime)s %(levelname)-8s %(threadName)s: %(message)s"
 
 DEFAULT_CONN_TIMEOUT = 45
 DEFAULT_EXPLORATION_STRATEGY = 'core'
@@ -48,6 +49,22 @@ DEFAULT_NAMENODE_ADDR = None
 if FILESYSTEM == 'isilon':
   DEFAULT_NAMENODE_ADDR = "{node}:{port}".format(node=os.getenv("ISILON_NAMENODE"),
                                                  port=ISILON_WEBHDFS_PORT)
+
+# Timeout each individual test case after 2 hours, or 4 hours for slow builds
+PYTEST_TIMEOUT_S = \
+    specific_build_type_timeout(2 * 60 * 60, slow_build_timeout=4 * 60 * 60)
+
+def pytest_configure(config):
+  """ Hook startup of pytest. Sets up log format and per-test timeout. """
+  configure_logging()
+  config.option.timeout = PYTEST_TIMEOUT_S
+
+
+def configure_logging():
+  # Use a "--" since most of our tests output SQL commands, and it's nice to
+  # be able to copy-paste directly from the test output back into a shell to
+  # try to reproduce a failure.
+  logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 
 
 def pytest_addoption(parser):
@@ -105,6 +122,14 @@ def pytest_addoption(parser):
   parser.addoption("--use_kerberos", action="store_true", default=False,
                    help="use kerberos transport for running tests")
 
+  parser.addoption("--use_local_catalog", dest="use_local_catalog", action="store_true",
+                   default=False, help="Run all tests against Impala configured with "
+                   "LocalCatalog.")
+
+  parser.addoption("--pull_incremental_statistics", dest="pull_incremental_statistics",
+                   action="store_true", default=False, help="Run all tests against Impala"
+                   " where impalads pull incremental statistics directly from catalogd.")
+
   parser.addoption("--sanity", action="store_true", default=False,
                    help="Runs a single test vector from each test to provide a quick "
                    "sanity check at the cost of lower test coverage.")
@@ -115,10 +140,6 @@ def pytest_addoption(parser):
   parser.addoption("--testing_remote_cluster", action="store_true", default=False,
                    help=("Indicates that tests are being run against a remote cluster. "
                          "Some tests may be marked to skip or xfail on remote clusters."))
-
-  parser.addoption("--test_no_krpc", dest="test_no_krpc", action="store_true",
-                   default=False, help="Run all tests with KRPC disabled. This assumes "
-                   "that the test cluster has been started with --disable_krpc.")
 
   parser.addoption("--shard_tests", default=None,
                    help="If set to N/M (e.g., 3/5), will split the tests into "
@@ -356,7 +377,7 @@ def conn(request):
     with __unique_conn(db_name=db_name, timeout=timeout) as conn:
       yield conn
   else:
-    with __auto_closed_conn(db_name=db_name) as conn:
+    with __auto_closed_conn(db_name=db_name, timeout=timeout) as conn:
       yield conn
 
 
@@ -388,7 +409,7 @@ def __unique_conn(db_name=None, timeout=DEFAULT_CONN_TIMEOUT):
   """
   if not db_name:
     db_name = choice(ascii_lowercase) + "".join(sample(ascii_lowercase + digits, 5))
-  with __auto_closed_conn() as conn:
+  with __auto_closed_conn(timeout=timeout) as conn:
     with __auto_closed_cursor(conn) as cur:
       cur.execute("CREATE DATABASE %s" % db_name)
   with __auto_closed_conn(db_name=db_name, timeout=timeout) as conn:

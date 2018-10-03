@@ -21,6 +21,7 @@
 // TODO: Remove when toolchain callbacks.h properly defines ::tm.
 struct tm;
 
+#include <gutil/strings/substitute.h>
 #include <kudu/client/callbacks.h>
 #include <kudu/client/client.h>
 #include <kudu/client/value.h>
@@ -35,7 +36,7 @@ namespace impala {
 /// Evaluates the prepend argument only if the status is not OK.
 #define KUDU_RETURN_IF_ERROR(expr, prepend) \
   do { \
-    kudu::Status _s = (expr); \
+    const kudu::Status& _s = (expr); \
     if (UNLIKELY(!_s.ok())) {                                      \
       return Status(strings::Substitute("$0: $1", prepend, _s.ToString())); \
     } \

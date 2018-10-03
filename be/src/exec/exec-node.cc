@@ -29,6 +29,7 @@
 #include "common/status.h"
 #include "exprs/scalar-expr.h"
 #include "exprs/scalar-expr-evaluator.h"
+#include "exec/aggregation-node.h"
 #include "exec/analytic-eval-node.h"
 #include "exec/cardinality-check-node.h"
 #include "exec/data-source-scan-node.h"
@@ -42,11 +43,11 @@
 #include "exec/kudu-util.h"
 #include "exec/nested-loop-join-node.h"
 #include "exec/partial-sort-node.h"
-#include "exec/partitioned-aggregation-node.h"
 #include "exec/partitioned-hash-join-node.h"
 #include "exec/select-node.h"
 #include "exec/singular-row-src-node.h"
 #include "exec/sort-node.h"
+#include "exec/streaming-aggregation-node.h"
 #include "exec/subplan-node.h"
 #include "exec/topn-node.h"
 #include "exec/union-node.h"
@@ -74,37 +75,6 @@ const string ExecNode::ROW_THROUGHPUT_COUNTER = "RowsReturnedRate";
 
 int ExecNode::GetNodeIdFromProfile(RuntimeProfile* p) {
   return p->metadata();
-}
-
-ExecNode::RowBatchQueue::RowBatchQueue(int max_batches)
-  : BlockingQueue<unique_ptr<RowBatch>>(max_batches) {
-}
-
-ExecNode::RowBatchQueue::~RowBatchQueue() {
-  DCHECK(cleanup_queue_.empty());
-}
-
-void ExecNode::RowBatchQueue::AddBatch(unique_ptr<RowBatch> batch) {
-  if (!BlockingPut(move(batch))) {
-    lock_guard<SpinLock> l(lock_);
-    cleanup_queue_.push_back(move(batch));
-  }
-}
-
-unique_ptr<RowBatch> ExecNode::RowBatchQueue::GetBatch() {
-  unique_ptr<RowBatch> result;
-  if (BlockingGet(&result)) return result;
-  return unique_ptr<RowBatch>();
-}
-
-void ExecNode::RowBatchQueue::Cleanup() {
-  unique_ptr<RowBatch> batch = NULL;
-  while ((batch = GetBatch()) != NULL) {
-    batch.reset();
-  }
-
-  lock_guard<SpinLock> l(lock_);
-  cleanup_queue_.clear();
 }
 
 ExecNode::ExecNode(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs)
@@ -156,7 +126,8 @@ Status ExecNode::Prepare(RuntimeState* state) {
   }
   reservation_manager_.Init(
       Substitute("$0 id=$1 ptr=$2", PrintThriftEnum(type_), id_, this), runtime_profile_,
-      mem_tracker_.get(), resource_profile_, debug_options_);
+      state->instance_buffer_reservation(), mem_tracker_.get(), resource_profile_,
+      debug_options_);
   return Status::OK();
 }
 
@@ -303,7 +274,11 @@ Status ExecNode::CreateNode(ObjectPool* pool, const TPlanNode& tnode,
       }
       break;
     case TPlanNodeType::AGGREGATION_NODE:
-      *node = pool->Add(new PartitionedAggregationNode(pool, tnode, descs));
+      if (tnode.agg_node.aggregators[0].use_streaming_preaggregation) {
+        *node = pool->Add(new StreamingAggregationNode(pool, tnode, descs));
+      } else {
+        *node = pool->Add(new AggregationNode(pool, tnode, descs));
+      }
       break;
     case TPlanNodeType::HASH_JOIN_NODE:
       *node = pool->Add(new PartitionedHashJoinNode(pool, tnode, descs));

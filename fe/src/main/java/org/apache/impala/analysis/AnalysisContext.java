@@ -51,6 +51,7 @@ import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import com.google.common.collect.ImmutableList;
 
 /**
  * Wrapper class for parsing, analyzing and rewriting a SQL stmt.
@@ -131,12 +132,15 @@ public class AnalysisContext {
       return stmt_ instanceof ShowCreateFunctionStmt;
     }
     public boolean isShowFilesStmt() { return stmt_ instanceof ShowFilesStmt; }
+    public boolean isAdminFnStmt() { return stmt_ instanceof AdminFnStmt; }
     public boolean isDescribeDbStmt() { return stmt_ instanceof DescribeDbStmt; }
     public boolean isDescribeTableStmt() { return stmt_ instanceof DescribeTableStmt; }
     public boolean isResetMetadataStmt() { return stmt_ instanceof ResetMetadataStmt; }
     public boolean isExplainStmt() { return stmt_.isExplain(); }
     public boolean isShowRolesStmt() { return stmt_ instanceof ShowRolesStmt; }
-    public boolean isShowGrantRoleStmt() { return stmt_ instanceof ShowGrantRoleStmt; }
+    public boolean isShowGrantPrincipalStmt() {
+      return stmt_ instanceof ShowGrantPrincipalStmt;
+    }
     public boolean isCreateDropRoleStmt() { return stmt_ instanceof CreateDropRoleStmt; }
     public boolean isGrantRevokeRoleStmt() {
       return stmt_ instanceof GrantRevokeRoleStmt;
@@ -170,7 +174,7 @@ public class AnalysisContext {
 
     private boolean isViewMetadataStmt() {
       return isShowFilesStmt() || isShowTablesStmt() || isShowDbsStmt() ||
-          isShowFunctionsStmt() || isShowRolesStmt() || isShowGrantRoleStmt() ||
+          isShowFunctionsStmt() || isShowRolesStmt() || isShowGrantPrincipalStmt() ||
           isShowCreateTableStmt() || isShowDataSrcsStmt() || isShowStatsStmt() ||
           isDescribeTableStmt() || isDescribeDbStmt() || isShowCreateFunctionStmt();
     }
@@ -363,6 +367,11 @@ public class AnalysisContext {
       return (AlterDbStmt) stmt_;
     }
 
+    public AdminFnStmt getAdminFnStmt() {
+      Preconditions.checkState(isAdminFnStmt());
+      return (AdminFnStmt) stmt_;
+    }
+
     public StatementBase getStmt() { return stmt_; }
     public Analyzer getAnalyzer() { return analyzer_; }
     public Set<TAccessEvent> getAccessEvents() { return analyzer_.getAccessEvents(); }
@@ -455,22 +464,41 @@ public class AnalysisContext {
       // reset() and re-analyzed. For a CTAS statement, the types represent column types
       // of the table that will be created, including the partition columns, if any.
       List<Type> origResultTypes = Lists.newArrayList();
-      for (Expr e: analysisResult_.stmt_.getResultExprs()) {
+      for (Expr e : analysisResult_.stmt_.getResultExprs()) {
         origResultTypes.add(e.getType());
       }
       List<String> origColLabels =
           Lists.newArrayList(analysisResult_.stmt_.getColLabels());
 
+      // Some expressions, such as function calls with constant arguments, can get
+      // folded into literals. Since literals do not require privilege requests, we
+      // must save the original privileges in order to not lose them during
+      // re-analysis.
+      ImmutableList<PrivilegeRequest> origPrivReqs =
+          analysisResult_.analyzer_.getPrivilegeReqs();
+
       // Re-analyze the stmt with a new analyzer.
       analysisResult_.analyzer_ = createAnalyzer(stmtTableCache);
       analysisResult_.stmt_.reset();
-      analysisResult_.stmt_.analyze(analysisResult_.analyzer_);
+      try {
+        analysisResult_.stmt_.analyze(analysisResult_.analyzer_);
+      } catch (AnalysisException e) {
+        LOG.error(String.format("Error analyzing the rewritten query.\n" +
+            "Original SQL: %s\nRewritten SQL: %s", analysisResult_.stmt_.toSql(),
+            analysisResult_.stmt_.toSql(true)));
+        throw e;
+      }
 
       // Restore the original result types and column labels.
       analysisResult_.stmt_.castResultExprs(origResultTypes);
       analysisResult_.stmt_.setColLabels(origColLabels);
       if (LOG.isTraceEnabled()) {
-        LOG.trace("rewrittenStmt: " + analysisResult_.stmt_.toSql());
+        LOG.trace("Rewritten SQL: " + analysisResult_.stmt_.toSql(true));
+      }
+
+      // Restore privilege requests found during the first pass
+      for (PrivilegeRequest req : origPrivReqs) {
+        analysisResult_.analyzer_.registerPrivReq(req);
       }
       if (isExplain) analysisResult_.stmt_.setIsExplain();
       Preconditions.checkState(!analysisResult_.requiresSubqueryRewrite());
@@ -544,7 +572,9 @@ public class AnalysisContext {
     // These checks don't result in an AuthorizationException but set the
     // 'user_has_profile_access' flag in queryCtx_.
     for (Pair<PrivilegeRequest, String> maskedReq: analyzer.getMaskedPrivilegeReqs()) {
-      if (!authzChecker.hasAccess(analyzer.getUser(), maskedReq.first)) {
+      try {
+        authorizePrivilegeRequest(authzChecker, maskedReq.first);
+      } catch (AuthorizationException e) {
         analysisResult_.setUserHasProfileAccess(false);
         if (!Strings.isNullOrEmpty(maskedReq.second)) {
           throw new AuthorizationException(maskedReq.second);

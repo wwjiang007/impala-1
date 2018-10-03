@@ -31,16 +31,17 @@
 #include "rpc/authentication.h"
 #include "rpc/thrift-util.h"
 #include "runtime/bufferpool/buffer-pool.h"
+#include "runtime/datetime-parse-util.h"
 #include "runtime/decimal-value.h"
 #include "runtime/exec-env.h"
 #include "runtime/hdfs-fs-cache.h"
 #include "runtime/lib-cache.h"
 #include "runtime/mem-tracker.h"
-#include "runtime/timestamp-parse-util.h"
 #include "util/cpu-info.h"
 #include "util/debug-util.h"
 #include "util/decimal-util.h"
 #include "util/disk-info.h"
+#include "util/jni-util.h"
 #include "util/logging-support.h"
 #include "util/mem-info.h"
 #include "util/memory-metrics.h"
@@ -69,6 +70,7 @@ DECLARE_int32(max_log_files);
 DECLARE_int32(max_minidumps);
 DECLARE_string(redaction_rules_file);
 DECLARE_string(reserved_words_version);
+DECLARE_bool(symbolize_stacktrace);
 
 DEFINE_int32(max_audit_event_log_files, 0, "Maximum number of audit event log files "
     "to retain. The most recent audit event log files are retained. If set to 0, "
@@ -172,6 +174,13 @@ static void PauseMonitorLoop() {
   }
 }
 
+// Signal handler for SIGTERM, that prints the message before doing an exit.
+[[noreturn]] static void HandleSigTerm(int signum, siginfo_t* info, void* context) {
+  LOG(INFO) << "Caught signal: SIGTERM. Daemon will exit. Sender UID: " << info->si_uid
+            << ", PID: " << info->si_pid;
+  exit(0);
+}
+
 void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
     TestInfo::Mode test_mode) {
   srand(time(NULL));
@@ -189,6 +198,7 @@ void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
   // Set the default hostname. The user can override this with the hostname flag.
   ABORT_IF_ERROR(GetHostname(&FLAGS_hostname));
 
+  FLAGS_symbolize_stacktrace = false;
   google::SetVersionString(impala::GetBuildVersion());
   google::ParseCommandLineFlags(&argc, &argv, true);
   if (!FLAGS_redaction_rules_file.empty()) {
@@ -217,7 +227,7 @@ void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
   AtomicOps_x86CPUFeaturesInit();
 #endif
   impala::InitThreading();
-  impala::TimestampParser::Init();
+  impala::datetime_parse_util::InitParseCtx();
   impala::SeedOpenSSLRNG();
   ABORT_IF_ERROR(impala::InitAuth(argv[0]));
 
@@ -259,6 +269,7 @@ void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
   if (init_jvm) {
     ABORT_IF_ERROR(JniUtil::Init());
     InitJvmLoggingSupport();
+    ABORT_IF_ERROR(JniUtil::InitJvmPauseMonitor());
     ZipUtil::InitJvm();
   }
 
@@ -277,10 +288,22 @@ void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
     HeapProfilerStart(FLAGS_heap_profile_dir.c_str());
   }
 #endif
+
+  // Signal handler for handling the SIGTERM. We want to log a message when catalogd or
+  // impalad or statestored is being shutdown using a SIGTERM.
+  struct sigaction action;
+  memset(&action, 0, sizeof(struct sigaction));
+  action.sa_sigaction = &HandleSigTerm;
+  action.sa_flags = SA_SIGINFO;
+  if (sigaction(SIGTERM, &action, nullptr) == -1) {
+    stringstream error_msg;
+    error_msg << "Failed to register action for SIGTERM: " << GetStrErrMsg();
+    CLEAN_EXIT_WITH_ERROR(error_msg.str());
+  }
 }
 
 Status impala::StartMemoryMaintenanceThread() {
-  DCHECK(AggregateMemoryMetrics::NUM_MAPS != nullptr) << "Mem metrics not registered.";
+  DCHECK(AggregateMemoryMetrics::TOTAL_USED != nullptr) << "Mem metrics not registered.";
   return Thread::Create("common", "memory-maintenance-thread",
       &MemoryMaintenanceThread, &memory_maintenance_thread);
 }
@@ -304,9 +327,6 @@ extern "C" const char *__tsan_default_options() {
 // Default UBSAN_OPTIONS. Override by setting environment variable $UBSAN_OPTIONS.
 #if defined(UNDEFINED_SANITIZER)
 extern "C" const char *__ubsan_default_options() {
-  static const string default_options = Substitute(
-      "print_stacktrace=1 suppressions=$0/bin/ubsan-suppressions.txt",
-      getenv("IMPALA_HOME") == nullptr ? "." : getenv("IMPALA_HOME"));
-  return default_options.c_str();
+  return "print_stacktrace=1 suppressions=" UNDEFINED_SANITIZER_SUPPRESSIONS;
 }
 #endif

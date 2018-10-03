@@ -30,7 +30,6 @@
 #include "runtime/bufferpool/reservation-tracker.h"
 #include "runtime/descriptors.h" // for RowDescriptor
 #include "runtime/reservation-manager.h"
-#include "util/blocking-queue.h"
 #include "util/runtime-profile.h"
 
 namespace impala {
@@ -211,6 +210,7 @@ class ExecNode {
   MemTracker* expr_mem_tracker() { return expr_mem_tracker_.get(); }
   MemPool* expr_perm_pool() { return expr_perm_pool_.get(); }
   MemPool* expr_results_pool() { return expr_results_pool_.get(); }
+  const TBackendResourceProfile& resource_profile() { return resource_profile_; }
   bool is_closed() const { return is_closed_; }
 
   /// Return true if codegen was disabled by the planner for this ExecNode. Does not
@@ -219,6 +219,10 @@ class ExecNode {
 
   /// Extract node id from p->name().
   static int GetNodeIdFromProfile(RuntimeProfile* p);
+
+  /// Returns true if this node is inside the right-hand side plan tree of a SubplanNode.
+  /// Valid to call in or after Prepare().
+  bool IsInSubplan() const { return containing_subplan_ != NULL; }
 
   /// Names of counters shared by all exec nodes
   static const std::string ROW_THROUGHPUT_COUNTER;
@@ -237,40 +241,6 @@ class ExecNode {
   Status ReleaseUnusedReservation() WARN_UNUSED_RESULT {
     return reservation_manager_.ReleaseUnusedReservation();
   }
-
-  /// Extends blocking queue for row batches. Row batches have a property that
-  /// they must be processed in the order they were produced, even in cancellation
-  /// paths. Preceding row batches can contain ptrs to memory in subsequent row batches
-  /// and we need to make sure those ptrs stay valid.
-  /// Row batches that are added after Shutdown() are queued in another queue, which can
-  /// be cleaned up during Close().
-  /// All functions are thread safe.
-  class RowBatchQueue : public BlockingQueue<std::unique_ptr<RowBatch>> {
-   public:
-    /// max_batches is the maximum number of row batches that can be queued.
-    /// When the queue is full, producers will block.
-    RowBatchQueue(int max_batches);
-    ~RowBatchQueue();
-
-    /// Adds a batch to the queue. This is blocking if the queue is full.
-    void AddBatch(std::unique_ptr<RowBatch> batch);
-
-    /// Gets a row batch from the queue. Returns NULL if there are no more.
-    /// This function blocks.
-    /// Returns NULL after Shutdown().
-    std::unique_ptr<RowBatch> GetBatch();
-
-    /// Deletes all row batches in cleanup_queue_. Not valid to call AddBatch()
-    /// after this is called.
-    void Cleanup();
-
-   private:
-    /// Lock protecting cleanup_queue_
-    SpinLock lock_;
-
-    /// Queue of orphaned row batches
-    std::list<std::unique_ptr<RowBatch>> cleanup_queue_;
-  };
 
   /// Unique within a single plan tree.
   int id_;
@@ -321,10 +291,6 @@ class ExecNode {
   /// Pointer to the containing SubplanNode or NULL if not inside a subplan.
   /// Set by SubplanNode::Init(). Not owned.
   SubplanNode* containing_subplan_;
-
-  /// Returns true if this node is inside the right-hand side plan tree of a SubplanNode.
-  /// Valid to call in or after Prepare().
-  bool IsInSubplan() const { return containing_subplan_ != NULL; }
 
   /// If true, codegen should be disabled for this exec node.
   const bool disable_codegen_;

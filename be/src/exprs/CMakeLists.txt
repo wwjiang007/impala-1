@@ -53,6 +53,7 @@ add_library(Exprs
   scalar-expr-evaluator.cc
   scalar-expr-ir.cc
   slot-ref.cc
+  string-functions.cc
   string-functions-ir.cc
   timestamp-functions.cc
   timestamp-functions-ir.cc
@@ -63,6 +64,7 @@ add_library(Exprs
   udf-builtins-ir.cc
   utility-functions.cc
   utility-functions-ir.cc
+  valid-tuple-id.cc
 )
 add_dependencies(Exprs gen-deps gen_ir_descriptions)
 

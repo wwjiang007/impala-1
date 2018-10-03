@@ -17,32 +17,34 @@
 
 #include "kudu/rpc/messenger.h"
 
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
-
-#include <list>
+#include <cstdlib>
+#include <functional>
 #include <mutex>
-#include <set>
+#include <ostream>
 #include <string>
+#include <type_traits>
+#include <utility>
 
 #include <glog/logging.h>
 
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/acceptor_pool.h"
-#include "kudu/rpc/connection.h"
-#include "kudu/rpc/constants.h"
+#include "kudu/rpc/connection_id.h"
+#include "kudu/rpc/inbound_call.h"
+#include "kudu/rpc/outbound_call.h"
 #include "kudu/rpc/reactor.h"
+#include "kudu/rpc/remote_method.h"
 #include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/rpc/rpc_service.h"
 #include "kudu/rpc/rpcz_store.h"
 #include "kudu/rpc/sasl_common.h"
 #include "kudu/rpc/server_negotiation.h"
-#include "kudu/rpc/transfer.h"
+#include "kudu/rpc/service_if.h"
+#include "kudu/security/openssl_util.h"
 #include "kudu/security/tls_context.h"
 #include "kudu/security/token_verifier.h"
 #include "kudu/util/flags.h"
@@ -51,15 +53,17 @@
 #include "kudu/util/net/socket.h"
 #include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/status.h"
+#include "kudu/util/thread_restrictions.h"
 #include "kudu/util/threadpool.h"
-#include "kudu/util/trace.h"
-
-#include "common/config.h"
 
 using std::string;
 using std::shared_ptr;
 using std::make_shared;
 using strings::Substitute;
+
+namespace boost {
+template <typename Signature> class function;
+}
 
 namespace kudu {
 namespace rpc {
@@ -77,7 +81,8 @@ MessengerBuilder::MessengerBuilder(std::string name)
       rpc_encryption_("optional"),
       rpc_tls_ciphers_(kudu::security::SecurityDefaults::kDefaultTlsCiphers),
       rpc_tls_min_protocol_(kudu::security::SecurityDefaults::kDefaultTlsMinVersion),
-      enable_inbound_tls_(false) {
+      enable_inbound_tls_(false),
+      reuseport_(false) {
 }
 
 MessengerBuilder& MessengerBuilder::set_connection_keepalive_time(const MonoDelta &keepalive) {
@@ -174,6 +179,11 @@ MessengerBuilder& MessengerBuilder::enable_inbound_tls() {
   return *this;
 }
 
+MessengerBuilder& MessengerBuilder::set_reuseport() {
+  reuseport_ = true;
+  return *this;
+}
+
 Status MessengerBuilder::Build(shared_ptr<Messenger> *msgr) {
   // Initialize SASL library before we start making requests
   RETURN_NOT_OK(SaslInit(!keytab_file_.empty()));
@@ -231,7 +241,13 @@ Status MessengerBuilder::Build(shared_ptr<Messenger> *msgr) {
 
 // See comment on Messenger::retain_self_ member.
 void Messenger::AllExternalReferencesDropped() {
-  Shutdown();
+  // The last external ref may have been dropped in the context of a task
+  // running on a reactor thread. If that's the case, a SYNC shutdown here
+  // would deadlock.
+  //
+  // If a SYNC shutdown is desired, Shutdown() should be called explicitly.
+  ShutdownInternal(ShutdownMode::ASYNC);
+
   CHECK(retain_self_.get());
   // If we have no more external references, then we no longer
   // need to retain ourself. We'll destruct as soon as all our
@@ -241,23 +257,41 @@ void Messenger::AllExternalReferencesDropped() {
 }
 
 void Messenger::Shutdown() {
+  ShutdownInternal(ShutdownMode::SYNC);
+}
+
+void Messenger::ShutdownInternal(ShutdownMode mode) {
+  if (mode == ShutdownMode::SYNC) {
+    ThreadRestrictions::AssertWaitAllowed();
+  }
+
   // Since we're shutting down, it's OK to block.
+  //
+  // TODO(adar): this ought to be removed (i.e. if ASYNC, waiting should be
+  // forbidden, and if SYNC, we already asserted above), but that's not
+  // possible while shutting down thread and acceptor pools still involves
+  // joining threads.
   ThreadRestrictions::ScopedAllowWait allow_wait;
 
-  std::lock_guard<percpu_rwlock> guard(lock_);
-  if (closing_) {
-    return;
-  }
-  VLOG(1) << "shutting down messenger " << name_;
-  closing_ = true;
+  acceptor_vec_t pools_to_shutdown;
+  RpcServicesMap services_to_release;
+  {
+    std::lock_guard<percpu_rwlock> guard(lock_);
+    if (closing_) {
+      return;
+    }
+    VLOG(1) << "shutting down messenger " << name_;
+    closing_ = true;
 
-  DCHECK(rpc_services_.empty()) << "Unregister RPC services before shutting down Messenger";
-  rpc_services_.clear();
-
-  for (const shared_ptr<AcceptorPool>& acceptor_pool : acceptor_pools_) {
-    acceptor_pool->Shutdown();
+    services_to_release = std::move(rpc_services_);
+    pools_to_shutdown = std::move(acceptor_pools_);
   }
-  acceptor_pools_.clear();
+
+  // Destroy state outside of the lock.
+  services_to_release.clear();
+  for (const auto& p : pools_to_shutdown) {
+    p->Shutdown();
+  }
 
   // Need to shut down negotiation pool before the reactors, since the
   // reactors close the Connection sockets, and may race against the negotiation
@@ -266,9 +300,8 @@ void Messenger::Shutdown() {
   server_negotiation_pool_->Shutdown();
 
   for (Reactor* reactor : reactors_) {
-    reactor->Shutdown();
+    reactor->Shutdown(mode);
   }
-  tls_context_.reset();
 }
 
 Status Messenger::AddAcceptorPool(const Sockaddr &accept_addr,
@@ -276,25 +309,17 @@ Status Messenger::AddAcceptorPool(const Sockaddr &accept_addr,
   // Before listening, if we expect to require Kerberos, we want to verify
   // that everything is set up correctly. This way we'll generate errors on
   // startup rather than later on when we first receive a client connection.
-  // We omit calling PreflightCheckGSSAPI() if we detect a kerberos version < krb-1.7,
-  // since SLES11 has krb-1.6, which has a bug that returns an error for empty
-  // 'clientin' buffers to sasl_server_start(). Also, since this is only done to fail
-  // fast, we're not losing functionality or security by omitting this. We'll fail in
-  // the negotiation phase instead.
-  // TODO: Remove ifdef in Impala 3.0 when we'll stop supporting older OSes.
   if (!keytab_file_.empty()) {
-#ifdef HAVE_KRB5_GET_INIT_CREDS_OPT_SET_FAST_CCACHE_NAME
     RETURN_NOT_OK_PREPEND(ServerNegotiation::PreflightCheckGSSAPI(sasl_proto_name()),
                           "GSSAPI/Kerberos not properly configured");
-#else
-    LOG(WARNING) << "Omitting Kerberos pre-flight check. Connection negotiations may fail"
-                 << " if there is a kerberos misconfiguration.";
-#endif
   }
 
   Socket sock;
   RETURN_NOT_OK(sock.Init(0));
   RETURN_NOT_OK(sock.SetReuseAddr(true));
+  if (reuseport_) {
+    RETURN_NOT_OK(sock.SetReusePort(true));
+  }
   RETURN_NOT_OK(sock.Bind(accept_addr));
   Sockaddr remote;
   RETURN_NOT_OK(sock.GetSocketAddress(&remote));
@@ -318,21 +343,27 @@ Status Messenger::RegisterService(const string& service_name,
   }
 }
 
-Status Messenger::UnregisterAllServices() {
-  std::lock_guard<percpu_rwlock> guard(lock_);
-  rpc_services_.clear();
-  return Status::OK();
+void Messenger::UnregisterAllServices() {
+  RpcServicesMap to_release;
+  {
+    std::lock_guard<percpu_rwlock> guard(lock_);
+    to_release = std::move(rpc_services_);
+  }
+  // Release the map outside of the lock.
 }
 
-// Unregister an RpcService.
 Status Messenger::UnregisterService(const string& service_name) {
-  std::lock_guard<percpu_rwlock> guard(lock_);
-  if (rpc_services_.erase(service_name)) {
-    return Status::OK();
-  } else {
-    return Status::ServiceUnavailable(Substitute("service $0 not registered on $1",
-                 service_name, name_));
+  scoped_refptr<RpcService> to_release;
+  {
+    std::lock_guard<percpu_rwlock> guard(lock_);
+    to_release = EraseKeyReturnValuePtr(&rpc_services_, service_name);
+    if (!to_release) {
+      return Status::ServiceUnavailable(Substitute(
+          "service $0 not registered on $1", service_name, name_));
+    }
   }
+  // Release the service outside of the lock.
+  return Status::OK();
 }
 
 void Messenger::QueueOutboundCall(const shared_ptr<OutboundCall> &call) {
@@ -380,6 +411,7 @@ Messenger::Messenger(const MessengerBuilder &bld)
     rpc_negotiation_timeout_ms_(bld.rpc_negotiation_timeout_ms_),
     sasl_proto_name_(bld.sasl_proto_name_),
     keytab_file_(bld.keytab_file_),
+    reuseport_(bld.reuseport_),
     retain_self_(this) {
   for (int i = 0; i < bld.num_reactors_; i++) {
     reactors_.push_back(new Reactor(retain_self_, i, bld));
@@ -447,13 +479,14 @@ void Messenger::ScheduleOnReactor(const boost::function<void(const Status&)>& fu
 }
 
 const scoped_refptr<RpcService> Messenger::rpc_service(const string& service_name) const {
-  std::lock_guard<percpu_rwlock> guard(lock_);
   scoped_refptr<RpcService> service;
-  if (FindCopy(rpc_services_, service_name, &service)) {
-    return service;
-  } else {
-    return scoped_refptr<RpcService>(nullptr);
+  {
+    shared_lock<rw_spinlock> guard(lock_.get_lock());
+    if (!FindCopy(rpc_services_, service_name, &service)) {
+      return scoped_refptr<RpcService>(nullptr);
+    }
   }
+  return service;
 }
 
 ThreadPool* Messenger::negotiation_pool(Connection::Direction dir) {

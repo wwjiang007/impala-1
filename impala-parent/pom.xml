@@ -54,7 +54,9 @@ under the License.
     <httpcomponents.core.version>4.4.9</httpcomponents.core.version>
     <yarn-extras.version>${project.version}</yarn-extras.version>
     <eclipse.output.directory>eclipse-classes</eclipse.output.directory>
-    <guava.version>11.0.2</guava.version>
+    <!-- hive-exec seems to leak this version of guava onto our classpath,
+         so it's important to depend on the same one -->
+    <guava.version>14.0.1</guava.version>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
   </properties>
 
@@ -71,6 +73,26 @@ under the License.
       </snapshots>
     </repository>
     <repository>
+      <!--
+      The Impala development bootstrapping depends on CDH Maven snapshots
+      which transitively pull dependencies from other repositories which
+      can cause the build to be non-reproducible, e.g. IMPALA-7316. This
+      patch makes the build to be reproducible by blacklisting
+      cdh.snapshots.repo so that Maven does not accidentally downloads the
+      latest CDH snapshots when running a build, which can cause
+      incompatibility issues.
+      -->
+      <id>cdh.snapshots.repo</id>
+      <url>https://repository.cloudera.com/content/repositories/snapshots</url>
+      <name>CDH Snapshots Repository</name>
+      <releases>
+        <enabled>false</enabled>
+      </releases>
+      <snapshots>
+        <enabled>false</enabled>
+      </snapshots>
+    </repository>
+    <repository>
       <id>cdh.rcs.releases.repo</id>
       <url>https://repository.cloudera.com/content/groups/cdh-releases-rcs</url>
       <name>CDH Releases Repository</name>
@@ -84,6 +106,14 @@ under the License.
       <name>CDH Releases Repository</name>
       <snapshots>
         <enabled>false</enabled>
+      </snapshots>
+    </repository>
+    <repository>
+      <id>impala.cdh.repo</id>
+      <url>https://${env.CDH_DOWNLOAD_HOST}/build/cdh_components/${env.CDH_BUILD_NUMBER}/maven</url>
+      <name>Impala CDH Repository</name>
+      <snapshots>
+        <enabled>true</enabled>
       </snapshots>
     </repository>
     <repository>
@@ -114,46 +144,5 @@ under the License.
       </snapshots>
     </pluginRepository>
   </pluginRepositories>
-
-  <profiles>
-    <profile>
-      <id>impala-mini-cluster-profile-2</id>
-      <activation>
-        <property>
-          <name>env.IMPALA_MINICLUSTER_PROFILE</name>
-          <value>2</value>
-        </property>
-      </activation>
-      <repositories>
-        <repository>
-          <id>cdh.snapshots.repo</id>
-          <url>https://repository.cloudera.com/content/repositories/snapshots</url>
-          <name>CDH Snapshots Repository</name>
-          <snapshots>
-            <enabled>true</enabled>
-          </snapshots>
-        </repository>
-      </repositories>
-    </profile>
-    <profile>
-      <id>impala-mini-cluster-profile-3</id>
-      <activation>
-        <property>
-          <name>env.IMPALA_MINICLUSTER_PROFILE</name>
-          <value>3</value>
-        </property>
-      </activation>
-      <repositories>
-        <repository>
-          <id>impala.cdh.repo</id>
-          <url>https://${env.CDH_DOWNLOAD_HOST}/build/cdh_components/${env.CDH_BUILD_NUMBER}/maven</url>
-          <name>Impala CDH Repository</name>
-          <snapshots>
-            <enabled>true</enabled>
-          </snapshots>
-        </repository>
-      </repositories>
-    </profile>
-  </profiles>
 
 </project>

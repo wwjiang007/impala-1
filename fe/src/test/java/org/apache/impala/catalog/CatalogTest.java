@@ -18,36 +18,73 @@
 package org.apache.impala.catalog;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
+import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import org.apache.commons.codec.binary.Base64;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.GlobalStorageStatistics;
+import org.apache.hadoop.fs.StorageStatistics;
+import org.apache.hadoop.hdfs.DFSOpsCountStatistics;
 import org.apache.hadoop.hive.metastore.TableType;
 import org.apache.hadoop.hive.metastore.api.ColumnStatisticsData;
 import org.apache.impala.analysis.FunctionName;
 import org.apache.impala.analysis.LiteralExpr;
 import org.apache.impala.analysis.NumericLiteral;
+import org.apache.impala.analysis.TableName;
 import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
+import org.apache.impala.common.FrontendTestBase;
+import org.apache.impala.common.ImpalaException;
+import org.apache.impala.common.Reference;
+import org.apache.impala.service.BackendConfig;
 import org.apache.impala.testutil.CatalogServiceTestCatalog;
+import org.apache.impala.thrift.CatalogObjectsConstants;
+import org.apache.impala.thrift.TBackendGflags;
 import org.apache.impala.thrift.TFunctionBinaryType;
+import org.apache.impala.thrift.TGetPartitionStatsRequest;
+import org.apache.impala.thrift.TGetPartitionStatsResponse;
+import org.apache.impala.thrift.TPartitionStats;
+import org.apache.impala.thrift.TPrincipalType;
+import org.apache.impala.thrift.TPrivilege;
+import org.apache.impala.thrift.TPrivilegeLevel;
+import org.apache.impala.thrift.TPrivilegeScope;
+import org.apache.impala.thrift.TTableName;
+import org.apache.impala.thrift.TUniqueId;
+import org.junit.Before;
 import org.junit.Test;
 
+import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 
+import junit.framework.AssertionFailedError;
+
 public class CatalogTest {
-  private static CatalogServiceCatalog catalog_ =
-      CatalogServiceTestCatalog.create();
+  private CatalogServiceCatalog catalog_;
+
+  @Before
+  public void init() {
+    catalog_ = CatalogServiceTestCatalog.create();
+  }
 
   public static void checkTableCols(FeDb db, String tblName, int numClusteringCols,
       String[] colNames, Type[] colTypes) throws TableLoadingException {
@@ -283,6 +320,51 @@ public class CatalogTest {
         catalog_.getOrLoadTable("functional", "AllTypes"));
   }
 
+  /**
+   * Regression test for IMPALA-7320: we should use batch APIs to fetch
+   * file permissions for partitions.
+   */
+  @Test
+  public void testNumberOfGetFileStatusCalls() throws CatalogException, IOException {
+    // Reset the filesystem statistics and load the table, ensuring that it's
+    // loaded fresh by invalidating it first.
+    GlobalStorageStatistics stats = FileSystem.getGlobalStorageStatistics();
+    stats.reset();
+    catalog_.invalidateTable(new TTableName("functional", "alltypes"),
+        /*tblWasRemoved=*/new Reference<Boolean>(),
+        /*dbWasAdded=*/new Reference<Boolean>());
+
+    HdfsTable table = (HdfsTable)catalog_.getOrLoadTable("functional", "AllTypes");
+    StorageStatistics opsCounts = stats.get(DFSOpsCountStatistics.NAME);
+
+    // We expect:
+    // - one listLocatedStatus() per partition, to get the file info
+    // - one listStatus() for the month=2010/ dir
+    // - one listStatus() for the month=2009/ dir
+    long expectedCalls = table.getPartitionIds().size() + 2;
+    // Due to HDFS-13747, the listStatus calls are incorrectly accounted as
+    // op_list_located_status. So, we'll just add up the two to make our
+    // assertion resilient to this bug.
+    long seenCalls = opsCounts.getLong("op_list_located_status") +
+        opsCounts.getLong("op_list_status");
+    assertEquals(expectedCalls, seenCalls);
+
+    // We expect only one getFileStatus call, for the top-level directory.
+    assertEquals(1L, (long)opsCounts.getLong("op_get_file_status"));
+
+    // Now test REFRESH on the table...
+    stats.reset();
+    catalog_.reloadTable(table);
+
+    // Again, we expect only one getFileStatus call, for the top-level directory.
+    assertEquals(1L, (long)opsCounts.getLong("op_get_file_status"));
+    // REFRESH calls listStatus on each of the partitions, but doesn't re-check
+    // the permissions of the partition directories themselves.
+    assertEquals(table.getPartitionIds().size(),
+        (long)opsCounts.getLong("op_list_status"));
+  }
+
+
   @Test
   public void TestPartitions() throws CatalogException {
     HdfsTable table =
@@ -300,6 +382,8 @@ public class CatalogTest {
     // check that partition keys cover the date range 1/1/2009-12/31/2010
     // and that we have one file per partition.
     assertEquals(24, partitions.size());
+    Set<HdfsStorageDescriptor> uniqueSds = Collections.newSetFromMap(
+        new IdentityHashMap<HdfsStorageDescriptor, Boolean>());
     Set<Long> months = Sets.newHashSet();
     for (FeFsPartition p: partitions) {
       assertEquals(2, p.getPartitionValues().size());
@@ -321,8 +405,14 @@ public class CatalogTest {
         // no need for this boolean anymore.
         assertEquals(p.getFileDescriptors().size(), 1);
       }
+
+      uniqueSds.add(p.getInputFormatDescriptor());
     }
     assertEquals(months.size(), 24);
+
+    // We intern storage descriptors, so we should only have a single instance across
+    // all of the partitions.
+    assertEquals(1, uniqueSds.size());
   }
 
   // TODO: All Hive-stats related tests are temporarily disabled because of an unknown,
@@ -463,6 +553,85 @@ public class CatalogTest {
 
     assertEquals(expectedSize, column.getStats().getAvgSerializedSize(), 0.0001);
     assertEquals(expectedSize, column.getStats().getMaxSize(), 0.0001);
+  }
+
+  // Fetch partition statistics for dbName.tableName for partitionIds.
+  private Map<String, ByteBuffer> getPartitionStatistics(String dbName, String tableName)
+      throws CatalogException {
+    TGetPartitionStatsRequest req = new TGetPartitionStatsRequest();
+    req.setTable_name(new TTableName(dbName, tableName));
+    return catalog_.getPartitionStats(req);
+  }
+
+  // Expect expCount partitions have statistics (though not incremental statistics).
+  private void expectStatistics(String dbName, String tableName, int expCount)
+      throws CatalogException {
+    Map<String, ByteBuffer> result = getPartitionStatistics(dbName, tableName);
+    assertEquals(expCount, result.size());
+    for (Map.Entry<String, ByteBuffer> e : result.entrySet()) {
+      ByteBuffer compressedBuffer = e.getValue();
+      byte[] compressedBytes = new byte[compressedBuffer.remaining()];
+      compressedBuffer.get(compressedBytes);
+      try {
+        TPartitionStats stats =
+            PartitionStatsUtil.partStatsFromCompressedBytes(compressedBytes, null);
+        assertNotNull(stats);
+        assertTrue(!stats.isSetIntermediate_col_stats());
+      } catch (ImpalaException ex) {
+        throw new CatalogException("Error deserializing partition stats.", ex);
+      }
+    }
+  }
+
+  // Expect an exception whose message prefix-matches msgPrefix when fetching partition
+  // statistics.
+  private void expectStatisticsException(
+      String dbName, String tableName, String msgPrefix) {
+    try {
+      getPartitionStatistics(dbName, tableName);
+      fail("Expected exception.");
+    } catch (Exception e) {
+      assertTrue(e.getMessage(), e.getMessage().startsWith(msgPrefix));
+    }
+  }
+
+  @Test
+  public void testPullIncrementalStats() throws CatalogException {
+    // Save the current setting for pull_incremental_statistics.
+    TBackendGflags gflags = BackendConfig.INSTANCE.getBackendCfg();
+    boolean pullStats = gflags.isSetPull_incremental_statistics();
+
+    try {
+      // Restored in the finally clause.
+      gflags.setPull_incremental_statistics(true);
+
+      // Partitioned table with stats. Load the table prior to fetching.
+      catalog_.getOrLoadTable("functional", "alltypesagg");
+      expectStatistics("functional", "alltypesagg", 11);
+
+      // Partitioned table with stats. Invalidate the table prior to fetching.
+      Reference<Boolean> tblWasRemoved = new Reference<Boolean>();
+      Reference<Boolean> dbWasAdded = new Reference<Boolean>();
+      catalog_.invalidateTable(
+          new TTableName("functional", "alltypesagg"), tblWasRemoved, dbWasAdded);
+      expectStatistics("functional", "alltypesagg", 11);
+
+      // Unpartitioned table with no stats.
+      expectStatistics("functional", "table_no_newline", 0);
+
+      // Unpartitioned table with stats.
+      expectStatistics("functional", "dimtbl", 0);
+
+      // Bogus table.
+      expectStatisticsException("functional", "doesnotexist",
+          "Requested partition statistics for table that does not exist");
+
+      // Case of IncompleteTable due to loading error.
+      expectStatisticsException("functional", "bad_serde",
+          "No statistics available for incompletely loaded table");
+    } finally {
+      gflags.setPull_incremental_statistics(pullStats);
+    }
   }
 
   @Test
@@ -646,5 +815,83 @@ public class CatalogTest {
     assertTrue(catalog_.addFunction(largeUdf) == false);
     fnNames = getFunctionSignatures("default");
     assertEquals(fnNames.size(), 0);
+  }
+
+  @Test
+  public void testSentryCatalog() throws CatalogException {
+    AuthorizationPolicy authPolicy = catalog_.getAuthPolicy();
+
+    User user = catalog_.addUser("user1");
+    TPrivilege userPrivilege = new TPrivilege();
+    userPrivilege.setPrincipal_type(TPrincipalType.USER);
+    userPrivilege.setPrincipal_id(user.getId());
+    userPrivilege.setCreate_time_ms(-1);
+    userPrivilege.setServer_name("server1");
+    userPrivilege.setScope(TPrivilegeScope.SERVER);
+    userPrivilege.setPrivilege_level(TPrivilegeLevel.ALL);
+    catalog_.addUserPrivilege("user1", userPrivilege);
+    assertSame(user, authPolicy.getPrincipal("user1", TPrincipalType.USER));
+    assertNull(authPolicy.getPrincipal("user2", TPrincipalType.USER));
+    assertNull(authPolicy.getPrincipal("user1", TPrincipalType.ROLE));
+    // Add the same user, the old user will be deleted.
+    user = catalog_.addUser("user1");
+    assertSame(user, authPolicy.getPrincipal("user1", TPrincipalType.USER));
+    // Delete the user.
+    assertSame(user, catalog_.removeUser("user1"));
+    assertNull(authPolicy.getPrincipal("user1", TPrincipalType.USER));
+
+    Role role = catalog_.addRole("role1", Sets.newHashSet("group1", "group2"));
+    TPrivilege rolePrivilege = new TPrivilege();
+    rolePrivilege.setPrincipal_type(TPrincipalType.ROLE);
+    rolePrivilege.setPrincipal_id(role.getId());
+    rolePrivilege.setCreate_time_ms(-1);
+    rolePrivilege.setServer_name("server1");
+    rolePrivilege.setScope(TPrivilegeScope.SERVER);
+    rolePrivilege.setPrivilege_level(TPrivilegeLevel.ALL);
+    catalog_.addRolePrivilege("role1", rolePrivilege);
+    assertSame(role, catalog_.getAuthPolicy().getPrincipal("role1", TPrincipalType.ROLE));
+    assertNull(catalog_.getAuthPolicy().getPrincipal("role1", TPrincipalType.USER));
+    assertNull(catalog_.getAuthPolicy().getPrincipal("role2", TPrincipalType.ROLE));
+    // Add the same role, the old role will be deleted.
+    role = catalog_.addRole("role1", new HashSet<String>());
+    assertSame(role, authPolicy.getPrincipal("role1", TPrincipalType.ROLE));
+    // Delete the role.
+    assertSame(role, catalog_.removeRole("role1"));
+    assertNull(authPolicy.getPrincipal("role1", TPrincipalType.ROLE));
+
+    // Assert that principal IDs will be unique between roles and users, e.g. no user and
+    // role with the same principal ID. The same name can be used for both user and role.
+    int size = 10;
+    String prefix = "foo";
+    for (int i = 0; i < size; i++) {
+      String name = prefix + i;
+      catalog_.addUser(name);
+      catalog_.addRole(name, new HashSet<String>());
+    }
+
+    for (int i = 0; i < size; i++) {
+      String name = prefix + i;
+      Principal u = authPolicy.getPrincipal(name, TPrincipalType.USER);
+      Principal r = authPolicy.getPrincipal(name, TPrincipalType.ROLE);
+      assertEquals(name, u.getName());
+      assertEquals(name, r.getName());
+      assertNotEquals(u.getId(), r.getId());
+    }
+
+    // Validate getAllUsers vs getAllUserNames
+    List<User> allUsers = authPolicy.getAllUsers();
+    Set<String> allUserNames = authPolicy.getAllUserNames();
+    assertEquals(allUsers.size(), allUserNames.size());
+    for (Principal principal: allUsers) {
+      assertTrue(allUserNames.contains(principal.getName()));
+    }
+
+    // Validate getAllRoles and getAllRoleNames work as expected.
+    List<Role> allRoles = authPolicy.getAllRoles();
+    Set<String> allRoleNames = authPolicy.getAllRoleNames();
+    assertEquals(allRoles.size(), allRoleNames.size());
+    for (Principal principal: allRoles) {
+      assertTrue(allRoleNames.contains(principal.getName()));
+    }
   }
 }

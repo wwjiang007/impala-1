@@ -105,10 +105,11 @@ class KrpcDataStreamSender::Channel : public CacheLineAligned {
   // data is getting accumulated before being sent; it only applies when data is added via
   // AddRow() and not sent directly via SendBatch().
   Channel(KrpcDataStreamSender* parent, const RowDescriptor* row_desc,
-      const TNetworkAddress& destination, const TUniqueId& fragment_instance_id,
-      PlanNodeId dest_node_id, int buffer_size)
+      const std::string& hostname, const TNetworkAddress& destination,
+      const TUniqueId& fragment_instance_id, PlanNodeId dest_node_id, int buffer_size)
     : parent_(parent),
       row_desc_(row_desc),
+      hostname_(hostname),
       address_(destination),
       fragment_instance_id_(fragment_instance_id),
       dest_node_id_(dest_node_id) {
@@ -160,6 +161,7 @@ class KrpcDataStreamSender::Channel : public CacheLineAligned {
   const RowDescriptor* row_desc_;
 
   // The triplet of IP-address:port/finst-id/node-id uniquely identifies the receiver.
+  const std::string hostname_;
   const TNetworkAddress address_;
   const TUniqueId fragment_instance_id_;
   const PlanNodeId dest_node_id_;
@@ -305,7 +307,7 @@ Status KrpcDataStreamSender::Channel::Init(RuntimeState* state) {
 
   // Create a DataStreamService proxy to the destination.
   RpcMgr* rpc_mgr = ExecEnv::GetInstance()->rpc_mgr();
-  RETURN_IF_ERROR(rpc_mgr->GetProxy(address_, &proxy_));
+  RETURN_IF_ERROR(rpc_mgr->GetProxy(address_, hostname_, &proxy_));
   return Status::OK();
 }
 
@@ -392,10 +394,16 @@ void KrpcDataStreamSender::Channel::TransmitDataCompleteCb() {
   const kudu::Status controller_status = rpc_controller_.status();
   if (LIKELY(controller_status.ok())) {
     DCHECK(rpc_in_flight_batch_ != nullptr);
-    COUNTER_ADD(parent_->bytes_sent_counter_,
-        RowBatch::GetSerializedSize(*rpc_in_flight_batch_));
+    int64_t row_batch_size = RowBatch::GetSerializedSize(*rpc_in_flight_batch_);
     int64_t network_time = total_time - resp_.receiver_latency_ns();
-    COUNTER_ADD(&parent_->total_network_timer_, network_time);
+    COUNTER_ADD(parent_->bytes_sent_counter_, row_batch_size);
+    if (LIKELY(network_time > 0)) {
+      // 'row_batch_size' is bounded by FLAGS_rpc_max_message_size which shouldn't exceed
+      // max 32-bit signed value so multiplication below should not overflow.
+      DCHECK_LE(row_batch_size, numeric_limits<int32_t>::max());
+      int64_t network_throughput = row_batch_size * NANOS_PER_SEC / network_time;
+      parent_->network_throughput_counter_->UpdateCounter(network_throughput);
+    }
     Status rpc_status = Status::OK();
     int32_t status_code = resp_.status().status_code();
     if (status_code == TErrorCode::DATASTREAM_RECVR_CLOSED) {
@@ -582,7 +590,6 @@ KrpcDataStreamSender::KrpcDataStreamSender(int sender_id, const RowDescriptor* r
     sender_id_(sender_id),
     partition_type_(sink.output_partition.type),
     per_channel_buffer_size_(per_channel_buffer_size),
-    total_network_timer_(TUnit::TIME_NS, 0),
     dest_node_id_(sink.dest_node_id),
     next_unknown_partition_(0) {
   DCHECK_GT(destinations.size(), 0);
@@ -593,9 +600,9 @@ KrpcDataStreamSender::KrpcDataStreamSender(int sender_id, const RowDescriptor* r
 
   for (int i = 0; i < destinations.size(); ++i) {
     channels_.push_back(
-        new Channel(this, row_desc, destinations[i].krpc_server,
-            destinations[i].fragment_instance_id, sink.dest_node_id,
-            per_channel_buffer_size));
+        new Channel(this, row_desc, destinations[i].thrift_backend.hostname,
+            destinations[i].krpc_backend, destinations[i].fragment_instance_id,
+            sink.dest_node_id, per_channel_buffer_size));
   }
 
   if (partition_type_ == TPartitionType::UNPARTITIONED ||
@@ -640,9 +647,7 @@ Status KrpcDataStreamSender::Prepare(
   bytes_sent_time_series_counter_ =
       ADD_TIME_SERIES_COUNTER(profile(), "BytesSent", bytes_sent_counter_);
   network_throughput_counter_ =
-      profile()->AddDerivedCounter("NetworkThroughput", TUnit::BYTES_PER_SECOND,
-          bind<int64_t>(&RuntimeProfile::UnitsPerSecond, bytes_sent_counter_,
-              &total_network_timer_));
+      ADD_SUMMARY_STATS_COUNTER(profile(), "NetworkThroughput", TUnit::BYTES_PER_SECOND);
   eos_sent_counter_ = ADD_COUNTER(profile(), "EosSent", TUnit::UNIT);
   uncompressed_bytes_counter_ =
       ADD_COUNTER(profile(), "UncompressedRowBatchSize", TUnit::BYTES);

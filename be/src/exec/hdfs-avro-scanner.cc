@@ -841,7 +841,6 @@ Status HdfsAvroScanner::CodegenMaterializeTuple(const HdfsScanNodeBase* node,
         bail_out_block, this_val, pool_val, tuple_val, data_val, data_end_val);
     if (!status.ok()) {
       VLOG_QUERY << status.GetDetail();
-      helper_fn->eraseFromParent();
       return status;
     }
 
@@ -1091,27 +1090,27 @@ Status HdfsAvroScanner::CodegenDecodeAvroData(const HdfsScanNodeBase* node,
   llvm::Function* init_tuple_fn;
   RETURN_IF_ERROR(CodegenInitTuple(node, codegen, &init_tuple_fn));
   int replaced = codegen->ReplaceCallSites(fn, init_tuple_fn, "InitTuple");
-  DCHECK_EQ(replaced, 1);
+  DCHECK_REPLACE_COUNT(replaced, 1);
 
   replaced = codegen->ReplaceCallSites(fn, materialize_tuple_fn, "MaterializeTuple");
-  DCHECK_EQ(replaced, 1);
+  DCHECK_REPLACE_COUNT(replaced, 1);
 
   llvm::Function* eval_conjuncts_fn;
   RETURN_IF_ERROR(ExecNode::CodegenEvalConjuncts(codegen, conjuncts, &eval_conjuncts_fn));
 
   replaced = codegen->ReplaceCallSites(fn, eval_conjuncts_fn, "EvalConjuncts");
-  DCHECK_EQ(replaced, 1);
+  DCHECK_REPLACE_COUNT(replaced, 1);
 
   llvm::Function* copy_strings_fn;
   RETURN_IF_ERROR(Tuple::CodegenCopyStrings(
       codegen, *node->tuple_desc(), &copy_strings_fn));
   replaced = codegen->ReplaceCallSites(fn, copy_strings_fn, "CopyStrings");
-  DCHECK_EQ(replaced, 1);
+  DCHECK_REPLACE_COUNT(replaced, 1);
 
   int tuple_byte_size = node->tuple_desc()->byte_size();
   replaced = codegen->ReplaceCallSitesWithValue(fn,
       codegen->GetI32Constant(tuple_byte_size), "tuple_byte_size");
-  DCHECK_EQ(replaced, 1);
+  DCHECK_REPLACE_COUNT(replaced, 1);
 
   fn->setName("DecodeAvroData");
   *decode_avro_data_fn = codegen->FinalizeFunction(fn);

@@ -34,22 +34,17 @@ import org.apache.hadoop.hive.metastore.PartitionDropOptions;
 import org.apache.hadoop.hive.metastore.TableType;
 import org.apache.hadoop.hive.metastore.Warehouse;
 import org.apache.hadoop.hive.metastore.api.AlreadyExistsException;
-import org.apache.hadoop.hive.metastore.api.BooleanColumnStatsData;
 import org.apache.hadoop.hive.metastore.api.ColumnStatistics;
 import org.apache.hadoop.hive.metastore.api.ColumnStatisticsData;
 import org.apache.hadoop.hive.metastore.api.ColumnStatisticsDesc;
 import org.apache.hadoop.hive.metastore.api.ColumnStatisticsObj;
 import org.apache.hadoop.hive.metastore.api.Database;
-import org.apache.hadoop.hive.metastore.api.DecimalColumnStatsData;
-import org.apache.hadoop.hive.metastore.api.DoubleColumnStatsData;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
-import org.apache.hadoop.hive.metastore.api.LongColumnStatsData;
 import org.apache.hadoop.hive.metastore.api.NoSuchObjectException;
 import org.apache.hadoop.hive.metastore.api.Partition;
 import org.apache.hadoop.hive.metastore.api.PrincipalType;
 import org.apache.hadoop.hive.metastore.api.SerDeInfo;
 import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
-import org.apache.hadoop.hive.metastore.api.StringColumnStatsData;
 import org.apache.impala.analysis.AlterTableSortByStmt;
 import org.apache.impala.analysis.FunctionName;
 import org.apache.impala.analysis.TableName;
@@ -58,6 +53,7 @@ import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.CatalogServiceCatalog;
 import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.ColumnNotFoundException;
+import org.apache.impala.catalog.ColumnStats;
 import org.apache.impala.catalog.DataSource;
 import org.apache.impala.catalog.Db;
 import org.apache.impala.catalog.FeCatalogUtils;
@@ -74,8 +70,9 @@ import org.apache.impala.catalog.KuduTable;
 import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
 import org.apache.impala.catalog.PartitionNotFoundException;
 import org.apache.impala.catalog.PartitionStatsUtil;
+import org.apache.impala.catalog.Principal;
+import org.apache.impala.catalog.PrincipalPrivilege;
 import org.apache.impala.catalog.Role;
-import org.apache.impala.catalog.RolePrivilege;
 import org.apache.impala.catalog.RowFormat;
 import org.apache.impala.catalog.ScalarFunction;
 import org.apache.impala.catalog.Table;
@@ -99,6 +96,7 @@ import org.apache.impala.thrift.TAlterTableAddReplaceColsParams;
 import org.apache.impala.thrift.TAlterTableAlterColParams;
 import org.apache.impala.thrift.TAlterTableDropColParams;
 import org.apache.impala.thrift.TAlterTableDropPartitionParams;
+import org.apache.impala.thrift.TAlterTableOrViewSetOwnerParams;
 import org.apache.impala.thrift.TAlterTableParams;
 import org.apache.impala.thrift.TAlterTableSetCachedParams;
 import org.apache.impala.thrift.TAlterTableSetFileFormatParams;
@@ -111,6 +109,7 @@ import org.apache.impala.thrift.TCatalogObject;
 import org.apache.impala.thrift.TCatalogObjectType;
 import org.apache.impala.thrift.TCatalogUpdateResult;
 import org.apache.impala.thrift.TColumn;
+import org.apache.impala.thrift.TColumnName;
 import org.apache.impala.thrift.TColumnStats;
 import org.apache.impala.thrift.TColumnType;
 import org.apache.impala.thrift.TColumnValue;
@@ -138,7 +137,10 @@ import org.apache.impala.thrift.THdfsFileFormat;
 import org.apache.impala.thrift.TPartitionDef;
 import org.apache.impala.thrift.TPartitionKeyValue;
 import org.apache.impala.thrift.TPartitionStats;
+import org.apache.impala.thrift.TPrincipalType;
 import org.apache.impala.thrift.TPrivilege;
+import org.apache.impala.thrift.TPrivilegeLevel;
+import org.apache.impala.thrift.TPrivilegeScope;
 import org.apache.impala.thrift.TRangePartitionOperationType;
 import org.apache.impala.thrift.TResetMetadataRequest;
 import org.apache.impala.thrift.TResetMetadataResponse;
@@ -153,6 +155,7 @@ import org.apache.impala.thrift.TTableStats;
 import org.apache.impala.thrift.TTruncateParams;
 import org.apache.impala.thrift.TUpdateCatalogRequest;
 import org.apache.impala.thrift.TUpdateCatalogResponse;
+import org.apache.impala.util.FunctionUtils;
 import org.apache.impala.util.HdfsCachingUtil;
 import org.apache.impala.util.MetaStoreUtil;
 import org.apache.log4j.Logger;
@@ -164,7 +167,6 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
-import com.google.common.math.LongMath;
 
 /**
  * Class used to execute Catalog Operations, including DDL and refresh/invalidate
@@ -214,7 +216,8 @@ import com.google.common.math.LongMath;
  * 2. Update the Hive Metastore
  * 3. Increment and get a new catalog version
  * 4. Update the catalog
- * 5. Release the metastoreDdlLock_
+ * 5. Make Sentry cache changes if ownership is enabled.
+ * 6. Release the metastoreDdlLock_
  *
  * It is imperative that other operations that need to hold both the catalog lock and
  * table locks at the same time follow the same locking protocol and acquire these
@@ -388,11 +391,7 @@ public class CatalogOpExecutor {
 
     TableName tableName = TableName.fromThrift(params.getTable_name());
     Table tbl = getExistingTable(tableName.getDb(), tableName.getTbl());
-
-    if (!catalog_.tryLockTable(tbl)) {
-      throw new InternalException(String.format("Error altering table %s due to lock " +
-          "contention.", tbl.getFullName()));
-    }
+    tryLock(tbl);
     final Timer.Context context
         = tbl.getMetrics().getTimer(Table.ALTER_DURATION_METRIC).time();
     try {
@@ -559,6 +558,11 @@ public class CatalogOpExecutor {
           alterTableRecoverPartitions(tbl);
           addSummary(response, "Partitions have been recovered.");
           break;
+        case SET_OWNER:
+          Preconditions.checkState(params.isSetSet_owner_params());
+          alterTableOrViewSetOwner(tbl, params.getSet_owner_params(), response);
+          addSummary(response, "Updated table/view.");
+          break;
         default:
           throw new UnsupportedOperationException(
               "Unknown ALTER TABLE operation type: " + params.getAlter_type());
@@ -661,6 +665,7 @@ public class CatalogOpExecutor {
   private static void addTableToCatalogUpdate(Table tbl, TCatalogUpdateResult result) {
     Preconditions.checkNotNull(tbl);
     TCatalogObject updatedCatalogObject = tbl.toTCatalogObject();
+    // TODO(todd): if client is a 'v2' impalad, only send back invalidation
     result.addToUpdated_catalog_objects(updatedCatalogObject);
     result.setVersion(updatedCatalogObject.getCatalog_version());
   }
@@ -692,13 +697,10 @@ public class CatalogOpExecutor {
     Preconditions.checkState(params.getColumns() != null &&
         params.getColumns().size() > 0,
           "Null or empty column list given as argument to DdlExecutor.alterView");
-    Table tbl = catalog_.getTable(tableName.getDb(), tableName.getTbl());
-    Preconditions.checkState(tbl instanceof View);
-
-    if (!catalog_.tryLockTable(tbl)) {
-      throw new InternalException(String.format("Error altering view %s due to lock " +
-          "contention", tbl.getFullName()));
-    }
+    Table tbl = getExistingTable(tableName.getDb(), tableName.getTbl());
+    Preconditions.checkState(tbl instanceof View, "Expected view: %s",
+        tableName);
+    tryLock(tbl);
     try {
       long newCatalogVersion = catalog_.incrementAndGetCatalogVersion();
       catalog_.getLock().writeLock().unlock();
@@ -854,7 +856,7 @@ public class CatalogOpExecutor {
         LOG.trace(String.format("Updating stats for partition %s: numRows=%s",
             partition.getValuesAsString(), numRows));
       }
-      PartitionStatsUtil.partStatsToParameters(partitionStats, partition);
+      PartitionStatsUtil.partStatsToPartition(partitionStats, partition);
       partition.putToParameters(StatsSetupConst.ROW_COUNT, String.valueOf(numRows));
       // HMS requires this param for stats changes to take effect.
       partition.putToParameters(MetastoreShim.statsGeneratedViaStatsTaskParam());
@@ -900,8 +902,10 @@ public class CatalogOpExecutor {
       Column tableCol = table.getColumn(entry.getKey());
       // Ignore columns that were dropped in the meantime.
       if (tableCol == null) continue;
-      ColumnStatisticsData colStatsData =
-          createHiveColStatsData(params, entry.getValue(), tableCol.getType());
+      // If we know the number of rows in the table, cap NDV of the column appropriately.
+      long ndvCap = params.isSetTable_stats() ? params.table_stats.num_rows : -1;
+      ColumnStatisticsData colStatsData = ColumnStats.createHiveColStatsData(
+              ndvCap, entry.getValue(), tableCol.getType());
       if (colStatsData == null) continue;
       if (LOG.isTraceEnabled()) {
         LOG.trace(String.format("Updating column stats for %s: numDVs=%s numNulls=%s " +
@@ -914,57 +918,6 @@ public class CatalogOpExecutor {
       colStats.addToStatsObj(colStatsObj);
     }
     return colStats;
-  }
-
-  private static ColumnStatisticsData createHiveColStatsData(
-      TAlterTableUpdateStatsParams params, TColumnStats colStats, Type colType) {
-    ColumnStatisticsData colStatsData = new ColumnStatisticsData();
-    long ndv = colStats.getNum_distinct_values();
-    // Cap NDV at row count if available.
-    if (params.isSetTable_stats()) ndv = Math.min(ndv, params.table_stats.num_rows);
-
-    long numNulls = colStats.getNum_nulls();
-    switch(colType.getPrimitiveType()) {
-      case BOOLEAN:
-        colStatsData.setBooleanStats(new BooleanColumnStatsData(1, -1, numNulls));
-        break;
-      case TINYINT:
-        ndv = Math.min(ndv, LongMath.pow(2, Byte.SIZE));
-        colStatsData.setLongStats(new LongColumnStatsData(numNulls, ndv));
-        break;
-      case SMALLINT:
-        ndv = Math.min(ndv, LongMath.pow(2, Short.SIZE));
-        colStatsData.setLongStats(new LongColumnStatsData(numNulls, ndv));
-        break;
-      case INT:
-        ndv = Math.min(ndv, LongMath.pow(2, Integer.SIZE));
-        colStatsData.setLongStats(new LongColumnStatsData(numNulls, ndv));
-        break;
-      case BIGINT:
-      case TIMESTAMP: // Hive and Impala use LongColumnStatsData for timestamps.
-        colStatsData.setLongStats(new LongColumnStatsData(numNulls, ndv));
-        break;
-      case FLOAT:
-      case DOUBLE:
-        colStatsData.setDoubleStats(new DoubleColumnStatsData(numNulls, ndv));
-        break;
-      case CHAR:
-      case VARCHAR:
-      case STRING:
-        long maxStrLen = colStats.getMax_size();
-        double avgStrLen = colStats.getAvg_size();
-        colStatsData.setStringStats(
-            new StringColumnStatsData(maxStrLen, avgStrLen, numNulls, ndv));
-        break;
-      case DECIMAL:
-        double decMaxNdv = Math.pow(10, colType.getPrecision());
-        ndv = (long) Math.min(ndv, decMaxNdv);
-        colStatsData.setDecimalStats(new DecimalColumnStatsData(numNulls, ndv));
-        break;
-      default:
-        return null;
-    }
-    return colStatsData;
   }
 
   /**
@@ -986,6 +939,7 @@ public class CatalogOpExecutor {
             + "and IF NOT EXISTS was specified.");
       }
       Preconditions.checkNotNull(existingDb);
+      // TODO(todd): if client is a 'v2' impalad, only send back invalidation
       resp.getResult().addToUpdated_catalog_objects(existingDb.toTCatalogObject());
       resp.getResult().setVersion(existingDb.getCatalogVersion());
       addSummary(resp, "Database already exists.");
@@ -1008,6 +962,11 @@ public class CatalogOpExecutor {
       try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
         try {
           msClient.getHiveClient().createDatabase(db);
+          // Load the database back from the HMS. It's unfortunate we need two
+          // RPCs here, but otherwise we can't populate the location field of the
+          // DB properly. We'll take the slight chance of a race over the incorrect
+          // behavior of showing no location in 'describe database' (IMPALA-7439).
+          db = msClient.getHiveClient().getDatabase(dbName);
           newDb = catalog_.addDb(dbName, db);
           addSummary(resp, "Database has been created.");
         } catch (AlreadyExistsException e) {
@@ -1038,12 +997,57 @@ public class CatalogOpExecutor {
       }
 
       Preconditions.checkNotNull(newDb);
+      // TODO(todd): if client is a 'v2' impalad, only send back invalidation
       resp.result.addToUpdated_catalog_objects(newDb.toTCatalogObject());
+      updateOwnerPrivileges(newDb.getName(), /* tableName */ null, params.server_name,
+          /* oldOwner */ null, /* oldOwnerType */ null,
+          newDb.getMetaStoreDb().getOwnerName(), newDb.getMetaStoreDb().getOwnerType(),
+          resp);
     }
     resp.result.setVersion(newDb.getCatalogVersion());
   }
 
- private void createFunction(TCreateFunctionParams params, TDdlExecResponse resp)
+  /**
+   * Update the owner privileges for an object.
+   * If object ownership is enabled in Sentry, we need to update the owner privilege
+   * in the catalog so that any subsequent statements that rely on that privilege, or
+   * the absence, will function correctly without waiting for the next refresh.
+   * If oldOwner is not null, the privilege will be removed. If newOwner is not null,
+   * the privilege will be added.
+   * The catalog will correctly reflect the owner in HMS, however because the owner
+   * privileges are created by HMS in Sentry, Impala does not have visibility on
+   * whether or not that create was successful. If Sentry failed to properly update the
+   * owner privilege, Impala will have a different view of privileges until the next
+   * Sentry refresh.
+   * e.g. For create, the privileges should be available to immediately create a table.
+   * Additionally, if the metadata operation is successful, but sentry fails to add
+   * the privilege, it will be removed on the next refresh. ALTER DATABASE SET OWNER
+   * can be used to try adding the owner privilege again.
+   * This method should be called from within a DDLLock or table lock (in the case of
+   * alter table statements.) to ensure that the privileges are in sync with the metadata
+   * operations.
+   */
+  private void updateOwnerPrivileges(String databaseName, String tableName,
+        String serverName, String oldOwner, PrincipalType oldOwnerType, String newOwner,
+        PrincipalType newOwnerType, TDdlExecResponse resp) {
+    if (catalog_.getSentryProxy() == null || !catalog_.getSentryProxy()
+        .isObjectOwnershipEnabled()) return;
+    Preconditions.checkNotNull(serverName);
+    TPrivilege filter;
+    if (tableName == null) {
+      filter = createDatabaseOwnerPrivilegeFilter(databaseName, serverName);
+    } else {
+      filter = createTableOwnerPrivilegeFilter(databaseName, tableName, serverName);
+    }
+    if(oldOwner != null && !oldOwner.isEmpty()) {
+      removePrivilegeFromCatalog(oldOwner, oldOwnerType, filter, resp);
+    }
+    if(newOwner != null && !newOwner.isEmpty()) {
+      addPrivilegeToCatalog(newOwner, newOwnerType, filter, resp);
+    }
+  }
+
+  private void createFunction(TCreateFunctionParams params, TDdlExecResponse resp)
       throws ImpalaException {
     Function fn = Function.fromThrift(params.getFn());
     if (LOG.isTraceEnabled()) {
@@ -1079,7 +1083,8 @@ public class CatalogOpExecutor {
         Preconditions.checkState(fn instanceof ScalarFunction);
         org.apache.hadoop.hive.metastore.api.Function hiveFn =
             ((ScalarFunction)fn).toHiveFunction();
-        List<Function> funcs = CatalogServiceCatalog.extractFunctions(fn.dbName(), hiveFn);
+        List<Function> funcs = FunctionUtils.extractFunctions(fn.dbName(), hiveFn,
+            BackendConfig.INSTANCE.getBackendCfg().local_library_path);
         if (funcs.isEmpty()) {
           throw new CatalogException(
             "No compatible function signatures found in class: " + hiveFn.getClassName());
@@ -1187,8 +1192,8 @@ public class CatalogOpExecutor {
         }
 
         for(HdfsPartition partition : partitions) {
-          if (partition.getPartitionStats() != null) {
-            PartitionStatsUtil.deletePartStats(partition);
+          if (partition.getPartitionStatsCompressed() != null) {
+            partition.dropPartitionStats();
             try {
               applyAlterPartition(table, partition);
             } finally {
@@ -1274,8 +1279,8 @@ public class CatalogOpExecutor {
       // TODO(todd): avoid downcast
       HdfsPartition part = (HdfsPartition) fePart;
       boolean isModified = false;
-      if (part.getPartitionStats() != null) {
-        PartitionStatsUtil.deletePartStats(part);
+      if (part.getPartitionStatsCompressed() != null) {
+        part.dropPartitionStats();
         isModified = true;
       }
 
@@ -1333,7 +1338,11 @@ public class CatalogOpExecutor {
         uncacheTable(removedDb.getTable(tableName));
       }
       removedObject = removedDb.toTCatalogObject();
+      updateOwnerPrivileges(db.getName(), /* tableName */ null, params.server_name,
+          db.getMetaStoreDb().getOwnerName(), db.getMetaStoreDb().getOwnerType(),
+          /* newOwner */ null, /* newOwnerType */ null, resp);
     }
+
     Preconditions.checkNotNull(removedObject);
     resp.result.setVersion(removedObject.getCatalog_version());
     resp.result.addToRemoved_catalog_objects(removedObject);
@@ -1389,6 +1398,23 @@ public class CatalogOpExecutor {
     TableName tableName = TableName.fromThrift(params.getTable_name());
     Preconditions.checkState(tableName != null && tableName.isFullyQualified());
     LOG.trace(String.format("Dropping table/view %s", tableName));
+
+    // If the table exists, ensure that it is loaded before we try to operate on it.
+    // We do this up here rather than down below to avoid doing too much table-loading
+    // work while holding the DDL lock. We can't simply use 'getExistingTable' because
+    // we rely on more granular checks to provide the correct summary message for
+    // the 'IF EXISTS' case.
+    //
+    // In the standard catalogd implementation, the table will most likely already
+    // be loaded because the planning phase on the impalad side triggered the loading.
+    // In the LocalCatalog configuration, however, this is often necessary.
+    try {
+      catalog_.getOrLoadTable(params.getTable_name().db_name,
+          params.getTable_name().table_name);
+    } catch (CatalogException e) {
+      // Ignore exceptions -- the above was just to trigger loading. Failure to load
+      // or non-existence of the database will be handled down below.
+    }
 
     TCatalogObject removedObject = new TCatalogObject();
     synchronized (metastoreDdlLock_) {
@@ -1464,6 +1490,12 @@ public class CatalogOpExecutor {
       }
       resp.result.setVersion(table.getCatalogVersion());
       uncacheTable(table);
+      if (table.getMetaStoreTable() != null) {
+        updateOwnerPrivileges(table.getDb().getName(), table.getName(),
+            params.server_name, table.getMetaStoreTable().getOwner(),
+            table.getMetaStoreTable().getOwnerType(), /* newOwner */ null,
+            /* newOwnerType */ null, resp);
+      }
     }
     removedObject.setType(TCatalogObjectType.TABLE);
     removedObject.setTable(new TTable());
@@ -1645,7 +1677,8 @@ public class CatalogOpExecutor {
     if (KuduTable.isKuduTable(tbl)) return createKuduTable(tbl, params, response);
     Preconditions.checkState(params.getColumns().size() > 0,
         "Empty column list given as argument to Catalog.createTable");
-    return createTable(tbl, params.if_not_exists, params.getCache_op(), response);
+    return createTable(tbl, params.if_not_exists, params.getCache_op(),
+        params.server_name, response);
   }
 
   /**
@@ -1769,8 +1802,8 @@ public class CatalogOpExecutor {
    * Returns true if a new table was created as part of this call, false otherwise.
    */
   private boolean createTable(org.apache.hadoop.hive.metastore.api.Table newTable,
-      boolean if_not_exists, THdfsCachingOp cacheOp, TDdlExecResponse response)
-      throws ImpalaException {
+      boolean if_not_exists, THdfsCachingOp cacheOp, String serverName,
+      TDdlExecResponse response) throws ImpalaException {
     Preconditions.checkState(!KuduTable.isKuduTable(newTable));
     synchronized (metastoreDdlLock_) {
       try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
@@ -1804,8 +1837,35 @@ public class CatalogOpExecutor {
       }
       Table newTbl = catalog_.addTable(newTable.getDbName(), newTable.getTableName());
       addTableToCatalogUpdate(newTbl, response.result);
+      updateOwnerPrivileges(newTable.getDbName(), newTable.getTableName(),
+          serverName, /* oldOwner */ null, /* oldOwnerType */ null, newTable.getOwner(),
+          newTable.getOwnerType(), response);
     }
     return true;
+  }
+
+  /**
+   * Create a TPrivilege for an owner of a table for use as a filter.
+   */
+  private TPrivilege createTableOwnerPrivilegeFilter(String databaseName,
+      String tableName, String serverName) {
+    TPrivilege privilege = createDatabaseOwnerPrivilegeFilter(databaseName, serverName);
+    privilege.setScope(TPrivilegeScope.TABLE);
+    privilege.setTable_name(tableName);
+    return privilege;
+  }
+
+  /**
+   * Create a TPrivilege for an owner of a database for use as a filter.
+   */
+  private TPrivilege createDatabaseOwnerPrivilegeFilter(String databaseName,
+      String serverName) {
+    TPrivilege privilege = new TPrivilege();
+    privilege.setScope(TPrivilegeScope.DATABASE).setServer_name(serverName)
+        .setPrivilege_level(TPrivilegeLevel.OWNER)
+        .setDb_name(databaseName).setCreate_time_ms(-1)
+        .setHas_grant_opt(isObjectOwnershipGrantEnabled());
+    return privilege;
   }
 
   /**
@@ -1831,7 +1891,7 @@ public class CatalogOpExecutor {
         new org.apache.hadoop.hive.metastore.api.Table();
     setCreateViewAttributes(params, view);
     LOG.trace(String.format("Creating view %s", tableName));
-    if (!createTable(view, params.if_not_exists, null, response)) {
+    if (!createTable(view, params.if_not_exists, null, params.server_name, response)) {
       addSummary(response, "View already exists.");
     } else {
       addSummary(response, "View has been created.");
@@ -1924,7 +1984,7 @@ public class CatalogOpExecutor {
     // Set the row count of this table to unknown.
     tbl.putToParameters(StatsSetupConst.ROW_COUNT, "-1");
     LOG.trace(String.format("Creating table %s LIKE %s", tblName, srcTblName));
-    createTable(tbl, params.if_not_exists, null, response);
+    createTable(tbl, params.if_not_exists, null, params.server_name, response);
   }
 
   /**
@@ -2252,9 +2312,6 @@ public class CatalogOpExecutor {
           msClient.getHiveClient().dropPartition(tableName.getDb(), tableName.getTbl(),
               part.getPartitionValuesAsStrings(true), dropOptions);
           ++numTargetedPartitions;
-          if (part.isMarkedCached()) {
-            HdfsCachingUtil.removePartitionCacheDirective(part);
-          }
         } catch (NoSuchObjectException e) {
           if (!ifExists) {
             throw new ImpalaRuntimeException(
@@ -2335,6 +2392,7 @@ public class CatalogOpExecutor {
           newTableName.toString()));
     }
 
+    // TODO(todd): if client is a 'v2' impalad, only send back invalidation
     response.result.addToRemoved_catalog_objects(result.first.toMinimalTCatalogObject());
     response.result.addToUpdated_catalog_objects(result.second.toTCatalogObject());
     response.result.setVersion(result.second.getCatalogVersion());
@@ -2787,6 +2845,81 @@ public class CatalogOpExecutor {
     }
   }
 
+  private void alterTableOrViewSetOwner(Table tbl, TAlterTableOrViewSetOwnerParams params,
+      TDdlExecResponse response) throws ImpalaRuntimeException {
+    org.apache.hadoop.hive.metastore.api.Table msTbl = tbl.getMetaStoreTable().deepCopy();
+    String oldOwner = msTbl.getOwner();
+    PrincipalType oldOwnerType = msTbl.getOwnerType();
+    msTbl.setOwner(params.owner_name);
+    msTbl.setOwnerType(PrincipalType.valueOf(params.owner_type.name()));
+    applyAlterTable(msTbl, true);
+
+    updateOwnerPrivileges(msTbl.getDbName(), msTbl.getTableName(), params.server_name,
+        oldOwner, oldOwnerType, msTbl.getOwner(), msTbl.getOwnerType(), response);
+
+  }
+
+  /**
+   * This is a helper method to take care of catalog related updates when removing
+   * a privilege.
+   */
+  private void removePrivilegeFromCatalog(String ownerString, PrincipalType ownerType,
+    TPrivilege filter, TDdlExecResponse response) {
+    try {
+      PrincipalPrivilege removedPrivilege;
+      switch (ownerType) {
+        case ROLE:
+          removedPrivilege = catalog_.removeRolePrivilege(ownerString,
+              PrincipalPrivilege.buildPrivilegeName(filter));
+          break;
+        case USER:
+          removedPrivilege = catalog_.removeUserPrivilege(ownerString,
+              PrincipalPrivilege.buildPrivilegeName(filter));
+          break;
+        default:
+          throw new CatalogException("Unexpected ownerType: " + ownerType.name());
+      }
+      if (removedPrivilege != null) {
+          response.result.addToRemoved_catalog_objects(removedPrivilege
+              .toTCatalogObject());
+      }
+    } catch (CatalogException e) {
+      LOG.error("Error removing privilege: ", e);
+    }
+  }
+
+  /**
+   * This is a helper method to take care of catalog related updates when adding
+   * a privilege. This will also add a user to the catalog if it doesn't exist.
+   */
+  private void addPrivilegeToCatalog(String ownerString, PrincipalType ownerType,
+    TPrivilege filter, TDdlExecResponse response) {
+    try {
+      Principal owner;
+      PrincipalPrivilege cPrivilege;
+      if (ownerType == PrincipalType.USER) {
+        Reference<Boolean> existingUser = new Reference<>();
+        owner = catalog_.addUserIfNotExists(ownerString, existingUser);
+        filter.setPrincipal_id(owner.getId());
+        filter.setPrincipal_type(TPrincipalType.USER);
+        cPrivilege = catalog_.addUserPrivilege(ownerString, filter);
+        if (!existingUser.getRef()) {
+          response.result.addToUpdated_catalog_objects(owner.toTCatalogObject());
+        }
+      } else if (ownerType == PrincipalType.ROLE) {
+        owner = catalog_.getAuthPolicy().getRole(ownerString);
+        filter.setPrincipal_id(owner.getId());
+        filter.setPrincipal_type(TPrincipalType.ROLE);
+        cPrivilege = catalog_.addRolePrivilege(ownerString, filter);
+      } else {
+        throw new CatalogException("Unexpected PrincipalType: " + ownerType.name());
+      }
+      response.result.addToUpdated_catalog_objects(cPrivilege.toTCatalogObject());
+    } catch (CatalogException e) {
+      LOG.error("Error adding privilege: ", e);
+    }
+  }
+
   /**
    * Create a new HMS Partition.
    */
@@ -2964,7 +3097,7 @@ public class CatalogOpExecutor {
 
     TCatalogObject catalogObject = new TCatalogObject();
     catalogObject.setType(role.getCatalogObjectType());
-    catalogObject.setRole(role.toThrift());
+    catalogObject.setPrincipal(role.toThrift());
     catalogObject.setCatalog_version(role.getCatalogVersion());
     if (createDropRoleParams.isIs_drop()) {
       resp.result.addToRemoved_catalog_objects(catalogObject);
@@ -2999,7 +3132,7 @@ public class CatalogOpExecutor {
     Preconditions.checkNotNull(role);
     TCatalogObject catalogObject = new TCatalogObject();
     catalogObject.setType(role.getCatalogObjectType());
-    catalogObject.setRole(role.toThrift());
+    catalogObject.setPrincipal(role.toThrift());
     catalogObject.setCatalog_version(role.getCatalogVersion());
     resp.result.addToUpdated_catalog_objects(catalogObject);
     if (grantRevokeRoleParams.isIs_grant()) {
@@ -3021,34 +3154,83 @@ public class CatalogOpExecutor {
     verifySentryServiceEnabled();
     String roleName = grantRevokePrivParams.getRole_name();
     List<TPrivilege> privileges = grantRevokePrivParams.getPrivileges();
-    List<RolePrivilege> rolePrivileges = null;
+    List<PrincipalPrivilege> addedRolePrivileges = null;
+    List<PrincipalPrivilege> removedGrantOptPrivileges =
+        Lists.newArrayListWithExpectedSize(privileges.size());
     if (grantRevokePrivParams.isIs_grant()) {
-      rolePrivileges = catalog_.getSentryProxy().grantRolePrivileges(requestingUser,
-          roleName, privileges);
+      addedRolePrivileges = catalog_.getSentryProxy().grantRolePrivileges(requestingUser,
+          roleName, privileges, grantRevokePrivParams.isHas_grant_opt(),
+          removedGrantOptPrivileges);
       addSummary(resp, "Privilege(s) have been granted.");
     } else {
-      rolePrivileges = catalog_.getSentryProxy().revokeRolePrivileges(requestingUser,
-          roleName, privileges, grantRevokePrivParams.isHas_grant_opt());
+      // If this is a revoke of a privilege that contains the grant option, the privileges
+      // with the grant option will be revoked and new privileges without the grant option
+      // will be added.  The privilege in the catalog cannot simply be updated since the
+      // name of the catalog object now contains the grantoption.
+
+      // If privileges contain the grant option and are revoked, this api will return a
+      // list of the revoked privileges that contain the grant option. The
+      // addedRolePrivileges parameter will contain a list of new privileges without the
+      // grant option that are granted. If this is simply a revoke of a privilege without
+      // grant options, the api will still return revoked privileges, but the
+      // addedRolePrivileges will be empty since there will be no newly granted
+      // privileges.
+      addedRolePrivileges = Lists.newArrayListWithExpectedSize(privileges.size());
+      removedGrantOptPrivileges = catalog_.getSentryProxy()
+          .revokeRolePrivileges(requestingUser, roleName, privileges,
+          grantRevokePrivParams.isHas_grant_opt(), addedRolePrivileges);
       addSummary(resp, "Privilege(s) have been revoked.");
     }
-    Preconditions.checkNotNull(rolePrivileges);
-    List<TCatalogObject> updatedPrivs = Lists.newArrayList();
-    for (RolePrivilege rolePriv: rolePrivileges) {
+    Preconditions.checkNotNull(addedRolePrivileges);
+    List<TCatalogObject> updatedPrivs =
+        Lists.newArrayListWithExpectedSize(addedRolePrivileges.size());
+    for (PrincipalPrivilege rolePriv: addedRolePrivileges) {
       updatedPrivs.add(rolePriv.toTCatalogObject());
     }
 
-    if (!updatedPrivs.isEmpty()) {
-      // If this is a REVOKE statement with hasGrantOpt, only the GRANT OPTION is revoked
-      // from the privileges. Otherwise the privileges are removed from the catalog.
-      if (grantRevokePrivParams.isIs_grant() ||
-          privileges.get(0).isHas_grant_opt()) {
-        resp.result.setUpdated_catalog_objects(updatedPrivs);
-      } else {
-        resp.result.setRemoved_catalog_objects(updatedPrivs);
-      }
-      resp.result.setVersion(
-          updatedPrivs.get(updatedPrivs.size() - 1).getCatalog_version());
+    List<TCatalogObject> removedPrivs =
+        Lists.newArrayListWithExpectedSize(removedGrantOptPrivileges.size());
+    for (PrincipalPrivilege rolePriv: removedGrantOptPrivileges) {
+      removedPrivs.add(rolePriv.toTCatalogObject());
     }
+
+    // If this is a REVOKE statement with hasGrantOpt, only the GRANT OPTION is removed
+    // from the privileges. Otherwise the privileges are removed from the catalog.
+    if (grantRevokePrivParams.isIs_grant()) {
+      if (!updatedPrivs.isEmpty()) {
+        resp.result.setUpdated_catalog_objects(updatedPrivs);
+        resp.result.setVersion(
+            updatedPrivs.get(updatedPrivs.size() - 1).getCatalog_version());
+        if (!removedPrivs.isEmpty()) {
+          resp.result.setRemoved_catalog_objects(removedPrivs);
+          resp.result.setVersion(
+              Math.max(getLastItemVersion(updatedPrivs),
+                  getLastItemVersion(removedPrivs)));
+        }
+      }
+    } else if (privileges.get(0).isHas_grant_opt()) {
+      if (!updatedPrivs.isEmpty() && !removedPrivs.isEmpty()) {
+        resp.result.setUpdated_catalog_objects(updatedPrivs);
+        resp.result.setRemoved_catalog_objects(removedPrivs);
+        resp.result.setVersion(
+            Math.max(getLastItemVersion(updatedPrivs), getLastItemVersion(removedPrivs)));
+      }
+    } else {
+      if (!removedPrivs.isEmpty()) {
+        resp.result.setRemoved_catalog_objects(removedPrivs);
+        resp.result.setVersion(
+            removedPrivs.get(removedPrivs.size() - 1).getCatalog_version());
+      }
+    }
+  }
+
+  /**
+   * Returns the version from the last item in the list.  This assumes that the items
+   * are added in version order.
+   */
+  private long getLastItemVersion(List<TCatalogObject> items) {
+    Preconditions.checkState(items != null && !items.isEmpty());
+    return items.get(items.size() - 1).getCatalog_version();
   }
 
   /**
@@ -3059,6 +3241,14 @@ public class CatalogOpExecutor {
       throw new CatalogException("Sentry Service is not enabled on the " +
           "CatalogServer.");
     }
+  }
+
+  /**
+   * Checks if with grant is enabled for object ownership in Sentry.
+   */
+  private boolean isObjectOwnershipGrantEnabled() {
+    return catalog_.getSentryProxy() == null ? false :
+        catalog_.getSentryProxy().isObjectOwnershipGrantEnabled();
   }
 
   /**
@@ -3479,12 +3669,18 @@ public class CatalogOpExecutor {
   private void alterCommentOn(TCommentOnParams params, TDdlExecResponse response)
       throws ImpalaRuntimeException, CatalogException, InternalException {
     if (params.getDb() != null) {
-      Preconditions.checkArgument(!params.isSetTable_name());
+      Preconditions.checkArgument(!params.isSetTable_name() &&
+          !params.isSetColumn_name());
       alterCommentOnDb(params.getDb(), params.getComment(), response);
     } else if (params.getTable_name() != null) {
-      Preconditions.checkArgument(!params.isSetDb());
+      Preconditions.checkArgument(!params.isSetDb() && !params.isSetColumn_name());
       alterCommentOnTableOrView(TableName.fromThrift(params.getTable_name()),
           params.getComment(), response);
+    } else if (params.getColumn_name() != null) {
+      Preconditions.checkArgument(!params.isSetDb() && !params.isSetTable_name());
+      TColumnName columnName = params.getColumn_name();
+      alterCommentOnColumn(TableName.fromThrift(columnName.getTable_name()),
+          columnName.getColumn_name(), params.getComment(), response);
     } else {
       throw new UnsupportedOperationException("Unsupported COMMENT ON operation");
     }
@@ -3544,9 +3740,12 @@ public class CatalogOpExecutor {
         msDb.setOwnerType(originalOwnerType);
         throw e;
       }
+      updateOwnerPrivileges(db.getName(), /* tableName */ null, params.server_name,
+          originalOwnerName, originalOwnerType, db.getMetaStoreDb().getOwnerName(),
+          db.getMetaStoreDb().getOwnerType(), response);
     }
     addDbToCatalogUpdate(db, response.result);
-    addSummary(response, "Updated database");
+    addSummary(response, "Updated database.");
   }
 
   private void addDbToCatalogUpdate(Db db, TCatalogUpdateResult result) {
@@ -3560,6 +3759,7 @@ public class CatalogOpExecutor {
       db.setCatalogVersion(newCatalogVersion);
       TCatalogObject updatedCatalogObject = db.toTCatalogObject();
       updatedCatalogObject.setCatalog_version(newCatalogVersion);
+      // TODO(todd): if client is a 'v2' impalad, only send back invalidation
       result.addToUpdated_catalog_objects(updatedCatalogObject);
       result.setVersion(updatedCatalogObject.getCatalog_version());
     } finally {
@@ -3571,14 +3771,12 @@ public class CatalogOpExecutor {
       TDdlExecResponse response) throws CatalogException, InternalException,
       ImpalaRuntimeException {
     Table tbl = getExistingTable(tableName.getDb(), tableName.getTbl());
-    if (!catalog_.tryLockTable(tbl)) {
-      throw new InternalException(String.format("Error altering table/view %s due to " +
-          "lock contention.", tbl.getFullName()));
-    }
+    tryLock(tbl);
     try {
       long newCatalogVersion = catalog_.incrementAndGetCatalogVersion();
       catalog_.getLock().writeLock().unlock();
-      org.apache.hadoop.hive.metastore.api.Table msTbl = tbl.getMetaStoreTable().deepCopy();
+      org.apache.hadoop.hive.metastore.api.Table msTbl =
+          tbl.getMetaStoreTable().deepCopy();
       boolean isView = msTbl.getTableType().equalsIgnoreCase(
           TableType.VIRTUAL_VIEW.toString());
       if (comment == null) {
@@ -3592,6 +3790,59 @@ public class CatalogOpExecutor {
       addSummary(response, String.format("Updated %s.", (isView) ? "view" : "table"));
     } finally {
       tbl.getLock().unlock();
+    }
+  }
+
+  private void alterCommentOnColumn(TableName tableName, String columnName,
+      String comment, TDdlExecResponse response) throws CatalogException,
+      InternalException, ImpalaRuntimeException {
+    Table tbl = getExistingTable(tableName.getDb(), tableName.getTbl());
+    tryLock(tbl);
+    try {
+      long newCatalogVersion = catalog_.incrementAndGetCatalogVersion();
+      catalog_.getLock().writeLock().unlock();
+      org.apache.hadoop.hive.metastore.api.Table msTbl =
+          tbl.getMetaStoreTable().deepCopy();
+      if (!updateColumnComment(msTbl.getSd().getColsIterator(), columnName, comment)) {
+        if (!updateColumnComment(msTbl.getPartitionKeysIterator(), columnName, comment)) {
+          throw new ColumnNotFoundException(String.format(
+              "Column name %s not found in table %s.", columnName, tbl.getFullName()));
+        }
+      }
+      applyAlterTable(msTbl, true);
+      loadTableMetadata(tbl, newCatalogVersion, false, true, null);
+      addTableToCatalogUpdate(tbl, response.result);
+      addSummary(response, "Column has been altered.");
+    } finally {
+      tbl.getLock().unlock();
+    }
+  }
+
+  /**
+   * Find the matching column name in the iterator and update its comment. Return
+   * true if found; false otherwise.
+   */
+  private static boolean updateColumnComment(Iterator<FieldSchema> iterator,
+      String columnName, String comment) {
+    while (iterator.hasNext()) {
+      FieldSchema fs = iterator.next();
+      if (fs.getName().equalsIgnoreCase(columnName)) {
+        fs.setComment(comment);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Try to lock a table in the catalog. Throw an InternalException if the catalog is
+   * unable to lock the given table.
+   */
+  private void tryLock(Table tbl) throws InternalException {
+    String type = tbl instanceof View ? "view" : "table";
+    if (!catalog_.tryLockTable(tbl)) {
+      throw new InternalException(String.format("Error altering %s %s due to " +
+          "lock contention.", type, tbl.getFullName()));
     }
   }
 }

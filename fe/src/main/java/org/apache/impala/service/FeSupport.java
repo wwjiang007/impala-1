@@ -37,6 +37,8 @@ import org.apache.impala.thrift.TCatalogServiceRequestHeader;
 import org.apache.impala.thrift.TColumnValue;
 import org.apache.impala.thrift.TErrorCode;
 import org.apache.impala.thrift.TExprBatch;
+import org.apache.impala.thrift.TGetPartitionStatsRequest;
+import org.apache.impala.thrift.TGetPartitionStatsResponse;
 import org.apache.impala.thrift.TPrioritizeLoadRequest;
 import org.apache.impala.thrift.TPrioritizeLoadResponse;
 import org.apache.impala.thrift.TQueryCtx;
@@ -45,6 +47,7 @@ import org.apache.impala.thrift.TResultRow;
 import org.apache.impala.thrift.TSymbolLookupParams;
 import org.apache.impala.thrift.TSymbolLookupResult;
 import org.apache.impala.thrift.TTable;
+import org.apache.impala.thrift.TUniqueId;
 import org.apache.impala.util.NativeLibUtil;
 import org.apache.thrift.TDeserializer;
 import org.apache.thrift.TException;
@@ -97,11 +100,21 @@ public class FeSupport {
   public native static boolean NativeLibCacheSetNeedsRefresh(String hdfsLocation);
   public native static boolean NativeLibCacheRemoveEntry(String hdfsLibFile);
 
-  // Does an RPCs to the Catalog Server to prioritize the metadata loading of a
-  // one or more catalog objects. To keep our kerberos configuration consolidated,
-  // we make make all RPCs in the BE layer instead of calling the Catalog Server
-  // using Java Thrift bindings.
+  // The two methods below make RPCs to the Catalog Server. To keep our kerberos
+  // configuration consolidated, we make make all RPCs in the BE layer instead of calling
+  // the Catalog Server using Java Thrift bindings.
+
+  // Does an RPC to the Catalog Server to prioritize the metadata loading of a
+  // one or more catalog objects.
   public native static byte[] NativePrioritizeLoad(byte[] thriftReq);
+
+  public native static byte[] NativeGetPartialCatalogObject(byte[] thriftReq)
+      throws InternalException;
+
+  // Does an RPC to the Catalog Server to fetch specified table partition statistics.
+  public native static byte[] NativeGetPartitionStats(byte[] thriftReq);
+
+  public native static byte[] NativeUpdateTableUsage(byte[] thriftReq);
 
   // Parses a string of comma-separated key=value query options ('csvQueryOptions'),
   // updates the existing query options ('queryOptions') with them and returns the
@@ -303,6 +316,48 @@ public class FeSupport {
     }
   }
 
+  private static byte[] GetPartitionStats(byte[] thriftReq) {
+    try {
+      return NativeGetPartitionStats(thriftReq);
+    } catch (UnsatisfiedLinkError e) {
+      loadLibrary();
+    }
+    return NativeGetPartitionStats(thriftReq);
+  }
+
+  public static TGetPartitionStatsResponse GetPartitionStats(
+      TableName table) throws InternalException {
+    Preconditions.checkNotNull(table);
+
+    LOG.info("Fetching partition statistics for table {} from catalog.", table);
+
+    TGetPartitionStatsRequest request = new TGetPartitionStatsRequest();
+    request.setTable_name(table.toThrift());
+    TGetPartitionStatsResponse response = new TGetPartitionStatsResponse();
+    TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
+    try {
+      byte[] result = GetPartitionStats(serializer.serialize(request));
+      Preconditions.checkNotNull(result);
+      TDeserializer deserializer = new TDeserializer(new TBinaryProtocol.Factory());
+
+      deserializer.deserialize(response, result);
+      if (response.getStatus().getStatus_code() != TErrorCode.OK) {
+        throw new InternalException("Error requesting GetPartitionStats: "
+            + Joiner.on("\n").join(response.getStatus().getError_msgs()));
+      }
+    } catch (TException e) {
+      // this should never happen
+      throw new InternalException("Error processing request: " + e.getMessage(), e);
+    }
+    int numPartitionsFetched = 0;
+    if (response.isSetPartition_stats()) {
+      numPartitionsFetched = response.partition_stats.size();
+    }
+    LOG.info("Fetched statistics for {} partitions of table {}.", numPartitionsFetched,
+        table);
+    return response;
+  }
+
   private static byte[] ParseQueryOptions(String csvQueryOptions, byte[] queryOptions) {
     try {
       return NativeParseQueryOptions(csvQueryOptions, queryOptions);
@@ -348,6 +403,17 @@ public class FeSupport {
     }
     return MinLogSpaceForBloomFilter(ndv, fpp);
   }
+
+  public static byte[] GetPartialCatalogObject(byte[] thriftReq)
+      throws InternalException {
+    try {
+      return NativeGetPartialCatalogObject(thriftReq);
+    } catch (UnsatisfiedLinkError e) {
+      loadLibrary();
+    }
+    return NativeGetPartialCatalogObject(thriftReq);
+  }
+
 
   /**
    * This function should be called explicitly by the FeSupport to ensure that

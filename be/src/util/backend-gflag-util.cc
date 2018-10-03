@@ -29,6 +29,8 @@ DECLARE_bool(load_auth_to_local_rules);
 DECLARE_bool(enable_stats_extrapolation);
 DECLARE_bool(enable_orc_scanner);
 DECLARE_bool(use_local_catalog);
+DECLARE_int32(local_catalog_cache_expiration_s);
+DECLARE_int32(local_catalog_cache_mb);
 DECLARE_int32(non_impala_java_vlog);
 DECLARE_int32(num_metadata_loading_threads);
 DECLARE_int32(max_hdfs_partitions_parallel_load);
@@ -48,12 +50,19 @@ DECLARE_string(authorized_proxy_user_config);
 DECLARE_string(authorized_proxy_user_config_delimiter);
 DECLARE_string(authorized_proxy_group_config);
 DECLARE_string(authorized_proxy_group_config_delimiter);
+DECLARE_string(catalog_topic_mode);
 DECLARE_string(kudu_master_hosts);
 DECLARE_string(reserved_words_version);
 DECLARE_string(sentry_config);
 DECLARE_double(max_filter_error_rate);
 DECLARE_int64(min_buffer_size);
-
+DECLARE_bool(disable_catalog_data_ops_debug_only);
+DECLARE_bool(pull_incremental_statistics);
+DECLARE_int32(invalidate_tables_timeout_s);
+DECLARE_bool(invalidate_tables_on_memory_pressure);
+DECLARE_double(invalidate_tables_gc_old_gen_full_threshold);
+DECLARE_double(invalidate_tables_fraction_on_memory_pressure);
+DECLARE_int32(local_catalog_max_fetch_retries);
 namespace impala {
 
 Status GetThriftBackendGflags(JNIEnv* jni_env, jbyteArray* cfg_bytes) {
@@ -62,6 +71,9 @@ Status GetThriftBackendGflags(JNIEnv* jni_env, jbyteArray* cfg_bytes) {
   cfg.__set_load_catalog_in_background(FLAGS_load_catalog_in_background);
   cfg.__set_enable_orc_scanner(FLAGS_enable_orc_scanner);
   cfg.__set_use_local_catalog(FLAGS_use_local_catalog);
+  cfg.__set_local_catalog_cache_mb(FLAGS_local_catalog_cache_mb);
+  cfg.__set_local_catalog_cache_expiration_s(
+    FLAGS_local_catalog_cache_expiration_s);
   cfg.__set_server_name(FLAGS_server_name);
   cfg.__set_sentry_config(FLAGS_sentry_config);
   cfg.__set_authorization_policy_provider_class(
@@ -95,6 +107,18 @@ Status GetThriftBackendGflags(JNIEnv* jni_env, jbyteArray* cfg_bytes) {
   cfg.__set_max_filter_error_rate(FLAGS_max_filter_error_rate);
   cfg.__set_min_buffer_size(FLAGS_min_buffer_size);
   cfg.__set_authorized_proxy_group_config(FLAGS_authorized_proxy_group_config);
+  cfg.__set_disable_catalog_data_ops_debug_only(
+      FLAGS_disable_catalog_data_ops_debug_only);
+  cfg.__set_pull_incremental_statistics(FLAGS_pull_incremental_statistics);
+  cfg.__set_catalog_topic_mode(FLAGS_catalog_topic_mode);
+  cfg.__set_invalidate_tables_timeout_s(FLAGS_invalidate_tables_timeout_s);
+  cfg.__set_invalidate_tables_on_memory_pressure(
+      FLAGS_invalidate_tables_on_memory_pressure);
+  cfg.__set_invalidate_tables_gc_old_gen_full_threshold(
+      FLAGS_invalidate_tables_gc_old_gen_full_threshold);
+  cfg.__set_invalidate_tables_fraction_on_memory_pressure(
+      FLAGS_invalidate_tables_fraction_on_memory_pressure);
+  cfg.__set_local_catalog_max_fetch_retries(FLAGS_local_catalog_max_fetch_retries);
   RETURN_IF_ERROR(SerializeThriftMsg(jni_env, &cfg, cfg_bytes));
   return Status::OK();
 }

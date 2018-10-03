@@ -17,16 +17,22 @@
 #ifndef KUDU_RPC_INBOUND_CALL_H
 #define KUDU_RPC_INBOUND_CALL_H
 
-#include <glog/logging.h>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <ostream>
 #include <string>
+#include <utility>
 #include <vector>
+
+#include <glog/logging.h>
 
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/rpc/remote_method.h"
-#include "kudu/rpc/service_if.h"
 #include "kudu/rpc/rpc_header.pb.h"
+#include "kudu/rpc/service_if.h"
 #include "kudu/rpc/transfer.h"
 #include "kudu/util/faststring.h"
 #include "kudu/util/monotime.h"
@@ -35,13 +41,14 @@
 
 namespace google {
 namespace protobuf {
-class Message;
+class MessageLite;
 } // namespace protobuf
 } // namespace google
 
 namespace kudu {
 
 class Histogram;
+class Sockaddr;
 class Trace;
 
 namespace rpc {
@@ -50,7 +57,6 @@ class Connection;
 class DumpRunningRpcsRequestPB;
 class RemoteUser;
 class RpcCallInProgressPB;
-struct RpcMethodInfo;
 class RpcSidecar;
 
 struct InboundCallTiming {
@@ -169,7 +175,7 @@ class InboundCall {
   // Updates the Histogram with time elapsed since the call was received,
   // and should only be called once on a given instance.
   // Not thread-safe. Should only be called by the current "owner" thread.
-  void RecordHandlingStarted(scoped_refptr<Histogram> incoming_queue_time);
+  void RecordHandlingStarted(Histogram* incoming_queue_time);
 
   // Return true if the deadline set by the client has already elapsed.
   // In this case, the server may stop processing the call, since the
@@ -179,7 +185,9 @@ class InboundCall {
   // Return an upper bound on the client timeout deadline. This does not
   // account for transmission delays between the client and the server.
   // If the client did not specify a deadline, returns MonoTime::Max().
-  MonoTime GetClientDeadline() const;
+  MonoTime GetClientDeadline() const {
+    return deadline_;
+  }
 
   // Return the time when this call was received.
   MonoTime GetTimeReceived() const;
@@ -264,6 +272,10 @@ class InboundCall {
   // to point to the information about this method. Acts as a pointer back to
   // per-method info such as tracing.
   scoped_refptr<RpcMethodInfo> method_info_;
+
+  // A time at which the client will time out, or MonoTime::Max if the
+  // client did not pass a timeout.
+  MonoTime deadline_;
 
   DISALLOW_COPY_AND_ASSIGN(InboundCall);
 };

@@ -26,31 +26,44 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 
+import org.apache.avro.Schema;
+import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.hadoop.hive.metastore.api.Partition;
+import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
+import org.apache.hadoop.hive.metastore.api.Table;
+import org.apache.hadoop.hive.serde.serdeConstants;
 import org.apache.impala.analysis.LiteralExpr;
 import org.apache.impala.analysis.NullLiteral;
 import org.apache.impala.catalog.CatalogException;
+import org.apache.impala.catalog.CatalogObject.ThriftObjectType;
 import org.apache.impala.catalog.Column;
+import org.apache.impala.catalog.ColumnStats;
 import org.apache.impala.catalog.FeCatalogUtils;
 import org.apache.impala.catalog.FeFsPartition;
 import org.apache.impala.catalog.FeFsTable;
 import org.apache.impala.catalog.HdfsFileFormat;
 import org.apache.impala.catalog.HdfsTable;
-import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
 import org.apache.impala.catalog.PrunablePartition;
+import org.apache.impala.catalog.local.MetaProvider.PartitionMetadata;
+import org.apache.impala.catalog.local.MetaProvider.PartitionRef;
+import org.apache.impala.catalog.local.MetaProvider.TableMetaRef;
+import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.CatalogObjectsConstants;
 import org.apache.impala.thrift.THdfsPartition;
 import org.apache.impala.thrift.THdfsTable;
 import org.apache.impala.thrift.TNetworkAddress;
-import org.apache.impala.thrift.TPartitionKeyValue;
 import org.apache.impala.thrift.TResultSet;
 import org.apache.impala.thrift.TTableDescriptor;
 import org.apache.impala.thrift.TTableType;
+import org.apache.impala.util.AvroSchemaConverter;
+import org.apache.impala.util.AvroSchemaUtils;
 import org.apache.impala.util.ListMap;
 import org.apache.thrift.TException;
 
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 
@@ -79,14 +92,99 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
   private ArrayList<HashSet<Long>> nullPartitionIds_;
 
   /**
+   * The value that will be stored in a partition name to indicate NULL.
+   */
+  private final String nullColumnValue_;
+
+  /**
    * Map assigning integer indexes for the hosts containing blocks for this table.
    * This is updated as a side effect of LocalFsPartition.loadFileDescriptors().
    */
   private final ListMap<TNetworkAddress> hostIndex_ = new ListMap<>();
 
-  public LocalFsTable(LocalDb db, String tblName, SchemaInfo schemaInfo) {
-    super(db, tblName, schemaInfo);
+  /**
+   * The Avro schema for this table. Non-null if this table is an Avro table.
+   * If this table is not an Avro table, this is usually null, but may be
+   * non-null in the case that an explicit external avro schema is specified
+   * as a table property. Such a schema is used when querying Avro partitions
+   * of non-Avro tables.
+   */
+  private final String avroSchema_;
+
+  public static LocalFsTable load(LocalDb db, Table msTbl, TableMetaRef ref) {
+    String fullName = msTbl.getDbName() + "." + msTbl.getTableName();
+
+    // Set Avro schema if necessary.
+    String avroSchema;
+    ColumnMap cmap;
+    try {
+      // Load the avro schema if it's external (explicitly specified).
+      avroSchema = loadAvroSchema(msTbl);
+
+      // If the table's format is Avro, then we should override the columns
+      // based on the schema (either inferred or explicit). Otherwise, even if
+      // there is an Avro schema set, we don't override the table-level columns:
+      // the Avro schema in that case is just used in case there is an Avro-formatted
+      // partition.
+      if (isAvroFormat(msTbl)) {
+        if (avroSchema == null) {
+          // No Avro schema was explicitly set in the table metadata, so infer the Avro
+          // schema from the column definitions.
+          Schema inferredSchema = AvroSchemaConverter.convertFieldSchemas(
+              msTbl.getSd().getCols(), fullName);
+          avroSchema = inferredSchema.toString();
+        }
+
+        List<FieldSchema> reconciledFieldSchemas = AvroSchemaUtils.reconcileAvroSchema(
+            msTbl, avroSchema);
+        Table msTblWithExplicitAvroSchema = msTbl.deepCopy();
+        msTblWithExplicitAvroSchema.getSd().setCols(reconciledFieldSchemas);
+        cmap = ColumnMap.fromMsTable(msTblWithExplicitAvroSchema);
+      } else {
+        cmap = ColumnMap.fromMsTable(msTbl);
+      }
+
+      return new LocalFsTable(db, msTbl, ref, cmap, avroSchema);
+    } catch (AnalysisException e) {
+      throw new LocalCatalogException("Failed to load Avro schema for table "
+          + fullName);
+    }
   }
+
+  private LocalFsTable(LocalDb db, Table msTbl, TableMetaRef ref, ColumnMap cmap,
+      String explicitAvroSchema) {
+    super(db, msTbl, ref, cmap);
+
+    // set NULL indicator string from table properties
+    String tableNullFormat =
+        msTbl.getParameters().get(serdeConstants.SERIALIZATION_NULL_FORMAT);
+    nullColumnValue_ = tableNullFormat != null ? tableNullFormat :
+        FeFsTable.DEFAULT_NULL_COLUMN_VALUE;
+
+    avroSchema_ = explicitAvroSchema;
+  }
+
+  private static String loadAvroSchema(Table msTbl) throws AnalysisException {
+    List<Map<String, String>> schemaSearchLocations = ImmutableList.of(
+        msTbl.getSd().getSerdeInfo().getParameters(),
+        msTbl.getParameters());
+
+    // TODO(todd): we should consider moving this to the MetaProvider interface
+    // so that it can more easily be cached rather than re-loaded from HDFS on
+    // each table reference.
+    return AvroSchemaUtils.getAvroSchema(schemaSearchLocations);
+  }
+
+  /**
+   * Creates a temporary FsTable object populated with the specified properties.
+   * This is used for CTAS statements.
+   */
+  public static LocalFsTable createCtasTarget(LocalDb db,
+      Table msTbl) throws CatalogException {
+    return new LocalFsTable(db, msTbl, /*ref=*/null, ColumnMap.fromMsTable(msTbl),
+        /*explicitAvroSchema=*/null);
+  }
+
 
   @Override
   public boolean isCacheable() {
@@ -117,13 +215,6 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
   }
 
   @Override
-  public TResultSet getFiles(List<List<TPartitionKeyValue>> partitionSet)
-      throws CatalogException {
-    // TODO(todd): implement for SHOW FILES.
-    return null;
-  }
-
-  @Override
   public String getHdfsBaseDir() {
     // TODO(todd): this is redundant with getLocation, it seems.
     return getLocation();
@@ -140,27 +231,38 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
   }
 
   @Override
-  public boolean isAvroTable() {
-    // TODO Auto-generated method stub
-    return false;
+  public boolean usesAvroSchemaOverride() {
+    return isAvroFormat(msTable_);
   }
 
   @Override
-  public HdfsFileFormat getMajorityFormat() {
-    // Needed by HdfsTableSink.
-    throw new UnsupportedOperationException("TODO: implement me");
+  public Set<HdfsFileFormat> getFileFormats() {
+    // TODO(todd): can we avoid loading all partitions here? this is called
+    // for any INSERT query, even if the partition is specified.
+    Collection<? extends FeFsPartition> parts;
+    if (ref_ != null) {
+      parts = FeCatalogUtils.loadAllPartitions(this);
+    } else {
+      // If this is a CTAS target, we don't want to try to load the partition list.
+      parts = Collections.emptyList();
+    }
+    // In the case that we have no partitions added to the table yet, it's
+    // important to add the "prototype" partition as a fallback.
+    Iterable<FeFsPartition> partitionsToConsider = Iterables.concat(
+        parts, Collections.singleton(createPrototypePartition()));
+    return FeCatalogUtils.getFileFormats(partitionsToConsider);
   }
 
   @Override
-  public long getExtrapolatedNumRows(long totalBytes) {
-    // TODO Auto-generated method stub
-    return 0;
+  public boolean hasWriteAccessToBaseDir() {
+    // TODO(todd): implement me properly
+    return true;
   }
 
   @Override
-  public boolean isStatsExtrapolationEnabled() {
-    // TODO Auto-generated method stub
-    return false;
+  public String getFirstLocationWithoutWriteAccess() {
+    // TODO(todd): implement me properly
+    return null;
   }
 
   @Override
@@ -169,27 +271,37 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
   }
 
   @Override
-  public TTableDescriptor toThriftDescriptor(int tableId, Set<Long> referencedPartitions) {
-    Preconditions.checkNotNull(referencedPartitions);
+  public TTableDescriptor toThriftDescriptor(int tableId,
+      Set<Long> referencedPartitions) {
+    if (referencedPartitions == null) {
+      // null means "all partitions".
+      referencedPartitions = getPartitionIds();
+    }
     Map<Long, THdfsPartition> idToPartition = Maps.newHashMap();
     List<? extends FeFsPartition> partitions = loadPartitions(referencedPartitions);
     for (FeFsPartition partition : partitions) {
       idToPartition.put(partition.getId(),
           FeCatalogUtils.fsPartitionToThrift(partition,
-              /*includeFileDesc=*/false,
+              ThriftObjectType.DESCRIPTOR_ONLY,
               /*includeIncrementalStats=*/false));
     }
 
     THdfsPartition tPrototypePartition = FeCatalogUtils.fsPartitionToThrift(
-        createPrototypePartition(),
-        /*includeFileDesc=*/false,
+        createPrototypePartition(), ThriftObjectType.DESCRIPTOR_ONLY,
         /*includeIncrementalStats=*/false);
 
-    // TODO(todd): implement avro schema support
-    // TODO(todd): set multiple_filesystems member?
     THdfsTable hdfsTable = new THdfsTable(getHdfsBaseDir(), getColumnNames(),
-        getNullPartitionKeyValue(), schemaInfo_.getNullColumnValue(), idToPartition,
+        getNullPartitionKeyValue(), nullColumnValue_, idToPartition,
         tPrototypePartition);
+
+    if (avroSchema_ != null) {
+      hdfsTable.setAvroSchema(avroSchema_);
+    } else if (hasAnyAvroPartition(partitions)) {
+      // Need to infer an Avro schema for the backend to use if any of the
+      // referenced partitions are Avro, even if the table is mixed-format.
+      hdfsTable.setAvroSchema(AvroSchemaConverter.convertFieldSchemas(
+          getMetaStoreTable().getSd().getCols(), getFullName()).toString());
+    }
 
     TTableDescriptor tableDesc = new TTableDescriptor(tableId, TTableType.HDFS_TABLE,
         FeCatalogUtils.getTColumnDescriptors(this),
@@ -198,14 +310,34 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
     return tableDesc;
   }
 
+  private static boolean isAvroFormat(Table msTbl) {
+    String inputFormat = msTbl.getSd().getInputFormat();
+    return HdfsFileFormat.fromJavaClassName(inputFormat) == HdfsFileFormat.AVRO;
+  }
+
+  private static boolean hasAnyAvroPartition(List<? extends FeFsPartition> partitions) {
+    for (FeFsPartition p : partitions) {
+      if (p.getFileFormat() == HdfsFileFormat.AVRO) return true;
+    }
+    return false;
+  }
+
   private LocalFsPartition createPrototypePartition() {
     Partition protoMsPartition = new Partition();
-    protoMsPartition.setSd(getMetaStoreTable().getSd());
+
+    // The prototype partition should not have a location set in its storage
+    // descriptor, or else all inserted files will end up written into the
+    // table directory instead of the new partition directories.
+    StorageDescriptor sd = getMetaStoreTable().getSd().deepCopy();
+    sd.unsetLocation();
+    protoMsPartition.setSd(sd);
+
     protoMsPartition.setParameters(Collections.<String, String>emptyMap());
     LocalPartitionSpec spec = new LocalPartitionSpec(
-        this, "", CatalogObjectsConstants.PROTOTYPE_PARTITION_ID);
+        this, CatalogObjectsConstants.PROTOTYPE_PARTITION_ID);
     LocalFsPartition prototypePartition = new LocalFsPartition(
-        this, spec, protoMsPartition);
+        this, spec, protoMsPartition, /*fileDescriptors=*/null, /*partitionStats=*/null,
+        /*hasIncrementalStats=*/false);
     return prototypePartition;
   }
 
@@ -241,32 +373,27 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
 
   @Override
   public List<? extends FeFsPartition> loadPartitions(Collection<Long> ids) {
+    // TODO(todd) it seems like some queries actually call this multiple times.
+    // Perhaps we should store the result in this class, instead of relying on
+    // catalog-layer caching?
     Preconditions.checkState(partitionSpecs_ != null,
         "Cannot load partitions without having fetched partition IDs " +
         "from the same LocalFsTable instance");
-    List<String> names = Lists.newArrayList();
+
+    // Possible in the case that all partitions were pruned.
+    if (ids.isEmpty()) return Collections.emptyList();
+
+    List<PartitionRef> refs = Lists.newArrayList();
     for (Long id : ids) {
       LocalPartitionSpec spec = partitionSpecs_.get(id);
       Preconditions.checkArgument(spec != null, "Invalid partition ID for table %s: %s",
           getFullName(), id);
-      String name = spec.getName();
-      if (name.isEmpty()) {
-        // Unpartitioned tables don't need to fetch partitions from the metadata
-        // provider. Rather, we just create a partition on the fly.
-        Preconditions.checkState(getNumClusteringCols() == 0,
-            "Cannot fetch empty partition name from a partitioned table");
-        Preconditions.checkArgument(ids.size() == 1,
-            "Expected to only fetch one partition for unpartitioned table %s",
-            getFullName());
-        return Lists.newArrayList(createUnpartitionedPartition(spec));
-      } else {
-        names.add(name);
-      }
+      refs.add(Preconditions.checkNotNull(spec.getRef()));
     }
-    Map<String, Partition> partsByName;
+    Map<String, PartitionMetadata> partsByName;
     try {
-      partsByName = db_.getCatalog().getMetaProvider().loadPartitionsByNames(
-          db_.getName(), name_, getClusteringColumnNames(), names);
+      partsByName = db_.getCatalog().getMetaProvider().loadPartitionsByRefs(
+          ref_, getClusteringColumnNames(), hostIndex_, refs);
     } catch (TException e) {
       throw new LocalCatalogException(
           "Could not load partitions for table " + getFullName(), e);
@@ -274,16 +401,19 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
     List<FeFsPartition> ret = Lists.newArrayListWithCapacity(ids.size());
     for (Long id : ids) {
       LocalPartitionSpec spec = partitionSpecs_.get(id);
-      Partition p = partsByName.get(spec.getName());
+      PartitionMetadata p = partsByName.get(spec.getRef().getName());
       if (p == null) {
         // TODO(todd): concurrent drop partition could result in this error.
         // Should we recover in a more graceful way from such an unexpected event?
         throw new LocalCatalogException(
             "Could not load expected partitions for table " + getFullName() +
-            ": missing expected partition with name '" + spec.getName() +
+            ": missing expected partition with name '" + spec.getRef().getName() +
             "' (perhaps it was concurrently dropped by another process)");
       }
-      ret.add(new LocalFsPartition(this, spec, p));
+
+      LocalFsPartition part = new LocalFsPartition(this, spec, p.getHmsPartition(),
+          p.getFileDescriptors(), p.getPartitionStats(), p.hasIncrementalStats());
+      ret.add(part);
     }
     return ret;
   }
@@ -294,23 +424,6 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
       names.add(c.getName());
     }
     return names;
-  }
-
-  /**
-   * Create a partition which represents the main partition of an unpartitioned
-   * table.
-   */
-  private LocalFsPartition createUnpartitionedPartition(LocalPartitionSpec spec) {
-    Preconditions.checkArgument(spec.getName().isEmpty());
-    Partition msp = new Partition();
-    msp.setSd(getMetaStoreTable().getSd());
-    msp.setParameters(getMetaStoreTable().getParameters());
-    msp.setValues(Collections.<String>emptyList());
-    return new LocalFsPartition(this, spec, msp);
-  }
-
-  private LocalPartitionSpec createUnpartitionedPartitionSpec() {
-    return new LocalPartitionSpec(this, "", /*id=*/0);
   }
 
   private void loadPartitionValueMap() {
@@ -348,45 +461,56 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
 
   private void loadPartitionSpecs() {
     if (partitionSpecs_ != null) return;
-
-    if (getNumClusteringCols() == 0) {
-      // Unpartitioned table.
-      // This table has no partition key, which means it has no declared partitions.
-      // We model partitions slightly differently to Hive - every file must exist in a
-      // partition, so add a single partition with no keys which will get all the
-      // files in the table's root directory.
-      partitionSpecs_ = ImmutableMap.of(0L, createUnpartitionedPartitionSpec());
+    if (ref_ == null) {
+      // This is a CTAS target. Don't try to load metadata.
+      partitionSpecs_ = ImmutableMap.of();
       return;
     }
-    List<String> partNames;
+
+    List<PartitionRef> partList;
     try {
-      partNames = db_.getCatalog().getMetaProvider().loadPartitionNames(
-          db_.getName(), name_);
+      partList = db_.getCatalog().getMetaProvider().loadPartitionList(ref_);
     } catch (TException e) {
       throw new LocalCatalogException("Could not load partition names for table " +
           getFullName(), e);
     }
     ImmutableMap.Builder<Long, LocalPartitionSpec> b = new ImmutableMap.Builder<>();
     long id = 0;
-    for (String partName : partNames) {
-      b.put(id, new LocalPartitionSpec(this, partName, id));
+    for (PartitionRef part: partList) {
+      b.put(id, new LocalPartitionSpec(this, part, id));
       id++;
     }
     partitionSpecs_ = b.build();
+  }
+
+  /**
+   * Override base implementation to populate column stats for
+   * clustering columns based on the partition map.
+   */
+  @Override
+  protected void loadColumnStats() {
+    super.loadColumnStats();
+    // TODO(todd): this is called for all tables even if not necessary,
+    // which means we need to load all partition names, even if not
+    // necessary.
+    loadPartitionValueMap();
+    for (int i = 0; i < getNumClusteringCols(); i++) {
+      ColumnStats stats = getColumns().get(i).getStats();
+      int nonNullParts = partitionValueMap_.get(i).size();
+      int nullParts = nullPartitionIds_.get(i).size();
+      stats.setNumDistinctValues(nonNullParts + (nullParts > 0 ? 1 : 0));
+
+      // TODO(todd): this calculation ends up setting the num_nulls stat
+      // to the number of partitions with null rows, not the number of rows.
+      // However, it maintains the existing behavior from HdfsTable.
+      stats.setNumNulls(nullParts);
+    }
   }
 
   @Override
   public int parseSkipHeaderLineCount(StringBuilder error) {
     // TODO Auto-generated method stub
     return 0;
-  }
-
-  @Override
-  public Map<Long, List<FileDescriptor>> getFilesSample(
-      Collection<? extends FeFsPartition> inputParts,
-      long percentBytes, long minSampleBytes, long randomSeed) {
-    // TODO(todd): implement me
-    return Collections.emptyMap();
   }
 
   @Override

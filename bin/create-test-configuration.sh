@@ -22,7 +22,8 @@
 # as creation of the Hive metastore.
 
 set -euo pipefail
-trap 'echo Error in $0 at line $LINENO: $(cd "'$PWD'" && awk "NR == $LINENO" $0)' ERR
+. $IMPALA_HOME/bin/report_build_error.sh
+setup_report_build_error
 
 CREATE_METASTORE=0
 CREATE_SENTRY_POLICY_DB=0
@@ -95,11 +96,7 @@ if [ $CREATE_METASTORE -eq 1 ]; then
   # Hive schema SQL scripts include other scripts using \i, which expects absolute paths.
   # Switch to the scripts directory to make this work.
   pushd ${HIVE_HOME}/scripts/metastore/upgrade/postgres
-  if [[ $IMPALA_MINICLUSTER_PROFILE == 2 ]]; then
-    psql -q -U hiveuser -d ${METASTORE_DB} -f hive-schema-1.1.0.postgres.sql
-  elif [[ $IMPALA_MINICLUSTER_PROFILE == 3 ]]; then
-    psql -q -U hiveuser -d ${METASTORE_DB} -f hive-schema-2.1.1.postgres.sql
-  fi
+  psql -q -U hiveuser -d ${METASTORE_DB} -f hive-schema-2.1.1.postgres.sql
   popd
   # Increase the size limit of PARAM_VALUE from SERDE_PARAMS table to be able to create
   # HBase tables with large number of columns.
@@ -109,8 +106,8 @@ fi
 
 if [ $CREATE_SENTRY_POLICY_DB -eq 1 ]; then
   echo "Creating Sentry Policy Server DB"
-  dropdb -U hiveuser sentry_policy 2> /dev/null || true
-  createdb -U hiveuser sentry_policy
+  dropdb -U hiveuser $SENTRY_POLICY_DB 2> /dev/null || true
+  createdb -U hiveuser $SENTRY_POLICY_DB
 fi
 
 # Perform search-replace on $1, output to $2.
@@ -164,14 +161,13 @@ fi
 
 generate_config postgresql-hive-site.xml.template hive-site.xml
 generate_config log4j.properties.template log4j.properties
-if [[ $IMPALA_MINICLUSTER_PROFILE == 3 ]]; then
-  generate_config hive-log4j2.properties.template hive-log4j2.properties
-else
-  generate_config hive-log4j.properties.template hive-log4j.properties
-fi
+generate_config hive-log4j2.properties.template hive-log4j2.properties
 generate_config hbase-site.xml.template hbase-site.xml
 generate_config authz-policy.ini.template authz-policy.ini
 generate_config sentry-site.xml.template sentry-site.xml
+generate_config sentry-site_oo.xml.template sentry-site_oo.xml
+generate_config sentry-site_oo_nogrant.xml.template sentry-site_oo_nogrant.xml
+generate_config sentry-site_no_oo.xml.template sentry-site_no_oo.xml
 
 if [ ! -z "${IMPALA_KERBERIZE}" ]; then
   generate_config hbase-jaas-server.conf.template hbase-jaas-server.conf

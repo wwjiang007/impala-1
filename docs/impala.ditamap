@@ -131,6 +131,7 @@ under the License.
       <topicref href="topics/impala_dml.xml"/>
       <topicref href="topics/impala_alter_table.xml"/>
       <topicref href="topics/impala_alter_view.xml"/>
+      <topicref href="topics/impala_comment.xml"/>
       <topicref href="topics/impala_compute_stats.xml"/>
       <topicref audience="hidden" href="topics/impala_create_data_source.xml"/>
       <topicref href="topics/impala_create_database.xml"/>
@@ -187,11 +188,14 @@ under the License.
           <topicref rev="2.5.0" href="topics/impala_disable_row_runtime_filtering.xml"/>
           <topicref rev="2.5.0" href="topics/impala_disable_streaming_preaggregations.xml"/>
           <topicref href="topics/impala_disable_unsafe_spills.xml"/>
+          <topicref href="topics/impala_enable_expr_rewrites.xml"/>
           <topicref href="topics/impala_exec_single_node_rows_threshold.xml"/>
           <topicref href="topics/impala_exec_time_limit_s.xml"/>
           <topicref href="topics/impala_explain_level.xml"/>
           <topicref href="topics/impala_hbase_cache_blocks.xml"/>
           <topicref href="topics/impala_hbase_caching.xml"/>
+          <topicref href="topics/impala_idle_session_timeout.xml"/>
+          <topicref href="topics/impala_kudu_read_mode.xml"/>
           <topicref href="topics/impala_live_progress.xml"/>
           <topicref href="topics/impala_live_summary.xml"/>
           <topicref href="topics/impala_max_errors.xml"/>
@@ -207,8 +211,10 @@ under the License.
           <topicref href="topics/impala_parquet_compression_codec.xml"/>
           <topicref rev="2.6.0 IMPALA-2069" href="topics/impala_parquet_annotate_strings_utf8.xml"/>
           <topicref rev="2.9.0 IMPALA-4725" href="topics/impala_parquet_array_resolution.xml"/>
+          <topicref href="topics/impala_parquet_dictionary_filtering.xml"/>
           <topicref rev="2.6.0 IMPALA-2835" href="topics/impala_parquet_fallback_schema_resolution.xml"/>
           <topicref href="topics/impala_parquet_file_size.xml"/>
+          <topicref href="topics/impala_parquet_read_statistics.xml"/>
           <topicref rev="2.6.0 IMPALA-3286" href="topics/impala_prefetch_mode.xml"/>
           <topicref href="topics/impala_query_timeout_s.xml"/>
           <topicref href="topics/impala_request_pool.xml"/>
@@ -219,6 +225,7 @@ under the License.
           <topicref rev="2.5.0" href="topics/impala_runtime_filter_mode.xml"/>
           <topicref rev="2.5.0" href="topics/impala_runtime_filter_wait_time_ms.xml"/>
           <topicref rev="2.6.0" href="topics/impala_s3_skip_insert_staging.xml"/>
+          <topicref rev="3.1" href="topics/impala_scan_bytes_limit.xml"/>
           <topicref rev="2.5.0" href="topics/impala_schedule_random_replica.xml"/>
           <topicref rev="2.8.0 IMPALA-3671" href="topics/impala_scratch_limit.xml"/>
           <!-- This option is for internal use only and might go away without ever being documented. -->
@@ -226,6 +233,9 @@ under the License.
           <topicref href="topics/impala_shuffle_distinct_exprs.xml"/>
           <topicref href="topics/impala_support_start_over.xml"/>
           <topicref href="topics/impala_sync_ddl.xml"/>
+          <topicref href="topics/impala_thread_reservation_aggregate_limit.xml"/>
+          <topicref href="topics/impala_thread_reservation_limit.xml"/>
+          <topicref href="topics/impala_timezone.xml"/>
         </topicref>
       </topicref>
       <topicref href="topics/impala_show.xml"/>
@@ -281,6 +291,7 @@ under the License.
     <topicref audience="hidden" href="topics/impala_perf_ddl.xml"/>
   </topicref>
   <topicref href="topics/impala_scalability.xml"/>
+    <topicref href="topics/impala_dedicated_coordinator.xml"/>
   <topicref href="topics/impala_partitioning.xml"/>
   <topicref href="topics/impala_file_formats.xml">
     <topicref href="topics/impala_txtfile.xml"/>

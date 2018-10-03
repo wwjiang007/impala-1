@@ -1086,11 +1086,30 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "select * from functional.alltypesagg");
     // View-definition references a view.
     AnalyzesOk("alter view functional.alltypes_view as " +
-        "select * from functional.alltypes_view");
+        "select * from functional.alltypes_view_sub");
+    // Change column definitions.
+    AnalyzesOk("alter view functional.alltypes_view (a, b) as " +
+        "select int_col, string_col from functional.alltypes");
+    // Change column definitions after renaming columns in select.
+    AnalyzesOk("alter view functional.alltypes_view (a, b) as " +
+        "select int_col x, string_col y from functional.alltypes");
 
     // View-definition resulting in Hive-style auto-generated column names.
     AnalyzesOk("alter view functional.alltypes_view as " +
         "select trim('abc'), 17 * 7");
+
+    // Altering a view on a view is ok (alltypes_view is a view on alltypes).
+    AnalyzesOk("alter view functional.alltypes_view (aaa, bbb) as " +
+        "select * from functional.complex_view");
+
+    // Altering a view with same column as existing one.
+    AnalyzesOk("alter view functional.complex_view (abc, xyz) as " +
+        "select year, month from functional.alltypes_view");
+
+    // Alter view with joins and aggregates.
+    AnalyzesOk("alter view functional.alltypes_view (cnt) as " +
+        "select count(distinct x.int_col) from functional.alltypessmall x " +
+        "inner join functional.alltypessmall y on (x.id = y.id) group by x.bigint_col");
 
     // Cannot ALTER VIEW a table.
     AnalysisError("alter view functional.alltypes as " +
@@ -1127,6 +1146,76 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalyzesOk("alter view functional.alltypes_view as " +
         "select * from functional.alltypestiny where id in " +
         "(select id from functional.alltypessmall where int_col = 1)");
+    // Mismatching number of columns in column definition and view-alteration statement.
+    AnalysisError("alter view functional.alltypes_view (a) as " +
+        "select int_col, string_col from functional.alltypes",
+        "Column-definition list has fewer columns (1) than the " +
+        "view-definition query statement returns (2).");
+    AnalysisError("alter view functional.alltypes_view (a, b, c) as " +
+        "select int_col from functional.alltypes",
+        "Column-definition list has more columns (3) than the " +
+        "view-definition query statement returns (1).");
+    // Duplicate columns in the view-alteration statement.
+    AnalysisError("alter view functional.alltypes_view as " +
+        "select * from functional.alltypessmall a " +
+        "inner join functional.alltypessmall b on a.id = b.id",
+        "Duplicate column name: id");
+    // Duplicate columns in the column definition.
+    AnalysisError("alter view functional.alltypes_view (a, b, a) as " +
+        "select int_col, int_col, int_col from functional.alltypes",
+        "Duplicate column name: a");
+
+    // Self-referncing view in view definition - SELECT.
+    AnalysisError("alter view functional.alltypes_view as " +
+        "select * from functional.alltypes_view",
+        "Self-reference not allowed on view: functional.alltypes_view");
+    AnalysisError("alter view functional.alltypes_view (a, b, c) as " +
+        "select smallint_col, int_col, bigint_col from functional.alltypes_view",
+        "Self-reference not allowed on view: functional.alltypes_view");
+    // Self-referencing view in view definition - UNION.
+    AnalysisError("alter view functional.alltypes_view as " +
+        "select * from functional.alltypes union all " +
+        "select * from functional.alltypes_view",
+        "Self-reference not allowed on view: functional.alltypes_view");
+    AnalysisError("alter view functional.alltypes_view as " +
+        "select * from functional.alltypes union distinct " +
+        "select * from functional.alltypes_view",
+        "Self-reference not allowed on view: functional.alltypes_view");
+    // Self-referencing view via a dependent view.
+    AnalysisError("alter view functional.alltypes_view as " +
+        "select * from functional.view_view",
+        "Self-reference not allowed on view: functional.alltypes_view");
+    AnalysisError("alter view functional.alltypes_view (a, b) as " +
+        "select smallint_col, int_col from functional.view_view",
+        "Self-reference not allowed on view: functional.alltypes_view");
+    // Self-referencing view in where caluse.
+    AnalysisError("alter view functional.alltypes_view as " +
+        "select * from functional.alltypes " +
+        "where id > (select sum(tinyint_col) from functional.alltypes_view)",
+        "Self-reference not allowed on view: functional.alltypes_view");
+    // Self-referencing view in with clause.
+    AnalysisError("alter view functional.alltypes_view as " +
+        "with temp_view(col_a, col_b, col_c) as " +
+        "(select tinyint_col, int_col, bigint_col from functional.alltypes_view) " +
+        "select * from temp_view",
+        "Self-reference not allowed on view: functional.alltypes_view");
+    AnalysisError("alter view functional.alltypes_view as " +
+        "with temp_view(col_a, col_b, col_c) as " +
+        "(select tinyint_col, int_col, bigint_col from functional.alltypes_view) " +
+        "select * from functional.alltypes",
+        "Self-reference not allowed on view: functional.alltypes_view");
+    AnalysisError("alter view functional.alltypes_view as " +
+        "with temp_view(col_a, col_b, col_c) as " +
+        "(select tinyint_col, int_col, bigint_col from functional.alltypes_view) " +
+        "select * from temp_view union all " +
+        "select tinyint_col, int_col, bigint_col from functional.alltypes",
+        "Self-reference not allowed on view: functional.alltypes_view");
+    AnalysisError("alter view functional.alltypes_view as " +
+        "with temp_view(col_a, col_b, col_c) as " +
+        "(select tinyint_col, int_col, bigint_col from functional.alltypes_view) " +
+        "select * from temp_view union distinct " +
+        "select tinyint_col, int_col, bigint_col from functional.alltypes",
+        "Self-reference not allowed on view: functional.alltypes_view");
   }
 
   @Test
@@ -3977,7 +4066,26 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "Could not resolve table reference: 'default.doesntexist'");
     AnalysisError("comment on view functional.alltypes is 'comment'",
         "COMMENT ON VIEW not allowed on a table: functional.alltypes");
-    AnalysisError(String.format("comment on table functional.alltypes_view is '%s'",
+    AnalysisError(String.format("comment on view functional.alltypes_view is '%s'",
+        buildLongComment()), "Comment exceeds maximum length of 256 characters. " +
+        "The given comment has 261 characters.");
+  }
+
+  @Test
+  public void TestCommentOnColumn() {
+    for (Pair<String, AnalysisContext> pair : new Pair[]{
+        new Pair<>("functional.alltypes.id", createAnalysisCtx()),
+        new Pair<>("alltypes.id", createAnalysisCtx("functional")),
+        new Pair<>("functional.alltypes_view.id", createAnalysisCtx()),
+        new Pair<>("alltypes_view.id", createAnalysisCtx("functional"))}) {
+      AnalyzesOk(String.format("comment on column %s is 'comment'", pair.first),
+          pair.second);
+      AnalyzesOk(String.format("comment on column %s is ''", pair.first), pair.second);
+      AnalyzesOk(String.format("comment on column %s is null", pair.first), pair.second);
+    }
+    AnalysisError("comment on column functional.alltypes.doesntexist is 'comment'",
+        "Column 'doesntexist' does not exist in table: functional.alltypes");
+    AnalysisError(String.format("comment on column functional.alltypes.id is '%s'",
         buildLongComment()), "Comment exceeds maximum length of 256 characters. " +
         "The given comment has 261 characters.");
   }
@@ -4000,6 +4108,44 @@ public class AnalyzeDDLTest extends FrontendTestBase {
       AnalysisError(String.format("alter database functional set owner %s %s",
           ownerType, buildLongOwnerName()), "Owner name exceeds maximum length of 128 " +
           "characters. The given owner name has 133 characters.");
+    }
+  }
+
+  @Test
+  public void TestAlterTableSetOwner() {
+    String[] ownerTypes = new String[]{"user", "role"};
+    for (String ownerType : ownerTypes) {
+      AnalyzesOk(String.format("alter table functional.alltypes set owner %s foo",
+          ownerType));
+      AnalysisError(String.format("alter table nodb.alltypes set owner %s foo",
+          ownerType), "Could not resolve table reference: 'nodb.alltypes'");
+      AnalysisError(String.format("alter table functional.notbl set owner %s foo",
+          ownerType), "Could not resolve table reference: 'functional.notbl'");
+      AnalysisError(String.format("alter table functional.alltypes set owner %s %s",
+          ownerType, buildLongOwnerName()), "Owner name exceeds maximum length of 128 " +
+          "characters. The given owner name has 133 characters.");
+      AnalysisError(String.format("alter table functional.alltypes_view " +
+          "set owner %s foo", ownerType), "ALTER TABLE not allowed on a view: " +
+          "functional.alltypes_view");
+    }
+  }
+
+  @Test
+  public void TestAlterViewSetOwner() {
+    String[] ownerTypes = new String[]{"user", "role"};
+    for (String ownerType : ownerTypes) {
+      AnalyzesOk(String.format("alter view functional.alltypes_view set owner %s foo",
+          ownerType));
+      AnalysisError(String.format("alter view nodb.alltypes set owner %s foo",
+          ownerType), "Could not resolve table reference: 'nodb.alltypes'");
+      AnalysisError(String.format("alter view functional.notbl set owner %s foo",
+          ownerType), "Could not resolve table reference: 'functional.notbl'");
+      AnalysisError(String.format("alter view functional.alltypes_view set owner %s %s",
+          ownerType, buildLongOwnerName()), "Owner name exceeds maximum length of 128 " +
+          "characters. The given owner name has 133 characters.");
+      AnalysisError(String.format("alter view functional.alltypes " +
+          "set owner %s foo", ownerType), "ALTER VIEW not allowed on a table: " +
+          "functional.alltypes");
     }
   }
 

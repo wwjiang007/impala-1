@@ -70,6 +70,17 @@ namespace llvm {
   class IRBuilderDefaultInserter;
 }
 
+// The number of function calls replaced is not knowable when UBSAN is enabled, since it
+// can double the number of references to a function. To fix, we replaced
+// "DCHECK_EQ(replaced" with "DCHECK_REPLACE_COUNT(replaced":
+//
+// find be/src -type f -execdir sed -i s/DCHECK_EQ\(replaced,\ /DCHECK_REPLACE_COUNT\(replaced,\ /g {} \;
+#if defined(UNDEFINED_SANITIZER)
+#define DCHECK_REPLACE_COUNT(p, q) DCHECK_GE(p, q); DCHECK_LE(p, 2*(q))
+#else
+#define DCHECK_REPLACE_COUNT(p, q) DCHECK_EQ(p, q)
+#endif
+
 namespace impala {
 
 class CodegenCallGraph;
@@ -238,7 +249,10 @@ class LlvmCodeGen {
   };
 
   /// Get host cpu attributes in format expected by EngineBuilder.
-  static void GetHostCPUAttrs(std::vector<std::string>* attrs);
+  static void GetHostCPUAttrs(std::unordered_set<std::string>* attrs);
+
+  /// Returns whether or not this cpu feature is supported.
+  static bool IsCPUFeatureEnabled(int64_t flag);
 
   /// Return a pointer type to 'type'
   llvm::PointerType* GetPtrType(llvm::Type* type);
@@ -392,8 +406,8 @@ class LlvmCodeGen {
   /// passed to AddFunctionToJit() otherwise the functions will be deleted from the
   /// module when the module is finalized. Also, all loaded functions that need to be JIT
   /// compiled after modification also need to be finalized.
-  /// If the function does not verify, it will delete the function and return NULL,
-  /// otherwise, it returns the function object.
+  /// If the function does not verify, it returns NULL and the function will eventually
+  /// be deleted in FinalizeModule(), otherwise, it returns the function object.
   llvm::Function* FinalizeFunction(llvm::Function* function);
 
   /// Adds the function to be automatically jit compiled when the codegen object is
@@ -593,6 +607,7 @@ class LlvmCodeGen {
   friend class ExprCodegenTest;
   friend class LlvmCodeGenTest;
   friend class LlvmCodeGenTest_CpuAttrWhitelist_Test;
+  friend class LlvmCodeGenTest_HashTest_Test;
   friend class SubExprElimination;
 
   /// Top level codegen object. 'module_id' is used for debugging when outputting the IR.
@@ -714,20 +729,28 @@ class LlvmCodeGen {
   /// always present in the output, except "+" is flipped to "-" for the disabled
   /// attributes. E.g. if 'cpu_attrs' is {"+x", "+y", "-z"} and the whitelist is
   /// {"x", "z"}, returns {"+x", "-y", "-z"}.
-  static std::vector<std::string> ApplyCpuAttrWhitelist(
-      const std::vector<std::string>& cpu_attrs);
+  static std::unordered_set<std::string> ApplyCpuAttrWhitelist(
+      const std::unordered_set<std::string>& cpu_attrs);
 
   /// Whether InitializeLlvm() has been called.
   static bool llvm_initialized_;
 
   /// Host CPU name and attributes, filled in by InitializeLlvm().
   static std::string cpu_name_;
-  static std::vector<std::string> cpu_attrs_;
+  /// The cpu_attrs_ should not be modified during the execution except for tests.
+  static std::unordered_set<std::string> cpu_attrs_;
 
   /// Value of "target-features" attribute to be set on all IR functions. Derived from
-  /// 'cpu_attrs_'. Using a consistent value for this attribute among hand-crafted IR
-  /// and cross-compiled functions allow them to be inlined into each other.
+  /// 'cpu_attrs_'. Using a consistent value for this attribute among
+  /// hand-crafted IR and cross-compiled functions allow them to be inlined into each
+  /// other.
   static std::string target_features_attr_;
+
+  /// Mapping between CpuInfo flags and the corresponding strings.
+  /// The key is mapped to the string as follows:
+  /// CpuInfo flag -> enabled feature.
+  /// Bitwise negation of CpuInfo flag -> disabled feature.
+  const static std::map<int64_t, std::string> cpu_flag_mappings_;
 
   /// A global shared call graph for all IR functions in the main module.
   /// Used for determining dependencies when materializing IR functions.

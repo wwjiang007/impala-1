@@ -73,6 +73,10 @@ struct TAlterDbSetOwnerParams {
 
   // The owner name.
   2: required string owner_name
+
+  // The server name for security privileges when authorization is enabled.
+  // TODO: Need to cleanup:IMPALA-7553
+  3: optional string server_name
 }
 
 struct TAlterDbParams {
@@ -104,6 +108,7 @@ enum TAlterTableType {
   SET_CACHED,
   RECOVER_PARTITIONS,
   SET_ROW_FORMAT,
+  SET_OWNER
 }
 
 // Parameters of CREATE DATABASE commands
@@ -123,6 +128,10 @@ struct TCreateDbParams {
 
   // Owner of the database
   5: required string owner
+
+  // The server name for security privileges when authorization is enabled.
+  // TODO: Need to cleanup:IMPALA-7553
+  6: optional string server_name
 }
 
 // Parameters of CREATE DATA SOURCE commands
@@ -317,6 +326,19 @@ struct TAlterTableSetLocationParams {
   2: optional list<CatalogObjects.TPartitionKeyValue> partition_spec
 }
 
+// Parameters for ALTER TABLE/VIEW SET OWNER commands.
+struct TAlterTableOrViewSetOwnerParams {
+  // The owner type.
+  1: required TOwnerType owner_type
+
+  // The owner name.
+  2: required string owner_name
+
+  // The server name for security privileges when authorization is enabled.
+  // TODO: Need to cleanup:IMPALA-7553
+  3: optional string server_name
+}
+
 // Parameters for updating the table and/or column statistics
 // of a table. Used by ALTER TABLE SET COLUMN STATS, and internally by
 // a COMPUTE STATS command.
@@ -397,6 +419,9 @@ struct TAlterTableParams {
 
   // Parameters for ALTER TABLE SET ROW FORMAT
   15: optional TAlterTableSetRowFormatParams set_row_format_params
+
+  // Parameters for ALTER TABLE/VIEW SET OWNER
+  16: optional TAlterTableOrViewSetOwnerParams set_owner_params
 }
 
 // Parameters of CREATE TABLE LIKE commands
@@ -431,6 +456,10 @@ struct TCreateTableLikeParams {
   // any such columns of the source table. If unspecified, the destination table will
   // inherit the sort columns of the source table.
   9: optional list<string> sort_columns
+
+  // The server name for security privileges when authorization is enabled.
+  // TODO: Need to cleanup:IMPALA-7553
+  10: optional string server_name
 }
 
 // Parameters of CREATE TABLE commands
@@ -485,6 +514,10 @@ struct TCreateTableParams {
 
   // Optional list of sort columns for the new table.
   16: optional list<string> sort_columns
+
+  // The server name for security privileges when authorization is enabled.
+  // TODO: Need to cleanup:IMPALA-7553
+  17: optional string server_name
 }
 
 // Parameters of a CREATE VIEW or ALTER VIEW AS SELECT command
@@ -509,6 +542,10 @@ struct TCreateOrAlterViewParams {
 
   // Do not throw an error if a table or view of the same name already exists
   7: optional bool if_not_exists
+
+  // The server name for security privileges when authorization is enabled.
+  // TODO: Need to cleanup:IMPALA-7553
+  8: optional string server_name
 }
 
 // Parameters of a COMPUTE STATS command
@@ -598,6 +635,10 @@ struct TDropDbParams {
 
   // If true, drops all tables of the database
   3: required bool cascade
+
+  // The server name for security privileges when authorization is enabled.
+  // TODO: Need to cleanup:IMPALA-7553
+  4: optional string server_name
 }
 
 // Parameters of DROP TABLE/VIEW commands
@@ -613,6 +654,10 @@ struct TDropTableOrViewParams {
 
   // Set to true for tables and false for views
   4: optional bool is_table
+
+  // The server name for security privileges when authorization is enabled.
+  // TODO: Need to cleanup:IMPALA-7553
+  5: optional string server_name
 }
 
 // Parameters of TRUNCATE commands
@@ -662,6 +707,14 @@ struct TGetCatalogUsageResponse{
   2: required list<TTableUsageMetrics> frequently_accessed_tables
 }
 
+struct TColumnName {
+  // Name of table/view.
+  1: required CatalogObjects.TTableName table_name
+
+  // Name of column.
+  2: required string column_name
+}
+
 struct TCommentOnParams {
   // Contents of comment to alter. When this field is not set, the comment will be removed.
   1: optional string comment
@@ -675,4 +728,7 @@ struct TCommentOnParams {
 
   // Name of table/view to alter.
   3: optional CatalogObjects.TTableName table_name
+
+  // Name of column to alter.
+  4: optional TColumnName column_name
 }

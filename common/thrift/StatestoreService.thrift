@@ -74,6 +74,10 @@ struct TBackendDescriptor {
 
   // The process memory limit of this backend (in bytes).
   8: required i64 proc_mem_limit;
+
+  // True if fragment instances should not be scheduled on this daemon because the
+  // daemon has been quiescing, e.g. if it shutting down.
+  9: required bool is_quiescing;
 }
 
 // Description of a single entry in a topic
@@ -145,6 +149,12 @@ struct TTopicRegistration {
   // actually required - computing the version is relatively expensive compared to
   // other aspects of preparing topic updates - see IMPALA-6816.
   3: required bool populate_min_subscriber_topic_version = false;
+
+  // Restrict the items to receive on this subscription to only those items
+  // starting with the given prefix.
+  //
+  // If this is not specified, all items will be subscribed to.
+  4: optional string filter_prefix
 }
 
 struct TRegisterSubscriberRequest {

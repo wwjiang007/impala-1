@@ -45,13 +45,13 @@ import org.apache.impala.analysis.ToSqlUtils;
 import org.apache.impala.authorization.AuthorizationConfig;
 import org.apache.impala.authorization.ImpalaInternalAdminUser;
 import org.apache.impala.authorization.User;
-import org.apache.impala.catalog.DataSource;
 import org.apache.impala.catalog.FeDataSource;
 import org.apache.impala.catalog.FeDb;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.Role;
 import org.apache.impala.catalog.StructType;
 import org.apache.impala.catalog.Type;
+import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.InternalException;
@@ -68,6 +68,7 @@ import org.apache.impala.thrift.TDescriptorTable;
 import org.apache.impala.thrift.TExecRequest;
 import org.apache.impala.thrift.TFunctionCategory;
 import org.apache.impala.thrift.TGetAllHadoopConfigsResponse;
+import org.apache.impala.thrift.TGetCatalogMetricsResult;
 import org.apache.impala.thrift.TGetDataSrcsParams;
 import org.apache.impala.thrift.TGetDataSrcsResult;
 import org.apache.impala.thrift.TGetDbsParams;
@@ -84,17 +85,18 @@ import org.apache.impala.thrift.TLoadDataReq;
 import org.apache.impala.thrift.TLoadDataResp;
 import org.apache.impala.thrift.TLogLevel;
 import org.apache.impala.thrift.TMetadataOpRequest;
+import org.apache.impala.thrift.TPrincipalType;
 import org.apache.impala.thrift.TQueryCtx;
 import org.apache.impala.thrift.TResultSet;
 import org.apache.impala.thrift.TShowFilesParams;
-import org.apache.impala.thrift.TShowGrantRoleParams;
+import org.apache.impala.thrift.TShowGrantPrincipalParams;
 import org.apache.impala.thrift.TShowRolesParams;
 import org.apache.impala.thrift.TShowRolesResult;
 import org.apache.impala.thrift.TShowStatsOp;
 import org.apache.impala.thrift.TShowStatsParams;
 import org.apache.impala.thrift.TTableName;
 import org.apache.impala.thrift.TUpdateCatalogCacheRequest;
-import org.apache.impala.thrift.TUpdateMembershipRequest;
+import org.apache.impala.thrift.TUpdateExecutorMembershipRequest;
 import org.apache.impala.util.GlogAppender;
 import org.apache.impala.util.PatternMatcher;
 import org.apache.impala.util.TSessionStateUtil;
@@ -185,12 +187,13 @@ public class JniFrontend {
 
   /**
    * Jni wrapper for Frontend.updateMembership(). Accepts a serialized
-   * TUpdateMembershipRequest.
+   * TUpdateExecutorMembershipRequest.
    */
-  public void updateMembership(byte[] thriftMembershipUpdate) throws ImpalaException {
-    TUpdateMembershipRequest req = new TUpdateMembershipRequest();
+  public void updateExecutorMembership(byte[] thriftMembershipUpdate)
+      throws ImpalaException {
+    TUpdateExecutorMembershipRequest req = new TUpdateExecutorMembershipRequest();
     JniUtil.deserializeThrift(protocolFactory_, req, thriftMembershipUpdate);
-    frontend_.updateMembership(req);
+    frontend_.updateExecutorMembership(req);
   }
 
   /**
@@ -222,6 +225,16 @@ public class JniFrontend {
     String plan = frontend_.getExplainString(queryCtx);
     if (LOG.isTraceEnabled()) LOG.trace("Explain plan: " + plan);
     return plan;
+  }
+
+  public byte[] getCatalogMetrics() throws ImpalaException {
+    TGetCatalogMetricsResult metrics = frontend_.getCatalogMetrics();
+    TSerializer serializer = new TSerializer(protocolFactory_);
+    try {
+      return serializer.serialize(metrics);
+    } catch (TException e) {
+      throw new InternalException(e.getMessage());
+    }
   }
 
   /**
@@ -540,11 +553,27 @@ public class JniFrontend {
     }
   }
 
-  public byte[] getRolePrivileges(byte[] showGrantRolesParams) throws ImpalaException {
-    TShowGrantRoleParams params = new TShowGrantRoleParams();
-    JniUtil.deserializeThrift(protocolFactory_, params, showGrantRolesParams);
-    TResultSet result = frontend_.getCatalog().getAuthPolicy().getRolePrivileges(
-        params.getRole_name(), params.getPrivilege());
+  /**
+   * Gets the principal privileges for the given principal.
+   */
+  public byte[] getPrincipalPrivileges(byte[] showGrantPrincipalParams)
+      throws ImpalaException {
+    TShowGrantPrincipalParams params = new TShowGrantPrincipalParams();
+    JniUtil.deserializeThrift(protocolFactory_, params, showGrantPrincipalParams);
+    TResultSet result;
+    switch (params.getPrincipal_type()) {
+      case USER:
+        result = frontend_.getCatalog().getAuthPolicy().getUserPrivileges(
+            params.getName(), params.getPrivilege(), frontend_);
+        break;
+      case ROLE:
+        result = frontend_.getCatalog().getAuthPolicy().getRolePrivileges(
+            params.getName(), params.getPrivilege());
+        break;
+      default:
+        throw new AnalysisException("Unexpected TPrincipalType: " +
+            params.getPrincipal_type());
+    }
     TSerializer serializer = new TSerializer(protocolFactory_);
     try {
       return serializer.serialize(result);
@@ -679,6 +708,10 @@ public class JniFrontend {
     output.append(checkShortCircuitRead(CONF));
     if (BackendConfig.INSTANCE.isAuthorizedProxyGroupEnabled()) {
       output.append(checkGroupsMappingProvider(CONF));
+    }
+    if (BackendConfig.INSTANCE.isAuthorizationFileSet()) {
+      LOG.warn("authorization_policy_file flag is deprecated. Object Ownership feature" +
+          " is not supported with authorization_policy_file.");
     }
     return output.toString();
   }

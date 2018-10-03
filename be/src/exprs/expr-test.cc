@@ -28,40 +28,45 @@
 #include <boost/scoped_ptr.hpp>
 #include <boost/unordered_map.hpp>
 
-#include "testutil/gtest-util.h"
 #include "codegen/llvm-codegen.h"
 #include "common/init.h"
 #include "common/object-pool.h"
+#include "exprs/anyval-util.h"
 #include "exprs/is-null-predicate.h"
 #include "exprs/like-predicate.h"
 #include "exprs/literal.h"
 #include "exprs/null-literal.h"
-#include "exprs/scalar-expr.h"
 #include "exprs/scalar-expr-evaluator.h"
+#include "exprs/scalar-expr.h"
 #include "exprs/string-functions.h"
 #include "exprs/timestamp-functions.h"
 #include "exprs/timezone_db.h"
 #include "gen-cpp/Exprs_types.h"
+#include "gen-cpp/ImpalaInternalService_types.h"
 #include "gen-cpp/hive_metastore_types.h"
 #include "rpc/thrift-client.h"
 #include "rpc/thrift-server.h"
-#include "runtime/runtime-state.h"
 #include "runtime/mem-pool.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/raw-value.inline.h"
+#include "runtime/runtime-state.h"
 #include "runtime/string-value.h"
 #include "runtime/timestamp-parse-util.h"
 #include "runtime/timestamp-value.h"
 #include "runtime/timestamp-value.inline.h"
 #include "service/fe-support.h"
 #include "service/impala-server.h"
+#include "statestore/statestore.h"
+#include "testutil/gtest-util.h"
 #include "testutil/impalad-query-executor.h"
 #include "testutil/in-process-servers.h"
 #include "udf/udf-test-harness.h"
+#include "util/asan.h"
 #include "util/debug-util.h"
 #include "util/string-parser.h"
+#include "util/string-util.h"
 #include "util/test-info.h"
-#include "gen-cpp/ImpalaInternalService_types.h"
+#include "utility-functions.h"
 
 #include "common/names.h"
 
@@ -82,6 +87,8 @@ using namespace impala;
 
 namespace impala {
 ImpaladQueryExecutor* executor_;
+scoped_ptr<MetricGroup> statestore_metrics(new MetricGroup("statestore_metrics"));
+Statestore* statestore;
 bool disable_codegen_;
 bool enable_expr_rewrites_;
 
@@ -592,6 +599,18 @@ class ExprTest : public testing::Test {
     vector<FieldSchema> result_types;
     Status status = executor_->Exec(stmt, &result_types);
     ASSERT_FALSE(status.ok()) << "stmt: " << stmt << "\nunexpected Status::OK.";
+  }
+
+  // "Execute 'expr' and check that the returned error ends with 'error_string'"
+  void TestErrorString(const string& expr, const string& error_string) {
+    string stmt = "select " + expr;
+    vector<FieldSchema> result_types;
+    string result_row;
+    Status status = executor_->Exec(stmt, &result_types);
+    status = executor_->FetchResult(&result_row);
+    ASSERT_FALSE(status.ok());
+    ASSERT_TRUE(EndsWith(status.msg().msg(), error_string)) << "Actual: "
+        << status.msg().msg() << endl << "Expected: " << error_string;
   }
 
   template <typename T> void TestFixedPointComparisons(bool test_boundaries) {
@@ -4851,10 +4870,14 @@ TEST_F(ExprTest, UtilityFunctions) {
   TestStringValue("user()", "impala_test_user");
   TestStringValue("current_user()", "impala_test_user");
   TestStringValue("effective_user()",  "impala_test_user");
+  TestStringValue("logged_in_user()", "impala_test_user");
   TestStringValue("session_user()",  "impala_test_user");
   TestStringValue("version()", GetVersionString());
   TestValue("sleep(100)", TYPE_BOOLEAN, true);
   TestIsNull("sleep(NULL)", TYPE_BOOLEAN);
+  string hostname;
+  ASSERT_OK(GetHostname(&hostname));
+  TestStringValue("coordinator()", hostname);
 
   // Test typeOf
   TestStringValue("typeOf(!true)", "BOOLEAN");
@@ -4871,6 +4894,8 @@ TEST_F(ExprTest, UtilityFunctions) {
   TestStringValue("typeOf(cast(10 as FLOAT))", "FLOAT");
   TestStringValue("typeOf(cast(10 as DOUBLE))", "DOUBLE");
   TestStringValue("typeOf(current_database())", "STRING");
+  TestStringValue("typeOf(version())", "STRING");
+  TestStringValue("typeOf(coordinator())", "STRING");
   TestStringValue("typeOf(now())", "TIMESTAMP");
   TestStringValue("typeOf(utc_timestamp())", "TIMESTAMP");
   TestStringValue("typeOf(cast(10 as DECIMAL))", "DECIMAL(9,0)");
@@ -4925,6 +4950,26 @@ TEST_F(ExprTest, UtilityFunctions) {
 
   // Test NULL input returns NULL
   TestIsNull("fnv_hash(NULL)", TYPE_BIGINT);
+}
+
+// Test that UtilityFunctions::Coordinator() will return null if coord_address is unset
+TEST_F(ExprTest, CoordinatorFunction) {
+  // Make a RuntimeState where the query context does not have coord_address set.
+  // Note that this should never happen in a real impalad.
+  RuntimeState state(TQueryCtx(), ExecEnv::GetInstance());
+  MemTracker tracker;
+  MemPool mem_pool(&tracker);
+  FunctionContext::TypeDesc return_type;
+  return_type.type = FunctionContext::Type::TYPE_STRING;
+  std::vector<FunctionContext::TypeDesc> no_arguments;
+  FunctionContext* context =
+      CreateUdfTestContext(return_type, no_arguments, &state, &mem_pool);
+
+  StringVal coordinator = UtilityFunctions::Coordinator(context);
+  ASSERT_TRUE(coordinator.is_null) << "Coordinator() did not return expected null value";
+
+  UdfTestHarness::CloseContext(context);
+  state.ReleaseResources();
 }
 
 TEST_F(ExprTest, MurmurHashFunction) {
@@ -5310,6 +5355,81 @@ TEST_F(ExprTest, MathFunctions) {
   TestValue("sqrt(121.0)", TYPE_DOUBLE, 11.0);
   TestValue("sqrt(2.0)", TYPE_DOUBLE, sqrt(2.0));
   TestValue("dsqrt(81.0)", TYPE_DOUBLE, 9);
+
+  TestValue("width_bucket(6.3, 2, 17, 2)", TYPE_BIGINT, 1);
+  TestValue("width_bucket(11, 6, 14, 3)", TYPE_BIGINT, 2);
+  TestValue("width_bucket(-1, -5, 5, 3)", TYPE_BIGINT, 2);
+  TestValue("width_bucket(1, -5, 5, 3)", TYPE_BIGINT, 2);
+  TestValue("width_bucket(3, 5, 20.1, 4)", TYPE_BIGINT, 0);
+  TestIsNull("width_bucket(NULL, 5, 20.1, 4)", TYPE_BIGINT);
+  TestIsNull("width_bucket(22, NULL, 20.1, 4)", TYPE_BIGINT);
+  TestIsNull("width_bucket(22, 5, NULL, 4)", TYPE_BIGINT);
+  TestIsNull("width_bucket(22, 5, 20.1, NULL)", TYPE_BIGINT);
+
+  TestValue("width_bucket(22, 5, 20.1, 4)", TYPE_BIGINT, 5);
+  // Test when the result (bucket number) is greater than the max value that can be
+  // stored in a IntVal
+  TestValue("width_bucket(22, 5, 20.1, 2147483647)", TYPE_BIGINT, 2147483648);
+  // Test when min and max of the bucket width range are equal.
+  TestErrorString("width_bucket(22, 5, 5, 4)",
+      "UDF ERROR: Lower bound cannot be greater than or equal to the upper bound\n");
+  // Test when min > max
+  TestErrorString("width_bucket(22, 50, 5, 4)",
+      "UDF ERROR: Lower bound cannot be greater than or equal to the upper bound\n");
+  // IMPALA-7412: Test max - min should not overflow anymore
+  TestValue("width_bucket(11, -9, 99999999999999999999999999999999999999, 4000)",
+      TYPE_BIGINT, 1);
+  TestValue("width_bucket(1, -99999999999999999999999999999999999999, 9, 40)",
+      TYPE_BIGINT, 40);
+  // Test when dist_from_min * buckets cannot be stored in a int128_t (overflows)
+  // and needs to be stored in a int256_t
+  TestValue("width_bucket(8000000000000000000000000000000000000,"
+      "100000000000000000000000000000000000, 9000000000000000000000000000000000000,"
+      "900000)", TYPE_BIGINT, 798877);
+  // Test when range_size * GetScaleMultiplier(input_scale) cannot be stored in a
+  // int128_t (overflows) and needs to be stored in a int256_t
+  TestValue("width_bucket(100000000, 199999.77777777777777777777777777, 99999999999.99999"
+    ", 40)", TYPE_BIGINT, 1);
+  // Test with max values for expr and num_bucket when the width_bucket can be
+  // evaluated with int128_t. Incrementing one of them will require using int256_t for
+  // width_bucket evaluation
+  TestValue("width_bucket(9999999999999999999999999999999999999, 1,"
+            "99999999999999999999999999999999999999, 15)", TYPE_BIGINT, 2);
+  // Test with the smallest value of num_bucket for the given combination of expr,
+  // max and min value that would require int256_t for evalation
+  TestValue("width_bucket(9999999999999999999999999999999999999, 1,"
+            "99999999999999999999999999999999999999, 16)", TYPE_BIGINT, 2);
+  // Test with the smallest value of expr for the given combination of num_buckets,
+  // max and min value that would require int256_t for evalation
+  TestValue("width_bucket(10000000000000000000000000000000000000, 1,"
+            "99999999999999999999999999999999999999, 15)", TYPE_BIGINT, 2);
+  // IMPALA-7412: These should not overflow anymore
+  TestValue("width_bucket(cast(-0.10 as decimal(37,30)), cast(-0.36028797018963968 "
+      "as decimal(25,25)), cast(9151517.4969773200562764155787276999832"
+      "as decimal(38,31)), 1328180220)", TYPE_BIGINT, 38);
+  TestValue("width_bucket(cast(9 as decimal(10,7)), cast(-60000 as decimal(11,6)), "
+      "cast(10 as decimal(7,5)), 249895273);", TYPE_BIGINT, 249891109);
+  // max - min and expr - min needs bigger type than the underlying type of
+  // the deduced decimal. The calculation must succeed by using a bigger type.
+  TestValue("width_bucket(cast(0.9999 as decimal(35,35)), cast(-0.705408425140 as "
+      "decimal(23,23)), cast(0.999999999999999999999 as decimal(38,38)), 699997927)",
+      TYPE_BIGINT, 699956882ll);
+  // max - min needs bigger type, but expr - min and (expr - min) * num_buckets fits
+  // into deduced decimal
+  TestValue("width_bucket(cast(-0.7054084251 as decimal(23,23)), cast(-0.705408425140 "
+      "as decimal(23,23)), cast(0.999999999999999999999 as decimal(38,38)), 10)",
+      TYPE_BIGINT, 1);
+  // max - min fits into deduced decimal, (max - min) * num_buckets needs bigger type,
+  // but expr == min
+  TestValue("width_bucket(cast(1 as decimal(9,0)), cast(1 as decimal(9,0)), "
+      "cast(100000000 as decimal(9,0)), 100)", TYPE_BIGINT, 1);
+  // max - min fits into deduced decimal, (max - min) * num_buckets needs bigger type,
+  // but (expr - min) * num_buckets fits
+  TestValue("width_bucket(cast(2 as decimal(9,0)), cast(1 as decimal(9,0)), "
+      "cast(100000000 as decimal(9,0)), 100)", TYPE_BIGINT, 1);
+  // max - min fits into deduced decimal, but (expr - min) * num_buckets needs bigger type
+  TestValue("width_bucket(cast(100000000 as decimal(9,0)), cast(1 as decimal(9,0)), "
+      "cast(100000001 as decimal(9,0)), 100)", TYPE_BIGINT, 100);
 
   // Run twice to test deterministic behavior.
   for (uint32_t seed : {0, 1234}) {
@@ -5958,6 +6078,8 @@ TEST_F(ExprTest, TimestampFunctions) {
   TestStringValue("cast(date_sub(cast('2012-01-02 01:00:00.033000001' "
       "as timestamp), interval cast(90000033 as bigint) milliseconds) as string)",
       "2012-01-01 00:00:00.000000001");
+  TestStringValue("cast(cast(0 as timestamp) + interval -10000000000000 milliseconds "
+      "as string)", "1653-02-10 06:13:20");
   // Add/sub microseconds.
   TestStringValue("cast(date_add(cast('2012-01-01 00:00:00.000000001' "
       "as timestamp), interval 1033 microseconds) as string)",
@@ -8702,6 +8824,149 @@ TEST_F(ExprTest, DateTruncTest) {
   TestError("date_trunc('2017-01-09', '2017-01-09 10:37:03.455722111' )");
   TestError("date_trunc('2017-01-09 10:00:00', 'HOUR')");
 }
+
+TEST_F(ExprTest, JsonTest) {
+  TestStringValue("get_json_object('{\"a\":1, \"b\":2, \"c\":3}', '$.b')", "2");
+  TestStringValue(
+      "get_json_object('{\"a\":true, \"b\":false, \"c\":true}', '$.b')", "false");
+  TestStringValue(
+      "get_json_object('{\"a\":-1, \"b\":-2, \"c\":-3}', '$.b')", "-2");
+  TestStringValue(
+      "get_json_object('{\"a\":\"A\", \"b\":\"B\", \"c\":\"C\"}', '$.b')", "B");
+  TestStringValue(
+      "get_json_object('{\"a\":[], \"b\":[2,3,4], \"c\":[3]}', '$.b')", "[2,3,4]");
+
+  TestStringValue("get_json_object('[\"abc\", \"ddd\", \"fff\"]', '$[1]')", "ddd");
+  TestStringValue("get_json_object('[1, 2, 3]', '$[*]')", "[1,2,3]");
+  TestStringValue(
+      "get_json_object('{\"key\": {\"a\": {\"b\": true}}}', '$.key.a.b')", "true");
+  TestStringValue(
+      "get_json_object('[{\"key\": \"v1\"}, {\"key\": \"v2\"}]', '$[*].key')",
+      "[\"v1\",\"v2\"]");
+  TestStringValue(
+      "get_json_object('[{\"key\": [1,2,3]}, {\"key\": [4,5]}]', '$[*].key')",
+      "[[1,2,3],[4,5]]");
+  TestStringValue(
+      "get_json_object('[{\"key\": [1,2,3]}, {\"key\": [4,5]}]', '$[*].key[*]')",
+      "[1,2,3,4,5]");
+  TestStringValue("get_json_object('[[0,1,2], [3,4,5], [6,7]]', '$[1][0]')", "3");
+  TestStringValue("get_json_object('[[0,1,2], [3,4,5], [6,7]]', '$[*][0]')", "[0,3,6]");
+  TestStringValue("get_json_object('[[0,1,2], [3,4,5], [6,7]]', '$[*][2]')", "[2,5]");
+  TestStringValue("get_json_object('[[0,1,2], [3,4,5], [6,7]]', '$[1][*]')", "[3,4,5]");
+
+  TestStringValue("get_json_object('{\"a\":1, \"b\":2, \"c\":3}', '$.*')", "[1,2,3]");
+  TestStringValue(
+      "get_json_object('{\"a\":true, \"b\":false, \"c\":true}', '$.*')",
+      "[true,false,true]");
+  TestStringValue(
+      "get_json_object('{\"a\":[], \"b\":[2,3,4], \"c\":[3]}', '$.*')",
+      "[[],[2,3,4],[3]]");
+  TestStringValue(
+      "get_json_object('[{\"key\": [1,2,3]}, {\"key\": [4,5]}]', '$[*].*')",
+      "[[1,2,3],[4,5]]");
+  TestStringValue(
+      "get_json_object('[{\"key\": [1,2,3]}, {\"key\": [4,5]}]', '$[*].*[*]')",
+      "[1,2,3,4,5]");
+  TestStringValue("get_json_object('[{\"key\": 1}, 123]', '$[*].*')", "1");
+  TestStringValue(
+      "get_json_object('{\"a\": {\"aa\": 1}, \"b\": {\"bb\": 2}}', '$.*')",
+      "[{\"aa\":1},{\"bb\":2}]");
+  TestStringValue(
+      "get_json_object('{\"a\": {\"aa\": 1}, \"b\": {\"bb\": 2}}', '$.*.*')",
+      "[1,2]");
+
+  // Tests about NULL
+  TestIsNull("get_json_object('{\"a\": 1}', '$.b')", TYPE_STRING);
+  TestIsNull("get_json_object('{\"a\": 1}', '$[0]')", TYPE_STRING);
+  TestIsNull("get_json_object('[1,2]', '$[2]')", TYPE_STRING);
+  TestIsNull("get_json_object('[1,2,3]', '$.*')", TYPE_STRING);
+  TestIsNull("get_json_object('{illegal_json}', '$.a')", TYPE_STRING);
+  TestIsNull("get_json_object('\"abc\"', '$.a')", TYPE_STRING);
+  TestIsNull("get_json_object('\"abc\"', '$[0]')", TYPE_STRING);
+  TestIsNull("get_json_object('123', '$.a')", TYPE_STRING);
+  TestIsNull("get_json_object('123', '$[0]')", TYPE_STRING);
+  TestIsNull("get_json_object('{}', '$.a')", TYPE_STRING);
+  TestIsNull("get_json_object('[]', '$[0]')", TYPE_STRING);
+  TestStringValue("get_json_object('[0, 1, null, 2, 3]', '$[*]')", "[0,1,null,2,3]");
+  TestStringValue("get_json_object('[{\"a\": null}, {\"a\": \"NULL\"}]', '$[*].a')",
+      "[null,\"NULL\"]");
+  TestIsNull(
+      "get_json_object('[{\"key\": \"v1\"}, {\"key\": \"v2\"}]', '$[*].key.abc')",
+      TYPE_STRING);
+  TestValue("get_json_object('{\"a\":\"NULL\", \"b\":null}', '$.a') IS NULL",
+      TYPE_BOOLEAN, false);
+  TestValue("get_json_object('{\"a\":\"NULL\", \"b\":null}', '$.b') IS NULL",
+      TYPE_BOOLEAN, true);
+
+  // Test whitespaces
+  TestStringValue("get_json_object('[1,2,3]', '  $[1]')", "2");
+  TestStringValue("get_json_object('[1,2,3]', '$[1]  ')", "2");
+  TestStringValue("get_json_object('[1,2,3]', ' $[ 1]')", "2");
+  TestStringValue("get_json_object('[1,2,3]', '$[  1  ]')", "2");
+  TestStringValue("get_json_object('[1,2,3]', '   $   [  1  ]  ')", "2");
+  TestStringValue("get_json_object('[1,2,3]', '   $   [  *  ]  ')", "[1,2,3]");
+  TestStringValue("get_json_object('{\"abc\":1}', ' $.abc')", "1");
+  TestStringValue("get_json_object('{\"abc\":1}', '$ .abc')", "1");
+  TestStringValue("get_json_object('{\"abc\":1}', '$. abc')", "1");
+  TestStringValue("get_json_object('{\"abc\":1}', '$.abc ')", "1");
+  TestStringValue("get_json_object('{\"abc\":1}', ' $ .abc')", "1");
+  TestStringValue("get_json_object('{\"abc\":1}', ' $ . abc ')", "1");
+  TestStringValue(
+      "get_json_object('{\"key\": 1, \" key\": 2, \" key \": 3}', ' $. key ')", "1");
+  TestStringValue("get_json_object('{\"abc\":[1,2,3]}', ' $ . abc  [  2 ] ')", "3");
+  TestStringValue("get_json_object('{\"a\":1}', '$.*  ')", "1");
+  TestStringValue("get_json_object('{\"a\":1}', '$.  *')", "1");
+  TestStringValue("get_json_object('{\"a\":1}', '$  .*')", "1");
+  TestStringValue("get_json_object('{\"a\":1}', '  $.*')", "1");
+  TestStringValue("get_json_object('{\"a\":1}', ' $ . * ')", "1");
+
+  // Test errors
+  TestErrorString("get_json_object('[1,2]', '$[-2]')",
+      "Failed to parse json path '$[-2]': Negative index at position 2\n");
+  TestErrorString("get_json_object('[1,2]', '$[999999999999999]')",
+      "Failed to parse json path '$[999999999999999]': Index too large at position 2\n");
+  TestErrorString("get_json_object('[1,2]', '$[0.1]')",
+      "Failed to parse json path '$[0.1]': Expected number at position 2\n");
+  TestErrorString("get_json_object('[1,2]', '$[]')",
+      "Failed to parse json path '$[]': Expected number at position 2\n");
+  TestErrorString("get_json_object('[1,2]', '$[  ]')",
+      "Failed to parse json path '$[  ]': Expected number at position 4\n");
+  TestErrorString("get_json_object('[1,2]', '$[a]')",
+      "Failed to parse json path '$[a]': Expected number at position 2\n");
+  TestErrorString("get_json_object('[1,2]', '$[1a]')",
+      "Failed to parse json path '$[1a]': Expected number at position 2\n");
+  TestErrorString("get_json_object('[1,2]', '$[0][a]')",
+      "Failed to parse json path '$[0][a]': Expected number at position 5\n");
+  TestErrorString("get_json_object('[1,2]', '$[*')",
+      "Unclosed brackets in json path '$[*'\n");
+  TestErrorString("get_json_object('{\"key\": 1}', '$.')",
+      "Failed to parse json path '$.': Found a trailing '.'\n");
+  TestErrorString("get_json_object('{\"key\": 1}', '$*')",
+      "Failed to parse json path '$*': Unexpected char '*' at position 1\n");
+  TestErrorString("get_json_object('{\"key\": 1}', '$.*a')",
+      "Failed to parse json path '$.*a': Encountered 'a' in position 3, "
+      "expects ' ', '[' or '.'\n");
+  TestErrorString("get_json_object('{\"key\": 1}', '$.a*')",
+      "Failed to parse json path '$.a*': Unexpected char '*' at position 3\n");
+  TestErrorString("get_json_object('[1,2]', '$[0')",
+      "Unclosed brackets in json path '$[0'\n");
+  TestErrorString("get_json_object('{\"key\": {\"a\": 1}}', '$..a')",
+      "Failed to parse json path '$..a': Expected key at position 2\n");
+  TestErrorString("get_json_object('{\"key\": \"value\"}', '$$')",
+      "Failed to parse json path '$$': $ should only be placed at start\n");
+  TestErrorString("get_json_object('{\"a\": 1}', '$a')",
+      "Failed to parse json path '$a': Unexpected char 'a' at position 1\n");
+  TestErrorString("get_json_object('[{\"a\": 1}]', '$[0]a')",
+      "Failed to parse json path '$[0]a': Unexpected char 'a' at position 4\n");
+  TestErrorString("get_json_object('{\"a\": 1}', 'a')",
+      "Failed to parse json path 'a': Should start with '$'\n");
+  TestErrorString("get_json_object('[1,2,3]', '$[**]')",
+      "Failed to parse json path '$[**]': "
+      "Encountered '*' in position 3, expects ' ' or ']'\n");
+  TestErrorString("get_json_object('[1,2,3]', '')", "Empty json path\n");
+  TestErrorString("get_json_object('[1,2,3]', '   ')",
+      "Failed to parse json path '   ': Should start with '$'\n");
+}
 } // namespace impala
 
 int main(int argc, char** argv) {
@@ -8733,11 +8998,16 @@ int main(int argc, char** argv) {
   FLAGS_abort_on_config_error = false;
   VLOG_CONNECTION << "creating test env";
   VLOG_CONNECTION << "starting backends";
-  InProcessStatestore* ips;
-  ABORT_IF_ERROR(InProcessStatestore::StartWithEphemeralPorts(&ips));
+  statestore = new Statestore(statestore_metrics.get());
+  IGNORE_LEAKING_OBJECT(statestore);
+
+  // Pass in 0 to have the statestore use an ephemeral port for the service.
+  ABORT_IF_ERROR(statestore->Init(0));
   InProcessImpalaServer* impala_server;
   ABORT_IF_ERROR(InProcessImpalaServer::StartWithEphemeralPorts(
-      FLAGS_hostname, ips->port(), &impala_server));
+      FLAGS_hostname, statestore->port(), &impala_server));
+  IGNORE_LEAKING_OBJECT(impala_server);
+
   executor_ = new ImpaladQueryExecutor(FLAGS_hostname, impala_server->GetBeeswaxPort());
   ABORT_IF_ERROR(executor_->Setup());
 

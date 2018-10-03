@@ -22,11 +22,13 @@
 #include "util/mem-info.h"
 #include "util/parse-util.h"
 #include "util/string-parser.h"
+#include "exprs/timezone_db.h"
 #include "gen-cpp/ImpalaInternalService_types.h"
 
 #include <sstream>
 #include <boost/algorithm/string.hpp>
 #include <gutil/strings/substitute.h>
+#include <gutil/strings/strip.h>
 
 #include "common/names.h"
 
@@ -226,25 +228,9 @@ Status impala::SetQueryOption(const string& key, const string& value,
       case TImpalaQueryOptions::NUM_SCANNER_THREADS:
         query_options->__set_num_scanner_threads(atoi(value.c_str()));
         break;
-      case TImpalaQueryOptions::ALLOW_UNSUPPORTED_FORMATS:
-        query_options->__set_allow_unsupported_formats(
-            iequals(value, "true") || iequals(value, "1"));
-        break;
       case TImpalaQueryOptions::DEBUG_ACTION:
         query_options->__set_debug_action(value.c_str());
         break;
-      case TImpalaQueryOptions::SEQ_COMPRESSION_MODE: {
-        if (iequals(value, "block")) {
-          query_options->__set_seq_compression_mode(THdfsSeqCompressionMode::BLOCK);
-        } else if (iequals(value, "record")) {
-          query_options->__set_seq_compression_mode(THdfsSeqCompressionMode::RECORD);
-        } else {
-          stringstream ss;
-          ss << "Invalid sequence file compression mode: " << value;
-          return Status(ss.str());
-        }
-        break;
-      }
       case TImpalaQueryOptions::COMPRESSION_CODEC: {
         if (iequals(value, "none")) {
           query_options->__set_compression_codec(THdfsCompression::NONE);
@@ -688,8 +674,44 @@ Status impala::SetQueryOption(const string& key, const string& value,
           query_options->__set_kudu_read_mode(TKuduReadMode::READ_AT_SNAPSHOT);
         } else {
           return Status(Substitute("Invalid kudu_read_mode '$0'. Valid values are "
-              "DEFAULT, READ_LATEST, and READ_AT_SNAPSHOT.", value));
+                                   "DEFAULT, READ_LATEST, and READ_AT_SNAPSHOT.",
+              value));
         }
+        break;
+      }
+      case TImpalaQueryOptions::ALLOW_ERASURE_CODED_FILES: {
+        query_options->__set_allow_erasure_coded_files(
+            iequals(value, "true") || iequals(value, "1"));
+        break;
+      }
+      case TImpalaQueryOptions::TIMEZONE: {
+        // Leading/trailing " and ' characters are stripped because the / character
+        // cannot be entered unquoted in some contexts.
+        string timezone = value;
+        TrimString(&timezone, "'\"");
+        timezone = timezone.empty() ? TimezoneDatabase::LocalZoneName() : timezone;
+        if (TimezoneDatabase::FindTimezone(timezone) == nullptr) {
+          return Status(Substitute("Invalid timezone name '$0'.", timezone));
+        }
+        query_options->__set_timezone(timezone);
+        break;
+      }
+      case TImpalaQueryOptions::SCAN_BYTES_LIMIT: {
+        int64_t bytes_limit;
+        RETURN_IF_ERROR(ParseMemValue(value, "query scan bytes limit", &bytes_limit));
+        query_options->__set_scan_bytes_limit(bytes_limit);
+        break;
+      }
+      case TImpalaQueryOptions::CPU_LIMIT_S: {
+        StringParser::ParseResult result;
+        const int64_t cpu_limit_s =
+            StringParser::StringToInt<int64_t>(value.c_str(), value.length(), &result);
+        if (result != StringParser::PARSE_SUCCESS || cpu_limit_s < 0) {
+          return Status(
+              Substitute("Invalid CPU limit: '$0'. "
+                         "Only non-negative numbers are allowed.", value));
+        }
+        query_options->__set_cpu_limit_s(cpu_limit_s);
         break;
       }
       default:

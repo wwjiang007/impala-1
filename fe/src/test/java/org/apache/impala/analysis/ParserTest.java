@@ -30,6 +30,7 @@ import org.apache.impala.analysis.TimestampArithmeticExpr.TimeUnit;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FrontendTestBase;
 import org.apache.impala.compat.MetastoreShim;
+import org.apache.impala.thrift.TQueryOptions;
 import org.junit.Test;
 
 import com.google.common.base.Preconditions;
@@ -67,6 +68,7 @@ public class ParserTest extends FrontendTestBase {
   public void ParserError(String stmt, String expectedErrorString) {
     SqlScanner input = new SqlScanner(new StringReader(stmt));
     SqlParser parser = new SqlParser(input);
+    parser.setQueryOptions(new TQueryOptions());
     Object result = null; // Save this object to make debugging easier
     try {
       result = parser.parse().value;
@@ -2906,12 +2908,19 @@ public class ParserTest extends FrontendTestBase {
     ParsesOk("ALTER VIEW Bar AS SELECT a, b, c FROM t");
     ParsesOk("ALTER VIEW Bar AS VALUES(1, 2, 3)");
     ParsesOk("ALTER VIEW Bar AS SELECT 1, 2, 3 UNION ALL select 4, 5, 6");
+    ParsesOk("ALTER VIEW Bar (x, y, z) AS SELECT a, b, c from t");
+    ParsesOk("ALTER VIEW Bar (x, y COMMENT 'foo', z) AS SELECT a, b, c from t");
 
     ParsesOk("ALTER VIEW Foo.Bar AS SELECT 1, 2, 3");
     ParsesOk("ALTER VIEW Foo.Bar AS SELECT a, b, c FROM t");
     ParsesOk("ALTER VIEW Foo.Bar AS VALUES(1, 2, 3)");
     ParsesOk("ALTER VIEW Foo.Bar AS SELECT 1, 2, 3 UNION ALL select 4, 5, 6");
     ParsesOk("ALTER VIEW Foo.Bar AS WITH t AS (SELECT 1, 2, 3) SELECT * FROM t");
+    ParsesOk("ALTER VIEW Foo.Bar (x, y, z) AS SELECT a, b, c from t");
+    ParsesOk("ALTER VIEW Foo.Bar (x, y, z COMMENT 'foo') AS SELECT a, b, c from t");
+
+    // Mismatched number of columns in column definition and view definition parses ok.
+    ParsesOk("ALTER VIEW Bar (x, y) AS SELECT 1, 2, 3");
 
     // Must be ALTER VIEW not ALTER TABLE.
     ParserError("ALTER TABLE Foo.Bar AS SELECT 1, 2, 3");
@@ -2921,6 +2930,14 @@ public class ParserTest extends FrontendTestBase {
     ParserError("ALTER VIEW Foo.Bar SELECT 1, 2, 3");
     // Missing view definition.
     ParserError("ALTER VIEW Foo.Bar AS");
+    // Empty column definition not allowed.
+    ParserError("ALTER VIEW Foo.Bar () AS SELECT c FROM t");
+    // Column definitions cannot include types.
+    ParserError("ALTER VIEW Foo.Bar (x int) AS SELECT c FROM t");
+    ParserError("ALTER VIEW Foo.Bar (x int COMMENT 'x') AS SELECT c FROM t");
+    // A type does not parse as an identifier.
+    ParserError("ALTER VIEW Foo.Bar (int COMMENT 'x') AS SELECT c FROM t");
+
     // Invalid view definitions. A view definition must be a query statement.
     ParserError("ALTER VIEW Foo.Bar AS INSERT INTO t select * from t");
     ParserError("ALTER VIEW Foo.Bar AS UPSERT INTO t select * from t");
@@ -3660,22 +3677,25 @@ public class ParserTest extends FrontendTestBase {
   }
 
   @Test
-  public void TestShowGrantRole() {
-    // Show all grants on a role
-    ParsesOk("SHOW GRANT ROLE foo");
+  public void TestShowGrantPrincipal() {
+    for (String type: new String[]{"ROLE", "USER"}) {
+      // Show all grants on a particular principal type.
+      ParsesOk(String.format("SHOW GRANT %s foo", type));
 
-    // Show grants on a specific object
-    ParsesOk("SHOW GRANT ROLE foo ON SERVER");
-    ParsesOk("SHOW GRANT ROLE foo ON DATABASE foo");
-    ParsesOk("SHOW GRANT ROLE foo ON TABLE foo");
-    ParsesOk("SHOW GRANT ROLE foo ON TABLE foo.bar");
-    ParsesOk("SHOW GRANT ROLE foo ON URI '/abc/123'");
+      // Show grants on a specific object
+      ParsesOk(String.format("SHOW GRANT %s foo ON SERVER", type));
+      ParsesOk(String.format("SHOW GRANT %s foo ON DATABASE foo", type));
+      ParsesOk(String.format("SHOW GRANT %s foo ON TABLE foo", type));
+      ParsesOk(String.format("SHOW GRANT %s foo ON TABLE foo.bar", type));
+      ParsesOk(String.format("SHOW GRANT %s foo ON URI '/abc/123'", type));
 
-    ParserError("SHOW GRANT ROLE");
-    ParserError("SHOW GRANT ROLE foo ON SERVER foo");
-    ParserError("SHOW GRANT ROLE foo ON DATABASE");
-    ParserError("SHOW GRANT ROLE foo ON TABLE");
-    ParserError("SHOW GRANT ROLE foo ON URI abc");
+      ParserError(String.format("SHOW GRANT %s", type));
+      ParserError(String.format("SHOW GRANT %s foo ON SERVER foo", type));
+      ParserError(String.format("SHOW GRANT %s foo ON DATABASE", type));
+      ParserError(String.format("SHOW GRANT %s foo ON TABLE", type));
+      ParserError(String.format("SHOW GRANT %s foo ON URI abc", type));
+    }
+    ParserError("SHOW GRANT FOO bar");
   }
 
   @Test
@@ -3761,6 +3781,15 @@ public class ParserTest extends FrontendTestBase {
 
     ParserError("COMMENT ON VIEW IS 'comment'");
     ParserError("COMMENT ON VIEW tbl IS");
+
+    for (String col : new String[]{"db.tbl.col", "tbl.col"}) {
+      ParsesOk(String.format("COMMENT ON COLUMN %s IS 'comment'", col));
+      ParsesOk(String.format("COMMENT ON COLUMN %s IS ''", col));
+      ParsesOk(String.format("COMMENT ON COLUMN %s IS NULL", col));
+    }
+    ParserError("COMMENT on col IS 'comment'");
+    ParserError("COMMENT on db.tbl.col IS");
+    ParserError("COMMENT on tbl.col IS");
   }
 
   @Test
@@ -3784,5 +3813,66 @@ public class ParserTest extends FrontendTestBase {
     ParserError("ALTER DATABASE db SET OWNER ROLE");
     ParserError("ALTER DATABASE SET OWNER ROLE foo");
     ParserError("ALTER DATABASE SET OWNER");
+  }
+
+  @Test
+  public void TestAlterTableOrViewSetOwner() {
+    for (String type : new String[]{"TABLE", "VIEW"}) {
+      for (String valid : new String[]{"foo", "user", "owner"}) {
+        ParsesOk(String.format("ALTER %s %s SET OWNER USER %s", type, valid, valid));
+        ParsesOk(String.format("ALTER %s %s SET OWNER ROLE %s", type, valid, valid));
+      }
+
+      for (String invalid : new String[]{"'foo'", "''", "NULL"}) {
+        ParserError(String.format("ALTER %s %s SET OWNER ROLE %s", type, invalid, invalid));
+        ParserError(String.format("ALTER %s %s SET OWNER USER %s", type, invalid, invalid));
+      }
+
+      ParserError(String.format("ALTER %s tbl PARTITION(i=1) SET OWNER ROLE foo", type));
+      ParserError(String.format("ALTER %s tbl SET ABC USER foo", type));
+      ParserError(String.format("ALTER %s tbl SET ABC ROLE foo", type));
+      ParserError(String.format("ALTER %s tbl SET OWNER ABC foo", type));
+      ParserError(String.format("ALTER %s tbl SET OWNER USER", type));
+      ParserError(String.format("ALTER %s SET OWNER foo", type));
+      ParserError(String.format("ALTER %s SET OWNER USER foo", type));
+      ParserError(String.format("ALTER %s tbl SET OWNER ROLE", type));
+      ParserError(String.format("ALTER %s SET OWNER ROLE foo", type));
+      ParserError(String.format("ALTER %s SET OWNER", type));
+    }
+  }
+
+  public void TestAdminFns() {
+    // Any combination of whitespace is ok.
+    ParsesOk(":foobar()");
+    ParsesOk(": foobar()");
+    ParsesOk(":\tfoobar()");
+    ParsesOk("   :\tfoobar()");
+    ParsesOk("\n:foobar()");
+    ParsesOk("\n:foobar(123)");
+    ParsesOk("\n:foobar(123, 456)");
+    ParsesOk("\n:foobar('foo', 'bar')");
+    ParsesOk("\n:foobar('foo', 'bar', 1, -1, 1234, 99, false)");
+
+    // Any identifier is supported.
+    ParsesOk(": 1a()");
+
+    // Must be prefixed with colon.
+    ParserError("foobar()");
+    ParserError("  foobar()");
+
+    // Non-identifiers not supported.
+    ParserError(": 1()");
+    ParserError(": 'string'()");
+    ParserError(": a.b()");
+
+    // Must be single function with parens. Cannot have multiple statements.
+    ParserError(": shutdown");
+    ParserError(": shutdown foo");
+    ParserError(": shutdown() other()");
+    ParserError(": shutdown(); other()");
+    ParserError(": shutdown(), other()");
+    ParserError(": shutdown() :other()");
+    ParserError(": shutdown() :other()");
+    ParserError(": shutdown('hostA'); :shutdown('hostB');");
   }
 }

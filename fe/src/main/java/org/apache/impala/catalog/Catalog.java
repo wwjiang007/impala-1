@@ -30,6 +30,7 @@ import org.apache.impala.thrift.TFunction;
 import org.apache.impala.thrift.TPartitionKeyValue;
 import org.apache.impala.thrift.TTable;
 import org.apache.impala.thrift.TTableName;
+import org.apache.impala.thrift.TUniqueId;
 import org.apache.impala.util.PatternMatcher;
 
 import com.google.common.base.Joiner;
@@ -55,8 +56,9 @@ import com.google.common.collect.Lists;
  * Builtins are populated on startup in initBuiltins().
  */
 public abstract class Catalog {
-  // Initial catalog version.
+  // Initial catalog version and ID.
   public final static long INITIAL_CATALOG_VERSION = 0L;
+  public static final TUniqueId INITIAL_CATALOG_SERVICE_ID = new TUniqueId(0L, 0L);
   public static final String DEFAULT_DB = "default";
 
   protected final MetaStoreClientPool metaStoreClientPool_ =
@@ -496,34 +498,39 @@ public abstract class Catalog {
         result.setCache_pool(pool.toThrift());
         break;
       }
-      case ROLE:
-        Role role = authPolicy_.getRole(objectDesc.getRole().getRole_name());
-        if (role == null) {
-          throw new CatalogException("Role not found: " +
-              objectDesc.getRole().getRole_name());
+      case PRINCIPAL:
+        Principal principal = authPolicy_.getPrincipal(
+            objectDesc.getPrincipal().getPrincipal_name(),
+            objectDesc.getPrincipal().getPrincipal_type());
+        if (principal == null) {
+          throw new CatalogException("Principal not found: " +
+              objectDesc.getPrincipal().getPrincipal_name());
         }
-        result.setType(role.getCatalogObjectType());
-        result.setCatalog_version(role.getCatalogVersion());
-        result.setRole(role.toThrift());
+        result.setType(principal.getCatalogObjectType());
+        result.setCatalog_version(principal.getCatalogVersion());
+        result.setPrincipal(principal.toThrift());
         break;
       case PRIVILEGE:
-        Role tmpRole = authPolicy_.getRole(objectDesc.getPrivilege().getRole_id());
-        if (tmpRole == null) {
-          throw new CatalogException("No role associated with ID: " +
-              objectDesc.getPrivilege().getRole_id());
+        Principal tmpPrincipal = authPolicy_.getPrincipal(
+            objectDesc.getPrincipal().getPrincipal_id(),
+            objectDesc.getPrincipal().getPrincipal_type());
+        if (tmpPrincipal == null) {
+          throw new CatalogException(String.format("No %s associated with ID: %d",
+              Principal.toString(objectDesc.getPrincipal().getPrincipal_type())
+                  .toLowerCase(), objectDesc.getPrivilege().getPrincipal_id()));
         }
-        for (RolePrivilege p: tmpRole.getPrivileges()) {
-          if (p.getName().equalsIgnoreCase(
-              objectDesc.getPrivilege().getPrivilege_name())) {
-            result.setType(p.getCatalogObjectType());
-            result.setCatalog_version(p.getCatalogVersion());
-            result.setPrivilege(p.toThrift());
-            return result;
-          }
+        String privilegeName = PrincipalPrivilege.buildPrivilegeName(
+            objectDesc.getPrivilege());
+        PrincipalPrivilege privilege = tmpPrincipal.getPrivilege(privilegeName);
+        if (privilege != null) {
+          result.setType(privilege.getCatalogObjectType());
+          result.setCatalog_version(privilege.getCatalogVersion());
+          result.setPrivilege(privilege.toThrift());
+          return result;
         }
-        throw new CatalogException(String.format("Role '%s' does not contain " +
-            "privilege: '%s'", tmpRole.getName(),
-            objectDesc.getPrivilege().getPrivilege_name()));
+        throw new CatalogException(String.format("%s '%s' does not contain " +
+            "privilege: '%s'", Principal.toString(tmpPrincipal.getPrincipalType()),
+            tmpPrincipal.getName(), privilegeName));
       default: throw new IllegalStateException(
           "Unexpected TCatalogObject type: " + objectDesc.getType());
     }
@@ -550,12 +557,15 @@ public abstract class Catalog {
       case FUNCTION:
         return "FUNCTION:" + catalogObject.getFn().getName() + "(" +
             catalogObject.getFn().getSignature() + ")";
-      case ROLE:
-        return "ROLE:" + catalogObject.getRole().getRole_name().toLowerCase();
+      case PRINCIPAL:
+        return "PRINCIPAL:" + catalogObject.getPrincipal().getPrincipal_name()
+            .toLowerCase();
       case PRIVILEGE:
+        // The combination of privilege name + principal ID is guaranteed to be unique.
         return "PRIVILEGE:" +
-            catalogObject.getPrivilege().getPrivilege_name().toLowerCase() + "." +
-            Integer.toString(catalogObject.getPrivilege().getRole_id());
+            PrincipalPrivilege.buildPrivilegeName(catalogObject.getPrivilege())
+                .toLowerCase() + "." +
+            Integer.toString(catalogObject.getPrivilege().getPrincipal_id());
       case HDFS_CACHE_POOL:
         return "HDFS_CACHE_POOL:" +
             catalogObject.getCache_pool().getPool_name().toLowerCase();

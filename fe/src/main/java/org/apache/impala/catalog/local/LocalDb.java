@@ -17,22 +17,35 @@
 
 package org.apache.impala.catalog.local;
 
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
 import org.apache.hadoop.hive.metastore.api.Database;
+import org.apache.hadoop.hive.metastore.api.Table;
+import org.apache.impala.analysis.ColumnDef;
+import org.apache.impala.analysis.KuduPartitionParam;
+import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.FeDb;
+import org.apache.impala.catalog.FeFsTable;
+import org.apache.impala.catalog.FeKuduTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.Function.CompareMode;
 import org.apache.impala.thrift.TDatabase;
 import org.apache.impala.thrift.TFunctionCategory;
+import org.apache.impala.util.FunctionUtils;
 import org.apache.impala.util.PatternMatcher;
 import org.apache.thrift.TException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+
 
 /**
  * Database instance loaded from {@link LocalCatalog}.
@@ -41,6 +54,8 @@ import com.google.common.collect.Maps;
  * each catalog instance.
  */
 class LocalDb implements FeDb {
+  private static final Logger LOG = LoggerFactory.getLogger(LocalDb.class);
+
   private final LocalCatalog catalog_;
   /** The lower-case name of the database. */
   private final String name_;
@@ -51,6 +66,11 @@ class LocalDb implements FeDb {
    * null for tables which have not yet been loaded.
    */
   private Map<String, LocalTable> tables_;
+
+  /**
+   * Map of function name to list of signatures for that function name.
+   */
+  private Map<String, List<Function>> functions_;
 
   public LocalDb(LocalCatalog catalog, String dbName) {
     Preconditions.checkNotNull(catalog);
@@ -87,7 +107,7 @@ class LocalDb implements FeDb {
   @Override
   public FeTable getTable(String tblName) {
     Preconditions.checkNotNull(tblName);
-    Preconditions.checkArgument(tblName.toLowerCase().equals(tblName));
+    tblName = tblName.toLowerCase();
     loadTableNames();
     if (!tables_.containsKey(tblName)) {
       // Table doesn't exist.
@@ -100,6 +120,19 @@ class LocalDb implements FeDb {
       tables_.put(tblName, tbl);
     }
     return tbl;
+  }
+
+  @Override
+  public FeKuduTable createKuduCtasTarget(Table msTbl, List<ColumnDef> columnDefs,
+      List<ColumnDef> primaryKeyColumnDefs,
+      List<KuduPartitionParam> kuduPartitionParams) {
+    return LocalKuduTable.createCtasTarget(this, msTbl, columnDefs, primaryKeyColumnDefs,
+        kuduPartitionParams);
+  }
+
+  @Override
+  public FeFsTable createFsCtasTarget(Table msTbl) throws CatalogException {
+    return LocalFsTable.createCtasTarget(this, msTbl);
   }
 
   @Override
@@ -136,34 +169,98 @@ class LocalDb implements FeDb {
 
   @Override
   public Function getFunction(Function desc, CompareMode mode) {
-    throw new UnsupportedOperationException("TODO");
+    loadFunction(desc.functionName());
+    List<Function> funcs = functions_.get(desc.functionName());
+    if (funcs == null) return null;
+    return FunctionUtils.resolveFunction(funcs, desc, mode);
+  }
+
+  /**
+   * Populate the 'functions_' map with the correct set of keys corresponding to
+   * the functions in this database. The values will be 'null' to indicate that the
+   * functions themselves have not yet been loaded.
+   */
+  private void loadFunctionNames() {
+    if (functions_ != null) return;
+
+    List<String> funcNames;
+    try {
+      funcNames = catalog_.getMetaProvider().loadFunctionNames(name_);
+    } catch (TException e) {
+      throw new LocalCatalogException(String.format(
+          "Could not load function names for database '%s'", name_), e);
+    }
+
+    functions_ = Maps.newHashMapWithExpectedSize(funcNames.size());
+    for (String fn : funcNames) functions_.put(fn, null);
+  }
+
+  /**
+   * Ensure that the given function has been fully loaded.
+   * If this function does not exist, this is a no-op.
+   */
+  private void loadFunction(String functionName) {
+    loadFunctionNames();
+
+
+    // If the function isn't in the map at all, then the function doesn't exist.
+    if (!functions_.containsKey(functionName)) return;
+    List<Function> overloads = functions_.get(functionName);
+
+    // If it's in the map, it might have a null value, or it might already be loaded.
+    // If it's already loaded, we're done.
+    if (overloads != null) return;
+
+
+    try {
+      overloads = catalog_.getMetaProvider().loadFunction(name_, functionName);
+    } catch (TException e) {
+      throw new LocalCatalogException(String.format("Could not load function '%s.%s'",
+          name_, functionName), e);
+    }
+    functions_.put(functionName,  overloads);
   }
 
   @Override
   public List<Function> getFunctions(String functionName) {
-    throw new UnsupportedOperationException("TODO");
+    loadFunction(functionName);
+    List<Function> funcs = functions_.get(functionName);
+    if (funcs == null) return Collections.emptyList();
+    return FunctionUtils.getVisibleFunctions(funcs);
   }
 
   @Override
   public List<Function> getFunctions(
-      TFunctionCategory category, String function) {
-    throw new UnsupportedOperationException("TODO");
+      TFunctionCategory category, String functionName) {
+    loadFunction(functionName);
+    List<Function> funcs = functions_.get(functionName);
+    if (funcs == null) return Collections.emptyList();
+    return FunctionUtils.getVisibleFunctionsInCategory(funcs, category);
   }
 
   @Override
   public List<Function> getFunctions(
-      TFunctionCategory category, PatternMatcher patternMatcher) {
-    throw new UnsupportedOperationException("TODO");
+      TFunctionCategory category, PatternMatcher matcher) {
+    loadFunctionNames();
+    List<Function> result = Lists.newArrayList();
+    Iterable<String> fnNames = Iterables.filter(functions_.keySet(), matcher);
+    for (String fnName : fnNames) {
+      result.addAll(getFunctions(category, fnName));
+    }
+    return result;
   }
 
   @Override
   public int numFunctions() {
-    throw new UnsupportedOperationException("TODO");
+    loadFunctionNames();
+    return functions_.size();
   }
 
   @Override
   public boolean containsFunction(String function) {
-    throw new UnsupportedOperationException("TODO");
+    loadFunctionNames();
+    // TODO(todd): does this need to be lower-cased here?
+    return functions_.containsKey(function);
   }
 
   @Override

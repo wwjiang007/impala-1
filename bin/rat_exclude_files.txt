@@ -5,11 +5,13 @@
 # in either its literal elements or its structure is not protected by copyright law;
 # therefore, such a file does not require a license header."
 .clang-format
+.gitattributes
 .gitignore
 */.gitignore
 */rat_exclude_files.txt
 be/src/testutil/htpasswd
 be/src/testutil/*.key
+bin/generate_junitxml.py
 tests/*/__init__.py
 testdata/common/__init__.py
 fe/src/test/resources/regionservers
@@ -19,6 +21,8 @@ testdata/__init__.py
 tests/__init__.py
 bin/diagnostics/__init__.py
 www/index.html
+lib/python/impala_py_lib/__init__.py
+lib/python/impala_py_lib/jenkins/__init__.py
 
 # See $IMPALA_HOME/LICENSE.txt
 be/src/gutil/*
@@ -40,6 +44,8 @@ www/d3.v3.min.js
 www/jquery/jquery-1.12.4.min.js
 tests/comparison/leopard/static/css/hljs.css
 tests/comparison/leopard/static/js/highlight.pack.js
+common/protobuf/kudu
+be/src/kudu/util/array_view.h
 be/src/kudu/util/cache-test.cc
 be/src/kudu/util/cache.cc
 be/src/kudu/util/cache.h
@@ -82,6 +88,8 @@ tests/comparison/POSTGRES.txt
 docs/README.md
 docker/README.md
 be/src/thirdparty/pcg-cpp-0.98/README.md
+lib/python/README.md
+lib/python/impala_py_lib/gdb/README.md
 
 # http://www.apache.org/legal/src-headers.html: "Test data for which the addition of a
 # source header would cause the tests to fail."

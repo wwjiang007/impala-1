@@ -25,9 +25,11 @@
 #include <boost/thread.hpp>
 #include <thrift/Thrift.h>
 #include <gutil/strings/substitute.h>
+#include <gutil/strings/util.h>
 
 #include "common/status.h"
 #include "gen-cpp/StatestoreService_types.h"
+#include "rpc/rpc-trace.h"
 #include "rpc/thrift-util.h"
 #include "statestore/failure-detector.h"
 #include "statestore/statestore-subscriber-client-wrapper.h"
@@ -73,6 +75,8 @@ DEFINE_int32(statestore_num_heartbeat_threads, 10, "(Advanced) Number of threads
     " send heartbeats in parallel to all registered subscribers.");
 DEFINE_int32(statestore_heartbeat_frequency_ms, 1000, "(Advanced) Frequency (in ms) with"
     " which the statestore sends heartbeat heartbeats to subscribers.");
+DEFINE_double_hidden(heartbeat_monitoring_frequency_ms, 60000, "(Advanced) Frequency (in "
+    "ms) with which the statestore monitors heartbeats from a subscriber.");
 
 DEFINE_int32(state_store_port, 24000, "port where StatestoreService is running");
 
@@ -97,6 +101,12 @@ DEFINE_int32(statestore_update_tcp_timeout_seconds, 300, "(Advanced) The time af
     "which an update RPC to a subscriber will timeout. This setting protects against "
     "badly hung machines that are not able to respond to the update RPC in short "
     "order.");
+
+DECLARE_string(ssl_server_certificate);
+DECLARE_string(ssl_private_key);
+DECLARE_string(ssl_private_key_password_cmd);
+DECLARE_string(ssl_cipher_list);
+DECLARE_string(ssl_minimum_version);
 
 // Metric keys
 // TODO: Replace 'backend' with 'subscriber' when we can coordinate a change with CM
@@ -225,7 +235,8 @@ void Statestore::Topic::ClearAllEntries() {
 }
 
 void Statestore::Topic::BuildDelta(const SubscriberId& subscriber_id,
-    TopicEntry::Version last_processed_version, TTopicDelta* delta) {
+    TopicEntry::Version last_processed_version,
+    const string& filter_prefix, TTopicDelta* delta) {
   // If the subscriber version is > 0, send this update as a delta. Otherwise, this is
   // a new subscriber so send them a non-delta update that includes all entries in the
   // topic.
@@ -246,6 +257,9 @@ void Statestore::Topic::BuildDelta(const SubscriberId& subscriber_id,
       if (!delta->is_delta && topic_entry.is_deleted()) {
         continue;
       }
+      // Skip any entries that don't match the requested prefix.
+      if (!HasPrefixString(itr->first, filter_prefix)) continue;
+
       delta->topic_entries.push_back(TTopicItem());
       TTopicItem& delta_entry = delta->topic_entries.back();
       delta_entry.key = itr->first;
@@ -303,11 +317,13 @@ Statestore::Subscriber::Subscriber(const SubscriberId& subscriber_id,
   : subscriber_id_(subscriber_id),
     registration_id_(registration_id),
     network_address_(network_address) {
+  RefreshLastHeartbeatTimestamp();
   for (const TTopicRegistration& topic : subscribed_topics) {
     GetTopicsMapForId(topic.topic_name)
         ->emplace(piecewise_construct, forward_as_tuple(topic.topic_name),
             forward_as_tuple(
-                topic.is_transient, topic.populate_min_subscriber_topic_version));
+                topic.is_transient, topic.populate_min_subscriber_topic_version,
+                topic.filter_prefix));
   }
 }
 
@@ -375,6 +391,11 @@ void Statestore::Subscriber::SetLastTopicVersionProcessed(const TopicId& topic_i
   topic_it->second.last_version.Store(version);
 }
 
+void Statestore::Subscriber::RefreshLastHeartbeatTimestamp() {
+  DCHECK_GE(MonotonicMillis(), last_heartbeat_ts_.Load());
+  last_heartbeat_ts_.Store(MonotonicMillis());
+}
+
 Statestore::Statestore(MetricGroup* metrics)
   : subscriber_topic_update_threadpool_("statestore-update",
         "subscriber-update-worker",
@@ -406,8 +427,8 @@ Statestore::Statestore(MetricGroup* metrics)
     failure_detector_(new MissedHeartbeatFailureDetector(
         FLAGS_statestore_max_missed_heartbeats,
         FLAGS_statestore_max_missed_heartbeats / 2)) {
-
   DCHECK(metrics != NULL);
+  metrics_ = metrics;
   num_subscribers_metric_ = metrics->AddGauge(STATESTORE_LIVE_SUBSCRIBERS, 0);
   subscriber_set_metric_ = SetMetric<string>::CreateAndRegister(metrics,
       STATESTORE_LIVE_SUBSCRIBERS_LIST, set<string>());
@@ -426,10 +447,38 @@ Statestore::Statestore(MetricGroup* metrics)
   heartbeat_client_cache_->InitMetrics(metrics, "subscriber-heartbeat");
 }
 
-Status Statestore::Init() {
+Statestore::~Statestore() {
+  CHECK(initialized_) << "Cannot shutdown Statestore once initialized.";
+}
+
+Status Statestore::Init(int32_t state_store_port) {
+  boost::shared_ptr<TProcessor> processor(new StatestoreServiceProcessor(thrift_iface()));
+  boost::shared_ptr<TProcessorEventHandler> event_handler(
+      new RpcEventHandler("statestore", metrics_));
+  processor->setEventHandler(event_handler);
+  ThriftServerBuilder builder("StatestoreService", processor, state_store_port);
+  if (IsInternalTlsConfigured()) {
+    SSLProtocol ssl_version;
+    RETURN_IF_ERROR(
+        SSLProtoVersions::StringToProtocol(FLAGS_ssl_minimum_version, &ssl_version));
+    LOG(INFO) << "Enabling SSL for Statestore";
+    builder.ssl(FLAGS_ssl_server_certificate, FLAGS_ssl_private_key)
+        .pem_password_cmd(FLAGS_ssl_private_key_password_cmd)
+        .ssl_version(ssl_version)
+        .cipher_list(FLAGS_ssl_cipher_list);
+  }
+  ThriftServer* server;
+  RETURN_IF_ERROR(builder.metrics(metrics_).Build(&server));
+  thrift_server_.reset(server);
+  RETURN_IF_ERROR(thrift_server_->Start());
+
   RETURN_IF_ERROR(subscriber_topic_update_threadpool_.Init());
   RETURN_IF_ERROR(subscriber_priority_topic_update_threadpool_.Init());
   RETURN_IF_ERROR(subscriber_heartbeat_threadpool_.Init());
+  RETURN_IF_ERROR(Thread::Create("statestore-heartbeat", "heartbeat-monitoring-thread",
+      &Statestore::MonitorSubscriberHeartbeat, this, &heartbeat_monitoring_thread_));
+  initialized_ = true;
+
   return Status::OK();
 }
 
@@ -500,6 +549,12 @@ void Statestore::SubscribersHandler(const Webserver::ArgumentMap& args,
     Value registration_id(PrintId(subscriber.second->registration_id()).c_str(),
         document->GetAllocator());
     sub_json.AddMember("registration_id", registration_id, document->GetAllocator());
+
+    Value secs_since_heartbeat(
+        StringPrintf("%.3f", subscriber.second->SecondsSinceHeartbeat()).c_str(),
+        document->GetAllocator());
+    sub_json.AddMember(
+        "secs_since_heartbeat", secs_since_heartbeat, document->GetAllocator());
 
     subscribers.PushBack(sub_json, document->GetAllocator());
   }
@@ -723,7 +778,8 @@ void Statestore::GatherTopicUpdates(const Subscriber& subscriber, UpdateKind upd
       TTopicDelta& topic_delta =
           update_state_request->topic_deltas[subscribed_topic.first];
       topic_delta.topic_name = subscribed_topic.first;
-      topic_it->second.BuildDelta(subscriber.id(), last_processed_version, &topic_delta);
+      topic_it->second.BuildDelta(subscriber.id(), last_processed_version,
+          subscribed_topic.second.filter_prefix, &topic_delta);
       if (subscribed_topic.second.populate_min_subscriber_topic_version) {
         deltas_needing_min_version.push_back(&topic_delta);
       }
@@ -862,7 +918,9 @@ void Statestore::DoSubscriberUpdate(UpdateKind update_kind, int thread_id,
   Status status;
   if (is_heartbeat) {
     status = SendHeartbeat(subscriber.get());
-    if (status.code() == TErrorCode::RPC_RECV_TIMEOUT) {
+    if (status.ok()) {
+      subscriber->RefreshLastHeartbeatTimestamp();
+    } else if (status.code() == TErrorCode::RPC_RECV_TIMEOUT) {
       // Add details to status to make it more useful, while preserving the stack
       status.AddDetail(Substitute(
           "Subscriber $0 timed-out during heartbeat RPC. Timeout is $1s.",
@@ -928,6 +986,35 @@ void Statestore::DoSubscriberUpdate(UpdateKind update_kind, int thread_id,
                   << " message to subscriber '" << subscriber->id() << "': "
                   << status.GetDetail();
       }
+    }
+  }
+}
+
+[[noreturn]] void Statestore::MonitorSubscriberHeartbeat() {
+  while (1) {
+    int num_subscribers;
+    vector<SubscriberId> inactive_subscribers;
+    SleepForMs(FLAGS_heartbeat_monitoring_frequency_ms);
+    {
+      lock_guard<mutex> l(subscribers_lock_);
+      num_subscribers = subscribers_.size();
+      for (const auto& subscriber : subscribers_) {
+        if (subscriber.second->SecondsSinceHeartbeat()
+            > FLAGS_heartbeat_monitoring_frequency_ms) {
+          inactive_subscribers.push_back(subscriber.second->id());
+        }
+      }
+    }
+    if (inactive_subscribers.empty()) {
+      LOG(INFO) << "All " << num_subscribers
+                << " subscribers successfully heartbeat in the last "
+                << FLAGS_heartbeat_monitoring_frequency_ms << "ms.";
+    } else {
+      int num_active_subscribers = num_subscribers - inactive_subscribers.size();
+      LOG(WARNING) << num_active_subscribers << "/" << num_subscribers
+                   << " subscribers successfully heartbeat in the last "
+                   << FLAGS_heartbeat_monitoring_frequency_ms << "ms."
+                   << " Slow subscribers: " << boost::join(inactive_subscribers, ", ");
     }
   }
 }

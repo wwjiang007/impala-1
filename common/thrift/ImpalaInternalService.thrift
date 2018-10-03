@@ -101,7 +101,6 @@ struct TQueryOptions {
   5: optional i32 num_nodes = NUM_NODES_ALL
   6: optional i64 max_scan_range_length = 0
   7: optional i32 num_scanner_threads = 0
-  9: optional bool allow_unsupported_formats = 0
   11: optional string debug_action = ""
   12: optional i64 mem_limit = 0
   14: optional CatalogObjects.THdfsCompression compression_codec
@@ -132,11 +131,6 @@ struct TQueryOptions {
   // disastrous query plans. Impala will excercise this option if a query
   // has no plan hints, and at least one table is missing relevant stats.
   29: optional bool disable_unsafe_spills = 0
-
-  // Mode for compression; RECORD, or BLOCK
-  // This field only applies for certain file types and is ignored
-  // by all other file types.
-  30: optional CatalogObjects.THdfsSeqCompressionMode seq_compression_mode
 
   // If the number of rows that are processed for a single query is below the
   // threshold, it will be executed on the coordinator only with codegen disabled
@@ -298,6 +292,18 @@ struct TQueryOptions {
 
   // See comment in ImpalaService.thrift.
   68: optional TKuduReadMode kudu_read_mode = TKuduReadMode.DEFAULT;
+
+  // Allow reading of erasure coded files in HDFS.
+  69: optional bool allow_erasure_coded_files = false;
+
+  // See comment in ImpalaService.thrift.
+  70: optional string timezone = ""
+
+  // See comment in ImpalaService.thrift.
+  71: optional i64 scan_bytes_limit = 0;
+
+  // See comment in ImpalaService.thrift.
+  72: optional i64 cpu_limit_s = 0;
 }
 
 // Impala currently has two types of sessions: Beeswax and HiveServer2
@@ -426,6 +432,10 @@ struct TQueryCtx {
   // String containing name of the local timezone.
   // It is guaranteed to be a valid timezone on the coordinator (but not necessarily on
   // the executor, since in theory the executor could have a different timezone db).
+  // TODO(Csaba): adding timezone as a query option made this property redundant. It
+  //   still has an effect if TimezoneDatabase::LocalZoneName() cannot find the
+  //   system's local timezone and falls back to UTC. This logic will be removed in
+  //   IMPALA-7359, which will make this member completely obsolete.
   18: required string local_time_zone
 }
 
@@ -434,11 +444,11 @@ struct TPlanFragmentDestination {
   // the globally unique fragment instance id
   1: required Types.TUniqueId fragment_instance_id
 
-  // IP address + port of the thrift based ImpalaInteralService on the destination
-  2: required Types.TNetworkAddress server
+  // hostname + port of the Thrift based ImpalaInteralService on the destination
+  2: required Types.TNetworkAddress thrift_backend
 
   // IP address + port of the KRPC based ImpalaInternalService on the destination
-  3: optional Types.TNetworkAddress krpc_server
+  3: optional Types.TNetworkAddress krpc_backend
 }
 
 // Context to collect information, which is shared among all instances of that plan
@@ -620,10 +630,12 @@ struct TErrorLogEntry {
 // Represents the states that a fragment instance goes through during its execution. The
 // current state gets sent back to the coordinator and will be presented to users through
 // the debug webpages.
+// The states are listed in order and one state will only strictly be reached after all
+// the previous states.
 enum TFInstanceExecState {
   WAITING_FOR_EXEC,
-  WAITING_FOR_CODEGEN,
   WAITING_FOR_PREPARE,
+  WAITING_FOR_CODEGEN,
   WAITING_FOR_OPEN,
   WAITING_FOR_FIRST_BATCH,
   FIRST_BATCH_PRODUCED,
@@ -703,34 +715,6 @@ struct TCancelQueryFInstancesParams {
 }
 
 struct TCancelQueryFInstancesResult {
-  // required in V1
-  1: optional Status.TStatus status
-}
-
-
-// TransmitData
-
-struct TTransmitDataParams {
-  1: required ImpalaInternalServiceVersion protocol_version
-
-  // required in V1
-  2: optional Types.TUniqueId dest_fragment_instance_id
-
-  // Id of this fragment in its role as a sender.
-  3: optional i32 sender_id
-
-  // required in V1
-  4: optional Types.TPlanNodeId dest_node_id
-
-  // optional in V1
-  5: optional Results.TRowBatch row_batch
-
-  // if set to true, indicates that no more row batches will be sent
-  // for this dest_node_id
-  6: optional bool eos
-}
-
-struct TTransmitDataResult {
   // required in V1
   1: optional Status.TStatus status
 }
@@ -867,6 +851,38 @@ struct TPublishFilterParams {
 struct TPublishFilterResult {
 }
 
+// RemoteShutdown
+
+struct TRemoteShutdownParams {
+  // Deadline for the shutdown. After this deadline expires (starting at the time when
+  // this remote shutdown command is received), the Impala daemon exits immediately
+  // regardless of whether queries are still executing.
+  1: optional i64 deadline_s
+}
+
+// The current status of a shutdown operation.
+struct TShutdownStatus {
+  // Milliseconds remaining in startup grace period. 0 if the period has expired.
+  1: required i64 grace_remaining_ms
+
+  // Milliseconds remaining in shutdown deadline. 0 if the deadline has expired.
+  2: required i64 deadline_remaining_ms
+
+  // Number of fragment instances still executing.
+  3: required i64 finstances_executing
+
+  // Number of client requests still registered with the Impala server that is being shut
+  // down.
+  4: required i64 client_requests_registered
+}
+
+struct TRemoteShutdownResult {
+  // Success or failure of the operation.
+  1: required Status.TStatus status
+
+  // If status is OK, additional info about the shutdown status
+  2: required TShutdownStatus shutdown_status
+}
 
 service ImpalaInternalService {
   // Called by coord to start asynchronous execution of a query's fragment instances in
@@ -884,10 +900,6 @@ service ImpalaInternalService {
   TCancelQueryFInstancesResult CancelQueryFInstances(
       1:TCancelQueryFInstancesParams params);
 
-  // Called by sender to transmit single row batch. Returns error indication
-  // if params.fragmentId or params.destNodeId are unknown or if data couldn't be read.
-  TTransmitDataResult TransmitData(1:TTransmitDataParams params);
-
   // Called by fragment instances that produce local runtime filters to deliver them to
   // the coordinator for aggregation and broadcast.
   TUpdateFilterResult UpdateFilter(1:TUpdateFilterParams params);
@@ -895,4 +907,7 @@ service ImpalaInternalService {
   // Called by the coordinator to deliver global runtime filters to fragments for
   // application at plan nodes.
   TPublishFilterResult PublishFilter(1:TPublishFilterParams params);
+
+  // Called to initiate shutdown of this backend.
+  TRemoteShutdownResult RemoteShutdown(1:TRemoteShutdownParams params);
 }

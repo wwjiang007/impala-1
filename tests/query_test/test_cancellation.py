@@ -47,8 +47,14 @@ CANCEL_DELAY_IN_SECONDS = [0, 0.01, 0.1, 1, 4]
 # Number of times to execute/cancel each query under test
 NUM_CANCELATION_ITERATIONS = 1
 
-# Test cancellation on both running and hung queries
-DEBUG_ACTIONS = [None, 'WAIT']
+# Test cancellation on both running and hung queries. Node ID 0 is the scan node
+WAIT_ACTIONS = [None, '0:GETNEXT:WAIT']
+
+# Verify that failed CancelFInstances() RPCs don't lead to hung queries
+FAIL_RPC_ACTIONS = [None, 'COORD_CANCEL_QUERY_FINSTANCES_RPC:FAIL']
+
+# Test cancelling when there is a resource limit.
+CPU_LIMIT_S = [0, 100000]
 
 # Verify close rpc running concurrently with fetch rpc. The two cases verify:
 # False: close and fetch rpc run concurrently.
@@ -75,11 +81,15 @@ class TestCancellation(ImpalaTestSuite):
     cls.ImpalaTestMatrix.add_dimension(
         ImpalaTestDimension('cancel_delay', *CANCEL_DELAY_IN_SECONDS))
     cls.ImpalaTestMatrix.add_dimension(
-        ImpalaTestDimension('action', *DEBUG_ACTIONS))
+        ImpalaTestDimension('wait_action', *WAIT_ACTIONS))
+    cls.ImpalaTestMatrix.add_dimension(
+        ImpalaTestDimension('fail_rpc_action', *FAIL_RPC_ACTIONS))
     cls.ImpalaTestMatrix.add_dimension(
         ImpalaTestDimension('join_before_close', *JOIN_BEFORE_CLOSE))
     cls.ImpalaTestMatrix.add_dimension(
         ImpalaTestDimension('buffer_pool_limit', 0))
+    cls.ImpalaTestMatrix.add_dimension(
+        ImpalaTestDimension('cpu_limit_s', *CPU_LIMIT_S))
 
     cls.ImpalaTestMatrix.add_constraint(
         lambda v: v.get_value('query_type') != 'CTAS' or (\
@@ -125,13 +135,15 @@ class TestCancellation(ImpalaTestSuite):
             (file_format, query)
 
     join_before_close = vector.get_value('join_before_close')
-    action = vector.get_value('action')
-    # node ID 0 is the scan node
-    debug_action = '0:GETNEXT:' + action if action != None else ''
+    wait_action = vector.get_value('wait_action')
+    fail_rpc_action = vector.get_value('fail_rpc_action')
+
+    debug_action = "|".join(filter(None, [wait_action, fail_rpc_action]))
     vector.get_value('exec_option')['debug_action'] = debug_action
 
     vector.get_value('exec_option')['buffer_pool_limit'] =\
         vector.get_value('buffer_pool_limit')
+    vector.get_value('exec_option')['cpu_limit_s'] = vector.get_value('cpu_limit_s')
 
     # Execute the query multiple times, cancelling it each time.
     for i in xrange(NUM_CANCELATION_ITERATIONS):
@@ -193,7 +205,7 @@ class TestCancellation(ImpalaTestSuite):
 
     # Executing the same query without canceling should work fine. Only do this if the
     # query has a limit or aggregation
-    if action is None and ('count' in query or 'limit' in query):
+    if not debug_action and ('count' in query or 'limit' in query):
       self.execute_query(query, vector.get_value('exec_option'))
 
   def teardown_method(self, method):

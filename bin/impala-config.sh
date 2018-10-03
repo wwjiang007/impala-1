@@ -68,7 +68,7 @@ fi
 # moving to a different build of the toolchain, e.g. when a version is bumped or a
 # compile option is changed. The build id can be found in the output of the toolchain
 # build jobs, it is constructed from the build number and toolchain git hash prefix.
-export IMPALA_TOOLCHAIN_BUILD_ID=107-764a0ddc79
+export IMPALA_TOOLCHAIN_BUILD_ID=185-ec90313c05
 # Versions of toolchain dependencies.
 # -----------------------------------
 export IMPALA_AVRO_VERSION=1.7.4-p4
@@ -93,9 +93,11 @@ export IMPALA_FLATBUFFERS_VERSION=1.6.0
 unset IMPALA_FLATBUFFERS_URL
 export IMPALA_GCC_VERSION=4.9.2
 unset IMPALA_GCC_URL
+export IMPALA_GDB_VERSION=7.9.1
+unset IMPALA_GDB_URL
 export IMPALA_GFLAGS_VERSION=2.2.0-p1
 unset IMPALA_GFLAGS_URL
-export IMPALA_GLOG_VERSION=0.3.4-p2
+export IMPALA_GLOG_VERSION=0.3.4-p3
 unset IMPALA_GLOG_URL
 export IMPALA_GPERFTOOLS_VERSION=2.5
 unset IMPALA_GPERFTOOLS_URL
@@ -103,14 +105,16 @@ export IMPALA_GTEST_VERSION=1.6.0
 unset IMPALA_GTEST_URL
 export IMPALA_LIBEV_VERSION=4.20
 unset IMPALA_LIBEV_URL
-export IMPALA_LLVM_VERSION=5.0.1
+export IMPALA_LIBUNWIND_VERSION=1.3-rc1-p3
+unset IMPALA_LIBUNWIND_URL
+export IMPALA_LLVM_VERSION=5.0.1-p1
 unset IMPALA_LLVM_URL
-export IMPALA_LLVM_ASAN_VERSION=5.0.1
+export IMPALA_LLVM_ASAN_VERSION=5.0.1-p1
 unset IMPALA_LLVM_ASAN_URL
 
 # Debug builds should use the release+asserts build to get additional coverage.
 # Don't use the LLVM debug build because the binaries are too large to distribute.
-export IMPALA_LLVM_DEBUG_VERSION=5.0.1-asserts
+export IMPALA_LLVM_DEBUG_VERSION=5.0.1-asserts-p1
 unset IMPALA_LLVM_DEBUG_URL
 export IMPALA_LZ4_VERSION=1.7.5
 unset IMPALA_LZ4_URL
@@ -120,11 +124,11 @@ export IMPALA_OPENSSL_VERSION=1.0.2l
 unset IMPALA_OPENSSL_URL
 export IMPALA_ORC_VERSION=1.4.3-p2
 unset IMPALA_ORC_URL
-export IMPALA_PROTOBUF_VERSION=2.6.1
+export IMPALA_PROTOBUF_VERSION=3.5.1
 unset IMPALA_PROTOBUF_URL
 export IMPALA_POSTGRES_JDBC_DRIVER_VERSION=9.0-801
 unset IMPALA_POSTGRES_JDBC_DRIVER_URL
-export IMPALA_RAPIDJSON_VERSION=0.11
+export IMPALA_RAPIDJSON_VERSION=1.1.0
 unset IMPALA_RAPIDJSON_URL
 export IMPALA_RE2_VERSION=20130115-p1
 unset IMPALA_RE2_URL
@@ -151,75 +155,27 @@ if [[ $OSTYPE == "darwin"* ]]; then
   unset IMPALA_OPENSSL_URL
 fi
 
-# Kudu version in the toolchain; provides libkudu_client.so and minicluster binaries.
-export IMPALA_KUDU_VERSION=a954418
-unset IMPALA_KUDU_URL
-
-
-# Versions of Hadoop ecosystem dependencies.
-# ------------------------------------------
-# IMPALA_MINICLUSTER_PROFILE can have two values:
-# 2 represents:
-#    Hadoop 2.6
-#    HBase 1.2
-#    Hive 1.1
-#    Sentry 1.5
-#    Parquet 1.5
-#    Llama (used for Mini KDC) 1.0
-# 3 represents:
-#    Hadoop 3.0
-#    HBase 2.0
-#    Hive 2.1
-#    Sentry 2.0
-#    Parquet 1.9
-#
-# Impala 3.x defaults to profile 3 and marks profile 2 deprecated,
-# so that it may be removed in the 3.x line.
-
-DEFAULT_MINICLUSTER_PROFILE=3
-: ${IMPALA_MINICLUSTER_PROFILE_OVERRIDE:=$DEFAULT_MINICLUSTER_PROFILE}
-
 : ${CDH_DOWNLOAD_HOST:=native-toolchain.s3.amazonaws.com}
 export CDH_DOWNLOAD_HOST
+export CDH_MAJOR_VERSION=6
+export CDH_BUILD_NUMBER=559250
+export IMPALA_HADOOP_VERSION=3.0.0-cdh6.x-SNAPSHOT
+export IMPALA_HBASE_VERSION=2.1.0-cdh6.x-SNAPSHOT
+export IMPALA_HIVE_VERSION=2.1.1-cdh6.x-SNAPSHOT
+export IMPALA_SENTRY_VERSION=2.0.0-cdh6.x-SNAPSHOT
+export IMPALA_PARQUET_VERSION=1.9.0-cdh6.x-SNAPSHOT
+export IMPALA_AVRO_JAVA_VERSION=1.8.2-cdh6.x-SNAPSHOT
+export IMPALA_LLAMA_MINIKDC_VERSION=1.0.0
+export IMPALA_KITE_VERSION=1.0.0-cdh6.x-SNAPSHOT
+export KUDU_JAVA_VERSION=1.8.0-cdh6.x-SNAPSHOT
 
-if [[ $IMPALA_MINICLUSTER_PROFILE_OVERRIDE == 2 ]]; then
-  echo "IMPALA_MINICLUSTER_PROFILE=2 is deprecated and may be removed in Impala 3.x"
-
-  export IMPALA_MINICLUSTER_PROFILE=2
-  export CDH_MAJOR_VERSION=5
-  export CDH_BUILD_NUMBER=44
-  export IMPALA_HADOOP_VERSION=2.6.0-cdh5.16.0-SNAPSHOT
-  export IMPALA_HBASE_VERSION=1.2.0-cdh5.16.0-SNAPSHOT
-  export IMPALA_HIVE_VERSION=1.1.0-cdh5.16.0-SNAPSHOT
-  export IMPALA_SENTRY_VERSION=1.5.1-cdh5.16.0-SNAPSHOT
-  export IMPALA_PARQUET_VERSION=1.5.0-cdh5.16.0-SNAPSHOT
-  export IMPALA_LLAMA_MINIKDC_VERSION=1.0.0
-  export IMPALA_KITE_VERSION=1.0.0-cdh5.16.0-SNAPSHOT
-  # Kudu version used to identify Java client jar from maven
-  export KUDU_JAVA_VERSION=1.8.0-cdh5.16.0-SNAPSHOT
-  # IMPALA-6972: Temporarily disable Hive parallelism during dataload
-  # The Hive version used for IMPALA_MINICLUSTER_PROFIILE=2 has a concurrency issue
-  # that intermittent fails parallel dataload.
-  export IMPALA_SERIAL_DATALOAD=1
-
-elif [[ $IMPALA_MINICLUSTER_PROFILE_OVERRIDE == 3 ]]; then
-  export IMPALA_MINICLUSTER_PROFILE=3
-  export CDH_MAJOR_VERSION=6
-  export CDH_BUILD_NUMBER=422770
-  export IMPALA_HADOOP_VERSION=3.0.0-cdh6.x-SNAPSHOT
-  export IMPALA_HBASE_VERSION=2.0.0-cdh6.x-SNAPSHOT
-  export IMPALA_HIVE_VERSION=2.1.1-cdh6.x-SNAPSHOT
-  export IMPALA_SENTRY_VERSION=2.0.0-cdh6.x-SNAPSHOT
-  export IMPALA_PARQUET_VERSION=1.9.0-cdh6.x-SNAPSHOT
-  export IMPALA_AVRO_JAVA_VERSION=1.8.2-cdh6.x-SNAPSHOT
-  export IMPALA_LLAMA_MINIKDC_VERSION=1.0.0
-  export IMPALA_KITE_VERSION=1.0.0-cdh6.x-SNAPSHOT
-  export KUDU_JAVA_VERSION=1.8.0-cdh6.x-SNAPSHOT
-fi
-
+# When IMPALA_(CDH_COMPONENT)_URL are overridden, they may contain '$(platform_label)'
+# which will be substituted for the CDH platform label in bootstrap_toolchain.py
 unset IMPALA_HADOOP_URL
 unset IMPALA_HBASE_URL
 unset IMPALA_HIVE_URL
+unset IMPALA_KUDU_URL
+unset IMPALA_KUDU_VERSION
 unset IMPALA_SENTRY_URL
 unset IMPALA_LLAMA_MINIKDC_URL
 
@@ -296,59 +252,6 @@ export DOWNLOAD_CDH_COMPONENTS=${DOWNLOAD_CDH_COMPONENTS-"$NO_THIRDPARTY"}
 
 export IS_OSX="$(if [[ "$OSTYPE" == "darwin"* ]]; then echo true; else echo false; fi)"
 
-# To use a local build of Kudu, set KUDU_BUILD_DIR to the path Kudu was built in and
-# set KUDU_CLIENT_DIR to the path KUDU was installed in.
-# Example:
-#   git clone https://github.com/cloudera/kudu.git
-#   ...build 3rd party etc...
-#   mkdir -p $KUDU_BUILD_DIR
-#   cd $KUDU_BUILD_DIR
-#   cmake <path to Kudu source dir>
-#   make
-#   DESTDIR=$KUDU_CLIENT_DIR make install
-export KUDU_BUILD_DIR=${KUDU_BUILD_DIR-}
-export KUDU_CLIENT_DIR=${KUDU_CLIENT_DIR-}
-if [[ -n "$KUDU_BUILD_DIR" && -z "$KUDU_CLIENT_DIR" ]]; then
-  echo When KUDU_BUILD_DIR is set KUDU_CLIENT_DIR must also be set. 1>&2
-  return 1
-fi
-if [[ -z "$KUDU_BUILD_DIR" && -n "$KUDU_CLIENT_DIR" ]]; then
-  echo When KUDU_CLIENT_DIR is set KUDU_BUILD_DIR must also be set. 1>&2
-  return 1
-fi
-
-# Only applies when using Kudu from the toolchain
-export USE_KUDU_DEBUG_BUILD=${USE_KUDU_DEBUG_BUILD-false}
-
-# Kudu doesn't compile on some old Linux distros. KUDU_IS_SUPPORTED enables building Kudu
-# into the backend. The frontend build is OS independent since it is Java.
-if [[ -z "${KUDU_IS_SUPPORTED-}" ]]; then
-  if [[ -n "$KUDU_BUILD_DIR" ]]; then
-    KUDU_IS_SUPPORTED=true
-  else
-    KUDU_IS_SUPPORTED=false
-    if ! $IS_OSX; then
-      if ! which lsb_release &>/dev/null; then
-        echo Unable to find the 'lsb_release' command. \
-            Please ensure it is available in your PATH. 1>&2
-        return 1
-      fi
-      DISTRO_VERSION="$(lsb_release -sir 2>&1)"
-      if [[ $? -ne 0 ]]; then
-        echo lsb_release command failed, output was: "$DISTRO_VERSION" 1>&2
-        return 1
-      fi
-      # Remove spaces, trim minor versions, and convert to lowercase.
-      DISTRO_VERSION="$(tr -d ' \n' <<< "$DISTRO_VERSION" | cut -d. -f1 | tr "A-Z" "a-z")"
-      case "$DISTRO_VERSION" in
-        centos6 | centos7 | debian7 | debian8 | suselinux12 | suse12 | ubuntu* )
-            KUDU_IS_SUPPORTED=true;;
-      esac
-    fi
-  fi
-fi
-export KUDU_IS_SUPPORTED
-
 export HADOOP_LZO="${HADOOP_LZO-$IMPALA_HOME/../hadoop-lzo}"
 export IMPALA_LZO="${IMPALA_LZO-$IMPALA_HOME/../Impala-lzo}"
 export IMPALA_AUX_TEST_HOME="${IMPALA_AUX_TEST_HOME-$IMPALA_HOME/../Impala-auxiliary-tests}"
@@ -365,7 +268,9 @@ export ISILON_NAMENODE="${ISILON_NAMENODE-}"
 export DEFAULT_FS="${DEFAULT_FS-hdfs://localhost:20500}"
 export WAREHOUSE_LOCATION_PREFIX="${WAREHOUSE_LOCATION_PREFIX-}"
 export LOCAL_FS="file:${WAREHOUSE_LOCATION_PREFIX}"
-export METASTORE_DB="hive_impala"
+ESCAPED_IMPALA_HOME=$(sed "s/[^0-9a-zA-Z]/_/g" <<< "$IMPALA_HOME")
+export METASTORE_DB=${METASTORE_DB-$(cut -c-63 <<< HMS$ESCAPED_IMPALA_HOME)}
+export SENTRY_POLICY_DB=${SENTRY_POLICY_DB-$(cut -c-63 <<< SP$ESCAPED_IMPALA_HOME)}
 
 # Environment variables carrying AWS security credentials are prepared
 # according to the following rules:
@@ -475,10 +380,6 @@ elif [ "${TARGET_FILESYSTEM}" = "local" ]; then
   export FILESYSTEM_PREFIX="${LOCAL_FS}"
 elif [ "${TARGET_FILESYSTEM}" = "hdfs" ]; then
   if [[ "${ERASURE_CODING}" = true ]]; then
-    if [[ "${IMPALA_MINICLUSTER_PROFILE}" -lt 3 ]]; then
-      echo "Hadoop 3 is required for HDFS erasure coding."
-      return 1
-    fi
     export HDFS_ERASURECODE_POLICY="RS-3-2-1024k"
     export HDFS_ERASURECODE_PATH="/test-warehouse"
   fi
@@ -521,11 +422,12 @@ export IMPALA_AUX_WORKLOAD_DIR="$IMPALA_AUX_TEST_HOME/testdata/workloads"
 export IMPALA_DATASET_DIR="$IMPALA_HOME/testdata/datasets"
 export IMPALA_AUX_DATASET_DIR="$IMPALA_AUX_TEST_HOME/testdata/datasets"
 export IMPALA_COMMON_DIR="$IMPALA_HOME/common"
+export PATH="$IMPALA_TOOLCHAIN/gdb-$IMPALA_GDB_VERSION/bin:$PATH"
 export PATH="$IMPALA_HOME/bin:$IMPALA_TOOLCHAIN/cmake-$IMPALA_CMAKE_VERSION/bin/:$PATH"
 
 # The directory in which all the thirdparty CDH components live.
 if [ "${DOWNLOAD_CDH_COMPONENTS}" = true ]; then
-  export CDH_COMPONENTS_HOME="$IMPALA_TOOLCHAIN/cdh_components"
+  export CDH_COMPONENTS_HOME="$IMPALA_TOOLCHAIN/cdh_components-$CDH_BUILD_NUMBER"
 else
   export CDH_COMPONENTS_HOME="$IMPALA_HOME/thirdparty"
 fi
@@ -546,14 +448,12 @@ export HADOOP_CLASSPATH="${HADOOP_CLASSPATH-}:${HADOOP_HOME}/share/hadoop/tools/
 export LZO_JAR_PATH="$HADOOP_LZO/build/hadoop-lzo-0.4.15.jar"
 HADOOP_CLASSPATH+=":$LZO_JAR_PATH"
 
-if [[ $IMPALA_MINICLUSTER_PROFILE == 3 ]]; then
-  # Beware of adding entries from $HADOOP_HOME here, because they can change
-  # the order of the classpath, leading to configuration not showing up first.
-  HADOOP_CLASSPATH="$LZO_JAR_PATH"
-  # Add the path containing the hadoop-aws jar, which is required to access AWS from the
-  # minicluster.
-  HADOOP_CLASSPATH="${HADOOP_CLASSPATH}:${HADOOP_HOME}/share/hadoop/tools/lib/*"
-fi
+# Beware of adding entries from $HADOOP_HOME here, because they can change
+# the order of the classpath, leading to configuration not showing up first.
+HADOOP_CLASSPATH="$LZO_JAR_PATH"
+# Add the path containing the hadoop-aws jar, which is required to access AWS from the
+# minicluster.
+HADOOP_CLASSPATH="${HADOOP_CLASSPATH}:${HADOOP_HOME}/share/hadoop/tools/lib/*"
 
 export MINI_DFS_BASE_DATA_DIR="$IMPALA_HOME/cdh-${CDH_MAJOR_VERSION}-hdfs-data"
 export PATH="$HADOOP_HOME/bin:$PATH"
@@ -607,6 +507,77 @@ export AUX_CLASSPATH="$AUX_CLASSPATH:$HBASE_HOME/lib/hbase-protocol-${IMPALA_HBA
 export AUX_CLASSPATH="$AUX_CLASSPATH:$HBASE_HOME/lib/hbase-hadoop-compat-${IMPALA_HBASE_VERSION}.jar"
 
 export HBASE_CONF_DIR="$IMPALA_FE_DIR/src/test/resources"
+
+# To use a local build of Kudu, set KUDU_BUILD_DIR to the path Kudu was built in and
+# set KUDU_CLIENT_DIR to the path KUDU was installed in.
+# Example:
+#   git clone https://github.com/cloudera/kudu.git
+#   ...build 3rd party etc...
+#   mkdir -p $KUDU_BUILD_DIR
+#   cd $KUDU_BUILD_DIR
+#   cmake <path to Kudu source dir>
+#   make
+#   DESTDIR=$KUDU_CLIENT_DIR make install
+export KUDU_BUILD_DIR=${KUDU_BUILD_DIR-}
+export KUDU_CLIENT_DIR=${KUDU_CLIENT_DIR-}
+if [[ -n "$KUDU_BUILD_DIR" && -z "$KUDU_CLIENT_DIR" ]]; then
+  echo When KUDU_BUILD_DIR is set KUDU_CLIENT_DIR must also be set. 1>&2
+  return 1
+fi
+if [[ -z "$KUDU_BUILD_DIR" && -n "$KUDU_CLIENT_DIR" ]]; then
+  echo When KUDU_CLIENT_DIR is set KUDU_BUILD_DIR must also be set. 1>&2
+  return 1
+fi
+
+# Only applies to the minicluster Kudu (we always link against the libkudu_client for the
+# overall build type) and does not apply when using a local Kudu build.
+export USE_KUDU_DEBUG_BUILD=${USE_KUDU_DEBUG_BUILD-false}
+
+# Kudu doesn't compile on some old Linux distros. KUDU_IS_SUPPORTED enables building Kudu
+# into the backend. We prefer to pull Kudu in from CDH, but will fall back to using the
+# toolchain Kudu for distros where the CDH tarballs are not provided by setting
+# USE_CDH_KUDU to false.
+# The frontend build is OS independent since it is Java.
+export USE_CDH_KUDU=${USE_CDH_KUDU-true}
+if [[ -z "${KUDU_IS_SUPPORTED-}" ]]; then
+  if [[ -n "$KUDU_BUILD_DIR" ]]; then
+    KUDU_IS_SUPPORTED=true
+  else
+    KUDU_IS_SUPPORTED=false
+    USE_CDH_KUDU=false
+    if ! $IS_OSX; then
+      if ! which lsb_release &>/dev/null; then
+        echo Unable to find the 'lsb_release' command. \
+            Please ensure it is available in your PATH. 1>&2
+        return 1
+      fi
+      DISTRO_VERSION="$(lsb_release -sir 2>&1)"
+      if [[ $? -ne 0 ]]; then
+        echo lsb_release command failed, output was: "$DISTRO_VERSION" 1>&2
+        return 1
+      fi
+      # Remove spaces, trim minor versions, and convert to lowercase.
+      DISTRO_VERSION="$(tr -d ' \n' <<< "$DISTRO_VERSION" | cut -d. -f1 | tr "A-Z" "a-z")"
+      case "$DISTRO_VERSION" in
+        centos6 | centos7 | debian8 | suselinux12 | suse12 | ubuntu16 )
+          USE_CDH_KUDU=true
+          KUDU_IS_SUPPORTED=true;;
+        ubuntu14 )
+          USE_CDH_KUDU=false
+          KUDU_IS_SUPPORTED=true;;
+      esac
+    fi
+  fi
+fi
+export KUDU_IS_SUPPORTED
+
+if $USE_CDH_KUDU; then
+  export IMPALA_KUDU_VERSION=${IMPALA_KUDU_VERSION-"1.8.0-cdh6.x-SNAPSHOT"}
+  export IMPALA_KUDU_HOME=${CDH_COMPONENTS_HOME}/kudu-$IMPALA_KUDU_VERSION
+else
+  export IMPALA_KUDU_VERSION=${IMPALA_KUDU_VERSION-"5211897"}
+  export IMPALA_KUDU_HOME=${IMPALA_TOOLCHAIN}/kudu-$IMPALA_KUDU_VERSION
+fi
 
 # Set $THRIFT_HOME to the Thrift directory in toolchain.
 export THRIFT_HOME="${IMPALA_TOOLCHAIN}/thrift-${IMPALA_THRIFT_VERSION}"
@@ -722,18 +693,16 @@ else
       | sort | uniq`
 fi
 
-if [[ $IMPALA_MINICLUSTER_PROFILE_OVERRIDE == 3 ]]; then
-  # Check for minimum required Java version
-  # Only issue Java version warning when running Java 7.
-  if $JAVA -version 2>&1 | grep -q 'java version "1.7'; then
-    cat << EOF
+# Check for minimum required Java version
+# Only issue Java version warning when running Java 7.
+if $JAVA -version 2>&1 | grep -q 'java version "1.7'; then
+  cat << EOF
 
 WARNING: Your development environment is configured for Hadoop 3 and Java 7. Hadoop 3
 requires at least Java 8. Your JAVA binary currently points to $JAVA
 and reports the following version:
 
 EOF
-    $JAVA -version
-    echo
-  fi
+  $JAVA -version
+  echo
 fi

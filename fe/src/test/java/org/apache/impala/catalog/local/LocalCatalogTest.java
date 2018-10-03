@@ -22,30 +22,41 @@ import static org.junit.Assert.*;
 import java.util.List;
 import java.util.Set;
 
+import org.apache.impala.analysis.ToSqlUtils;
 import org.apache.impala.catalog.CatalogTest;
+import org.apache.impala.catalog.ColumnStats;
 import org.apache.impala.catalog.FeCatalogUtils;
 import org.apache.impala.catalog.FeDb;
 import org.apache.impala.catalog.FeFsPartition;
 import org.apache.impala.catalog.FeFsTable;
 import org.apache.impala.catalog.FeTable;
+import org.apache.impala.catalog.FeView;
 import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
 import org.apache.impala.catalog.Type;
+import org.apache.impala.service.BackendConfig;
+import org.apache.impala.service.FeSupport;
+import org.apache.impala.thrift.TCatalogObjectType;
 import org.apache.impala.thrift.TResultSet;
 import org.apache.impala.util.MetaStoreUtil;
 import org.apache.impala.util.PatternMatcher;
+import org.hamcrest.CoreMatchers;
+import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 
+import com.google.common.base.Joiner;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 
 public class LocalCatalogTest {
-
+  private CatalogdMetaProvider provider_;
   private LocalCatalog catalog_;
 
   @Before
   public void setupCatalog() {
-    catalog_ = new LocalCatalog(new DirectMetaProvider());
+    FeSupport.loadLibrary();
+    provider_ = new CatalogdMetaProvider(BackendConfig.INSTANCE.getBackendCfg());
+    catalog_ = new LocalCatalog(provider_, /*defaultKuduMasterHosts=*/null);
   }
 
   @Test
@@ -148,5 +159,128 @@ public class LocalCatalogTest {
       }
     }
     assertEquals(24, totalFds);
+    assertTrue(t.getHostIndex().size() > 0);
+  }
+
+
+  @Test
+  public void testLoadFileDescriptorsUnpartitioned() throws Exception {
+    FeFsTable t = (FeFsTable) catalog_.getTable("tpch",  "region");
+    int totalFds = 0;
+    for (FeFsPartition p: FeCatalogUtils.loadAllPartitions(t)) {
+      List<FileDescriptor> fds = p.getFileDescriptors();
+      totalFds += fds.size();
+      for (FileDescriptor fd : fds) {
+        assertTrue(fd.getFileLength() > 0);
+        assertEquals(fd.getNumFileBlocks(), 1);
+        assertEquals(3, fd.getFbFileBlock(0).diskIdsLength());
+      }
+    }
+    assertEquals(1, totalFds);
+  }
+
+  @Test
+  public void testColumnStats() throws Exception {
+    FeFsTable t = (FeFsTable) catalog_.getTable("functional",  "alltypesagg");
+    // Verify expected stats for a partitioning column.
+    // 'days' has 10 non-NULL plus one NULL partition
+    ColumnStats stats = t.getColumn("day").getStats();
+    assertEquals(11, stats.getNumDistinctValues());
+    assertEquals(1, stats.getNumNulls());
+
+    // Verify expected stats for timestamp.
+    stats = t.getColumn("timestamp_col").getStats();
+    assertEquals(10210, stats.getNumDistinctValues());
+    assertEquals(-1, stats.getNumNulls());
+  }
+
+  @Test
+  public void testView() throws Exception {
+    FeView v = (FeView) catalog_.getTable("functional",  "alltypes_view");
+    assertEquals(TCatalogObjectType.VIEW, v.getCatalogObjectType());
+    assertEquals("SELECT * FROM functional.alltypes", v.getQueryStmt().toSql());
+  }
+
+  @Test
+  public void testKuduTable() throws Exception {
+    LocalKuduTable t = (LocalKuduTable) catalog_.getTable("functional_kudu",  "alltypes");
+    assertEquals("id,bool_col,tinyint_col,smallint_col,int_col," +
+        "bigint_col,float_col,double_col,date_string_col,string_col," +
+        "timestamp_col,year,month", Joiner.on(",").join(t.getColumnNames()));
+    // Assert on the generated SQL for the table, but not the table properties, since
+    // those might change based on whether this test runs before or after other
+    // tests which compute stats, etc.
+    Assert.assertThat(ToSqlUtils.getCreateTableSql(t), CoreMatchers.startsWith(
+        "CREATE TABLE functional_kudu.alltypes (\n" +
+        "  id INT NOT NULL ENCODING AUTO_ENCODING COMPRESSION DEFAULT_COMPRESSION,\n" +
+        "  bool_col BOOLEAN NULL ENCODING AUTO_ENCODING COMPRESSION DEFAULT_COMPRESSION,\n" +
+        "  tinyint_col TINYINT NULL ENCODING AUTO_ENCODING COMPRESSION DEFAULT_COMPRESSION,\n" +
+        "  smallint_col SMALLINT NULL ENCODING AUTO_ENCODING COMPRESSION DEFAULT_COMPRESSION,\n" +
+        "  int_col INT NULL ENCODING AUTO_ENCODING COMPRESSION DEFAULT_COMPRESSION,\n" +
+        "  bigint_col BIGINT NULL ENCODING AUTO_ENCODING COMPRESSION DEFAULT_COMPRESSION,\n" +
+        "  float_col FLOAT NULL ENCODING AUTO_ENCODING COMPRESSION DEFAULT_COMPRESSION,\n" +
+        "  double_col DOUBLE NULL ENCODING AUTO_ENCODING COMPRESSION DEFAULT_COMPRESSION,\n" +
+        "  date_string_col STRING NULL ENCODING AUTO_ENCODING COMPRESSION DEFAULT_COMPRESSION,\n" +
+        "  string_col STRING NULL ENCODING AUTO_ENCODING COMPRESSION DEFAULT_COMPRESSION,\n" +
+        "  timestamp_col TIMESTAMP NULL ENCODING AUTO_ENCODING COMPRESSION DEFAULT_COMPRESSION,\n" +
+        "  year INT NULL ENCODING AUTO_ENCODING COMPRESSION DEFAULT_COMPRESSION,\n" +
+        "  month INT NULL ENCODING AUTO_ENCODING COMPRESSION DEFAULT_COMPRESSION,\n" +
+        "  PRIMARY KEY (id)\n" +
+        ")\n" +
+        "PARTITION BY HASH (id) PARTITIONS 3\n" +
+        "STORED AS KUDU\n" +
+        "TBLPROPERTIES"));
+  }
+
+  @Test
+  public void testHbaseTable() throws Exception {
+    LocalHbaseTable t = (LocalHbaseTable) catalog_.getTable("functional_hbase",
+        "alltypes");
+    Assert.assertThat(ToSqlUtils.getCreateTableSql(t), CoreMatchers.startsWith(
+        "CREATE EXTERNAL TABLE functional_hbase.alltypes (\n" +
+        "  id INT COMMENT 'Add a comment',\n" +
+        "  bigint_col BIGINT,\n" +
+        "  bool_col BOOLEAN,\n" +
+        "  date_string_col STRING,\n" +
+        "  double_col DOUBLE,\n" +
+        "  float_col FLOAT,\n" +
+        "  int_col INT,\n" +
+        "  month INT,\n" +
+        "  smallint_col SMALLINT,\n" +
+        "  string_col STRING,\n" +
+        "  timestamp_col TIMESTAMP,\n" +
+        "  tinyint_col TINYINT,\n" +
+        "  year INT\n" +
+        ")\n" +
+        "STORED BY 'org.apache.hadoop.hive.hbase.HBaseStorageHandler'\n" +
+        "WITH SERDEPROPERTIES ('hbase.columns.mapping'=':key,d:bool_col,d:tinyint_col," +
+        "d:smallint_col,d:int_col,d:bigint_col,d:float_col,d:double_col," +
+        "d:date_string_col,d:string_col,d:timestamp_col,d:year,d:month', " +
+        "'serialization.format'='1')"
+    ));
+  }
+
+  /**
+   * Test loading an Avro table which has an explicit avro schema. The schema
+   * should override the columns from the HMS.
+   */
+  @Test
+  public void testAvroExplicitSchema() throws Exception {
+    FeFsTable t = (FeFsTable)catalog_.getTable("functional_avro", "zipcode_incomes");
+    assertNotNull(t.toThriftDescriptor(0, null).hdfsTable.avroSchema);
+    assertTrue(t.usesAvroSchemaOverride());
+  }
+
+  /**
+   * Test loading a table which does not have an explicit avro schema property.
+   * In this case we create an avro schema on demand from the table schema.
+   */
+  @Test
+  public void testAvroImplicitSchema() throws Exception {
+    FeFsTable t = (FeFsTable)catalog_.getTable("functional_avro_snap", "no_avro_schema");
+    assertNotNull(t.toThriftDescriptor(0, null).hdfsTable.avroSchema);
+    // The tinyint column should get promoted to INT to be Avro-compatible.
+    assertEquals(t.getColumn("tinyint_col").getType(), Type.INT);
+    assertTrue(t.usesAvroSchemaOverride());
   }
 }

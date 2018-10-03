@@ -18,6 +18,7 @@
 #ifndef STATESTORE_STATESTORE_H
 #define STATESTORE_STATESTORE_H
 
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -97,6 +98,13 @@ typedef TUniqueId RegistrationId;
 /// subscriber, rather than all items in the topic.  For non-delta updates, the statestore
 /// will send an update that includes all values in the topic.
 ///
+/// Subscribers may filter the keys within a subscribed topic by an optional prefix. If
+/// a key filter prefix is specified, only entries matching that prefix will be sent to
+/// the subscriber in updates. Note that this may result in empty updates being sent
+/// to subscribers in the case that all updated keys have been excluded by the filter.
+/// These empty updates are important so that subscribers can keep track of the current
+/// version number and report back their progress in receiving the topic contents.
+///
 /// +================+
 /// | Implementation |
 /// +================+
@@ -123,9 +131,13 @@ class Statestore : public CacheLineAligned {
   /// The only constructor; initialises member variables only.
   Statestore(MetricGroup* metrics);
 
+  /// Destructor, should not be called once the Statestore is initialized.
+  ~Statestore();
+
+  /// Initialize and start the backing ThriftServer with port 'state_store_port'.
   /// Initialize the ThreadPools used for updates and heartbeats. Returns an error if
-  /// ThreadPool initialization fails.
-  Status Init() WARN_UNUSED_RESULT;
+  /// any of the above initialization fails.
+  Status Init(int32_t state_store_port) WARN_UNUSED_RESULT;
 
   /// Registers a new subscriber with the given unique subscriber ID, running a subscriber
   /// service at the given location, with the provided list of topic subscriptions.
@@ -142,7 +154,7 @@ class Statestore : public CacheLineAligned {
 
   void RegisterWebpages(Webserver* webserver);
 
-  /// The main processing loop. Blocks until the exit flag is set.
+  /// The main processing loop. Runs infinitely.
   void MainLoop();
 
   /// Returns the Thrift API interface that proxies requests onto the local Statestore.
@@ -158,6 +170,9 @@ class Statestore : public CacheLineAligned {
   static const std::string IMPALA_MEMBERSHIP_TOPIC;
   /// Topic tracking the state of admission control on all coordinators.
   static const std::string IMPALA_REQUEST_QUEUE_TOPIC;
+
+  int32_t port() { return thrift_server_->port(); }
+
  private:
   /// A TopicEntry is a single entry in a topic, and logically is a <string, byte string>
   /// pair.
@@ -258,12 +273,14 @@ class Statestore : public CacheLineAligned {
     void DeleteIfVersionsMatch(TopicEntry::Version version, const TopicEntryKey& key);
 
     /// Build a delta update to send to 'subscriber_id' including the deltas greater
-    /// than 'last_processed_version' (not inclusive).
+    /// than 'last_processed_version' (not inclusive). Only those items whose keys
+    /// start with 'filter_prefix' are included in the update.
     ///
     /// Safe to call concurrently from multiple threads (for different subscribers).
     /// Acquires a shared read lock for the topic.
     void BuildDelta(const SubscriberId& subscriber_id,
-        TopicEntry::Version last_processed_version, TTopicDelta* delta);
+        TopicEntry::Version last_processed_version, const std::string& filter_prefix,
+        TTopicDelta* delta);
 
     /// Adds entries representing the current topic state to 'topic_json'.
     void ToJson(rapidjson::Document* document, rapidjson::Value* topic_json);
@@ -331,9 +348,11 @@ class Statestore : public CacheLineAligned {
 
     /// Information about a subscriber's subscription to a specific topic.
     struct TopicSubscription {
-      TopicSubscription(bool is_transient, bool populate_min_subscriber_topic_version)
+      TopicSubscription(bool is_transient, bool populate_min_subscriber_topic_version,
+          std::string filter_prefix)
         : is_transient(is_transient),
-          populate_min_subscriber_topic_version(populate_min_subscriber_topic_version) {}
+          populate_min_subscriber_topic_version(populate_min_subscriber_topic_version),
+          filter_prefix(std::move(filter_prefix)) {}
 
       /// Whether entries written by this subscriber should be considered transient.
       const bool is_transient;
@@ -341,6 +360,9 @@ class Statestore : public CacheLineAligned {
       /// Whether min_subscriber_topic_version needs to be filled in for this
       /// subscription.
       const bool populate_min_subscriber_topic_version;
+
+      /// The prefix for which the subscriber wants to see updates.
+      const std::string filter_prefix;
 
       /// The last topic entry version successfully processed by this subscriber. Only
       /// written by a single thread at a time but can be read concurrently.
@@ -365,6 +387,12 @@ class Statestore : public CacheLineAligned {
     const TNetworkAddress& network_address() const { return network_address_; }
     const SubscriberId& id() const { return subscriber_id_; }
     const RegistrationId& registration_id() const { return registration_id_; }
+
+    /// Returns the time elapsed (in seconds) since the last heartbeat.
+    double SecondsSinceHeartbeat() const {
+      return (static_cast<double>(MonotonicMillis() - last_heartbeat_ts_.Load()))
+          / 1000.0;
+    }
 
     /// Get the Topics map that would be used to store 'topic_id'.
     const Topics& GetTopicsMapForId(const TopicId& topic_id) const {
@@ -409,6 +437,9 @@ class Statestore : public CacheLineAligned {
     void SetLastTopicVersionProcessed(const TopicId& topic_id,
         TopicEntry::Version version);
 
+    /// Refresh the subscriber's last heartbeat timestamp to the current monotonic time.
+    void RefreshLastHeartbeatTimestamp();
+
    private:
     /// Unique human-readable identifier for this subscriber, set by the subscriber itself
     /// on a Register call.
@@ -430,6 +461,10 @@ class Statestore : public CacheLineAligned {
     /// on the topic. The set of keys is not modified after construction.
     Topics priority_subscribed_topics_;
     Topics non_priority_subscribed_topics_;
+
+    /// The timestamp of the last successful heartbeat in milliseconds. A timestamp much
+    /// older than the heartbeat frequency implies an unresponsive subscriber.
+    AtomicInt64 last_heartbeat_ts_{0};
 
     /// Lock held when adding or deleting transient entries. See class comment for lock
     /// acquisition order.
@@ -516,6 +551,12 @@ class Statestore : public CacheLineAligned {
 
   ThreadPool<ScheduledSubscriberUpdate> subscriber_heartbeat_threadpool_;
 
+  /// Thread that monitors the heartbeats of all subscribers.
+  std::unique_ptr<Thread> heartbeat_monitoring_thread_;
+
+  /// Flag to indicate that the statestore has been initialized.
+  bool initialized_ = false;
+
   /// Cache of subscriber clients used for UpdateState() RPCs. Only one client per
   /// subscriber should be used, but the cache helps with the client lifecycle on failure.
   boost::scoped_ptr<StatestoreSubscriberClientCache> update_state_client_cache_;
@@ -525,6 +566,12 @@ class Statestore : public CacheLineAligned {
   /// whereas they are not safe for UpdateState() RPCs which can take an unbounded amount
   /// of time.
   boost::scoped_ptr<StatestoreSubscriberClientCache> heartbeat_client_cache_;
+
+  /// Container for the internal statestore service.
+  boost::scoped_ptr<ThriftServer> thrift_server_;
+
+  /// Pointer to the MetricGroup for this statestore. Not owned.
+  MetricGroup* metrics_;
 
   /// Thrift API implementation which proxies requests onto this Statestore
   boost::shared_ptr<StatestoreServiceIf> thrift_iface_;
@@ -659,6 +706,11 @@ class Statestore : public CacheLineAligned {
   void SubscribersHandler(const Webserver::ArgumentMap& args,
       rapidjson::Document* document);
 
+  /// Monitors the heartbeats of all subscribers every
+  /// FLAGS_heartbeat_monitoring_frequency_ms milliseconds. If a subscriber's
+  /// last_heartbeat_ts_ has not been updated in that interval, it logs the subscriber's
+  /// id.
+  [[noreturn]] void MonitorSubscriberHeartbeat();
 };
 
 }

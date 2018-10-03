@@ -30,6 +30,9 @@ class Frontend;
 class Status;
 class RuntimeProfile;
 
+class TGetPartialCatalogObjectRequest;
+class TGetPartialCatalogObjectResponse;
+
 /// The CatalogOpExecutor is responsible for executing catalog operations.
 /// This includes DDL statements such as CREATE and ALTER as well as statements such
 /// as INVALIDATE METADATA. One CatalogOpExecutor is typically created per catalog
@@ -47,6 +50,10 @@ class CatalogOpExecutor {
   /// be loaded.
   Status GetCatalogObject(const TCatalogObject& object_desc, TCatalogObject* result);
 
+  /// Fetch partial information about a specific TCatalogObject from the catalog server.
+  Status GetPartialCatalogObject(const TGetPartialCatalogObjectRequest& req,
+      TGetPartialCatalogObjectResponse* resp);
+
   /// Translates the given compute stats request and its child-query results into
   /// a new table alteration request for updating the stats metadata, and executes
   /// the alteration via Exec();
@@ -61,6 +68,16 @@ class CatalogOpExecutor {
   /// otherwise a bad status will be returned.
   Status PrioritizeLoad(const TPrioritizeLoadRequest& req,
       TPrioritizeLoadResponse* result);
+
+  /// Makes an RPC to the CatalogServer to fetch the partition statistics of the
+  /// partitions that are specified in TGetPartitionStatsRequest.
+  Status GetPartitionStats(
+      const TGetPartitionStatsRequest& req, TGetPartitionStatsResponse* result);
+
+  /// Makes an RPC to the catalog server to report recently used tables and their use
+  /// counts in this impalad since the last report.
+  Status UpdateTableUsage(const TUpdateTableUsageRequest& req,
+      TUpdateTableUsageResponse* resp);
 
   /// Makes an RPC to the CatalogServer to verify whether the specified user has privileges
   /// to access the Sentry Policy Service. Returns OK if the user has privileges or

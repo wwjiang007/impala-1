@@ -21,17 +21,26 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
+import com.google.common.cache.CacheStats;
 import org.apache.hadoop.hive.common.FileUtils;
 import org.apache.hadoop.hive.common.StatsSetupConst;
+import org.apache.hadoop.hive.metastore.api.ColumnStatisticsObj;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.impala.analysis.Expr;
 import org.apache.impala.analysis.LiteralExpr;
 import org.apache.impala.analysis.NullLiteral;
 import org.apache.impala.analysis.PartitionKeyValue;
 import org.apache.impala.analysis.ToSqlUtils;
+import org.apache.impala.catalog.local.CatalogdMetaProvider;
+import org.apache.impala.catalog.CatalogObject.ThriftObjectType;
 import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
+import org.apache.impala.catalog.local.LocalCatalog;
+import org.apache.impala.catalog.local.MetaProvider;
+import org.apache.impala.service.BackendConfig;
 import org.apache.impala.thrift.TColumnDescriptor;
+import org.apache.impala.thrift.TGetCatalogMetricsResult;
 import org.apache.impala.thrift.THdfsPartition;
 import org.apache.impala.thrift.TTableStats;
 import org.slf4j.Logger;
@@ -43,6 +52,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import com.google.common.collect.Sets;
 
 /**
  * Static utility functions shared between FeCatalog implementations.
@@ -126,6 +136,34 @@ public abstract class FeCatalogUtils {
       colDescs.add(new TColumnDescriptor(col.getName(), col.getType().toThrift()));
     }
     return colDescs;
+  }
+
+  /**
+   * Given the list of column stats returned from the metastore, inject those
+   * stats into matching columns in 'table'.
+   */
+  public static void injectColumnStats(List<ColumnStatisticsObj> colStats,
+      FeTable table) {
+    for (ColumnStatisticsObj stats: colStats) {
+      Column col = table.getColumn(stats.getColName());
+      Preconditions.checkNotNull(col, "Unable to find column %s in table %s",
+          stats.getColName(), table.getFullName());
+      if (!ColumnStats.isSupportedColType(col.getType())) {
+        LOG.warn(String.format(
+            "Statistics for %s, column %s are not supported as column " +
+            "has type %s", table.getFullName(), col.getName(), col.getType()));
+        continue;
+      }
+
+      if (!col.updateStats(stats.getStatsData())) {
+        LOG.warn(String.format(
+            "Failed to load column stats for %s, column %s. Stats may be " +
+            "incompatible with column type %s. Consider regenerating statistics " +
+            "for %s.", table.getFullName(), col.getName(), col.getType(),
+            table.getFullName()));
+        continue;
+      }
+    }
   }
 
   /**
@@ -264,36 +302,19 @@ public abstract class FeCatalogUtils {
   }
 
   /**
-   * Return the most commonly-used file format within a set of partitions.
+   * Return the set of all file formats used in the collection of partitions.
    */
-  public static HdfsFileFormat getMajorityFormat(
+  public static Set<HdfsFileFormat> getFileFormats(
       Iterable<? extends FeFsPartition> partitions) {
-    Map<HdfsFileFormat, Integer> numPartitionsByFormat = Maps.newHashMap();
-    for (FeFsPartition partition: partitions) {
-      HdfsFileFormat format = partition.getInputFormatDescriptor().getFileFormat();
-      Integer numPartitions = numPartitionsByFormat.get(format);
-      if (numPartitions == null) {
-        numPartitions = Integer.valueOf(1);
-      } else {
-        numPartitions = Integer.valueOf(numPartitions.intValue() + 1);
-      }
-      numPartitionsByFormat.put(format, numPartitions);
+    Set<HdfsFileFormat> fileFormats = Sets.newHashSet();
+    for (FeFsPartition partition : partitions) {
+      fileFormats.add(partition.getFileFormat());
     }
-
-    int maxNumPartitions = Integer.MIN_VALUE;
-    HdfsFileFormat majorityFormat = null;
-    for (Map.Entry<HdfsFileFormat, Integer> entry: numPartitionsByFormat.entrySet()) {
-      if (entry.getValue().intValue() > maxNumPartitions) {
-        majorityFormat = entry.getKey();
-        maxNumPartitions = entry.getValue().intValue();
-      }
-    }
-    Preconditions.checkNotNull(majorityFormat);
-    return majorityFormat;
+    return fileFormats;
   }
 
   public static THdfsPartition fsPartitionToThrift(FeFsPartition part,
-      boolean includeFileDesc, boolean includeIncrementalStats) {
+      ThriftObjectType type, boolean includePartitionStats) {
     HdfsStorageDescriptor sd = part.getInputFormatDescriptor();
     THdfsPartition thriftHdfsPart = new THdfsPartition(
         sd.getLineDelim(),
@@ -304,19 +325,22 @@ public abstract class FeCatalogUtils {
         sd.getFileFormat().toThrift(),
         Expr.treesToThrift(part.getPartitionValues()),
         sd.getBlockSize());
-    thriftHdfsPart.setLocation(part.getLocationAsThrift());
-    thriftHdfsPart.setStats(new TTableStats(part.getNumRows()));
-    thriftHdfsPart.setAccess_level(part.getAccessLevel());
-    thriftHdfsPart.setIs_marked_cached(part.isMarkedCached());
     thriftHdfsPart.setId(part.getId());
-    thriftHdfsPart.setHas_incremental_stats(part.hasIncrementalStats());
-    // IMPALA-4902: Shallow-clone the map to avoid concurrent modifications. One thread
-    // may try to serialize the returned THdfsPartition after releasing the table's lock,
-    // and another thread doing DDL may modify the map.
-    thriftHdfsPart.setHms_parameters(Maps.newHashMap(
-        includeIncrementalStats ? part.getParameters() :
-          part.getFilteredHmsParameters()));
-    if (includeFileDesc) {
+    thriftHdfsPart.setLocation(part.getLocationAsThrift());
+    if (type == ThriftObjectType.FULL) {
+      thriftHdfsPart.setStats(new TTableStats(part.getNumRows()));
+      thriftHdfsPart.setAccess_level(part.getAccessLevel());
+      thriftHdfsPart.setIs_marked_cached(part.isMarkedCached());
+      // IMPALA-4902: Shallow-clone the map to avoid concurrent modifications. One thread
+      // may try to serialize the returned THdfsPartition after releasing the table's lock,
+      // and another thread doing DDL may modify the map.
+      thriftHdfsPart.setHms_parameters(Maps.newHashMap(part.getParameters()));
+      thriftHdfsPart.setHas_incremental_stats(part.hasIncrementalStats());
+      if (includePartitionStats && part.getPartitionStatsCompressed() != null) {
+        thriftHdfsPart.setPartition_stats(
+            Preconditions.checkNotNull(part.getPartitionStatsCompressed()));
+      }
+
       // Add block location information
       long numBlocks = 0;
       long totalFileBytes = 0;
@@ -330,4 +354,35 @@ public abstract class FeCatalogUtils {
     }
     return thriftHdfsPart;
   }
+
+  /**
+   * Populates cache metrics in the input TGetCatalogMetricsResult object.
+   * No-op if CatalogdMetaProvider is not the configured metadata provider.
+   */
+  public static void populateCacheMetrics(
+      FeCatalog catalog, TGetCatalogMetricsResult metrics) {
+    Preconditions.checkNotNull(catalog);
+    Preconditions.checkNotNull(metrics);
+    // Populate cache stats only if configured in local mode.
+    if (!BackendConfig.INSTANCE.getBackendCfg().use_local_catalog) return;
+    Preconditions.checkState(catalog instanceof LocalCatalog);
+    MetaProvider provider = ((LocalCatalog) catalog).getMetaProvider();
+    if (!(provider instanceof CatalogdMetaProvider)) return;
+
+    CacheStats stats = ((CatalogdMetaProvider) provider).getCacheStats();
+    metrics.setCache_eviction_count(stats.evictionCount());
+    metrics.setCache_hit_count(stats.hitCount());
+    metrics.setCache_load_count(stats.loadCount());
+    metrics.setCache_load_exception_count(stats.loadExceptionCount());
+    metrics.setCache_load_success_count(stats.loadSuccessCount());
+    metrics.setCache_miss_count(stats.missCount());
+    metrics.setCache_request_count(stats.requestCount());
+    metrics.setCache_total_load_time(stats.totalLoadTime());
+    metrics.setCache_avg_load_time(stats.averageLoadPenalty());
+    metrics.setCache_hit_rate(stats.hitRate());
+    metrics.setCache_load_exception_rate(stats.loadExceptionRate());
+    metrics.setCache_miss_rate(stats.missRate());
+  }
+
+
 }

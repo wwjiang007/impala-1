@@ -17,12 +17,16 @@
 #ifndef KUDU_RPC_RPC_CONTEXT_H
 #define KUDU_RPC_RPC_CONTEXT_H
 
+#include <memory>
 #include <stddef.h>
 #include <string>
 
+#include <glog/logging.h>
+
 #include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/rpc/rpc_header.pb.h"
-#include "kudu/rpc/service_if.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/status.h"
 
 namespace google {
@@ -33,6 +37,7 @@ class Message;
 
 namespace kudu {
 
+class Slice;
 class Sockaddr;
 class Trace;
 
@@ -65,7 +70,7 @@ class RpcContext {
   RpcContext(InboundCall *call,
              const google::protobuf::Message *request_pb,
              google::protobuf::Message *response_pb,
-             const scoped_refptr<ResultTracker>& result_tracker);
+             scoped_refptr<ResultTracker> result_tracker);
 
   ~RpcContext();
 
@@ -162,6 +167,13 @@ class RpcContext {
 
   // Return the identity of remote user who made this call.
   const RemoteUser& remote_user() const;
+
+  // Whether it's OK to pass confidential information between the client and the
+  // server in the context of the RPC call being handled.  In real world, this
+  // translates into properties of the connection between the client and the
+  // server. For example, this methods returns 'true' for a call over an
+  // encrypted connection.
+  bool is_confidential() const;
 
   // Discards the memory associated with the inbound call's payload. All previously
   // obtained sidecar slices will be invalidated by this call. It is an error to call

@@ -15,9 +15,10 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from tests.common.impala_cluster import ImpalaCluster
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.skip import SkipIfS3, SkipIfADLS, SkipIfIsilon, SkipIfLocal
-from tests.common.impala_cluster import ImpalaCluster
+from tests.util.filesystem_utils import IS_EC
 import logging
 import pytest
 import re
@@ -117,9 +118,12 @@ class TestObservability(ImpalaTestSuite):
         profile
     # For this query, the planner sets NUM_NODES=1, NUM_SCANNER_THREADS=1,
     # RUNTIME_FILTER_MODE=0 and MT_DOP=0
-    assert "Query Options (set by configuration and planner): MEM_LIMIT=8589934592," \
-        "NUM_NODES=1,NUM_SCANNER_THREADS=1,RUNTIME_FILTER_MODE=0,MT_DOP=0\n" \
-        in profile
+    expected_str = ("Query Options (set by configuration and planner): "
+        "MEM_LIMIT=8589934592,NUM_NODES=1,NUM_SCANNER_THREADS=1,"
+        "RUNTIME_FILTER_MODE=0,MT_DOP=0{erasure_coding}\n")
+    expected_str = expected_str.format(
+        erasure_coding=",ALLOW_ERASURE_CODED_FILES=1" if IS_EC else "")
+    assert expected_str in profile
 
   def test_exec_summary(self):
     """Test that the exec summary is populated correctly in every query state"""
@@ -213,6 +217,41 @@ class TestObservability(ImpalaTestSuite):
             event_regexes[event_regex_index] + " not in " + line + "\n" + runtime_profile
     assert event_regex_index == len(event_regexes), \
         "Didn't find all events in profile: \n" + runtime_profile
+
+  def test_query_profile_contains_all_events(self, unique_database):
+    """Test that the expected events show up in a query profile for various queries"""
+    # make a data file to load data from
+    path = "test-warehouse/{0}.db/data_file".format(unique_database)
+    self.filesystem_client.create_file(path, "1")
+    use_query = "use {0}".format(unique_database)
+    self.execute_query(use_query)
+    # all the events we will see for every query
+    event_regexes = [
+      r'Query Compilation:',
+      r'Query Timeline:',
+      r'Planning finished'
+    ]
+    # queries that explore different code paths in Frontend compilation
+    queries = [
+      'create table if not exists impala_6568 (i int)',
+      'select * from impala_6568',
+      'explain select * from impala_6568',
+      'describe impala_6568',
+      'alter table impala_6568 set tblproperties(\'numRows\'=\'10\')',
+      "load data inpath '/{0}' into table impala_6568".format(path)
+    ]
+    # run each query...
+    for query in queries:
+      runtime_profile = self.execute_query(query).runtime_profile
+      # and check that all the expected events appear in the resulting profile
+      self.__verify_profile_contains_every_event(event_regexes, runtime_profile, query)
+
+  def __verify_profile_contains_every_event(self, event_regexes, runtime_profile, query):
+    """Test that all the expected events show up in a given query profile."""
+    for regex in event_regexes:
+      assert any(re.search(regex, line) for line in runtime_profile.splitlines()), \
+          "Didn't find event '" + regex + "' for query '" + query + \
+          "' in profile: \n" + runtime_profile
 
 class TestThriftProfile(ImpalaTestSuite):
   @classmethod

@@ -72,8 +72,7 @@ enum TImpalaQueryOptions {
   // Number of scanner threads.
   NUM_SCANNER_THREADS,
 
-  // If true, Impala will try to execute on file formats that are not fully supported yet
-  ALLOW_UNSUPPORTED_FORMATS,
+  ALLOW_UNSUPPORTED_FORMATS, // Removed
 
   DEFAULT_ORDER_BY_LIMIT, // Removed
 
@@ -110,8 +109,7 @@ enum TImpalaQueryOptions {
   // Leave blank to use default.
   COMPRESSION_CODEC,
 
-  // Mode for compressing sequence files; either BLOCK, RECORD, or DEFAULT
-  SEQ_COMPRESSION_MODE,
+  SEQ_COMPRESSION_MODE, // Removed
 
   // HBase scan query option. If set and > 0, HBASE_CACHING is the value for
   // "hbase.client.Scan.setCaching()" when querying HBase table. Otherwise, use backend
@@ -326,6 +324,21 @@ enum TImpalaQueryOptions {
   // Overrides the -kudu_read_mode flag to set the consistency level for Kudu scans.
   // Possible values are DEFAULT, READ_LATEST, and READ_AT_SNAPSHOT.
   KUDU_READ_MODE,
+
+  // Allow reading of erasure coded files.
+  ALLOW_ERASURE_CODED_FILES,
+
+  // The timezone used in UTC<->localtime conversions. The default is the OS's timezone
+  // at the coordinator, which can be overridden by environment variable $TZ.
+  TIMEZONE,
+
+  // Scan bytes limit, after which a query will be terminated with an error.
+  SCAN_BYTES_LIMIT,
+
+  // CPU time limit in seconds, after which a query will be terminated with an error.
+  // Note that until IMPALA-7318 is fixed, CPU usage can be very stale and this may not
+  // terminate queries soon enough.
+  CPU_LIMIT_S,
 }
 
 // The summary of a DML statement.

@@ -133,12 +133,22 @@ class RpcMgr {
       kudu::rpc::GeneratedServiceIf* service_ptr, MemTracker* service_mem_tracker)
       WARN_UNUSED_RESULT;
 
-  /// Creates a new proxy for a remote service of type P at location 'address', and places
-  /// it in 'proxy'. 'P' must descend from kudu::rpc::ServiceIf. Note that 'address' must
-  /// be a resolved IP address.
+  /// Returns true if the given 'remote_user' in RpcContext 'context' is authorized to
+  /// access 'service_name' registered with this RpcMgr. Authorization is only enforced
+  /// when Kerberos is enabled.
+  ///
+  /// If authorization is denied, the RPC is responded to with an error message. Memory
+  /// of RPC payloads accounted towards 'mem_tracker', the service's MemTracker, is also
+  /// released.
+  bool Authorize(const string& service_name, kudu::rpc::RpcContext* context,
+      MemTracker* mem_tracker) const;
+
+  /// Creates a new proxy for a remote service of type P at location 'address' with
+  /// hostname 'hostname' and places it in 'proxy'. 'P' must descend from
+  /// kudu::rpc::ServiceIf. Note that 'address' must be a resolved IP address.
   template <typename P>
-  Status GetProxy(const TNetworkAddress& address, std::unique_ptr<P>* proxy)
-      WARN_UNUSED_RESULT;
+  Status GetProxy(const TNetworkAddress& address, const std::string& hostname,
+      std::unique_ptr<P>* proxy) WARN_UNUSED_RESULT;
 
   /// Shut down all previously registered services. All service pools are shut down.
   /// All acceptor and reactor threads within the messenger are also shut down.

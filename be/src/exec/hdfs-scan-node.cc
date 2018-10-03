@@ -27,10 +27,13 @@
 #include "runtime/descriptors.h"
 #include "runtime/fragment-instance-state.h"
 #include "runtime/io/request-context.h"
+#include "runtime/mem-tracker.h"
+#include "runtime/query-state.h"
+#include "runtime/row-batch-queue.h"
+#include "runtime/row-batch.h"
 #include "runtime/runtime-filter.inline.h"
 #include "runtime/runtime-state.h"
-#include "runtime/mem-tracker.h"
-#include "runtime/row-batch.h"
+#include "runtime/scanner-mem-limiter.h"
 #include "runtime/thread-resource-mgr.h"
 #include "util/debug-util.h"
 #include "util/disk-info.h"
@@ -38,16 +41,8 @@
 
 #include "common/names.h"
 
-DEFINE_int32(max_row_batches, 0, "the maximum size of materialized_row_batches_");
-
-// The maximum capacity of materialized_row_batches_ per scanner thread that can
-// be created. This is multiplied by 'max_num_scanner_threads_' to get an upper
-// bound on the queue size. This reduces the queue size on systems with many disks
-// and makes the num_scanner_threads query option more effective at reducing memory
-// consumption. For now, make this relatively high. We should consider lowering
-// this or using a better heuristic (e.g. based on queued memory).
-DEFINE_int32_hidden(max_queued_row_batches_per_scanner_thread, 5,
-    "(Advanced) the maximum number of queued row batches per scanner thread.");
+DEFINE_int32(max_row_batches, 0,
+    "the maximum number of batches to queue in multithreaded HDFS scans");
 
 #ifndef NDEBUG
 DECLARE_bool(skip_file_runtime_filtering);
@@ -56,14 +51,25 @@ DECLARE_bool(skip_file_runtime_filtering);
 using namespace impala;
 using namespace impala::io;
 
+// Amount of memory that we approximate a scanner thread will use not including I/O
+// buffers. The memory used does not vary considerably between file formats (just a
+// couple of MBs). This value is conservative and taken from running against the tpch
+// lineitem table. Note: this is a crude heuristic to help reduce odds of OOM until
+// we can remove the multithreaded scanners.
+DEFINE_int64_hidden(hdfs_scanner_thread_max_estimated_bytes, 32L * 1024L * 1024L,
+    "Estimated bytes of memory consumed by HDFS scanner thread.");
+
+// Estimated upper bound on the compression ratio of compressed text files. Used to
+// estimate scanner thread memory usage.
+const int COMPRESSED_TEXT_COMPRESSION_RATIO = 11;
+
 // Amount of time to block waiting for GetNext() to release scanner threads between
 // checking if a scanner thread should yield itself back to the global thread pool.
 const int SCANNER_THREAD_WAIT_TIME_MS = 20;
 
 HdfsScanNode::HdfsScanNode(ObjectPool* pool, const TPlanNode& tnode,
                            const DescriptorTbl& descs)
-    : HdfsScanNodeBase(pool, tnode, descs),
-      max_num_scanner_threads_(CpuInfo::num_cores()) {
+    : HdfsScanNodeBase(pool, tnode, descs) {
 }
 
 HdfsScanNode::~HdfsScanNode() {
@@ -78,10 +84,21 @@ Status HdfsScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos
     // so we need to tell them there is work to do.
     // TODO: This is probably not worth splitting the organisational cost of splitting
     // initialisation across two places. Move to before the scanner threads start.
-    RETURN_IF_ERROR(IssueInitialScanRanges(state));
+    Status status = IssueInitialScanRanges(state);
+    if (!status.ok()) {
+      // If the status returned is CANCELLED, it could be because the
+      // reader_context_ was cancelled by a scanner thread which hit an error. In this
+      // case, the scanner thread's error must take precedence. In other cases,
+      // the non-ok status represents the error in ValidateScanRange() or describes
+      // the unsupported compression formats. For such non-CANCELLED cases, the status
+      // returned by IssueInitialScanRanges() takes precedence.
+      unique_lock<mutex> l(lock_);
+      if (status.IsCancelled() && !status_.ok()) return status_;
+      return status;
+    }
 
     // Release the scanner threads
-    ranges_issued_barrier_.Notify();
+    discard_result(ranges_issued_barrier_.Notify());
 
     if (progress_.done()) SetDone();
   }
@@ -91,9 +108,6 @@ Status HdfsScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos
     unique_lock<mutex> l(lock_);
     lock_guard<SpinLock> l2(file_type_counts_);
     StopAndFinalizeCounters();
-    row_batches_put_timer_->Set(materialized_row_batches_->total_put_wait_time());
-    row_batches_get_timer_->Set(materialized_row_batches_->total_get_wait_time());
-    row_batches_peak_mem_consumption_->Set(row_batches_mem_tracker_->peak_consumption());
   }
   return status;
 }
@@ -111,7 +125,7 @@ Status HdfsScanNode::GetNextInternal(
     return Status::OK();
   }
   *eos = false;
-  unique_ptr<RowBatch> materialized_batch = materialized_row_batches_->GetBatch();
+  unique_ptr<RowBatch> materialized_batch = thread_state_.batch_queue()->GetBatch();
   if (materialized_batch != NULL) {
     row_batch->AcquireState(materialized_batch.get());
     // Update the number of materialized rows now instead of when they are materialized.
@@ -140,52 +154,10 @@ Status HdfsScanNode::GetNextInternal(
   return status_;
 }
 
-Status HdfsScanNode::Init(const TPlanNode& tnode, RuntimeState* state) {
-  if (state->query_options().num_scanner_threads > 0) {
-    max_num_scanner_threads_ = state->query_options().num_scanner_threads;
-  }
-  DCHECK_GT(max_num_scanner_threads_, 0);
-
-  int default_max_row_batches = FLAGS_max_row_batches;
-  if (default_max_row_batches <= 0) {
-    // TODO: IMPALA-7096: re-evaluate this heuristic to get a tighter bound on memory
-    // consumption, we could do something better.
-    default_max_row_batches = min(
-        10 * DiskInfo::num_disks() + DiskIoMgr::REMOTE_NUM_DISKS,
-        max_num_scanner_threads_ * FLAGS_max_queued_row_batches_per_scanner_thread);
-  }
-  if (state->query_options().__isset.mt_dop && state->query_options().mt_dop > 0) {
-    // To avoid a significant memory increase, adjust the number of maximally queued
-    // row batches per scan instance based on MT_DOP. The max materialized row batches
-    // is at least 2 to allow for some parallelism between the producer/consumer.
-    max_materialized_row_batches_ =
-        max(2, default_max_row_batches / state->query_options().mt_dop);
-  } else {
-    max_materialized_row_batches_ = default_max_row_batches;
-  }
-  VLOG_QUERY << "Max row batch queue size for scan node '" << id_
-      << "' in fragment instance '" << PrintId(state->fragment_instance_id())
-      << "': " << max_materialized_row_batches_;
-  materialized_row_batches_.reset(new RowBatchQueue(max_materialized_row_batches_));
-  return HdfsScanNodeBase::Init(tnode, state);
-}
-
 Status HdfsScanNode::Prepare(RuntimeState* state) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
   RETURN_IF_ERROR(HdfsScanNodeBase::Prepare(state));
-  row_batches_mem_tracker_ = state->obj_pool()->Add(new MemTracker(
-        -1, "Queued Batches", mem_tracker(), false));
-
-  row_batches_enqueued_ =
-      ADD_COUNTER(runtime_profile(), "RowBatchesEnqueued", TUnit::UNIT);
-  row_batch_bytes_enqueued_ =
-      ADD_COUNTER(runtime_profile(), "RowBatchBytesEnqueued", TUnit::BYTES);
-  row_batches_get_timer_ = ADD_TIMER(runtime_profile(), "RowBatchQueueGetWaitTime");
-  row_batches_put_timer_ = ADD_TIMER(runtime_profile(), "RowBatchQueuePutWaitTime");
-  row_batches_max_capacity_ = runtime_profile()->AddHighWaterMarkCounter(
-      "RowBatchQueueCapacity", TUnit::UNIT);
-  row_batches_peak_mem_consumption_ =
-      ADD_COUNTER(runtime_profile(), "RowBatchQueuePeakMemoryUsage", TUnit::BYTES);
+  thread_state_.Prepare(this, EstimateScannerThreadMemConsumption());
   scanner_thread_reservations_denied_counter_ =
       ADD_COUNTER(runtime_profile(), "NumScannerThreadReservationsDenied", TUnit::UNIT);
   return Status::OK();
@@ -197,11 +169,7 @@ Status HdfsScanNode::Prepare(RuntimeState* state) {
 Status HdfsScanNode::Open(RuntimeState* state) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
   RETURN_IF_ERROR(HdfsScanNodeBase::Open(state));
-
-  if (file_descs_.empty() || progress_.done()) return Status::OK();
-
-  average_scanner_thread_concurrency_ = runtime_profile()->AddSamplingCounter(
-      AVERAGE_SCANNER_THREAD_CONCURRENCY, &active_scanner_thread_counter_);
+  thread_state_.Open(this, FLAGS_max_row_batches);
 
   thread_avail_cb_id_ = runtime_state_->resource_pool()->AddThreadAvailableCb(
       bind<void>(mem_fn(&HdfsScanNode::ThreadTokenAvailableCb), this, _1));
@@ -214,9 +182,7 @@ void HdfsScanNode::Close(RuntimeState* state) {
   if (thread_avail_cb_id_ != -1) {
     state->resource_pool()->RemoveThreadAvailableCb(thread_avail_cb_id_);
   }
-  scanner_threads_.JoinAll();
-  materialized_row_batches_->Cleanup();
-  if (row_batches_mem_tracker_ != nullptr) row_batches_mem_tracker_->Close();
+  thread_state_.Close(this);
   HdfsScanNodeBase::Close(state);
 }
 
@@ -233,13 +199,7 @@ void HdfsScanNode::TransferToScanNodePool(MemPool* pool) {
 
 void HdfsScanNode::AddMaterializedRowBatch(unique_ptr<RowBatch> row_batch) {
   InitNullCollectionValues(row_batch.get());
-  COUNTER_ADD(row_batches_enqueued_, 1);
-  // Only need to count tuple_data_pool() bytes since after IMPALA-5307, no buffers are
-  // returned from the scan node.
-  COUNTER_ADD(row_batch_bytes_enqueued_,
-      row_batch->tuple_data_pool()->total_reserved_bytes());
-  row_batch->SetMemTracker(row_batches_mem_tracker_);
-  materialized_row_batches_->AddBatch(move(row_batch));
+  thread_state_.EnqueueBatch(move(row_batch));
 }
 
 Status HdfsScanNode::AddDiskIoRanges(const vector<ScanRange*>& ranges,
@@ -249,6 +209,31 @@ Status HdfsScanNode::AddDiskIoRanges(const vector<ScanRange*>& ranges,
   DCHECK_GE(num_unqueued_files_.Load(), 0);
   if (!ranges.empty()) ThreadTokenAvailableCb(runtime_state_->resource_pool());
   return Status::OK();
+}
+
+int64_t HdfsScanNode::EstimateScannerThreadMemConsumption() const {
+  // Start with the minimum I/O buffer requirement.
+  int64_t est_total_bytes = resource_profile_.min_reservation;
+
+  // Next add in the other memory that we estimate the scanner thread will use,
+  // e.g. decompression buffers, tuple buffers, etc.
+  // For compressed text, we estimate this based on the file size (since the whole file
+  // will need to be decompressed at once). For all other formats, we use a constant.
+  // Note: this is crude and we could try to refine it by factoring in the number of
+  // columns, etc, but it is unclear how beneficial this would be.
+  int64_t est_non_reserved_bytes = FLAGS_hdfs_scanner_thread_max_estimated_bytes;
+  auto it = per_type_files_.find(THdfsFileFormat::TEXT);
+  if (it != per_type_files_.end()) {
+    for (HdfsFileDesc* file : it->second) {
+      if (file->file_compression != THdfsCompression::NONE) {
+        int64_t compressed_text_est_bytes =
+            file->file_length * COMPRESSED_TEXT_COMPRESSION_RATIO;
+        est_non_reserved_bytes = max(compressed_text_est_bytes, est_non_reserved_bytes);
+      }
+    }
+  }
+  est_total_bytes += est_non_reserved_bytes;
+  return est_total_bytes;
 }
 
 void HdfsScanNode::ReturnReservationFromScannerThread(const unique_lock<mutex>& lock,
@@ -270,18 +255,22 @@ void HdfsScanNode::ThreadTokenAvailableCb(ThreadResourcePool* pool) {
   //  3. Don't start up if the number of ranges left is less than the number of
   //     active scanner threads.
   //  4. Don't start up if no initial ranges have been issued (see IMPALA-1722).
-  //  5. Don't start up a ScannerThread if materialized_row_batches_ is full since
+  //  5. Don't start up a ScannerThread if the row batch queue is not full since
   //     we are not scanner bound.
-  //  6. Don't start up a thread if it is an extra thread and we can't reserve another
+  //  6. Don't start up a thread if there is not enough memory available for the
+  //     estimated memory consumption (include reservation and non-reserved memory).
+  //  7. Don't start up a thread if it is an extra thread and we can't reserve another
   //     minimum reservation's worth of memory for the thread.
-  //  7. Don't start up more than maximum number of scanner threads configured.
-  //  8. Don't start up if there are no thread tokens.
+  //  8. Don't start up more than maximum number of scanner threads configured.
+  //  9. Don't start up if there are no thread tokens.
 
   // Case 4. We have not issued the initial ranges so don't start a scanner thread.
   // Issuing ranges will call this function and we'll start the scanner threads then.
   // TODO: It would be good to have a test case for that.
   if (!initial_ranges_issued_) return;
 
+  ScannerMemLimiter* scanner_mem_limiter =
+      runtime_state_->query_state()->scanner_mem_limiter();
   Status status = Status::OK();
   while (true) {
     // The lock must be given up between loops in order to give writers to done_,
@@ -290,8 +279,9 @@ void HdfsScanNode::ThreadTokenAvailableCb(ThreadResourcePool* pool) {
     // correct way to communicate between this method and ScannerThreadHelper
     unique_lock<mutex> lock(lock_);
 
-    const int64_t num_active_scanner_threads = active_scanner_thread_counter_.value();
+    const int64_t num_active_scanner_threads = thread_state_.GetNumActive();
     const bool first_thread = num_active_scanner_threads == 0;
+    const int64_t est_mem = thread_state_.estimated_per_thread_mem();
     const int64_t scanner_thread_reservation = resource_profile_.min_reservation;
     // Cases 1, 2, 3.
     if (done_ || all_ranges_started_ ||
@@ -300,38 +290,46 @@ void HdfsScanNode::ThreadTokenAvailableCb(ThreadResourcePool* pool) {
     }
 
     if (!first_thread) {
-      // Cases 5 and 6.
-      if (materialized_row_batches_->Size() >= max_materialized_row_batches_) break;
+      // Cases 5, 6 and 7.
+      if (thread_state_.batch_queue()->AtCapacity()) break;
+      if (!scanner_mem_limiter->ClaimMemoryForScannerThread(this, est_mem)) {
+        COUNTER_ADD(thread_state_.scanner_thread_mem_unavailable_counter(), 1);
+        break;
+      }
+
       // The node's min reservation is for the first thread so we don't need to check
       if (!buffer_pool_client()->IncreaseReservation(scanner_thread_reservation)) {
+        scanner_mem_limiter->ReleaseMemoryForScannerThread(this, est_mem);
         COUNTER_ADD(scanner_thread_reservations_denied_counter_, 1);
         break;
       }
     }
 
-    // Case 7 and 8.
+    // Case 8 and 9.
     if (first_thread) {
       // The first thread is required to make progress on the scan.
       pool->AcquireThreadToken();
-    } else if (active_scanner_thread_counter_.value() >= max_num_scanner_threads_
+    } else if (thread_state_.GetNumActive() >= thread_state_.max_num_scanner_threads()
         || !pool->TryAcquireThreadToken()) {
+      scanner_mem_limiter->ReleaseMemoryForScannerThread(this, est_mem);
       ReturnReservationFromScannerThread(lock, scanner_thread_reservation);
       break;
     }
 
-    COUNTER_ADD(&active_scanner_thread_counter_, 1);
     string name = Substitute("scanner-thread (finst:$0, plan-node-id:$1, thread-idx:$2)",
         PrintId(runtime_state_->fragment_instance_id()), id(),
-        num_scanner_threads_started_counter_->value());
+        thread_state_.GetNumStarted());
     auto fn = [this, first_thread, scanner_thread_reservation]() {
       this->ScannerThread(first_thread, scanner_thread_reservation);
     };
     std::unique_ptr<Thread> t;
-    status =
-      Thread::Create(FragmentInstanceState::FINST_THREAD_GROUP_NAME, name, fn, &t, true);
+    status = Thread::Create(
+        FragmentInstanceState::FINST_THREAD_GROUP_NAME, name, fn, &t, true);
     if (!status.ok()) {
+      if (!first_thread) {
+        scanner_mem_limiter->ReleaseMemoryForScannerThread(this, est_mem);
+      }
       ReturnReservationFromScannerThread(lock, scanner_thread_reservation);
-      COUNTER_ADD(&active_scanner_thread_counter_, -1);
       // Release the token and skip running callbacks to find a replacement. Skipping
       // serves two purposes. First, it prevents a mutual recursion between this function
       // and ReleaseThreadToken()->InvokeCallbacks(). Second, Thread::Create() failed and
@@ -340,19 +338,16 @@ void HdfsScanNode::ThreadTokenAvailableCb(ThreadResourcePool* pool) {
 
       // Abort the query. This is still holding the lock_, so done_ is known to be
       // false and status_ must be ok.
-      DCHECK(status_.ok());
-      status_ = status;
-      SetDoneInternal();
+      SetDoneInternal(status);
       break;
     }
     // Thread successfully started
-    COUNTER_ADD(num_scanner_threads_started_counter_, 1);
-    scanner_threads_.AddThread(move(t));
+    thread_state_.AddThread(move(t));
   }
 }
 
 void HdfsScanNode::ScannerThread(bool first_thread, int64_t scanner_thread_reservation) {
-  SCOPED_THREAD_COUNTER_MEASUREMENT(scanner_thread_counters());
+  SCOPED_THREAD_COUNTER_MEASUREMENT(thread_state_.thread_counters());
   SCOPED_THREAD_COUNTER_MEASUREMENT(runtime_state_->total_thread_statistics());
   // Make thread-local copy of filter contexts to prune scan ranges, and to pass to the
   // scanner for finer-grained filtering. Use a thread-local MemPool for the filter
@@ -401,14 +396,9 @@ void HdfsScanNode::ScannerThread(bool first_thread, int64_t scanner_thread_reser
       // If there was already an error, the main thread will do the cleanup
       if (!status_.ok()) break;
 
-      if (status.IsCancelled() && done_) {
-        // Scan node initiated scanner thread cancellation.  No need to do anything.
-        break;
-      }
-      // Set status_ before calling SetDone() (which shuts down the RowBatchQueue),
-      // to ensure that GetNextInternal() notices the error status.
-      status_ = status;
-      SetDoneInternal();
+      // Invoke SetDoneInternal() with the error status (which shuts down the
+      // RowBatchQueue) to ensure that GetNextInternal() notices the error.
+      SetDoneInternal(status);
       break;
     }
 
@@ -427,6 +417,15 @@ void HdfsScanNode::ScannerThread(bool first_thread, int64_t scanner_thread_reser
       all_ranges_started_ = true;
       break;
     }
+
+    // Stop extra threads if we're over a soft limit in order to free up memory.
+    if (!first_thread &&
+        (mem_tracker_->AnyLimitExceeded(MemLimit::SOFT) ||
+          !DebugAction(runtime_state_->query_options(),
+              "HDFS_SCANNER_THREAD_CHECK_SOFT_MEM_LIMIT").ok())) {
+      VLOG_QUERY << "Soft memory limit exceeded. Extra scanner thread exiting.";
+      break;
+    }
   }
 
   {
@@ -437,7 +436,12 @@ void HdfsScanNode::ScannerThread(bool first_thread, int64_t scanner_thread_reser
   filter_mem_pool.FreeAll();
   expr_results_pool.FreeAll();
   runtime_state_->resource_pool()->ReleaseThreadToken(first_thread);
-  COUNTER_ADD(&active_scanner_thread_counter_, -1);
+  if (!first_thread) {
+    // Memory for the first thread is released in thread_state_.Close().
+    runtime_state_->query_state()->scanner_mem_limiter()->ReleaseMemoryForScannerThread(
+        this, thread_state_.estimated_per_thread_mem());
+  }
+  thread_state_.DecrementNumActive();
 }
 
 Status HdfsScanNode::ProcessSplit(const vector<FilterContext>& filter_ctxs,
@@ -453,7 +457,7 @@ Status HdfsScanNode::ProcessSplit(const vector<FilterContext>& filter_ctxs,
 
   if (!PartitionPassesFilters(partition_id, FilterStats::SPLITS_KEY, filter_ctxs)) {
     // Avoid leaking unread buffers in scan_range.
-    scan_range->Cancel(Status::CANCELLED);
+    scan_range->Cancel(Status::CancelledInternal("HDFS partition pruning"));
     HdfsFileDesc* desc = GetFileDesc(partition_id, *scan_range->file_string());
     if (metadata->is_sequence_header) {
       // File ranges haven't been issued yet, skip entire file
@@ -486,23 +490,33 @@ Status HdfsScanNode::ProcessSplit(const vector<FilterContext>& filter_ctxs,
   }
 
   status = scanner->ProcessSplit();
-  if (VLOG_QUERY_IS_ON && !status.ok() && !status.IsCancelled()) {
-    // This thread hit an error, record it and bail
-    stringstream ss;
-    ss << "Scan node (id=" << id() << ") ran into a parse error for scan range "
-       << scan_range->file() << "(" << scan_range->offset() << ":"
-       << scan_range->len() << ").";
-    // Parquet doesn't read the range end to end so the current offset isn't useful.
-    // TODO: make sure the parquet reader is outputting as much diagnostic
-    // information as possible.
-    if (partition->file_format() != THdfsFileFormat::PARQUET) {
-      ScannerContext::Stream* stream = context.GetStream();
-      ss << " Processed " << stream->total_bytes_returned() << " bytes.";
+  if (!status.ok()) {
+    if (VLOG_QUERY_IS_ON && !status.IsCancelled()) {
+      // This thread hit an error, record it and bail
+      stringstream ss;
+      ss << "Scan node (id=" << id() << ") ran into a parse error for scan range "
+         << scan_range->file() << "(" << scan_range->offset() << ":" << scan_range->len()
+         << ").";
+      // Parquet doesn't read the range end to end so the current offset isn't useful.
+      // TODO: make sure the parquet reader is outputting as much diagnostic
+      // information as possible.
+      if (partition->file_format() != THdfsFileFormat::PARQUET) {
+        ScannerContext::Stream* stream = context.GetStream();
+        ss << " Processed " << stream->total_bytes_returned() << " bytes.";
+      }
+      VLOG_QUERY << ss.str();
     }
-    VLOG_QUERY << ss.str();
-  }
 
-  // Transfer remaining resources to a final batch and add it to the row batch queue.
+    // If status is the first non-ok status returned by any scanner thread, update
+    // HdfsScanNodeBase::status_ variable and notify other scanner threads. Ensure that
+    // status_ is updated before marking a range as complete (The scanner->Close() call
+    // marks a scan range as complete).
+    unique_lock<mutex> l(lock_);
+    // Update the status_ and set the done_ flag if this is the first non-ok status.
+    SetDoneInternal(status);
+  }
+  // Transfer remaining resources to a final batch and add it to the row batch queue and
+  // decrement progress_ to indicate that the scan range is complete.
   scanner->Close();
   // Reservation may have been increased by the scanner, e.g. Parquet may allocate
   // additional reservation to scan columns.
@@ -510,14 +524,17 @@ Status HdfsScanNode::ProcessSplit(const vector<FilterContext>& filter_ctxs,
   return status;
 }
 
-void HdfsScanNode::SetDoneInternal() {
+void HdfsScanNode::SetDoneInternal(const Status& status) {
+  // If the scan node is already in the done state, do nothing.
   if (done_) return;
+  DCHECK(status_.ok());
   done_ = true;
+  if (!status.ok()) status_ = status;
   if (reader_context_ != nullptr) reader_context_->Cancel();
-  materialized_row_batches_->Shutdown();
+  thread_state_.Shutdown();
 }
 
 void HdfsScanNode::SetDone() {
   unique_lock<mutex> l(lock_);
-  SetDoneInternal();
+  SetDoneInternal(status_);
 }

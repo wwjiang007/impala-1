@@ -24,9 +24,9 @@
 #include <gutil/strings/substitute.h>
 
 #include "exprs/anyval-util.h"
+#include "runtime/datetime-parse-util.h"
 #include "runtime/string-value.inline.h"
 #include "runtime/timestamp-value.inline.h"
-#include "runtime/timestamp-parse-util.h"
 #include "runtime/timestamp-value.h"
 #include "udf/udf.h"
 #include "udf/udf-internal.h"
@@ -56,13 +56,16 @@ typedef boost::posix_time::seconds Seconds;
 
 namespace impala {
 
+using datetime_parse_util::DateTimeFormatContext;
+using datetime_parse_util::ParseFormatTokens;
+
 StringVal TimestampFunctions::StringValFromTimestamp(FunctionContext* context,
     const TimestampValue& tv, const StringVal& fmt) {
   void* state = context->GetFunctionState(FunctionContext::THREAD_LOCAL);
   DateTimeFormatContext* dt_ctx = reinterpret_cast<DateTimeFormatContext*>(state);
   if (!context->IsArgConstant(1)) {
     dt_ctx->Reset(reinterpret_cast<const char*>(fmt.ptr), fmt.len);
-    if (!TimestampParser::ParseFormatTokens(dt_ctx)){
+    if (!ParseFormatTokens(dt_ctx)){
       TimestampFunctions::ReportBadFormat(context, fmt, false);
       return StringVal::null();
     }
@@ -165,7 +168,7 @@ TimestampVal TimestampFunctions::ToTimestamp(FunctionContext* context,
   DateTimeFormatContext* dt_ctx = reinterpret_cast<DateTimeFormatContext*>(state);
   if (!context->IsArgConstant(1)) {
      dt_ctx->Reset(reinterpret_cast<const char*>(fmt.ptr), fmt.len);
-     if (!TimestampParser::ParseFormatTokens(dt_ctx)) {
+     if (!ParseFormatTokens(dt_ctx)) {
        ReportBadFormat(context, fmt, false);
        return TimestampVal::null();
      }
@@ -329,6 +332,8 @@ StringVal TimestampFunctions::ToDate(FunctionContext* context,
   // our built-in functions might incorrectly return such a malformed timestamp.
   if (!ts_value.HasDate()) return StringVal::null();
   StringVal result(context, 10);
+  // Return NULL if 'result' allocation fails inside of the StringVal constructor.
+  if (UNLIKELY(result.is_null)) return StringVal::null();
   result.len = 10;
   // Fill in year, month, and day.
   IntToChar(result.ptr, ts_value.date().year(), 4);
@@ -704,6 +709,16 @@ inline void AddInterval<Seconds>(FunctionContext* context, int64_t interval,
   int64_t seconds = interval % (60 * 60 * 24);
   AddInterval<Days>(context, days, datetime);
   *datetime += Seconds(seconds);
+}
+
+/// Workaround a boost bug in adding large millisecond intervals.
+template <>
+inline void AddInterval<Milliseconds>(FunctionContext* context, int64_t interval,
+    ptime* datetime) {
+  int64_t seconds = interval / 1000;
+  int64_t milliseconds = interval % 1000;
+  AddInterval<Seconds>(context, seconds, datetime);
+  *datetime += Milliseconds(milliseconds);
 }
 
 /// Workaround a boost bug in adding large microsecond intervals.

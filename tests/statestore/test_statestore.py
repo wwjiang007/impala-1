@@ -18,6 +18,7 @@
 from collections import defaultdict
 import json
 import logging
+from random import randint
 import socket
 import threading
 import traceback
@@ -69,6 +70,9 @@ DEFAULT_UPDATE_STATE_RESPONSE = TUpdateStateResponse(status=STATUS_OK, topic_upd
 
 # IMPALA-3501: the timeout needs to be higher in code coverage builds
 WAIT_FOR_FAILURE_TIMEOUT = specific_build_type_timeout(40, code_coverage_build_timeout=60)
+WAIT_FOR_HEARTBEAT_TIMEOUT = specific_build_type_timeout(
+    40, code_coverage_build_timeout=60)
+WAIT_FOR_UPDATE_TIMEOUT = specific_build_type_timeout(40, code_coverage_build_timeout=60)
 
 class WildcardServerSocket(TSocket.TSocketBase, TTransport.TServerTransportBase):
   """Specialised server socket that binds to a random port at construction"""
@@ -104,6 +108,9 @@ class KillableThreadedServer(TServer):
     self.is_shutdown = True
     self.serverTransport.close()
     self.wait_until_down()
+    # The processor contains a reference to a StatestoreSubscriber. Clean up that
+    # reference to avoid a circular reference that would prevent object deletion.
+    self.processor = None
 
   def wait_until_up(self, num_tries=10):
     for i in xrange(num_tries):
@@ -180,6 +187,13 @@ class StatestoreSubscriber(object):
     self.subscriber_id = "python-test-client-%s" % uuid.uuid1()
     self.exception = None
 
+  def __enter__(self):
+    return self
+
+  def __exit__(self, *args):
+    self.kill()
+    self.wait_for_failure()
+
   def Heartbeat(self, args):
     """Heartbeat RPC handler. Calls heartbeat callback if one exists."""
     self.heartbeat_event.acquire()
@@ -241,8 +255,10 @@ class StatestoreSubscriber(object):
   def kill(self):
     """Closes both the server and client sockets, and waits for the server to become
     unavailable"""
-    self.client_transport.close()
-    self.server.shutdown()
+    if self.client_transport:
+      self.client_transport.close()
+    if self.server:
+      self.server.shutdown()
     return self
 
   def start(self):
@@ -279,10 +295,11 @@ class StatestoreSubscriber(object):
       while count > self.heartbeat_count:
         self.check_thread_exceptions()
         last_count = self.heartbeat_count
-        self.heartbeat_event.wait(10)
+        self.heartbeat_event.wait(WAIT_FOR_HEARTBEAT_TIMEOUT)
         if last_count == self.heartbeat_count:
-          raise Exception("Heartbeat not received within 10s (heartbeat count: %s)" %
-                          self.heartbeat_count)
+          raise Exception(
+              "Heartbeat not received within {0}s (heartbeat count: {1})".format(
+                WAIT_FOR_HEARTBEAT_TIMEOUT, self.heartbeat_count))
       self.check_thread_exceptions()
       return self
     finally:
@@ -300,11 +317,12 @@ class StatestoreSubscriber(object):
       while count > self.update_counts[topic_name]:
         self.check_thread_exceptions()
         last_count = self.update_counts[topic_name]
-        self.update_event.wait(10)
-        if (time.time() > start_time + 10 and
-            last_count == self.update_counts[topic_name]):
-          raise Exception("Update not received for %s within 10s (update count: %s)" %
-                          (topic_name, last_count))
+        self.update_event.wait(WAIT_FOR_UPDATE_TIMEOUT)
+        if (time.time() > start_time + WAIT_FOR_UPDATE_TIMEOUT and
+              last_count == self.update_counts[topic_name]):
+          raise Exception(
+              "Update not received for {0} within {1} (update count: {2})".format(
+                topic_name, WAIT_FOR_UPDATE_TIMEOUT, last_count))
       self.check_thread_exceptions()
       return self
     finally:
@@ -315,11 +333,13 @@ class StatestoreSubscriber(object):
     """Waits until this subscriber no longer appears in the statestore's subscriber
     list. If 'timeout' seconds pass, throws an exception."""
     start = time.time()
-    while time.time() - start < timeout:
+    while True:
       subs = [s["id"] for s in get_statestore_subscribers()["subscribers"]]
       if self.subscriber_id not in subs: return self
+      if time.time() - start > timeout:
+        raise Exception("Subscriber {0} did not fail in {1}s".format(
+            self.subscriber_id, timeout))
       time.sleep(0.2)
-    raise Exception("Subscriber %s did not fail in %ss" % (self.subscriber_id, timeout))
 
 class TestStatestore():
   def make_topic_update(self, topic_name, key_template="foo", value_template="bar",
@@ -335,17 +355,17 @@ class TestStatestore():
   def test_registration_ids_different(self):
     """Test that if a subscriber with the same id registers twice, the registration ID is
     different"""
-    sub = StatestoreSubscriber()
-    sub.start().register()
-    old_reg_id = sub.registration_id
-    sub.register()
-    assert old_reg_id != sub.registration_id
+    with StatestoreSubscriber() as sub:
+      sub.start().register()
+      old_reg_id = sub.registration_id
+      sub.register()
+      assert old_reg_id != sub.registration_id
 
   def test_receive_heartbeats(self):
     """Smoke test to confirm that heartbeats get sent to a correctly registered
     subscriber"""
-    sub = StatestoreSubscriber()
-    sub.start().register().wait_for_heartbeat(5)
+    with StatestoreSubscriber() as sub:
+      sub.start().register().wait_for_heartbeat(5)
 
   def test_receive_updates(self):
     """Test that updates are correctly received when a subscriber alters a topic"""
@@ -370,13 +390,62 @@ class TestStatestore():
 
       return DEFAULT_UPDATE_STATE_RESPONSE
 
-    sub = StatestoreSubscriber(update_cb=topic_update_correct)
-    reg = TTopicRegistration(topic_name=topic_name, is_transient=False)
-    (
-      sub.start()
-         .register(topics=[reg])
-         .wait_for_update(topic_name, 3)
-    )
+    with StatestoreSubscriber(update_cb=topic_update_correct) as sub:
+      reg = TTopicRegistration(topic_name=topic_name, is_transient=False)
+      (
+        sub.start()
+           .register(topics=[reg])
+           .wait_for_update(topic_name, 3)
+      )
+
+  def test_filter_prefix(self):
+    topic_name = "topic_delta_%s" % uuid.uuid1()
+
+    def topic_update_correct(sub, args):
+      foo_delta = self.make_topic_update(topic_name, num_updates=1)
+      bar_delta = self.make_topic_update(topic_name, num_updates=2, key_template='bar')
+
+      update_count = sub.update_counts[topic_name]
+      if topic_name not in args.topic_deltas:
+        # The update doesn't contain our topic.
+        pass
+      elif update_count == 1:
+        # Send some values with both prefixes.
+        return TUpdateStateResponse(status=STATUS_OK,
+                                    topic_updates=[foo_delta, bar_delta],
+                                    skipped=False)
+      elif update_count == 2:
+        # We should only get the 'bar' entries back.
+        assert len(args.topic_deltas) == 1, args.topic_deltas
+        assert args.topic_deltas[topic_name].topic_entries == bar_delta.topic_entries
+        assert args.topic_deltas[topic_name].topic_name == bar_delta.topic_name
+      elif update_count == 3:
+        # Send some more updates that only have 'foo' prefixes.
+        return TUpdateStateResponse(status=STATUS_OK,
+                                    topic_updates=[foo_delta],
+                                    skipped=False)
+      elif update_count == 4:
+        # We shouldn't see any entries from the above update, but we should still see
+        # the version number change due to the new entries in the topic.
+        assert len(args.topic_deltas[topic_name].topic_entries) == 0
+        assert args.topic_deltas[topic_name].from_version == 3
+        assert args.topic_deltas[topic_name].to_version == 4
+      elif update_count == 5:
+        # After the content-bearing update was processed, the next delta should be empty
+        assert len(args.topic_deltas[topic_name].topic_entries) == 0
+        assert args.topic_deltas[topic_name].from_version == 4
+        assert args.topic_deltas[topic_name].to_version == 4
+
+      return DEFAULT_UPDATE_STATE_RESPONSE
+
+    with StatestoreSubscriber(update_cb=topic_update_correct) as sub:
+      reg = TTopicRegistration(topic_name=topic_name, is_transient=False,
+                               filter_prefix="bar")
+      (
+        sub.start()
+           .register(topics=[reg])
+           .wait_for_update(topic_name, 5)
+      )
 
   def test_update_is_delta(self):
     """Test that the 'is_delta' flag is correctly set. The first update for a topic should
@@ -403,13 +472,13 @@ class TestStatestore():
 
       return DEFAULT_UPDATE_STATE_RESPONSE
 
-    sub = StatestoreSubscriber(update_cb=check_delta)
-    reg = TTopicRegistration(topic_name=topic_name, is_transient=False)
-    (
-      sub.start()
-         .register(topics=[reg])
-         .wait_for_update(topic_name, 3)
-    )
+    with StatestoreSubscriber(update_cb=check_delta) as sub:
+      reg = TTopicRegistration(topic_name=topic_name, is_transient=False)
+      (
+        sub.start()
+           .register(topics=[reg])
+           .wait_for_update(topic_name, 3)
+      )
 
   def test_skipped(self):
     """Test that skipping an update causes it to be resent"""
@@ -429,39 +498,58 @@ class TestStatestore():
       assert len(args.topic_deltas[topic_name].topic_entries) == 1
       return TUpdateStateResponse(status=STATUS_OK, skipped=True)
 
-    sub = StatestoreSubscriber(update_cb=check_skipped)
-    reg = TTopicRegistration(topic_name=topic_name, is_transient=False)
-    (
-      sub.start()
-         .register(topics=[reg])
-         .wait_for_update(topic_name, 3)
-    )
+    with StatestoreSubscriber(update_cb=check_skipped) as sub:
+      reg = TTopicRegistration(topic_name=topic_name, is_transient=False)
+      (
+        sub.start()
+           .register(topics=[reg])
+           .wait_for_update(topic_name, 3)
+      )
 
   def test_failure_detected(self):
-    sub = StatestoreSubscriber()
-    topic_name = "test_failure_detected"
-    reg = TTopicRegistration(topic_name=topic_name, is_transient=True)
-    (
-      sub.start()
-         .register(topics=[reg])
-         .wait_for_update(topic_name, 1)
-         .kill()
-         .wait_for_failure()
-    )
+    with StatestoreSubscriber() as sub:
+      topic_name = "test_failure_detected"
+      reg = TTopicRegistration(topic_name=topic_name, is_transient=True)
+      (
+        sub.start()
+           .register(topics=[reg])
+           .wait_for_update(topic_name, 1)
+           .kill()
+           .wait_for_failure()
+       )
 
   def test_hung_heartbeat(self):
     """Test for IMPALA-1712: If heartbeats hang (which we simulate by sleeping for five
     minutes) the statestore should time them out every 3s and then eventually fail after
     40s (10 times (3 + 1), where the 1 is the inter-heartbeat delay)"""
-    sub = StatestoreSubscriber(heartbeat_cb=lambda sub, args: time.sleep(300))
-    topic_name = "test_hung_heartbeat"
-    reg = TTopicRegistration(topic_name=topic_name, is_transient=True)
-    (
-      sub.start()
-         .register(topics=[reg])
-         .wait_for_update(topic_name, 1)
-         .wait_for_failure(timeout=60)
-    )
+    with StatestoreSubscriber(heartbeat_cb=lambda sub, args: time.sleep(300)) as sub:
+      topic_name = "test_hung_heartbeat"
+      reg = TTopicRegistration(topic_name=topic_name, is_transient=True)
+      (
+        sub.start()
+           .register(topics=[reg])
+           .wait_for_update(topic_name, 1)
+           .wait_for_failure(timeout=60)
+       )
+
+  def test_slow_subscriber(self):
+    """Test for IMPALA-6644: This test kills a healthy subscriber and sleeps for a random
+    interval between 1 and 9 seconds, this lets the heartbeats fail without removing the
+    subscriber from the set of active subscribers. It then checks the subscribers page
+    of the statestore to ensure that the 'time_since_heartbeat' field is updated with an
+    acceptable value. Since the statestore heartbeats at 1 second intervals, an acceptable
+    value would be between ((sleep_time-1.0), (sleep_time+1.0))."""
+    sub = StatestoreSubscriber()
+    sub.start().register().wait_for_heartbeat(1)
+    sub.kill()
+    sleep_time = randint(1, 9)
+    time.sleep(sleep_time)
+    subscribers = get_statestore_subscribers()["subscribers"]
+    for s in subscribers:
+      if str(s["id"]) == sub.subscriber_id:
+        secs_since_heartbeat = float(s["secs_since_heartbeat"])
+        assert (secs_since_heartbeat > float(sleep_time - 1.0))
+        assert (secs_since_heartbeat < float(sleep_time + 1.0))
 
   def test_topic_persistence(self):
     """Test that persistent topic entries survive subscriber failure, but transent topic
@@ -502,23 +590,23 @@ class TestStatestore():
     reg = [TTopicRegistration(topic_name=persistent_topic_name, is_transient=False),
            TTopicRegistration(topic_name=transient_topic_name, is_transient=True)]
 
-    sub = StatestoreSubscriber(update_cb=add_entries)
-    (
-      sub.start()
-         .register(topics=reg)
-         .wait_for_update(persistent_topic_name, 2)
-         .wait_for_update(transient_topic_name, 2)
-         .kill()
-         .wait_for_failure()
-    )
+    with StatestoreSubscriber(update_cb=add_entries) as sub:
+      (
+        sub.start()
+           .register(topics=reg)
+           .wait_for_update(persistent_topic_name, 2)
+           .wait_for_update(transient_topic_name, 2)
+           .kill()
+           .wait_for_failure()
+      )
 
-    sub2 = StatestoreSubscriber(update_cb=check_entries)
-    (
-      sub2.start()
-          .register(topics=reg)
-          .wait_for_update(persistent_topic_name, 1)
-          .wait_for_update(transient_topic_name, 1)
-    )
+    with StatestoreSubscriber(update_cb=check_entries) as sub2:
+      (
+         sub2.start()
+             .register(topics=reg)
+             .wait_for_update(persistent_topic_name, 1)
+             .wait_for_update(transient_topic_name, 1)
+       )
 
   def test_update_with_clear_entries_flag(self):
     """Test that the statestore clears all topic entries when a subscriber
@@ -549,47 +637,47 @@ class TestStatestore():
       return DEFAULT_UPDATE_STATE_RESPONSE
 
     reg = [TTopicRegistration(topic_name=topic_name, is_transient=False)]
-    sub1 = StatestoreSubscriber(update_cb=add_entries)
-    (
-      sub1.start()
-        .register(topics=reg)
-        .wait_for_update(topic_name, 1)
-        .kill()
-        .wait_for_failure()
-        .start()
-        .register(topics=reg)
-        .wait_for_update(topic_name, 1)
-    )
+    with StatestoreSubscriber(update_cb=add_entries) as sub1:
+      (
+        sub1.start()
+            .register(topics=reg)
+            .wait_for_update(topic_name, 1)
+            .kill()
+            .wait_for_failure()
+            .start()
+            .register(topics=reg)
+            .wait_for_update(topic_name, 2)
+      )
 
-    sub2 = StatestoreSubscriber(update_cb=check_entries)
-    (
-      sub2.start()
-        .register(topics=reg)
-        .wait_for_update(topic_name, 2)
-    )
+    with StatestoreSubscriber(update_cb=check_entries) as sub2:
+      (
+        sub2.start()
+            .register(topics=reg)
+            .wait_for_update(topic_name, 2)
+      )
 
   def test_heartbeat_failure_reset(self):
     """Regression test for IMPALA-6785: the heartbeat failure count for the subscriber ID
     should be reset when it resubscribes, not after the first successful heartbeat. Delay
     the heartbeat to force the topic update to finish first."""
 
-    sub = StatestoreSubscriber(heartbeat_cb=lambda sub, args: time.sleep(0.5))
-    topic_name = "test_heartbeat_failure_reset"
-    reg = TTopicRegistration(topic_name=topic_name, is_transient=True)
-    sub.start()
-    sub.register(topics=[reg])
-    LOG.info("Registered with id {0}".format(sub.subscriber_id))
-    sub.wait_for_heartbeat(1)
-    sub.kill()
-    LOG.info("Killed, waiting for statestore to detect failure via heartbeats")
-    sub.wait_for_failure()
-    # IMPALA-6785 caused only one topic update to be send. Wait for multiple updates to
-    # be received to confirm that the subsequent updates are being scheduled repeatedly.
-    target_updates = sub.update_counts[topic_name] + 5
-    sub.start()
-    sub.register(topics=[reg])
-    LOG.info("Re-registered with id {0}, waiting for update".format(sub.subscriber_id))
-    sub.wait_for_update(topic_name, target_updates)
+    with StatestoreSubscriber(heartbeat_cb=lambda sub, args: time.sleep(0.5)) as sub:
+      topic_name = "test_heartbeat_failure_reset"
+      reg = TTopicRegistration(topic_name=topic_name, is_transient=True)
+      sub.start()
+      sub.register(topics=[reg])
+      LOG.info("Registered with id {0}".format(sub.subscriber_id))
+      sub.wait_for_heartbeat(1)
+      sub.kill()
+      LOG.info("Killed, waiting for statestore to detect failure via heartbeats")
+      sub.wait_for_failure()
+      # IMPALA-6785 caused only one topic update to be send. Wait for multiple updates to
+      # be received to confirm that the subsequent updates are being scheduled repeatedly.
+      target_updates = sub.update_counts[topic_name] + 5
+      sub.start()
+      sub.register(topics=[reg])
+      LOG.info("Re-registered with id {0}, waiting for update".format(sub.subscriber_id))
+      sub.wait_for_update(topic_name, target_updates)
 
   def test_min_subscriber_topic_version(self):
     self._do_test_min_subscriber_topic_version(False)
@@ -667,19 +755,81 @@ class TestStatestore():
     # version, the other which just consumes the updates.
     def producer_callback(sub, args): return callback(sub, args, True, "producer")
     def consumer_callback(sub, args): return callback(sub, args, False, "consumer")
-    consumer_sub = StatestoreSubscriber(update_cb=consumer_callback)
-    consumer_reg = TTopicRegistration(topic_name=topic_name, is_transient=True)
-    producer_sub = StatestoreSubscriber(update_cb=producer_callback)
-    producer_reg = TTopicRegistration(topic_name=topic_name, is_transient=True,
-        populate_min_subscriber_topic_version=True)
-    NUM_UPDATES = 6
-    (
-      consumer_sub.start()
-          .register(topics=[consumer_reg])
-    )
-    (
-      producer_sub.start()
-          .register(topics=[producer_reg])
-          .wait_for_update(topic_name, NUM_UPDATES)
-    )
-    consumer_sub.wait_for_update(topic_name, NUM_UPDATES)
+    with StatestoreSubscriber(update_cb=consumer_callback) as consumer_sub:
+      with StatestoreSubscriber(update_cb=producer_callback) as producer_sub:
+        consumer_reg = TTopicRegistration(topic_name=topic_name, is_transient=True)
+        producer_reg = TTopicRegistration(topic_name=topic_name, is_transient=True,
+            populate_min_subscriber_topic_version=True)
+        NUM_UPDATES = 6
+        (
+          consumer_sub.start()
+                      .register(topics=[consumer_reg])
+        )
+        (
+          producer_sub.start()
+                      .register(topics=[producer_reg])
+                      .wait_for_update(topic_name, NUM_UPDATES)
+        )
+        consumer_sub.wait_for_update(topic_name, NUM_UPDATES)
+
+  def test_transient_entry_removal_race(self):
+    """IMPALA-7306: transient entries were not deleted if the subscriber is unregistered
+    while it is in the middle of a callback. This test exercises that case by blocking
+    the update callback so that it is still running when the statestore unregisters the
+    subscriber for failed heartbeats. It also confirms that non-transient entries are not
+    removed."""
+    transient_topic_name = "test_transient_entry_removal_race_transient"
+    non_transient_topic_name = "test_transient_entry_removal_race_non_transient"
+    topic_regs = [TTopicRegistration(topic_name=transient_topic_name, is_transient=True),
+          TTopicRegistration(topic_name=non_transient_topic_name, is_transient=False)]
+    # The heartbeat timeout is 3s, so sleep for long enough for it to expire
+    HEARTBEAT_DELAY = 10
+
+    def delayed_heartbeat(sub, args):
+      LOG.info("Heartbeat callback called")
+      time.sleep(HEARTBEAT_DELAY)
+      LOG.debug("Heartbeat callback about to return")
+
+    def add_transient_entries_after_hb_failure(sub, args):
+      LOG.info("Update callback called")
+      # Add an additional delay so that this returns after the heartbeat.
+      time.sleep(WAIT_FOR_FAILURE_TIMEOUT)
+      updates = [self.make_topic_update(transient_topic_name, "k", "v"),
+                 self.make_topic_update(non_transient_topic_name, "k", "v")]
+      LOG.debug("Update callback about to return")
+      return TUpdateStateResponse(status=STATUS_OK, topic_updates=updates, skipped=False)
+
+    # Subscriber with delay creates a transient entry, which should not be added since
+    # the subscriber failed and was unregistered.
+    with StatestoreSubscriber(heartbeat_cb=delayed_heartbeat,
+                              update_cb=add_transient_entries_after_hb_failure) as sub:
+      # Wait for the first update (which should happen after failure), then confirm
+      # that the failure occurred.
+      (
+        sub.start()
+           .register(topics=topic_regs)
+           .wait_for_update(transient_topic_name, 1)
+           .wait_for_failure(timeout=WAIT_FOR_FAILURE_TIMEOUT)
+       )
+
+    def verify_transient_entry_removed(sub, args):
+      transient_delta = args.topic_deltas[transient_topic_name]
+      assert len(transient_delta.topic_entries) == 0, args
+      non_transient_delta = args.topic_deltas[non_transient_topic_name]
+      # Non-transient update should include topic that was not removed
+      assert len(non_transient_delta.topic_entries) == 1, args
+      entry = non_transient_delta.topic_entries[0]
+      assert entry.key == "k0"
+      assert entry.value == "v0"
+      assert not entry.deleted
+      # Skip updates so that statestore will re-send non-transient entries and the above
+      # assertions remain valid on subsequent callbacks.
+      return TUpdateStateResponse(status=STATUS_OK, topic_updates=[], skipped=True)
+
+    # Verify that the transient entry for the failed subscriber is not present.
+    with StatestoreSubscriber(update_cb=verify_transient_entry_removed) as sub:
+      (
+        sub.start()
+           .register(topics=topic_regs)
+           .wait_for_update(transient_topic_name, 1)
+       )

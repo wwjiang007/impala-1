@@ -72,6 +72,12 @@ class Catalog {
   /// information on the error will be returned.
   Status GetCatalogObject(const TCatalogObject& request, TCatalogObject* response);
 
+  /// Return partial information about a Catalog object.
+  /// Returns OK if the operation was successful, otherwise a Status object with
+  /// information on the error will be returned.
+  Status GetPartialCatalogObject(const TGetPartialCatalogObjectRequest& request,
+      TGetPartialCatalogObjectResponse* response);
+
   /// Return all databases matching the optional argument 'pattern'.
   /// If pattern is NULL, match all databases otherwise match only those databases that
   /// match the pattern string. Patterns are "p1|p2|p3" where | denotes choice,
@@ -107,10 +113,18 @@ class Catalog {
   /// TPrioritizeLoadRequest.
   Status PrioritizeLoad(const TPrioritizeLoadRequest& req);
 
+  /// Get partition statistics for the partitions specified in TGetPartitionStatsRequest.
+  Status GetPartitionStats(
+      const TGetPartitionStatsRequest& req, TGetPartitionStatsResponse* resp);
+
   /// Checks whether the requesting user has admin privileges on the Sentry Service and
   /// returns OK if they do. Returns a bad status if the user is not an admin or if there
   /// was an error executing the request.
   Status SentryAdminCheck(const TSentryAdminCheckRequest& req);
+
+  /// Update recently used table names and their use counts in an impalad since the last
+  /// report.
+  Status UpdateTableUsage(const TUpdateTableUsageRequest& req);
 
  private:
   /// Descriptor of Java Catalog class itself, used to create a new instance.
@@ -121,6 +135,7 @@ class Catalog {
   jmethodID exec_ddl_id_;  // JniCatalog.execDdl()
   jmethodID reset_metadata_id_;  // JniCatalog.resetMetdata()
   jmethodID get_catalog_object_id_;  // JniCatalog.getCatalogObject()
+  jmethodID get_partial_catalog_object_id_;  // JniCatalog.getPartialCatalogObject()
   jmethodID get_catalog_delta_id_;  // JniCatalog.getCatalogDelta()
   jmethodID get_catalog_version_id_;  // JniCatalog.getCatalogVersion()
   jmethodID get_catalog_usage_id_; // JniCatalog.getCatalogUsage()
@@ -128,9 +143,11 @@ class Catalog {
   jmethodID get_table_names_id_; // JniCatalog.getTableNames()
   jmethodID get_table_metrics_id_; // JniCatalog.getTableMetrics()
   jmethodID get_functions_id_; // JniCatalog.getFunctions()
+  jmethodID get_partition_stats_id_; // JniCatalog.getPartitionStats()
   jmethodID prioritize_load_id_; // JniCatalog.prioritizeLoad()
   jmethodID sentry_admin_check_id_; // JniCatalog.checkUserSentryAdmin()
   jmethodID catalog_ctor_;
+  jmethodID update_table_usage_id_;
 };
 
 }

@@ -20,11 +20,11 @@
 #include <boost/scoped_ptr.hpp>
 
 #include "exprs/scalar-expr.h"
-#include "runtime/data-stream-mgr.h"
-#include "runtime/data-stream-recvr.h"
-#include "runtime/runtime-state.h"
-#include "runtime/row-batch.h"
 #include "runtime/exec-env.h"
+#include "runtime/krpc-data-stream-mgr.h"
+#include "runtime/krpc-data-stream-recvr.h"
+#include "runtime/row-batch.h"
+#include "runtime/runtime-state.h"
 #include "util/debug-util.h"
 #include "util/runtime-profile-counters.h"
 #include "util/time.h"
@@ -82,7 +82,8 @@ Status ExchangeNode::Prepare(RuntimeState* state) {
   RETURN_IF_ERROR(ExecEnv::GetInstance()->buffer_pool()->RegisterClient(
       Substitute("Exchg Recvr (id=$0)", id_), nullptr,
       ExecEnv::GetInstance()->buffer_reservation(), mem_tracker(),
-      numeric_limits<int64_t>::max(), runtime_profile(), &recvr_buffer_pool_client_));
+      numeric_limits<int64_t>::max(), runtime_profile(), &recvr_buffer_pool_client_,
+      MemLimit::HARD));
 
   // TODO: figure out appropriate buffer size
   DCHECK_GT(num_senders_, 0);

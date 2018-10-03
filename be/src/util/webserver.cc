@@ -137,7 +137,9 @@ const char* GetDefaultDocumentRoot() {
 
 namespace impala {
 
-const char* Webserver::ENABLE_RAW_JSON_KEY = "__raw__";
+const char* Webserver::ENABLE_RAW_HTML_KEY = "__raw__";
+
+const char* Webserver::ENABLE_PLAIN_JSON_KEY = "__json__";
 
 // Supported HTTP response codes
 enum ResponseCode {
@@ -148,14 +150,13 @@ enum ResponseCode {
 // Builds a valid HTTP header given the response code and a content type.
 string BuildHeaderString(ResponseCode response, ContentType content_type) {
   static const string RESPONSE_TEMPLATE = "HTTP/1.1 $0 $1\r\n"
-      "Content-Type: text/$2\r\n"
+      "Content-Type: $2\r\n"
       "Content-Length: %d\r\n"
       "X-Frame-Options: $3\r\n"
       "\r\n";
 
   return Substitute(RESPONSE_TEMPLATE, response, response == OK ? "OK" : "Not found",
-      content_type == HTML ? "html" : "plain",
-      FLAGS_webserver_x_frame_options.c_str());
+      Webserver::GetMimeType(content_type), FLAGS_webserver_x_frame_options.c_str());
 }
 
 Webserver::Webserver()
@@ -339,21 +340,27 @@ void Webserver::Stop() {
 void Webserver::GetCommonJson(Document* document) {
   DCHECK(document != nullptr);
   Value obj(kObjectType);
-  obj.AddMember("process-name", google::ProgramInvocationShortName(),
+  obj.AddMember("process-name",
+      rapidjson::StringRef(google::ProgramInvocationShortName()),
       document->GetAllocator());
 
   Value lst(kArrayType);
   for (const UrlHandlerMap::value_type& handler: url_handlers_) {
     if (handler.second.is_on_nav_bar()) {
-      Value obj(kObjectType);
-      obj.AddMember("link", handler.first.c_str(), document->GetAllocator());
-      obj.AddMember("title", handler.first.c_str(), document->GetAllocator());
-      lst.PushBack(obj, document->GetAllocator());
+      Value hdl(kObjectType);
+      // Though we set link and title the same value, be careful with RapidJSON's MOVE
+      // semantic. We create the values by deep-copy here.
+      Value link(handler.first.c_str(), document->GetAllocator());
+      Value title(handler.first.c_str(), document->GetAllocator());
+      hdl.AddMember("link", link, document->GetAllocator());
+      hdl.AddMember("title", title, document->GetAllocator());
+      lst.PushBack(hdl, document->GetAllocator());
     }
   }
 
   obj.AddMember("navbar", lst, document->GetAllocator());
-  document->AddMember(COMMON_JSON_KEY, obj, document->GetAllocator());
+  document->AddMember(rapidjson::StringRef(COMMON_JSON_KEY), obj,
+      document->GetAllocator());
 }
 
 int Webserver::LogMessageCallbackStatic(const struct sq_connection* connection,
@@ -436,21 +443,23 @@ void Webserver::RenderUrlWithTemplate(const ArgumentMap& arguments,
   document.SetObject();
   GetCommonJson(&document);
 
-  bool raw_json = (arguments.find("json") != arguments.end());
   url_handler.callback()(arguments, &document);
-  if (raw_json) {
+  bool plain_json = (arguments.find("json") != arguments.end())
+      || document.HasMember(ENABLE_PLAIN_JSON_KEY);
+  if (plain_json) {
     // Callbacks may optionally be rendered as a text-only, pretty-printed Json document
     // (mostly for debugging or integration with third-party tools).
     StringBuffer strbuf;
     PrettyWriter<StringBuffer> writer(strbuf);
     document.Accept(writer);
     (*output) << strbuf.GetString();
-    *content_type = PLAIN;
+    *content_type = JSON;
   } else {
     if (arguments.find("raw") != arguments.end()) {
-      document.AddMember(ENABLE_RAW_JSON_KEY, "true", document.GetAllocator());
+      document.AddMember(rapidjson::StringRef(ENABLE_RAW_HTML_KEY), "true",
+          document.GetAllocator());
     }
-    if (document.HasMember(ENABLE_RAW_JSON_KEY)) {
+    if (document.HasMember(ENABLE_RAW_HTML_KEY)) {
       *content_type = PLAIN;
     }
 
@@ -490,4 +499,12 @@ void Webserver::RegisterUrlCallback(const string& path, const RawUrlCallback& ca
   url_handlers_.insert(make_pair(path, UrlHandler(callback)));
 }
 
+const string Webserver::GetMimeType(const ContentType& content_type) {
+  switch (content_type) {
+    case HTML: return "text/html; charset=UTF-8";
+    case PLAIN: return "text/plain; charset=UTF-8";
+    case JSON: return "application/json";
+    default: DCHECK(false) << "Invalid content_type: " << content_type;
+  }
+}
 }

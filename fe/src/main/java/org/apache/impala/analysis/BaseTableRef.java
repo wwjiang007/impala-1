@@ -17,9 +17,10 @@
 
 package org.apache.impala.analysis;
 
+import org.apache.impala.catalog.FeFsTable;
 import org.apache.impala.catalog.FeTable;
-import org.apache.impala.catalog.HdfsTable;
 import org.apache.impala.common.AnalysisException;
+
 import com.google.common.base.Preconditions;
 
 /**
@@ -59,7 +60,8 @@ public class BaseTableRef extends TableRef {
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
     if (isAnalyzed_) return;
-    analyzer.registerAuthAndAuditEvent(resolvedPath_.getRootTable(), priv_);
+    analyzer.registerAuthAndAuditEvent(resolvedPath_.getRootTable(), priv_,
+        requireGrantOption_);
     desc_ = analyzer.registerTableRef(this);
     isAnalyzed_ = true;
     analyzeTableSample(analyzer);
@@ -90,11 +92,11 @@ public class BaseTableRef extends TableRef {
    */
   private void analyzeSkipHeaderLineCount() throws AnalysisException {
     FeTable table = getTable();
-    if (!(table instanceof HdfsTable)) return;
-    HdfsTable hdfsTable = (HdfsTable)table;
+    if (!(table instanceof FeFsTable)) return;
+    FeFsTable fsTable = (FeFsTable)table;
 
     StringBuilder error = new StringBuilder();
-    hdfsTable.parseSkipHeaderLineCount(error);
+    fsTable.parseSkipHeaderLineCount(error);
     if (error.length() > 0) throw new AnalysisException(error.toString());
   }
 }

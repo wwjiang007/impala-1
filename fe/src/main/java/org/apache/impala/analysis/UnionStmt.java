@@ -19,8 +19,10 @@ package org.apache.impala.analysis;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 
 import org.apache.impala.catalog.ColumnStats;
+import org.apache.impala.catalog.FeView;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.rewrite.ExprRewriter;
 import org.slf4j.Logger;
@@ -141,9 +143,9 @@ public class UnionStmt extends QueryStmt {
   // of the DISTINCT operands)
   protected final List<UnionOperand> allOperands_ = Lists.newArrayList();
 
-  protected AggregateInfo distinctAggInfo_;  // only set if we have DISTINCT ops
+  protected MultiAggregateInfo distinctAggInfo_; // only set if we have DISTINCT ops
 
- // Single tuple materialized by the union. Set in analyze().
+  // Single tuple materialized by the union. Set in analyze().
   protected TupleId tupleId_;
 
   // set prior to unnesting
@@ -197,7 +199,7 @@ public class UnionStmt extends QueryStmt {
   public boolean hasDistinctOps() { return !distinctOperands_.isEmpty(); }
   public List<UnionOperand> getAllOperands() { return allOperands_; }
   public boolean hasAllOps() { return !allOperands_.isEmpty(); }
-  public AggregateInfo getDistinctAggInfo() { return distinctAggInfo_; }
+  public MultiAggregateInfo getDistinctAggInfo() { return distinctAggInfo_; }
   public boolean hasAnalyticExprs() { return hasAnalyticExprs_; }
   public TupleId getTupleId() { return tupleId_; }
 
@@ -255,9 +257,8 @@ public class UnionStmt extends QueryStmt {
       // Aggregate produces exactly the same tuple as the original union stmt.
       ArrayList<Expr> groupingExprs = Expr.cloneList(resultExprs_);
       try {
-        distinctAggInfo_ =
-            AggregateInfo.create(groupingExprs, null,
-              analyzer.getDescTbl().getTupleDesc(tupleId_), analyzer);
+        distinctAggInfo_ = MultiAggregateInfo.createDistinct(
+            groupingExprs, analyzer.getTupleDesc(tupleId_), analyzer);
       } catch (AnalysisException e) {
         // Should never happen.
         throw new IllegalStateException(
@@ -314,11 +315,9 @@ public class UnionStmt extends QueryStmt {
       for (UnionOperand op: operands_) {
         exprs.add(op.getQueryStmt().getBaseTblResultExprs().get(i));
       }
-      if (distinctAggInfo_ != null) {
-        // also mark the corresponding slot in the distinct agg tuple as being
-        // materialized
-        distinctAggInfo_.getOutputTupleDesc().getSlots().get(i).setIsMaterialized(true);
-      }
+    }
+    if (distinctAggInfo_ != null) {
+      distinctAggInfo_.materializeRequiredSlots(analyzer, null);
     }
     materializeSlots(analyzer, exprs);
 
@@ -551,24 +550,33 @@ public class UnionStmt extends QueryStmt {
   }
 
   @Override
-  public String toSql() {
-    if (toSqlString_ != null) return toSqlString_;
+  public void collectInlineViews(Set<FeView> inlineViews) {
+    super.collectInlineViews(inlineViews);
+    for (UnionOperand operand : operands_) {
+      operand.getQueryStmt().collectInlineViews(inlineViews);
+    }
+  }
+
+  @Override
+  public String toSql(boolean rewritten) {
+    if (!rewritten && toSqlString_ != null) return toSqlString_;
+
     StringBuilder strBuilder = new StringBuilder();
     Preconditions.checkState(operands_.size() > 0);
 
     if (withClause_ != null) {
-      strBuilder.append(withClause_.toSql());
+      strBuilder.append(withClause_.toSql(rewritten));
       strBuilder.append(" ");
     }
 
-    strBuilder.append(operands_.get(0).getQueryStmt().toSql());
+    strBuilder.append(operands_.get(0).getQueryStmt().toSql(rewritten));
     for (int i = 1; i < operands_.size() - 1; ++i) {
       strBuilder.append(" UNION " +
           ((operands_.get(i).getQualifier() == Qualifier.ALL) ? "ALL " : ""));
       if (operands_.get(i).getQueryStmt() instanceof UnionStmt) {
         strBuilder.append("(");
       }
-      strBuilder.append(operands_.get(i).getQueryStmt().toSql());
+      strBuilder.append(operands_.get(i).getQueryStmt().toSql(rewritten));
       if (operands_.get(i).getQueryStmt() instanceof UnionStmt) {
         strBuilder.append(")");
       }
@@ -583,10 +591,10 @@ public class UnionStmt extends QueryStmt {
             !lastQueryStmt.hasLimit() && !lastQueryStmt.hasOffset() &&
             !lastQueryStmt.hasOrderByClause())) {
       strBuilder.append("(");
-      strBuilder.append(lastQueryStmt.toSql());
+      strBuilder.append(lastQueryStmt.toSql(rewritten));
       strBuilder.append(")");
     } else {
-      strBuilder.append(lastQueryStmt.toSql());
+      strBuilder.append(lastQueryStmt.toSql(rewritten));
     }
     // Order By clause
     if (hasOrderByClause()) {

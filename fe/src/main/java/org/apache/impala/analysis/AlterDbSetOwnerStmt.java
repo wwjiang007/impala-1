@@ -18,10 +18,12 @@
 package org.apache.impala.analysis;
 
 import com.google.common.base.Preconditions;
+import org.apache.impala.authorization.Privilege;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TAlterDbParams;
 import org.apache.impala.thrift.TAlterDbSetOwnerParams;
 import org.apache.impala.thrift.TAlterDbType;
+import org.apache.impala.thrift.TOwnerType;
 import org.apache.impala.util.MetaStoreUtil;
 
 /**
@@ -29,6 +31,9 @@ import org.apache.impala.util.MetaStoreUtil;
  */
 public class AlterDbSetOwnerStmt extends AlterDbStmt {
   private final Owner owner_;
+
+  // Server name needed for privileges. Set during analysis.
+  private String serverName_;
 
   public AlterDbSetOwnerStmt(String dbName, Owner owner) {
     super(dbName);
@@ -38,13 +43,25 @@ public class AlterDbSetOwnerStmt extends AlterDbStmt {
 
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
-    super.analyze(analyzer);
+    // Require ALL with GRANT OPTION privilege.
+    analyzer.getDb(dbName_, Privilege.ALL, /* throw if does not exist */ true,
+        /* grant option */ true);
     String ownerName = owner_.getOwnerName();
     if (ownerName.length() > MetaStoreUtil.MAX_OWNER_LENGTH) {
       throw new AnalysisException(String.format("Owner name exceeds maximum length of " +
           "%d characters. The given owner name has %d characters.",
           MetaStoreUtil.MAX_OWNER_LENGTH, ownerName.length()));
     }
+    // We don't allow assigning to a non-existent role because Sentry should know about
+    // all roles. Sentry does not track all users so we allow assigning to a user
+    // that Sentry doesn't know about yet.
+    if (analyzer.getAuthzConfig().isEnabled() && owner_.getOwnerType() == TOwnerType.ROLE
+        && analyzer.getCatalog().getAuthPolicy().getRole(ownerName) == null) {
+      throw new AnalysisException(String.format("Role '%s' does not exist.", ownerName));
+    }
+    // Set the servername here if authorization is enabled because analyzer_ is not
+    // available in the toThrift() method.
+    serverName_ = analyzer.getServerName();
   }
 
   @Override
@@ -54,6 +71,7 @@ public class AlterDbSetOwnerStmt extends AlterDbStmt {
     TAlterDbSetOwnerParams setOwnerParams = new TAlterDbSetOwnerParams();
     setOwnerParams.setOwner_type(owner_.getOwnerType());
     setOwnerParams.setOwner_name(owner_.getOwnerName());
+    setOwnerParams.setServer_name(serverName_);
     params.setSet_owner_params(setOwnerParams);
     return params;
   }

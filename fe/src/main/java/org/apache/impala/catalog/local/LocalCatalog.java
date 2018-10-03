@@ -21,8 +21,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.impala.analysis.TableName;
 import org.apache.impala.catalog.AuthorizationPolicy;
 import org.apache.impala.catalog.BuiltinsDb;
@@ -31,20 +29,26 @@ import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.DatabaseNotFoundException;
 import org.apache.impala.catalog.Db;
 import org.apache.impala.catalog.FeCatalog;
+import org.apache.impala.catalog.FeCatalogUtils;
 import org.apache.impala.catalog.FeDataSource;
 import org.apache.impala.catalog.FeDb;
 import org.apache.impala.catalog.FeFsPartition;
+import org.apache.impala.catalog.FeFsTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.Function.CompareMode;
+import org.apache.impala.common.InternalException;
 import org.apache.impala.catalog.HdfsCachePool;
-import org.apache.impala.catalog.ImpaladCatalog;
+import org.apache.impala.catalog.PartitionNotFoundException;
+import org.apache.impala.catalog.PrunablePartition;
 import org.apache.impala.thrift.TCatalogObject;
+import org.apache.impala.thrift.TGetPartitionStatsResponse;
 import org.apache.impala.thrift.TPartitionKeyValue;
 import org.apache.impala.thrift.TUniqueId;
 import org.apache.impala.util.PatternMatcher;
 import org.apache.thrift.TException;
 
+import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Maps;
 
@@ -67,15 +71,11 @@ public class LocalCatalog implements FeCatalog {
   private final MetaProvider metaProvider_;
   private Map<String, FeDb> dbs_ = Maps.newHashMap();
   private String nullPartitionKeyValue_;
-  private static final Db builtinsDb_ = new BuiltinsDb(ImpaladCatalog.BUILTINS_DB);
+  private final String defaultKuduMasterHosts_;
 
-  public static FeCatalog create(String defaultKuduMasterHosts) {
-    // TODO(todd): store the kudu master hosts
-    return new LocalCatalog(new DirectMetaProvider());
-  }
-
-  public LocalCatalog(MetaProvider metaProvider) {
+  public LocalCatalog(MetaProvider metaProvider, String defaultKuduMasterHosts) {
     metaProvider_ = Preconditions.checkNotNull(metaProvider);
+    defaultKuduMasterHosts_ = defaultKuduMasterHosts;
   }
 
   @Override
@@ -101,7 +101,9 @@ public class LocalCatalog implements FeCatalog {
         dbs.put(dbName, new LocalDb(this, dbName));
       }
     }
-    dbs.put(builtinsDb_.getName(), builtinsDb_);
+
+    Db bdb = BuiltinsDb.getInstance();
+    dbs.put(bdb.getName(), bdb);
     dbs_ = dbs;
   }
 
@@ -129,7 +131,7 @@ public class LocalCatalog implements FeCatalog {
   @Override
   public FeDb getDb(String db) {
     loadDbs();
-    return dbs_.get(db);
+    return dbs_.get(db.toLowerCase());
   }
 
   private FeDb getDbOrThrow(String dbName) throws DatabaseNotFoundException {
@@ -141,11 +143,28 @@ public class LocalCatalog implements FeCatalog {
     return db;
   }
 
+  private void throwPartitionNotFound(List<TPartitionKeyValue> partitionSpec)
+      throws PartitionNotFoundException {
+    throw new PartitionNotFoundException(
+        "Partition not found: " + Joiner.on(", ").join(partitionSpec));
+  }
+
   @Override
   public FeFsPartition getHdfsPartition(
-      String db, String tbl, List<TPartitionKeyValue> partition_spec)
+      String db, String tbl, List<TPartitionKeyValue> partitionSpec)
       throws CatalogException {
-    throw new UnsupportedOperationException("TODO");
+    // TODO(todd): somewhat copy-pasted from Catalog.getHdfsPartition
+
+    FeTable table = getTable(db, tbl);
+    // This is not an FS table, throw an error.
+    if (!(table instanceof FeFsTable)) {
+      throwPartitionNotFound(partitionSpec);
+    }
+    // Get the FeFsPartition object for the given partition spec.
+    PrunablePartition partition = FeFsTable.Utils.getPartitionFromThriftPartitionSpec(
+        (FeFsTable)table, partitionSpec);
+    if (partition == null) throwPartitionNotFound(partitionSpec);
+    return FeCatalogUtils.loadPartition((FeFsTable)table, partition.getId());
   }
 
   @Override
@@ -177,13 +196,24 @@ public class LocalCatalog implements FeCatalog {
   }
 
   @Override
-  public void waitForCatalogUpdate(long timeoutMs) {
-    // No-op for local catalog.
+  public TGetPartitionStatsResponse getPartitionStats(
+      TableName table) throws InternalException {
+    // TODO(vercegovac): add validation to ensure that both pulling incremental
+    // statistics and a local catalog are not specified.
+    throw new UnsupportedOperationException("--pull_incremental_statistics and "
+        + "--use_local_catalog cannot both be enabled."
+    );
   }
 
   @Override
-  public Path getTablePath(Table msTbl) {
-    throw new UnsupportedOperationException("TODO");
+  public void waitForCatalogUpdate(long timeoutMs) {
+    if (isReady()) return;
+    // Sleep here to avoid log spew from the retry loop in Frontend.
+    try {
+      Thread.sleep(timeoutMs);
+    } catch (InterruptedException e) {
+      // Ignore
+    }
   }
 
   @Override
@@ -193,12 +223,12 @@ public class LocalCatalog implements FeCatalog {
 
   @Override
   public AuthorizationPolicy getAuthPolicy() {
-    return null; // TODO(todd): implement auth policy
+    return metaProvider_.getAuthPolicy();
   }
 
   @Override
   public String getDefaultKuduMasterHosts() {
-    throw new UnsupportedOperationException("TODO");
+    return defaultKuduMasterHosts_;
   }
 
   public String getNullPartitionKeyValue() {
@@ -216,16 +246,16 @@ public class LocalCatalog implements FeCatalog {
 
   @Override
   public boolean isReady() {
-    // We are always ready.
-    return true;
+    return metaProvider_.isReady();
   }
 
   @Override
   public void setIsReady(boolean isReady) {
     // No-op for local catalog.
+    // This appears to only be used in some tests.
   }
 
-  MetaProvider getMetaProvider() {
+  public MetaProvider getMetaProvider() {
     return metaProvider_;
   }
 }

@@ -24,19 +24,28 @@
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/rpc/service_pool.h"
+#include "kudu/rpc/user_credentials.h"
 #include "util/network-util.h"
 
 namespace impala {
 
 /// Always inline to avoid having to provide a definition for each use type P.
 template <typename P>
-Status RpcMgr::GetProxy(const TNetworkAddress& address, std::unique_ptr<P>* proxy) {
+Status RpcMgr::GetProxy(const TNetworkAddress& address, const std::string& hostname,
+    std::unique_ptr<P>* proxy) {
   DCHECK(proxy != nullptr);
   DCHECK(is_inited()) << "Must call Init() before GetProxy()";
   DCHECK(IsResolvedAddress(address));
   kudu::Sockaddr sockaddr;
   RETURN_IF_ERROR(TNetworkAddressToSockaddr(address, &sockaddr));
-  proxy->reset(new P(messenger_, sockaddr, address.hostname));
+  proxy->reset(new P(messenger_, sockaddr, hostname));
+
+  // Always set the user credentials as Proxy ctor may fail in GetLoggedInUser().
+  // An empty user name will result in SASL failure. See IMPALA-7585.
+  kudu::rpc::UserCredentials creds;
+  creds.set_real_user("impala");
+  (*proxy)->set_user_credentials(creds);
+
   return Status::OK();
 }
 

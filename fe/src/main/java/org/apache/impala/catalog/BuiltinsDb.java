@@ -56,8 +56,19 @@ public class BuiltinsDb extends Db {
   // Size in bytes of RankState used for rank() and dense_rank().
   private static final int RANK_INTERMEDIATE_SIZE = 16;
 
-  public BuiltinsDb(String name) {
-    super(name, createMetastoreDb(name));
+  private static BuiltinsDb INSTANCE;
+
+  public static final String NAME = "_impala_builtins";
+
+  public static synchronized Db getInstance() {
+    if (INSTANCE == null) {
+      INSTANCE = new BuiltinsDb();
+    }
+    return INSTANCE;
+  }
+
+  private BuiltinsDb() {
+    super(NAME, createMetastoreDb(NAME));
     setIsSystemDb(true);
     initBuiltins();
   }
@@ -326,6 +337,78 @@ public class BuiltinsDb extends Db {
             "16SampledNdvUpdateIN10impala_udf12TimestampValEEEvPNS2_15FunctionContextERKT_RKNS2_9DoubleValEPNS2_9StringValE")
         .put(Type.DECIMAL,
             "16SampledNdvUpdateIN10impala_udf10DecimalValEEEvPNS2_15FunctionContextERKT_RKNS2_9DoubleValEPNS2_9StringValE")
+        .build();
+
+  private static final Map<Type, String> AGGIF_UPDATE_SYMBOL =
+      ImmutableMap.<Type, String>builder()
+        .put(Type.BOOLEAN,
+            "11AggIfUpdateIN10impala_udf10BooleanValEEEvPNS2_15FunctionContextERKS3_RKT_PS8_")
+        .put(Type.TINYINT,
+            "11AggIfUpdateIN10impala_udf10TinyIntValEEEvPNS2_15FunctionContextERKNS2_10BooleanValERKT_PS9_")
+        .put(Type.SMALLINT,
+            "11AggIfUpdateIN10impala_udf11SmallIntValEEEvPNS2_15FunctionContextERKNS2_10BooleanValERKT_PS9_")
+        .put(Type.INT,
+            "11AggIfUpdateIN10impala_udf6IntValEEEvPNS2_15FunctionContextERKNS2_10BooleanValERKT_PS9_")
+        .put(Type.BIGINT,
+            "11AggIfUpdateIN10impala_udf9BigIntValEEEvPNS2_15FunctionContextERKNS2_10BooleanValERKT_PS9_")
+        .put(Type.FLOAT,
+            "11AggIfUpdateIN10impala_udf8FloatValEEEvPNS2_15FunctionContextERKNS2_10BooleanValERKT_PS9_")
+        .put(Type.DOUBLE,
+            "11AggIfUpdateIN10impala_udf9DoubleValEEEvPNS2_15FunctionContextERKNS2_10BooleanValERKT_PS9_")
+        .put(Type.STRING,
+            "11AggIfUpdateIN10impala_udf9StringValEEEvPNS2_15FunctionContextERKNS2_10BooleanValERKT_PS9_")
+        .put(Type.TIMESTAMP,
+            "11AggIfUpdateIN10impala_udf12TimestampValEEEvPNS2_15FunctionContextERKNS2_10BooleanValERKT_PS9_")
+        .put(Type.DECIMAL,
+            "11AggIfUpdateIN10impala_udf10DecimalValEEEvPNS2_15FunctionContextERKNS2_10BooleanValERKT_PS9_")
+        .build();
+
+  private static final Map<Type, String> AGGIF_MERGE_SYMBOL =
+      ImmutableMap.<Type, String>builder()
+        .put(Type.BOOLEAN,
+            "10AggIfMergeIN10impala_udf10BooleanValEEEvPNS2_15FunctionContextERKT_PS6_")
+        .put(Type.TINYINT,
+            "10AggIfMergeIN10impala_udf10TinyIntValEEEvPNS2_15FunctionContextERKT_PS6_")
+        .put(Type.SMALLINT,
+            "10AggIfMergeIN10impala_udf11SmallIntValEEEvPNS2_15FunctionContextERKT_PS6_")
+        .put(Type.INT,
+            "10AggIfMergeIN10impala_udf6IntValEEEvPNS2_15FunctionContextERKT_PS6_")
+        .put(Type.BIGINT,
+            "10AggIfMergeIN10impala_udf9BigIntValEEEvPNS2_15FunctionContextERKT_PS6_")
+        .put(Type.FLOAT,
+            "10AggIfMergeIN10impala_udf8FloatValEEEvPNS2_15FunctionContextERKT_PS6_")
+        .put(Type.DOUBLE,
+            "10AggIfMergeIN10impala_udf9DoubleValEEEvPNS2_15FunctionContextERKT_PS6_")
+        .put(Type.STRING,
+            "10AggIfMergeIN10impala_udf9StringValEEEvPNS2_15FunctionContextERKT_PS6_")
+        .put(Type.TIMESTAMP,
+            "10AggIfMergeIN10impala_udf12TimestampValEEEvPNS2_15FunctionContextERKT_PS6_")
+        .put(Type.DECIMAL,
+            "10AggIfMergeIN10impala_udf10DecimalValEEEvPNS2_15FunctionContextERKT_PS6_")
+        .build();
+
+  private static final Map<Type, String> AGGIF_FINALIZE_SYMBOL =
+      ImmutableMap.<Type, String>builder()
+        .put(Type.BOOLEAN,
+            "13AggIfFinalizeIN10impala_udf10BooleanValEEET_PNS2_15FunctionContextERKS4_")
+        .put(Type.TINYINT,
+            "13AggIfFinalizeIN10impala_udf10TinyIntValEEET_PNS2_15FunctionContextERKS4_")
+        .put(Type.SMALLINT,
+            "13AggIfFinalizeIN10impala_udf11SmallIntValEEET_PNS2_15FunctionContextERKS4_")
+        .put(Type.INT,
+            "13AggIfFinalizeIN10impala_udf6IntValEEET_PNS2_15FunctionContextERKS4_")
+        .put(Type.BIGINT,
+            "13AggIfFinalizeIN10impala_udf9BigIntValEEET_PNS2_15FunctionContextERKS4_")
+        .put(Type.FLOAT,
+            "13AggIfFinalizeIN10impala_udf8FloatValEEET_PNS2_15FunctionContextERKS4_")
+        .put(Type.DOUBLE,
+            "13AggIfFinalizeIN10impala_udf9DoubleValEEET_PNS2_15FunctionContextERKS4_")
+        .put(Type.STRING,
+            "13AggIfFinalizeIN10impala_udf9StringValEEET_PNS2_15FunctionContextERKS4_")
+        .put(Type.TIMESTAMP,
+            "13AggIfFinalizeIN10impala_udf12TimestampValEEET_PNS2_15FunctionContextERKS4_")
+        .put(Type.DECIMAL,
+            "13AggIfFinalizeIN10impala_udf10DecimalValEEET_PNS2_15FunctionContextERKS4_")
         .build();
 
   private static final Map<Type, String> PC_UPDATE_SYMBOL =
@@ -824,6 +907,15 @@ public class BuiltinsDb extends Db {
           prefix + "15SampledNdvMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
           null,
           prefix + "18SampledNdvFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
+          true, false, true));
+
+      db.addBuiltin(AggregateFunction.createBuiltin(db, "aggif",
+          Lists.newArrayList(ScalarType.BOOLEAN, t), t, t,
+          initNull,
+          prefix + AGGIF_UPDATE_SYMBOL.get(t),
+          prefix + AGGIF_MERGE_SYMBOL.get(t),
+          null,
+          prefix + AGGIF_FINALIZE_SYMBOL.get(t),
           true, false, true));
 
       Type pcIntermediateType =

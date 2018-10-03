@@ -61,7 +61,7 @@ Status RuntimeFilterBank::ClaimBufferReservation() {
   DCHECK(!buffer_pool_client_.is_registered());
   string filter_bank_name = Substitute(
       "RuntimeFilterBank (Fragment Id: $0)", PrintId(state_->fragment_instance_id()));
-  RETURN_IF_ERROR(state_->exec_env()->buffer_pool()->RegisterClient(filter_bank_name,
+  RETURN_IF_ERROR(ExecEnv::GetInstance()->buffer_pool()->RegisterClient(filter_bank_name,
       state_->query_state()->file_group(), state_->instance_buffer_reservation(),
       filter_mem_tracker_.get(), total_bloom_filter_mem_required_,
       state_->runtime_profile(), &buffer_pool_client_));
@@ -84,7 +84,7 @@ RuntimeFilter* RuntimeFilterBank::RegisterFilter(const TRuntimeFilterDesc& filte
     if (consumed_filters_.find(filter_desc.filter_id) == consumed_filters_.end()) {
       ret = obj_pool_.Add(new RuntimeFilter(filter_desc, filter_desc.filter_size_bytes));
       consumed_filters_[filter_desc.filter_id] = ret;
-      VLOG_QUERY << "registered consumer filter " << filter_desc.filter_id;
+      VLOG(2) << "registered consumer filter " << filter_desc.filter_id;
     } else {
       // The filter has already been registered in this filter bank by another
       // target node.
@@ -268,7 +268,7 @@ void RuntimeFilterBank::Close() {
               << ") returning reservation " << total_bloom_filter_mem_required_;
     state_->query_state()->initial_reservations()->Return(
         &buffer_pool_client_, total_bloom_filter_mem_required_);
-    state_->exec_env()->buffer_pool()->DeregisterClient(&buffer_pool_client_);
+    ExecEnv::GetInstance()->buffer_pool()->DeregisterClient(&buffer_pool_client_);
   }
   DCHECK_EQ(filter_mem_tracker_->consumption(), 0);
   filter_mem_tracker_->Close();

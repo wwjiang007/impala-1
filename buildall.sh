@@ -18,6 +18,8 @@
 # under the License.
 
 set -euo pipefail
+. $IMPALA_HOME/bin/report_build_error.sh
+setup_report_build_error
 
 # run buildall.sh -help to see options
 ROOT=`dirname "$0"`
@@ -28,8 +30,6 @@ then
    echo "IMPALA_HOME cannot have spaces in the path"
    exit 1
 fi
-
-trap 'echo Error in $0 at line $LINENO: $(cd "'$PWD'" && awk "NR == $LINENO" $0)' ERR
 
 # Grab this *before* we source impala-config.sh to see if the caller has
 # kerberized environment variables already or not.
@@ -125,6 +125,10 @@ do
     -ubsan)
       BUILD_UBSAN=1
       ;;
+    -full_ubsan)
+      BUILD_UBSAN=1
+      MAKE_IMPALA_ARGS="${MAKE_IMPALA_ARGS} -ubsan_codegen"
+      ;;
     -tsan)
       BUILD_TSAN=1
       ;;
@@ -199,7 +203,10 @@ do
       echo "[-codecoverage] : Build with code coverage [Default: False]"
       echo "[-asan] : Address sanitizer build [Default: False]"
       echo "[-tidy] : clang-tidy build [Default: False]"
-      echo "[-ubsan] : Undefined behavior build [Default: False]"
+      echo "[-ubsan] : Undefined behavior sanitizer build [Default: False]"
+      echo "[-full_ubsan] : Undefined behavior sanitizer build, including code generated"\
+           " by cross-compilation to LLVM IR. Much slower queries than plain -ubsan "\
+           " [Default: False]"
       echo "[-skiptests] : Skips execution of all tests"
       echo "[-notests] : Skips building and execution of all tests"
       echo "[-start_minicluster] : Start test cluster including Impala and all"\
@@ -464,6 +471,18 @@ fi
 create_log_dirs
 
 bootstrap_dependencies
+
+# Create .cdh file that contains the CDH_BUILD_NUMBER. If the content
+# of the file is different than the one in the environment variable,
+# append -U into IMPALA_MAVEN_OPTION to force Maven to update its local
+# cache.
+CDH_FILE="${IMPALA_HOME}/.cdh"
+if [[ -f ${CDH_FILE} ]]; then
+  if [[ $(cat ${CDH_FILE}) != ${CDH_BUILD_NUMBER} ]]; then
+    export IMPALA_MAVEN_OPTIONS="${IMPALA_MAVEN_OPTIONS} -U"
+  fi
+fi
+echo "${CDH_BUILD_NUMBER}" > ${CDH_FILE}
 
 if [[ "$BUILD_FE_ONLY" -eq 1 ]]; then
   build_fe

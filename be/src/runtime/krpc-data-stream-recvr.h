@@ -18,8 +18,6 @@
 #ifndef IMPALA_RUNTIME_KRPC_DATA_STREAM_RECVR_H
 #define IMPALA_RUNTIME_KRPC_DATA_STREAM_RECVR_H
 
-#include "data-stream-recvr-base.h"
-
 #include <boost/scoped_ptr.hpp>
 #include <boost/thread/mutex.hpp>
 
@@ -43,7 +41,7 @@ class MemTracker;
 class RowBatch;
 class RuntimeProfile;
 class SortedRunMerger;
-class TransmitDataCtx;
+struct TransmitDataCtx;
 class TransmitDataRequestPB;
 class TransmitDataResponsePB;
 
@@ -84,7 +82,7 @@ class TransmitDataResponsePB;
 /// - no new row batch or deferred RPCs should be added to a cancelled sender queue
 /// - Cancel() will drain the deferred RPCs queue and the row batch queue
 ///
-class KrpcDataStreamRecvr : public DataStreamRecvrBase {
+class KrpcDataStreamRecvr {
  public:
   ~KrpcDataStreamRecvr();
 

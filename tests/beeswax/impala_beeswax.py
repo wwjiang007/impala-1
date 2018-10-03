@@ -25,6 +25,7 @@
 #   client.connect()
 #   result = client.execute(query_string)
 #   where result is an object of the class ImpalaBeeswaxResult.
+import logging
 import time
 import shlex
 import getpass
@@ -43,6 +44,8 @@ from tests.util.thrift_util import create_transport
 from thrift.transport.TTransport import TTransportException
 from thrift.protocol import TBinaryProtocol
 from thrift.Thrift import TApplicationException
+
+LOG = logging.getLogger('impala_beeswax')
 
 # Custom exception wrapper.
 # All exceptions coming from thrift/beeswax etc. go through this wrapper.
@@ -336,13 +339,15 @@ class ImpalaBeeswaxClient(object):
     query.query = query_string
     query.hadoop_user = user if user is not None else getpass.getuser()
     query.configuration = self.__options_to_string_list()
-    return self.__do_rpc(lambda: self.imp_service.query(query,))
+    handle = self.__do_rpc(lambda: self.imp_service.query(query,))
+    LOG.info("Started query {0}".format(handle.id))
+    return handle
 
   def __execute_query(self, query_string, user=None):
     """Executes a query and waits for completion"""
     handle = self.execute_query_async(query_string, user=user)
     # Wait for the query to finish execution.
-    self.wait_for_completion(handle)
+    self.wait_for_finished(handle)
     return handle
 
   def cancel_query(self, query_id):
@@ -351,8 +356,9 @@ class ImpalaBeeswaxClient(object):
   def close_query(self, handle):
     self.__do_rpc(lambda: self.imp_service.close(handle))
 
-  def wait_for_completion(self, query_handle):
-    """Given a query handle, polls the coordinator waiting for the query to complete"""
+  def wait_for_finished(self, query_handle):
+    """Given a query handle, polls the coordinator waiting for the query to transition to
+       'FINISHED' state"""
     while True:
       query_state = self.get_state(query_handle)
       # if the rpc succeeded, the output is the query state
@@ -366,6 +372,25 @@ class ImpalaBeeswaxClient(object):
         finally:
           self.close_query(query_handle)
       time.sleep(0.05)
+
+  def wait_for_finished_timeout(self, query_handle, timeout=10):
+    """Given a query handle and a timeout, polls the coordinator waiting for the query to
+       transition to 'FINISHED' state till 'timeout' seconds"""
+    start_time = time.time()
+    while (time.time() - start_time < timeout):
+      query_state = self.get_state(query_handle)
+      # if the rpc succeeded, the output is the query state
+      if query_state == self.query_states["FINISHED"]:
+        return True
+      elif query_state == self.query_states["EXCEPTION"]:
+        try:
+          error_log = self.__do_rpc(
+            lambda: self.imp_service.get_log(query_handle.log_context))
+          raise ImpalaBeeswaxException("Query aborted:" + error_log, None)
+        finally:
+          self.close_query(query_handle)
+      time.sleep(0.05)
+    return False
 
   def wait_for_admission_control(self, query_handle):
     """Given a query handle, polls the coordinator waiting for it to complete
