@@ -22,7 +22,7 @@
 import json
 import logging
 import re
-import urllib
+import requests
 from time import sleep, time
 
 from tests.common.impala_connection import create_connection, create_ldap_connection
@@ -41,50 +41,29 @@ LOG.setLevel(level=logging.DEBUG)
 # Base class for all Impala services
 # TODO: Refactor the retry/timeout logic into a common place.
 class BaseImpalaService(object):
-  def __init__(self, hostname, webserver_port):
+  def __init__(self, hostname, webserver_port, webserver_certificate_file):
     self.hostname = hostname
     self.webserver_port = webserver_port
+    self.webserver_certificate_file = webserver_certificate_file
 
   def open_debug_webpage(self, page_name, timeout=10, interval=1):
     start_time = time()
 
     while (time() - start_time < timeout):
       try:
-        return urllib.urlopen("http://%s:%d/%s" %
-            (self.hostname, int(self.webserver_port), page_name))
-      except Exception:
-        LOG.info("Debug webpage not yet available.")
+        protocol = "http"
+        if self.webserver_certificate_file != "":
+          protocol = "https"
+        url = "%s://%s:%d/%s" % \
+            (protocol, self.hostname, int(self.webserver_port), page_name)
+        return requests.get(url, verify=self.webserver_certificate_file)
+      except Exception as e:
+        LOG.info("Debug webpage not yet available: %s", str(e))
       sleep(interval)
     assert 0, 'Debug webpage did not become available in expected time.'
 
   def read_debug_webpage(self, page_name, timeout=10, interval=1):
-    return self.open_debug_webpage(page_name, timeout=timeout, interval=interval).read()
-
-  def get_thrift_profile(self, query_id, timeout=10, interval=1):
-    """Returns thrift profile of the specified query ID, if available"""
-    page_name = "query_profile_encoded?query_id=%s" % (query_id)
-    try:
-      response = self.open_debug_webpage(page_name, timeout=timeout, interval=interval)
-      tbuf = response.read()
-    except Exception as e:
-      LOG.info("Thrift profile for query %s not yet available: %s", query_id, str(e))
-      return None
-    else:
-      tree = TRuntimeProfileTree()
-      try:
-        deserialize(tree, zlib.decompress(base64.b64decode(tbuf)),
-                  protocol_factory=TCompactProtocol.TCompactProtocolFactory())
-        tree.validate()
-        return tree
-      except Exception as e:
-        LOG.info("Exception while deserializing query profile of %s: %s", query_id,
-                str(e));
-        # We should assert that the response code is not 200 once
-        # IMPALA-6332: Impala webserver should return HTTP error code for missing query
-        # profiles, is fixed.
-        if str(e) == 'Incorrect padding':
-          assert "Could not obtain runtime profile" in tbuf, tbuf
-        return None
+    return self.open_debug_webpage(page_name, timeout=timeout, interval=interval).text
 
   def get_debug_webpage_json(self, page_name):
     """Returns the json for the given Impala debug webpage, eg. '/queries'"""
@@ -166,8 +145,9 @@ class BaseImpalaService(object):
 # new connections or accessing the debug webpage.
 class ImpaladService(BaseImpalaService):
   def __init__(self, hostname, webserver_port=25000, beeswax_port=21000, be_port=22000,
-               hs2_port=21050):
-    super(ImpaladService, self).__init__(hostname, webserver_port)
+               hs2_port=21050, webserver_certificate_file=""):
+    super(ImpaladService, self).__init__(
+        hostname, webserver_port, webserver_certificate_file)
     self.beeswax_port = beeswax_port
     self.be_port = be_port
     self.hs2_port = hs2_port
@@ -257,8 +237,8 @@ class ImpaladService(BaseImpalaService):
         return
       sleep(interval)
     assert target_state == query_state, \
-        'Did not reach query state in time target={0} actual={1}'.format(
-            target_state, query_state)
+        'Query {0} did not reach query state in time target={1} actual={2}'.format(
+            query_handle.get_handle().id, target_state, query_state)
     return
 
   def wait_for_query_status(self, client, query_id, expected_content,
@@ -283,9 +263,20 @@ class ImpaladService(BaseImpalaService):
 
   def create_beeswax_client(self, use_kerberos=False):
     """Creates a new beeswax client connection to the impalad"""
-    client = create_connection('%s:%d' % (self.hostname, self.beeswax_port), use_kerberos)
+    client = create_connection('%s:%d' % (self.hostname, self.beeswax_port),
+                               use_kerberos, 'beeswax')
     client.connect()
     return client
+
+  def beeswax_port_is_open(self):
+    """Test if the beeswax port is open. Does not need to authenticate."""
+    try:
+      # The beeswax client will connect successfully even if not authenticated.
+      client = self.create_beeswax_client()
+      client.close()
+      return True
+    except Exception:
+      return False
 
   def create_ldap_beeswax_client(self, user, password, use_ssl=False):
     client = create_ldap_connection('%s:%d' % (self.hostname, self.beeswax_port),
@@ -295,20 +286,30 @@ class ImpaladService(BaseImpalaService):
 
   def create_hs2_client(self):
     """Creates a new HS2 client connection to the impalad"""
-    host, port = (self.hostname, self.hs2_port)
-    socket = TSocket(host, port)
-    transport = TBufferedTransport(socket)
-    transport.open()
-    protocol = TBinaryProtocol.TBinaryProtocol(transport)
-    hs2_client = TCLIService.Client(protocol)
-    return hs2_client
+    client = create_connection('%s:%d' % (self.hostname, self.hs2_port), protocol='hs2')
+    client.connect()
+    return client
 
+  def hs2_port_is_open(self):
+    """Test if the HS2 port is open. Does not need to authenticate."""
+    # Impyla will try to authenticate as part of connecting, so preserve previous logic
+    # that uses the HS2 thrift code directly.
+    try:
+      socket = TSocket(self.hostname, self.hs2_port)
+      transport = TBufferedTransport(socket)
+      transport.open()
+      transport.close()
+      return True
+    except Exception, e:
+      LOG.info(e)
+      return False
 
 # Allows for interacting with the StateStore service to perform operations such as
 # accessing the debug webpage.
 class StateStoredService(BaseImpalaService):
-  def __init__(self, hostname, webserver_port):
-    super(StateStoredService, self).__init__(hostname, webserver_port)
+  def __init__(self, hostname, webserver_port, webserver_certificate_file):
+    super(StateStoredService, self).__init__(
+        hostname, webserver_port, webserver_certificate_file)
 
   def wait_for_live_subscribers(self, num_subscribers, timeout=15, interval=1):
     self.wait_for_metric_value('statestore.live-backends', num_subscribers,
@@ -318,8 +319,9 @@ class StateStoredService(BaseImpalaService):
 # Allows for interacting with the Catalog service to perform operations such as
 # accessing the debug webpage.
 class CatalogdService(BaseImpalaService):
-  def __init__(self, hostname, webserver_port, service_port):
-    super(CatalogdService, self).__init__(hostname, webserver_port)
+  def __init__(self, hostname, webserver_port, webserver_certificate_file, service_port):
+    super(CatalogdService, self).__init__(
+        hostname, webserver_port, webserver_certificate_file)
     self.service_port = service_port
 
   def get_catalog_version(self, timeout=10, interval=1):

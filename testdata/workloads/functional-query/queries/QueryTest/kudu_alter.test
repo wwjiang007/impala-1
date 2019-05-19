@@ -14,7 +14,7 @@ AnalysisException: SHOW RANGE PARTITIONS requested but table does not have range
 ---- QUERY
 # Alter master address to a different location
 alter table simple set tblproperties (
-  'kudu.master_addresses' = 'localhost'
+  'kudu.master_addresses' = '$INTERNAL_LISTEN_HOST'
 )
 ---- RESULTS
 'Updated table.'
@@ -23,14 +23,15 @@ STRING
 ====
 ---- QUERY
 # Show that new address is picked up
+# Note that "describe formatted" pads the hostname string so we need to use a regex.
 describe formatted simple
 ---- RESULTS: VERIFY_IS_SUBSET
-'','kudu.master_addresses','localhost           '
+row_regex:'','kudu.master_addresses','$INTERNAL_LISTEN_HOST *'
 ---- TYPES
 STRING,STRING,STRING
 ====
 ---- QUERY
-alter table simple set tblproperties ('kudu.master_addresses' = '127.0.0.1')
+alter table simple set tblproperties ('kudu.master_addresses' = '$INTERNAL_LISTEN_IP')
 ---- RESULTS
 'Updated table.'
 ---- TYPES
@@ -219,7 +220,7 @@ alter table tbl_to_alter add range partition 1 < values <= 20;
 alter table tbl_to_alter add columns (new_col1 int not null default 10,
   new_col2 bigint not null default 1000)
 ---- RESULTS
-'Column has been added/replaced.'
+'Column(s) have been added.'
 ====
 ---- QUERY
 # Verify partition layout
@@ -272,7 +273,7 @@ INT,STRING,BIGINT,INT,BIGINT
 # Add nullable columns: with and without a default
 alter table tbl_to_alter add columns (new_col3 string null, new_col4 int null default -1)
 ---- RESULTS
-'Column has been added/replaced.'
+'Column(s) have been added.'
 ====
 ---- QUERY
 # Add a row
@@ -381,13 +382,23 @@ BIGINT
 ====
 ---- QUERY
 # Create an external Kudu table pointing to an existing Kudu table
+# The Kudu table kudu_tbl_to_alter is used in order to validate that renaming
+# the managed Impala-Kudu table tbl_to_alter renames the underlying Kudu table
 create external table external_tbl stored as kudu
-  tblproperties('kudu.table_name'='impala::$DATABASE.tbl_to_alter');
+  tblproperties('kudu.table_name'='impala::$DATABASE.kudu_tbl_to_alter');
 select count(*) from external_tbl
 ---- RESULTS
 5
 ---- TYPES
 BIGINT
+====
+---- QUERY
+# Ensure that after renaming the Impala table that the old Kudu table no longer
+# exists
+create external table external_tbl_on_nonexistent_kudu_tbl stored as kudu
+  tblproperties('kudu.table_name'='impala::$DATABASE.tbl_to_alter');
+---- CATCH
+ImpalaRuntimeException: Table does not exist in Kudu: 'impala::$DATABASE.tbl_to_alter'
 ====
 ---- QUERY
 # Insert an item into the table pointed by the external Kudu table
@@ -610,3 +621,17 @@ alter table multi_range_partition_cols add range partition ('b', 2) <= values < 
 ---- CATCH
 NonRecoverableException: New range partition conflicts with existing range partition: ("b", 2) <= VALUES < ("c", 1)
 ====
+---- QUERY
+# Check that renaming an external Impala-Kudu table does not rename the underlying Kudu
+# table; this test consists of this QUERY block as well as the next one
+alter table external_tbl rename to external_tbl_new;
+---- RESULTS
+'Renaming was successful.'
+====
+---- QUERY
+describe formatted external_tbl_new;
+---- RESULTS: VERIFY_IS_SUBSET
+'','kudu.table_name     ','impala::$DATABASE.temp_kudu_table'
+---- TYPES
+STRING,STRING,STRING
+----

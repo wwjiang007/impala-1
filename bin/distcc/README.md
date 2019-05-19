@@ -30,8 +30,8 @@ The rest of the setup is done for you; here is a short description of what they 
   IMPALA_TOOLCHAIN at that directory. This ensures toolchain binaries are at the
   same path locally as on the distcc servers
 
-        mkdir -p "$IMPALA_TOOLCHAIN"/toolchain
-        sudo ln -s "$IMPALA_TOOLCHAIN"/toolchain /opt/Impala-Toolchain
+        mkdir -p "$IMPALA_TOOLCHAIN"
+        sudo ln -s "$IMPALA_TOOLCHAIN" /opt/Impala-Toolchain
         echo 'export IMPALA_TOOLCHAIN=/opt/Impala-Toolchain' >> bin/impala-config-local.sh
 
 1. Source bin/impala-config.sh in the Impala repo. Step #2 depends on this.
@@ -56,10 +56,6 @@ you can either
 ```
 make -j$(distcc -j)
 ```
-or
-```
-bin/make_impala.sh
-```
 
 ### Switching back to local compilation
 If you want to compile a very small change, a local build might be faster.
@@ -71,8 +67,7 @@ to switch back
 switch_compiler distcc
 ```
 ### Second time
-If you open a new terminal and attempt to build with "make" or "bin/make_impala.sh",
-that will fail. To fix:
+If you open a new terminal and attempt to build with "make" that will fail. To fix:
 ```
 source "$IMPALA_HOME"/bin/impala-config.sh   # Skip if already done
 source "$IMPALA_HOME"/bin/distcc/distcc_env.sh

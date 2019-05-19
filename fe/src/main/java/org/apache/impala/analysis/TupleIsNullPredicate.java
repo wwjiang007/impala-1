@@ -17,6 +17,7 @@
 
 package org.apache.impala.analysis;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 
@@ -25,6 +26,7 @@ import org.apache.impala.common.InternalException;
 import org.apache.impala.thrift.TExprNode;
 import org.apache.impala.thrift.TExprNodeType;
 import org.apache.impala.thrift.TTupleIsNullPredicate;
+
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
@@ -91,7 +93,9 @@ public class TupleIsNullPredicate extends Predicate {
   }
 
   @Override
-  protected String toSqlImpl() { return "TupleIsNull()"; }
+  protected String toSqlImpl(ToSqlOptions options) {
+    return "TupleIsNull()";
+  }
 
   public Set<TupleId> getTupleIds() { return tupleIds_; }
 
@@ -135,7 +139,7 @@ public class TupleIsNullPredicate extends Predicate {
   public static Expr wrapExpr(Expr expr, List<TupleId> tids, Analyzer analyzer)
       throws InternalException {
     if (!requiresNullWrapping(expr, analyzer)) return expr;
-    List<Expr> params = Lists.newArrayList();
+    List<Expr> params = new ArrayList<>();
     params.add(new TupleIsNullPredicate(tids));
     params.add(new NullLiteral());
     params.add(expr);
@@ -173,7 +177,7 @@ public class TupleIsNullPredicate extends Predicate {
       List<Expr> params = fnCallExpr.getParams().exprs();
       if (fnCallExpr.getFnName().getFunction().equals("if") &&
           params.get(0) instanceof TupleIsNullPredicate &&
-          params.get(1) instanceof NullLiteral) {
+          Expr.IS_NULL_LITERAL.apply(params.get(1))) {
         return unwrapExpr(params.get(2));
       }
     }

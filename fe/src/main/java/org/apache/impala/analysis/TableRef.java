@@ -17,7 +17,11 @@
 
 package org.apache.impala.analysis;
 
+import static org.apache.impala.analysis.ToSqlOptions.DEFAULT;
+
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
@@ -32,7 +36,6 @@ import org.apache.impala.thrift.TReplicaPreference;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
-import com.google.common.collect.Sets;
 
 /**
  * Superclass of all table references, including references to views, base tables
@@ -62,7 +65,7 @@ import com.google.common.collect.Sets;
  * TODO for 2.3: Rename this class to CollectionRef and re-consider the naming and
  * structure of all subclasses.
  */
-public class TableRef implements ParseNode {
+public class TableRef extends StmtNode {
   // Path to a collection type. Not set for inline views.
   protected List<String> rawPath_;
 
@@ -85,10 +88,10 @@ public class TableRef implements ParseNode {
   protected TableSampleClause sampleParams_;
 
   protected JoinOperator joinOp_;
-  protected List<PlanHint> joinHints_ = Lists.newArrayList();
+  protected List<PlanHint> joinHints_ = new ArrayList<>();
   protected List<String> usingColNames_;
 
-  protected List<PlanHint> tableHints_ = Lists.newArrayList();
+  protected List<PlanHint> tableHints_ = new ArrayList<>();
   protected TReplicaPreference replicaPreference_;
   protected boolean randomReplica_;
 
@@ -116,14 +119,14 @@ public class TableRef implements ParseNode {
   // we may alter the chain of table refs during plan generation, but we still rely
   // on the original list of ids for correct predicate assignment.
   // Populated in analyzeJoin().
-  protected List<TupleId> allTableRefIds_ = Lists.newArrayList();
-  protected List<TupleId> allMaterializedTupleIds_ = Lists.newArrayList();
+  protected List<TupleId> allTableRefIds_ = new ArrayList<>();
+  protected List<TupleId> allMaterializedTupleIds_ = new ArrayList<>();
 
   // All physical tuple ids that this table ref is correlated with:
   // Tuple ids of root descriptors from outer query blocks that this table ref
   // (if a CollectionTableRef) or contained CollectionTableRefs (if an InlineViewRef)
   // are rooted at. Populated during analysis.
-  protected List<TupleId> correlatedTupleIds_ = Lists.newArrayList();
+  protected List<TupleId> correlatedTupleIds_ = new ArrayList<>();
 
   // analysis output
   protected TupleDescriptor desc_;
@@ -531,7 +534,7 @@ public class TableRef implements ParseNode {
       onClause_.analyze(analyzer);
       analyzer.setVisibleSemiJoinedTuple(null);
       onClause_.checkReturnsBool("ON clause", true);
-        if (onClause_.contains(Expr.isAggregatePredicate())) {
+        if (onClause_.contains(Expr.IS_AGGREGATE)) {
           throw new AnalysisException(
               "aggregate function not allowed in ON clause: " + toSql());
       }
@@ -543,7 +546,7 @@ public class TableRef implements ParseNode {
         throw new AnalysisException(
             "Subquery is not allowed in ON clause: " + toSql());
       }
-      Set<TupleId> onClauseTupleIds = Sets.newHashSet();
+      Set<TupleId> onClauseTupleIds = new HashSet<>();
       List<Expr> conjuncts = onClause_.getConjuncts();
       // Outer join clause conjuncts are registered for this particular table ref
       // (ie, can only be evaluated by the plan node that implements this join).
@@ -552,7 +555,7 @@ public class TableRef implements ParseNode {
       // without violating outer join semantics.
       analyzer.registerOnClauseConjuncts(conjuncts, this);
       for (Expr e: conjuncts) {
-        List<TupleId> tupleIds = Lists.newArrayList();
+        List<TupleId> tupleIds = new ArrayList<>();
         e.getIds(tupleIds, null);
         onClauseTupleIds.addAll(tupleIds);
       }
@@ -572,7 +575,9 @@ public class TableRef implements ParseNode {
     if (onClause_ != null) onClause_ = rewriter.rewrite(onClause_, analyzer);
   }
 
-  protected String tableRefToSql() {
+  protected String tableRefToSql() { return tableRefToSql(DEFAULT); }
+
+  protected String tableRefToSql(ToSqlOptions options) {
     String aliasSql = null;
     String alias = getExplicitAlias();
     if (alias != null) aliasSql = ToSqlUtils.getIdentSql(alias);
@@ -581,29 +586,27 @@ public class TableRef implements ParseNode {
     return ToSqlUtils.getPathSql(path) + ((aliasSql != null) ? " " + aliasSql : "");
   }
 
-  protected String tableRefToSql(boolean rewritten) {
-    return tableRefToSql();
+  @Override
+  public final String toSql() {
+    return toSql(DEFAULT);
   }
 
   @Override
-  public String toSql() {
-    return toSql(false);
-  }
-
-  public String toSql(boolean rewritten) {
+  public String toSql(ToSqlOptions options) {
     if (joinOp_ == null) {
       // prepend "," if we're part of a sequence of table refs w/o an
       // explicit JOIN clause
-      return (leftTblRef_ != null ? ", " : "") + tableRefToSql(rewritten);
+      return (leftTblRef_ != null ? ", " : "") + tableRefToSql(options);
     }
 
     StringBuilder output = new StringBuilder(" " + joinOp_.toString() + " ");
-    if(!joinHints_.isEmpty()) output.append(ToSqlUtils.getPlanHintsSql(joinHints_) + " ");
-    output.append(tableRefToSql(rewritten));
+    if (!joinHints_.isEmpty())
+      output.append(ToSqlUtils.getPlanHintsSql(options, joinHints_)).append(" ");
+    output.append(tableRefToSql(options));
     if (usingColNames_ != null) {
       output.append(" USING (").append(Joiner.on(", ").join(usingColNames_)).append(")");
     } else if (onClause_ != null) {
-      output.append(" ON ").append(onClause_.toSql());
+      output.append(" ON ").append(onClause_.toSql(options));
     }
     return output.toString();
   }

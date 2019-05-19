@@ -24,6 +24,7 @@
 
 #include <thrift/protocol/TDebugProtocol.h>
 
+#include "common/config.h"
 #include "gen-cpp/JniCatalog_types.h"
 #include "gen-cpp/Descriptors_types.h"
 #include "gen-cpp/Exprs_types.h"
@@ -68,10 +69,13 @@ std::string PrintThriftEnum(const TRuntimeFilterMode::type& value);
 std::string PrintThriftEnum(const TSessionType::type& value);
 std::string PrintThriftEnum(const TStmtType::type& value);
 std::string PrintThriftEnum(const TUnit::type& value);
+std::string PrintThriftEnum(const TParquetTimestampType::type& value);
 
 std::string PrintTuple(const Tuple* t, const TupleDescriptor& d);
 std::string PrintRow(TupleRow* row, const RowDescriptor& d);
 std::string PrintBatch(RowBatch* batch);
+/// Converts id to a string represantation. If necessary, the gdb equivalent is:
+///    printf "%lx:%lx\n", id.hi, id.lo
 std::string PrintId(const TUniqueId& id, const std::string& separator = ":");
 
 /// Returns the fully qualified path, e.g. "database.table.array_col.item.field"
@@ -97,6 +101,24 @@ bool ParseId(const std::string& s, TUniqueId* id);
 /// This is used to set gflags build version
 std::string GetBuildVersion(bool compact = false);
 
+#ifndef IMPALA_CMAKE_BUILD_TYPE
+static_assert(false, "IMPALA_CMAKE_BUILD_TYPE is not defined");
+#endif
+
+/// Returns the value of CMAKE_BUILD_TYPE used to build the code
+constexpr const char* GetCMakeBuildType() {
+  return AS_STRING(IMPALA_CMAKE_BUILD_TYPE);
+}
+
+/// Returns whether the code was dynamically or statically linked, return
+/// value is either STATIC or DYNAMIC.
+constexpr const char* GetLibraryLinkType() {
+  return AS_STRING(IMPALA_BUILD_SHARED_LIBS)[0] == 'O'
+          && AS_STRING(IMPALA_BUILD_SHARED_LIBS)[1] == 'N' ?
+      "DYNAMIC" :
+      "STATIC";
+}
+
 /// Returns "<program short name> version <GetBuildVersion(compact)>"
 std::string GetVersionString(bool compact = false);
 
@@ -118,19 +140,29 @@ DebugActionTokens TokenizeDebugActions(const string& debug_actions);
 /// becomes {"x", "y"} and "x" becomes {"x"}.
 std::vector<std::string> TokenizeDebugActionParams(const string& action);
 
-/// Slow path implementing DebugAction() for the case where
-/// 'query_options.debug_action' is non-empty.
-Status DebugActionImpl(
-    const TQueryOptions& query_options, const char* label) WARN_UNUSED_RESULT;
+/// Slow path implementing DebugAction() for the case where 'debug_action' is non-empty.
+Status DebugActionImpl(const string& debug_action, const char* label) WARN_UNUSED_RESULT;
 
 /// If debug_action query option has a "global action" (i.e. not exec-node specific)
 /// and matches the given 'label', apply the the action. See ImpalaService.thrift for
 /// details of the format and available global actions. For ExecNode code, use
 /// ExecNode::ExecDebugAction() instead.
 WARN_UNUSED_RESULT static inline Status DebugAction(
+    const string& debug_action, const char* label) {
+  if (LIKELY(debug_action.empty())) return Status::OK();
+  return DebugActionImpl(debug_action, label);
+}
+
+WARN_UNUSED_RESULT static inline Status DebugAction(
     const TQueryOptions& query_options, const char* label) {
-  if (LIKELY(query_options.debug_action.empty())) return Status::OK();
-  return DebugActionImpl(query_options, label);
+  return DebugAction(query_options.debug_action, label);
+}
+
+static inline void DebugActionNoFail(const string& debug_action, const char* label) {
+  Status status = DebugAction(debug_action, label);
+  if (!status.ok()) {
+    LOG(ERROR) << "Ignoring debug action failure: " << status.GetDetail();
+  }
 }
 
 /// Like DebugAction() but for use in contexts that can't safely propagate an error
@@ -138,10 +170,7 @@ WARN_UNUSED_RESULT static inline Status DebugAction(
 /// and ignored.
 static inline void DebugActionNoFail(
     const TQueryOptions& query_options, const char* label) {
-  Status status = DebugAction(query_options, label);
-  if (!status.ok()) {
-    LOG(ERROR) << "Ignoring debug action failure: " << status.GetDetail();
-  }
+  DebugActionNoFail(query_options.debug_action, label);
 }
 
 // FILE_CHECKs are conditions that we expect to be true but could fail due to a malformed

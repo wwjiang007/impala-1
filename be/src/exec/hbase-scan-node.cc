@@ -19,18 +19,19 @@
 
 #include <algorithm>
 
+#include "exec/exec-node-util.h"
+#include "exec/text-converter.inline.h"
+#include "gen-cpp/PlanNodes_types.h"
 #include "runtime/exec-env.h"
 #include "runtime/mem-tracker.h"
-#include "runtime/runtime-state.h"
 #include "runtime/row-batch.h"
+#include "runtime/runtime-state.h"
 #include "runtime/string-value.h"
 #include "runtime/tuple-row.h"
 #include "runtime/tuple.h"
 #include "util/jni-util.h"
 #include "util/periodic-counter-updater.h"
 #include "util/runtime-profile-counters.h"
-#include "gen-cpp/PlanNodes_types.h"
-#include "exec/text-converter.inline.h"
 
 #include "common/names.h"
 using namespace impala;
@@ -118,11 +119,12 @@ Status HBaseScanNode::Prepare(RuntimeState* state) {
 }
 
 Status HBaseScanNode::Open(RuntimeState* state) {
+  SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedOpenEventAdder ea(this);
   RETURN_IF_ERROR(ExecNode::Open(state));
   RETURN_IF_CANCELLED(state);
   RETURN_IF_ERROR(QueryMaintenance(state));
-  SCOPED_TIMER(runtime_profile_->total_time_counter());
-  JNIEnv* env = getJNIEnv();
+  JNIEnv* env = JniUtil::GetJNIEnv();
 
   // No need to initialize hbase_scanner_ if there are no scan ranges.
   if (scan_range_vector_.size() == 0) return Status::OK();
@@ -148,13 +150,11 @@ void HBaseScanNode::WriteTextSlot(
 }
 
 Status HBaseScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
+  SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedGetNextEventAdder ea(this, eos);
   RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::GETNEXT, state));
   RETURN_IF_CANCELLED(state);
   RETURN_IF_ERROR(QueryMaintenance(state));
-  // For GetNext, most of the time is spent in HBaseTableScanner::ResultScanner_next,
-  // but there's still some considerable time inside here.
-  // TODO: need to understand how the time is spent inside this function.
-  SCOPED_TIMER(runtime_profile_->total_time_counter());
 
   if (scan_range_vector_.empty() || ReachedLimit()) {
     *eos = true;
@@ -174,12 +174,12 @@ Status HBaseScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eo
   bool error_in_row = false;
 
   // Indicates whether there are more rows to process. Set in hbase_scanner_.Next().
-  JNIEnv* env = getJNIEnv();
+  JNIEnv* env = JniUtil::GetJNIEnv();
   bool has_next = false;
   while (true) {
     RETURN_IF_CANCELLED(state);
     RETURN_IF_ERROR(QueryMaintenance(state));
-    if (ReachedLimit() || row_batch->AtCapacity()) {
+    if (row_batch->AtCapacity() || ReachedLimit()) {
       // hang on to last allocated chunk in pool, we'll keep writing into it in the
       // next GetNext() call
       *eos = ReachedLimit();
@@ -251,8 +251,8 @@ Status HBaseScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eo
     DCHECK_EQ(conjunct_evals_.size(), conjuncts_.size());
     if (EvalConjuncts(conjunct_evals_.data(), conjuncts_.size(), row)) {
       row_batch->CommitLastRow();
-      ++num_rows_returned_;
-      COUNTER_SET(rows_returned_counter_, num_rows_returned_);
+      IncrementNumRowsReturned(1);
+      COUNTER_SET(rows_returned_counter_, rows_returned());
       tuple = reinterpret_cast<Tuple*>(
           reinterpret_cast<uint8_t*>(tuple) + tuple_desc_->byte_size());
     } else {
@@ -266,7 +266,7 @@ Status HBaseScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eo
   return Status::OK();
 }
 
-Status HBaseScanNode::Reset(RuntimeState* state) {
+Status HBaseScanNode::Reset(RuntimeState* state, RowBatch* row_batch) {
   DCHECK(false) << "NYI";
   return Status("NYI");
 }
@@ -277,7 +277,7 @@ void HBaseScanNode::Close(RuntimeState* state) {
   runtime_profile_->StopPeriodicCounters();
 
   if (hbase_scanner_.get() != NULL) {
-    JNIEnv* env = getJNIEnv();
+    JNIEnv* env = JniUtil::GetJNIEnv();
     hbase_scanner_->Close(env);
   }
   ScanNode::Close(state);

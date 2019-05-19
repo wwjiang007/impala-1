@@ -120,13 +120,11 @@ class MemTracker {
   /// The counters should be owned by the fragment's RuntimeProfile.
   void EnableReservationReporting(const ReservationTrackerCounters& counters);
 
-  /// Construct a MemTracker object for query 'id'. The query limits are determined based
-  /// on 'query_options'. The MemTracker is a child of the request pool MemTracker for
-  /// 'pool_name', which is created if needed. The returned MemTracker is owned by
-  /// 'obj_pool'.
-  static MemTracker* CreateQueryMemTracker(const TUniqueId& id,
-      const TQueryOptions& query_options, const std::string& pool_name,
-      ObjectPool* obj_pool);
+  /// Construct a MemTracker object for query 'id' with 'mem_limit' as the memory limit.
+  /// The MemTracker is a child of the request pool MemTracker for 'pool_name', which is
+  /// created if needed. The returned MemTracker is owned by 'obj_pool'.
+  static MemTracker* CreateQueryMemTracker(const TUniqueId& id, int64_t mem_limit,
+      const std::string& pool_name, ObjectPool* obj_pool);
 
   /// Increases consumption of this tracker and its ancestors by 'bytes'.
   void Consume(int64_t bytes) {
@@ -268,7 +266,7 @@ class MemTracker {
       if (mode == MemLimit::HARD && bytes_over_limit_metric_ != nullptr) {
         bytes_over_limit_metric_->SetValue(consumption() - limit_);
       }
-      return mode == MemLimit::HARD ? GcMemory(limit_) : true;
+      return GcMemory(GetLimit(mode));
     }
     return false;
   }

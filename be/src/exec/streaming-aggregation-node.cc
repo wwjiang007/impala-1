@@ -19,6 +19,7 @@
 
 #include <sstream>
 
+#include "exec/exec-node-util.h"
 #include "gutil/strings/substitute.h"
 #include "runtime/row-batch.h"
 #include "runtime/runtime-state.h"
@@ -43,6 +44,7 @@ StreamingAggregationNode::StreamingAggregationNode(
 
 Status StreamingAggregationNode::Open(RuntimeState* state) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedOpenEventAdder ea(this);
   // Open the child before consuming resources in this node.
   RETURN_IF_ERROR(child(0)->Open(state));
   RETURN_IF_ERROR(ExecNode::Open(state));
@@ -56,6 +58,7 @@ Status StreamingAggregationNode::Open(RuntimeState* state) {
 Status StreamingAggregationNode::GetNext(
     RuntimeState* state, RowBatch* row_batch, bool* eos) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedGetNextEventAdder ea(this, eos);
   RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::GETNEXT, state));
   RETURN_IF_CANCELLED(state);
 
@@ -80,8 +83,8 @@ Status StreamingAggregationNode::GetNext(
     *eos = curr_output_agg_idx_ >= aggs_.size();
   }
 
-  num_rows_returned_ += row_batch->num_rows();
-  COUNTER_SET(rows_returned_counter_, num_rows_returned_);
+  IncrementNumRowsReturned(row_batch->num_rows());
+  COUNTER_SET(rows_returned_counter_, rows_returned());
   return Status::OK();
 }
 
@@ -171,7 +174,7 @@ Status StreamingAggregationNode::GetRowsStreaming(
     child_batch_->Reset();
   } while (out_batch->num_rows() == 0 && !child_eos_);
 
-  if (child_eos_) {
+  if (child_eos_ && child_batch_processed_) {
     child(0)->Close(state);
     child_batch_.reset();
     for (auto& agg : aggs_) RETURN_IF_ERROR(agg->InputDone());
@@ -180,7 +183,7 @@ Status StreamingAggregationNode::GetRowsStreaming(
   return Status::OK();
 }
 
-Status StreamingAggregationNode::Reset(RuntimeState* state) {
+Status StreamingAggregationNode::Reset(RuntimeState* state, RowBatch* row_batch) {
   DCHECK(false) << "Cannot reset preaggregation";
   return Status("Cannot reset preaggregation");
 }

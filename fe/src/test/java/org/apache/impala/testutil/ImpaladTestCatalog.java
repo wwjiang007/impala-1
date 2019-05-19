@@ -19,15 +19,15 @@ package org.apache.impala.testutil;
 
 import com.google.common.base.Preconditions;
 import org.apache.impala.analysis.TableName;
-import org.apache.impala.authorization.AuthorizationConfig;
+import org.apache.impala.authorization.AuthorizationFactory;
+import org.apache.impala.authorization.NoopAuthorizationFactory;
+import org.apache.impala.catalog.BuiltinsDb;
 import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.CatalogServiceCatalog;
 import org.apache.impala.catalog.Db;
-import org.apache.impala.catalog.FeDb;
 import org.apache.impala.catalog.HdfsCachePool;
 import org.apache.impala.catalog.HdfsTable;
 import org.apache.impala.catalog.ImpaladCatalog;
-import org.apache.impala.catalog.Principal;
 import org.apache.impala.catalog.PrincipalPrivilege;
 import org.apache.impala.catalog.Role;
 import org.apache.impala.catalog.Table;
@@ -36,6 +36,7 @@ import org.apache.impala.thrift.TPrivilege;
 import org.apache.impala.util.PatternMatcher;
 
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 
 /**
@@ -47,30 +48,63 @@ public class ImpaladTestCatalog extends ImpaladCatalog {
   private final CatalogServiceCatalog srcCatalog_;
 
   public ImpaladTestCatalog() {
-    this(AuthorizationConfig.createAuthDisabledConfig());
+    this(new NoopAuthorizationFactory());
   }
 
   /**
-   * Takes an AuthorizationConfig to bootstrap the backing CatalogServiceCatalog.
+   * Takes an {@link AuthorizationFactory} to bootstrap the backing CatalogServiceCatalog.
    */
-  public ImpaladTestCatalog(AuthorizationConfig authzConfig) {
-    super("127.0.0.1");
+  public ImpaladTestCatalog(AuthorizationFactory authzFactory) {
+    super("127.0.0.1", null);
     CatalogServiceCatalog catalogServerCatalog =
-        CatalogServiceTestCatalog.createWithAuth(authzConfig.getSentryConfig());
-    // Bootstrap the catalog by adding all dbs, tables, and functions.
-    for (FeDb db: catalogServerCatalog.getDbs(PatternMatcher.MATCHER_MATCH_ALL)) {
-      // Adding DB should include all tables/fns in that database.
-      addDb((Db)db);
-    }
+        CatalogServiceTestCatalog.createWithAuth(authzFactory);
     authPolicy_ = catalogServerCatalog.getAuthPolicy();
     srcCatalog_ = catalogServerCatalog;
+    srcCatalog_.addDb(BuiltinsDb.getInstance());
     setIsReady(true);
+  }
+
+  /**
+   * Creates ImpaladTestCatalog backed by a given catalog instance.
+   */
+  public ImpaladTestCatalog(CatalogServiceCatalog catalog) {
+    super("127.0.0.1", null);
+    srcCatalog_ = Preconditions.checkNotNull(catalog);
+    authPolicy_ = srcCatalog_.getAuthPolicy();
+    setIsReady(true);
+  }
+
+  @Override
+  public void addDb(Db db) {
+    // Builtins are loaded explicitly after the srcCatalog_ is initialized.
+    if (db == BuiltinsDb.getInstance()) return;
+    srcCatalog_.addDb(db);
+  }
+
+  @Override
+  public Db removeDb(String dbName) {
+    return srcCatalog_.removeDb(dbName);
+  }
+
+  /**
+   * Delegates the getDb() request to the source catalog.
+   */
+  public Db getDb(String dbName) {
+    if (dbName.equals(BuiltinsDb.NAME)) return BuiltinsDb.getInstance();
+    return srcCatalog_.getDb(dbName);
+  }
+
+  @Override
+  public List<Db> getDbs(PatternMatcher matcher) {
+    return srcCatalog_.getDbs(matcher);
   }
 
   @Override
   public HdfsCachePool getHdfsCachePool(String poolName) {
     return srcCatalog_.getHdfsCachePool(poolName);
   }
+
+  public CatalogServiceCatalog getSrcCatalog() { return srcCatalog_; }
 
   /**
    * Reloads all metadata from the source catalog.
@@ -147,4 +181,10 @@ public class ImpaladTestCatalog extends ImpaladCatalog {
   }
 
   public void removeUser(String userName) { srcCatalog_.removeUser(userName); }
+
+  @Override
+  public void close() {
+    super.close();
+    srcCatalog_.close();
+  }
 }

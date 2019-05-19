@@ -18,6 +18,7 @@
 #include "exprs/string-functions.h"
 
 #include <cctype>
+#include <numeric>
 #include <stdint.h>
 #include <re2/re2.h>
 #include <re2/stringpiece.h>
@@ -93,7 +94,21 @@ StringVal StringFunctions::Repeat(
     FunctionContext* context, const StringVal& str, const BigIntVal& n) {
   if (str.is_null || n.is_null) return StringVal::null();
   if (str.len == 0 || n.val <= 0) return StringVal();
-  StringVal result(context, str.len * n.val);
+  if (n.val > StringVal::MAX_LENGTH) {
+    context->SetError("Number of repeats in repeat() call is larger than allowed limit "
+        "of 1 GB character data.");
+    return StringVal::null();
+  }
+  static_assert(numeric_limits<int64_t>::max() / numeric_limits<int>::max()
+      >= StringVal::MAX_LENGTH,
+      "multiplying StringVal::len with positive int fits in int64_t");
+  int64_t out_len = str.len * n.val;
+  if (out_len > StringVal::MAX_LENGTH) {
+    context->SetError(
+        "repeat() result is larger than allowed limit of 1 GB character data.");
+    return StringVal::null();
+  }
+  StringVal result(context, static_cast<int>(out_len));
   if (UNLIKELY(result.is_null)) return StringVal::null();
   uint8_t* ptr = result.ptr;
   for (int64_t i = 0; i < n.val; ++i) {
@@ -649,7 +664,7 @@ bool StringFunctions::SetRE2Options(const StringVal& match_parameter,
 
 void StringFunctions::RegexpPrepare(
     FunctionContext* context, FunctionContext::FunctionStateScope scope) {
-  if (scope != FunctionContext::FRAGMENT_LOCAL) return;
+  if (scope != FunctionContext::THREAD_LOCAL) return;
   if (!context->IsArgConstant(1)) return;
   DCHECK_EQ(context->GetArgType(1)->type, FunctionContext::TYPE_STRING);
   StringVal* pattern = reinterpret_cast<StringVal*>(context->GetConstantArg(1));
@@ -666,7 +681,7 @@ void StringFunctions::RegexpPrepare(
 
 void StringFunctions::RegexpClose(
     FunctionContext* context, FunctionContext::FunctionStateScope scope) {
-  if (scope != FunctionContext::FRAGMENT_LOCAL) return;
+  if (scope != FunctionContext::THREAD_LOCAL) return;
   re2::RE2* re = reinterpret_cast<re2::RE2*>(context->GetFunctionState(scope));
   delete re;
   context->SetFunctionState(scope, nullptr);
@@ -700,7 +715,7 @@ StringVal StringFunctions::RegexpExtract(FunctionContext* context, const StringV
   if (index.val < 0) return StringVal();
 
   re2::RE2* re = reinterpret_cast<re2::RE2*>(
-      context->GetFunctionState(FunctionContext::FRAGMENT_LOCAL));
+      context->GetFunctionState(FunctionContext::THREAD_LOCAL));
   scoped_ptr<re2::RE2> scoped_re; // destroys re if we have to locally compile it
   if (re == NULL) {
     DCHECK(!context->IsArgConstant(1));
@@ -732,7 +747,7 @@ StringVal StringFunctions::RegexpReplace(FunctionContext* context, const StringV
   if (str.is_null || pattern.is_null || replace.is_null) return StringVal::null();
 
   re2::RE2* re = reinterpret_cast<re2::RE2*>(
-      context->GetFunctionState(FunctionContext::FRAGMENT_LOCAL));
+      context->GetFunctionState(FunctionContext::THREAD_LOCAL));
   scoped_ptr<re2::RE2> scoped_re; // destroys re if state->re is NULL
   if (re == NULL) {
     DCHECK(!context->IsArgConstant(1));
@@ -754,7 +769,7 @@ StringVal StringFunctions::RegexpReplace(FunctionContext* context, const StringV
 
 void StringFunctions::RegexpMatchCountPrepare(FunctionContext* context,
     FunctionContext::FunctionStateScope scope) {
-  if (scope != FunctionContext::FRAGMENT_LOCAL) return;
+  if (scope != FunctionContext::THREAD_LOCAL) return;
   int num_args = context->GetNumArgs();
   DCHECK(num_args == 2 || num_args == 4);
   if (!context->IsArgConstant(1) || (num_args == 4 && !context->IsArgConstant(3))) return;
@@ -801,7 +816,7 @@ IntVal StringFunctions::RegexpMatchCount4Args(FunctionContext* context,
   }
 
   re2::RE2* re = reinterpret_cast<re2::RE2*>(
-      context->GetFunctionState(FunctionContext::FRAGMENT_LOCAL));
+      context->GetFunctionState(FunctionContext::THREAD_LOCAL));
   // Destroys re if we have to locally compile it.
   scoped_ptr<re2::RE2> scoped_re;
   if (re == NULL) {
@@ -1105,5 +1120,51 @@ StringVal StringFunctions::Base64Decode(FunctionContext* ctx, const StringVal& s
 StringVal StringFunctions::GetJsonObject(FunctionContext *ctx, const StringVal &json_str,
     const StringVal &path_str) {
   return GetJsonObjectImpl(ctx, json_str, path_str);
+}
+
+IntVal StringFunctions::Levenshtein(
+    FunctionContext* ctx, const StringVal& s1, const StringVal& s2) {
+  // Adapted from https://bit.ly/2SbDgN4
+  // under the Creative Commons Attribution-ShareAlike License
+
+  int s1len = s1.len;
+  int s2len = s2.len;
+
+  // error if either input exceeds 255 characters
+  if (s1len > 255 || s2len > 255) {
+    ctx->SetError("levenshtein argument exceeds maximum length of 255 characters");
+    return IntVal(-1);
+  }
+
+  // short cut cases:
+  // - null strings
+  // - zero length strings
+  // - identical length and value strings
+  if (s1.is_null || s2.is_null) return IntVal::null();
+  if (s1len == 0) return IntVal(s2len);
+  if (s2len == 0) return IntVal(s1len);
+  if (s1len == s2len && memcmp(s1.ptr, s2.ptr, s1len) == 0) return IntVal(0);
+
+  int column_start = 1;
+
+  auto column = reinterpret_cast<int*>(ctx->Allocate(sizeof(int) * (s1len + 1)));
+
+  std::iota(column + column_start - 1, column + s1len + 1, column_start - 1);
+
+  for (int x = column_start; x <= s2len; x++) {
+    column[0] = x;
+    int last_diagonal = x - column_start;
+    for (int y = column_start; y <= s1len; y++) {
+      int old_diagonal = column[y];
+      auto possibilities = {column[y] + 1, column[y - 1] + 1,
+          last_diagonal + (s1.ptr[y - 1] == s2.ptr[x - 1] ? 0 : 1)};
+      column[y] = std::min(possibilities);
+      last_diagonal = old_diagonal;
+    }
+  }
+  int result = column[s1len];
+  ctx->Free(reinterpret_cast<uint8_t*>(column));
+
+  return IntVal(result);
 }
 }

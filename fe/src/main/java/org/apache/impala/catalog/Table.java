@@ -19,18 +19,22 @@ package org.apache.impala.catalog;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 
+import org.apache.hadoop.hive.common.ValidWriteIdList;
 import org.apache.hadoop.hive.metastore.IMetaStoreClient;
 import org.apache.hadoop.hive.metastore.TableType;
 import org.apache.hadoop.hive.metastore.api.ColumnStatisticsData;
 import org.apache.hadoop.hive.metastore.api.ColumnStatisticsObj;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.impala.analysis.TableName;
+import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.common.ImpalaRuntimeException;
 import org.apache.impala.common.Metrics;
 import org.apache.impala.common.Pair;
@@ -52,7 +56,6 @@ import org.apache.log4j.Logger;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
 
 /**
  * Base class for table metadata.
@@ -89,15 +92,20 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
   // table lock.
   protected AtomicLong metadataOpsCount_ = new AtomicLong(0);
 
+  // Number of files that the table has.
+  // Stored in an AtomicLong to allow this field to be accessed without holding the
+  // table lock.
+  protected AtomicLong numFiles_ = new AtomicLong(0);
+
   // Metrics for this table
   protected final Metrics metrics_ = new Metrics();
 
   // colsByPos[i] refers to the ith column in the table. The first numClusteringCols are
   // the clustering columns.
-  protected final ArrayList<Column> colsByPos_ = Lists.newArrayList();
+  protected final ArrayList<Column> colsByPos_ = new ArrayList<>();
 
   // map from lowercase column name to Column object.
-  private final Map<String, Column> colsByName_ = Maps.newHashMap();
+  private final Map<String, Column> colsByName_ = new HashMap<>();
 
   // Type of this table (array of struct) that mirrors the columns. Useful for analysis.
   protected final ArrayType type_ = new ArrayType(new StructType());
@@ -109,6 +117,17 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
   // CatalogdTableInvalidator.nanoTime(). This is only set in catalogd and not used by
   // impalad.
   protected long lastUsedTime_;
+
+  // Valid write id list for this table
+  protected String validWriteIds_ = null;
+
+  // maximum number of catalog versions to store for in-flight events for this table
+  private static final int MAX_NUMBER_OF_INFLIGHT_EVENTS = 10;
+
+  // FIFO list of versions for all the in-flight metastore events in this table
+  // This queue can only grow up to MAX_NUMBER_OF_INFLIGHT_EVENTS size. Anything which
+  // is attempted to be added to this list when its at maximum capacity is ignored
+  private final LinkedList<Long> versionsForInflightEvents_ = new LinkedList<>();
 
   // Table metrics. These metrics are applicable to all table types. Each subclass of
   // Table can define additional metrics specific to that table type.
@@ -135,6 +154,7 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
   }
 
   public ReentrantLock getLock() { return tableLock_; }
+  @Override
   public abstract TTableDescriptor toThriftDescriptor(
       int tableId, Set<Long> referencedPartitions);
 
@@ -143,6 +163,8 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
 
   public long getMetadataOpsCount() { return metadataOpsCount_.get(); }
   public long getEstimatedMetadataSize() { return estimatedMetadataSize_.get(); }
+  public long getNumFiles() { return numFiles_.get(); }
+
   public void setEstimatedMetadataSize(long estimatedMetadataSize) {
     estimatedMetadataSize_.set(estimatedMetadataSize);
     if (!isStoredInImpaladCatalogCache()) {
@@ -154,6 +176,13 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
     metadataOpsCount_.incrementAndGet();
     if (!isStoredInImpaladCatalogCache()) {
       CatalogUsageMonitor.INSTANCE.updateFrequentlyAccessedTables(this);
+    }
+  }
+
+  public void setNumFiles(long numFiles) {
+    numFiles_.set(numFiles);
+    if (!isStoredInImpaladCatalogCache()) {
+      CatalogUsageMonitor.INSTANCE.updateHighFileCountTables(this);
     }
   }
 
@@ -214,7 +243,7 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
   // stats. This method allows each table type to volunteer the set of columns we should
   // ask the metastore for in loadAllColumnStats().
   protected List<String> getColumnNamesWithHmsStats() {
-    List<String> ret = Lists.newArrayList();
+    List<String> ret = new ArrayList<>();
     for (String name: colsByName_.keySet()) ret.add(name);
     return ret;
   }
@@ -245,13 +274,49 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
   }
 
   /**
+   * Get valid write ids for the acid table.
+   * @param client the client to access HMS
+   * @return the list of valid write IDs for the table
+   */
+  protected String fetchValidWriteIds(IMetaStoreClient client)
+      throws TableLoadingException {
+    String tblFullName = getFullName();
+    if (LOG.isTraceEnabled()) LOG.trace("Get valid writeIds for table: " + tblFullName);
+    String writeIds = null;
+    try {
+      ValidWriteIdList validWriteIds = MetastoreShim.fetchValidWriteIds(client,
+          tblFullName);
+      writeIds = validWriteIds == null ? null : validWriteIds.writeToString();
+    } catch (Exception e) {
+      throw new TableLoadingException(String.format("Error loading ValidWriteIds for " +
+          "table '%s'", getName()), e);
+    }
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("Valid writeIds: " + writeIds);
+    }
+    return writeIds;
+  }
+
+  /**
+   * Set ValistWriteIdList with stored writeId
+   * @param client the client to access HMS
+   */
+  protected void loadValidWriteIdList(IMetaStoreClient client)
+      throws TableLoadingException {
+    if (MetastoreShim.getMajorVersion() > 2) {
+      validWriteIds_ = fetchValidWriteIds(client);
+    }
+  }
+
+  /**
    * Creates a table of the appropriate type based on the given hive.metastore.api.Table
    * object.
    */
   public static Table fromMetastoreTable(Db db,
       org.apache.hadoop.hive.metastore.api.Table msTbl) {
-    // Create a table of appropriate type
+    CatalogInterners.internFieldsInPlace(msTbl);
     Table table = null;
+    // Create a table of appropriate type
     if (TableType.valueOf(msTbl.getTableType()) == TableType.VIRTUAL_VIEW) {
       table = new View(msTbl, db, msTbl.getTableName(), msTbl.getOwner());
     } else if (HBaseTable.isHBaseTable(msTbl)) {
@@ -276,6 +341,7 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
    */
   public static Table fromThrift(Db parentDb, TTable thriftTable)
       throws TableLoadingException {
+    CatalogInterners.internFieldsInPlace(thriftTable);
     Table newTable;
     if (!thriftTable.isSetLoad_status() && thriftTable.isSetMetastore_table())  {
       newTable = Table.fromMetastoreTable(parentDb, thriftTable.getMetastore_table());
@@ -321,6 +387,8 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
         TAccessLevel.READ_WRITE;
 
     storedInImpaladCatalogCache_ = true;
+    validWriteIds_ = thriftTable.isSetValid_write_ids() ?
+        thriftTable.getValid_write_ids() : null;
   }
 
   /**
@@ -356,8 +424,8 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
     table.setAccess_level(accessLevel_);
 
     // Populate both regular columns and clustering columns (if there are any).
-    table.setColumns(new ArrayList<TColumn>());
-    table.setClustering_columns(new ArrayList<TColumn>());
+    table.setColumns(new ArrayList<>());
+    table.setClustering_columns(new ArrayList<>());
     for (int i = 0; i < colsByPos_.size(); ++i) {
       TColumn colDesc = colsByPos_.get(i).toThrift();
       // Clustering columns come first.
@@ -370,14 +438,10 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
 
     table.setMetastore_table(getMetaStoreTable());
     table.setTable_stats(tableStats_);
+    if (validWriteIds_ != null) {
+      table.setValid_write_ids(validWriteIds_);
+    }
     return table;
-  }
-
-  public TCatalogObject toTCatalogObject() {
-    TCatalogObject catalogObject =
-        new TCatalogObject(getCatalogObjectType(), getCatalogVersion());
-    catalogObject.setTable(toThrift());
-    return catalogObject;
   }
 
   public TCatalogObject toMinimalTCatalogObject() {
@@ -387,6 +451,11 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
     catalogObject.getTable().setDb_name(getDb().getName());
     catalogObject.getTable().setTbl_name(getName());
     return catalogObject;
+  }
+
+  @Override
+  protected void setTCatalogObject(TCatalogObject catalogObject) {
+    catalogObject.setTable(toThrift());
   }
 
   /**
@@ -454,11 +523,8 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
     return new TableName(db_ != null ? db_.getName() : null, name_);
   }
 
-  @Override // CatalogObject
-  public String getUniqueName() { return "TABLE:" + getFullName(); }
-
   @Override // FeTable
-  public ArrayList<Column> getColumns() { return colsByPos_; }
+  public List<Column> getColumns() { return colsByPos_; }
 
   @Override // FeTable
   public List<String> getColumnNames() { return Column.toColumnNames(colsByPos_); }
@@ -479,7 +545,7 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
 
   @Override // FeTable
   public List<Column> getColumnsInHiveOrder() {
-    ArrayList<Column> columns = Lists.newArrayList(getNonClusteringColumns());
+    List<Column> columns = Lists.newArrayList(getNonClusteringColumns());
     columns.addAll(getClusteringColumns());
     return Collections.unmodifiableList(columns);
   }
@@ -505,6 +571,7 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
 
   public void setMetaStoreTable(org.apache.hadoop.hive.metastore.api.Table msTbl) {
     msTable_ = msTbl;
+    CatalogInterners.internFieldsInPlace(msTable_);
   }
 
   @Override // FeTable
@@ -586,5 +653,52 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
 
   public void refreshLastUsedTime() {
     lastUsedTime_ = CatalogdTableInvalidator.nanoTime();
+  }
+
+  /**
+   * Gets the current list of versions for in-flight events for this table
+   */
+  public List<Long> getVersionsForInflightEvents() {
+    return Collections.unmodifiableList(versionsForInflightEvents_);
+  }
+
+  /**
+   * Removes a given version from the collection of version numbers for in-flight events
+   * @param versionNumber version number to remove from the collection
+   * @return true if version was successfully removed, false if didn't exist
+   */
+  public boolean removeFromVersionsForInflightEvents(long versionNumber) {
+    return versionsForInflightEvents_.remove(versionNumber);
+  }
+
+  /**
+   * Adds a version number to the collection of versions for in-flight events. If the
+   * collection is already at the max size defined by
+   * <code>MAX_NUMBER_OF_INFLIGHT_EVENTS</code>, then it ignores the given version and
+   * does not add it
+   * @param versionNumber version number to add
+   * @return True if version number was added, false if the collection is at its max
+   * capacity
+   */
+  public boolean addToVersionsForInflightEvents(long versionNumber) {
+    if (versionsForInflightEvents_.size() == MAX_NUMBER_OF_INFLIGHT_EVENTS) {
+      LOG.warn(String.format("Number of versions to be stored for table %s is at "
+              + " its max capacity %d. Ignoring add request for version number %d. This "
+              + "could cause unnecessary table invalidation when the event is processed",
+          getFullName(), MAX_NUMBER_OF_INFLIGHT_EVENTS, versionNumber));
+      return false;
+    }
+    versionsForInflightEvents_.add(versionNumber);
+    return true;
+  }
+
+  @Override
+  public long getWriteId() {
+    return MetastoreShim.getWriteIdFromMSTable(msTable_);
+  }
+
+  @Override
+  public String getValidWriteIds() {
+    return validWriteIds_;
   }
 }

@@ -81,11 +81,14 @@ class HdfsScanNode : public HdfsScanNodeBase {
 
   virtual bool HasRowBatchQueue() const override { return true; }
 
-  bool done() const { return done_; }
+  bool done() const { return done_.Load(); }
 
   /// Adds ranges to the io mgr queue and starts up new scanner threads if possible.
+  /// The enqueue_location parameter determines the location at which the scan ranges are
+  /// added to the queue.
   virtual Status AddDiskIoRanges(const std::vector<io::ScanRange*>& ranges,
-      int num_files_queued) override WARN_UNUSED_RESULT;
+      EnqueueLocation enqueue_location = EnqueueLocation::TAIL)
+      override WARN_UNUSED_RESULT;
 
   /// Adds a materialized row batch for the scan node.  This is called from scanner
   /// threads. This function will block if the row batch queue is full.
@@ -103,6 +106,10 @@ class HdfsScanNode : public HdfsScanNodeBase {
   /// Transfers all memory from 'pool' to 'scan_node_pool_'.
   virtual void TransferToScanNodePool(MemPool* pool) override;
 
+  virtual ExecutionModel getExecutionModel() const override {
+    return NON_TASK_BASED_SYNC;
+  }
+
  private:
   ScannerThreadState thread_state_;
 
@@ -111,18 +118,21 @@ class HdfsScanNode : public HdfsScanNodeBase {
 
   /// Lock protects access between scanner thread and main query thread (the one calling
   /// GetNext()) for all fields below.  If this lock and any other locks needs to be taken
-  /// together, this lock must be taken first.
-  boost::mutex lock_;
+  /// together, this lock must be taken first. This is a "timed_mutex" to allow specifying
+  /// a timeout when acquiring the mutex. Almost all code locations acquire the mutex
+  /// without a timeout; see ThreadTokenAvailableCb for a location using a timeout.
+  boost::timed_mutex lock_;
 
   /// Protects file_type_counts_. Cannot be taken together with any other lock
   /// except lock_, and if so, lock_ must be taken first.
-  SpinLock file_type_counts_;
+  SpinLock file_type_counts_lock_;
 
   /// Flag signaling that all scanner threads are done.  This could be because they
   /// are finished, an error/cancellation occurred, or the limit was reached.
   /// Setting this to true triggers the scanner threads to clean up.
-  /// This should not be explicitly set. Instead, call SetDone().
-  bool done_ = false;
+  /// This should not be explicitly set. Instead, call SetDone(). This is set while
+  /// holding lock_, but it is atomic to allow reads without holding the lock.
+  AtomicBool done_;
 
   /// Set to true if all ranges have started. Some of the ranges may still be in flight
   /// being processed by scanner threads, but no new ScannerThreads should be started.
@@ -136,6 +146,9 @@ class HdfsScanNode : public HdfsScanNodeBase {
   /// Number of times scanner threads were not created because of reservation increase
   /// being denied.
   RuntimeProfile::Counter* scanner_thread_reservations_denied_counter_ = nullptr;
+
+  /// Number of times scanner thread didn't find work to do.
+  RuntimeProfile::Counter* scanner_thread_workless_loops_counter_ = nullptr;
 
   /// Compute the estimated memory consumption of a scanner thread in bytes for the
   /// purposes of deciding whether to start a new scanner thread.
@@ -162,16 +175,17 @@ class HdfsScanNode : public HdfsScanNodeBase {
   /// thread. 'filter_ctxs' is a clone of the class-wide filter_ctxs_, used to filter rows
   /// in this split. 'scanner_thread_reservation' is an in/out argument that tracks the
   /// total reservation from 'buffer_pool_client_' that is allotted for this thread's
-  /// use.
-  Status ProcessSplit(const std::vector<FilterContext>& filter_ctxs,
+  /// use. If an error is encountered, calls SetDoneInternal() with the error to
+  /// initiate shutdown of the scan.
+  void ProcessSplit(const std::vector<FilterContext>& filter_ctxs,
       MemPool* expr_results_pool, io::ScanRange* scan_range,
-      int64_t* scanner_thread_reservation) WARN_UNUSED_RESULT;
+      int64_t* scanner_thread_reservation);
 
   /// Called by scanner thread to return some or all of its reservation that is not
   /// needed. Always holds onto at least the minimum reservation to avoid violating the
   /// invariants of ExecNode::buffer_pool_client_. 'lock_' must be held via 'lock'.
-  void ReturnReservationFromScannerThread(const boost::unique_lock<boost::mutex>& lock,
-      int64_t bytes);
+  void ReturnReservationFromScannerThread(
+      const boost::unique_lock<boost::timed_mutex>& lock, int64_t bytes);
 
   /// Checks for eos conditions and returns batches from the row batch queue.
   Status GetNextInternal(RuntimeState* state, RowBatch* row_batch, bool* eos)
@@ -185,6 +199,11 @@ class HdfsScanNode : public HdfsScanNodeBase {
   /// Gets lock_ and calls SetDoneInternal(status_). Usually used after the scan node
   /// completes execution successfully.
   void SetDone();
+
+  /// Gets lock_ and calls SetDoneInternal(status). Called after a scanner hits an
+  /// error. Must be called before HdfsScanner::Close() to ensure that 'status'
+  /// is propagated before the scan range is marked as complete by HdfsScanner::Close().
+  void SetError(const Status& status);
 };
 
 }

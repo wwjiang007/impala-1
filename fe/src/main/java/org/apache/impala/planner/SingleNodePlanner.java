@@ -20,10 +20,10 @@ package org.apache.impala.planner;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
-import java.util.ListIterator;
 import java.util.Map;
 import java.util.Set;
 
@@ -48,6 +48,7 @@ import org.apache.impala.analysis.SingularRowSrcTableRef;
 import org.apache.impala.analysis.SlotDescriptor;
 import org.apache.impala.analysis.SlotId;
 import org.apache.impala.analysis.SlotRef;
+import org.apache.impala.analysis.SortInfo;
 import org.apache.impala.analysis.TableRef;
 import org.apache.impala.analysis.TupleDescriptor;
 import org.apache.impala.analysis.TupleId;
@@ -61,12 +62,14 @@ import org.apache.impala.catalog.FeFsTable;
 import org.apache.impala.catalog.FeHBaseTable;
 import org.apache.impala.catalog.FeKuduTable;
 import org.apache.impala.catalog.FeTable;
-import org.apache.impala.catalog.Type;
+import org.apache.impala.catalog.HdfsFileFormat;
+import org.apache.impala.catalog.ScalarType;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.common.NotImplementedException;
 import org.apache.impala.common.Pair;
 import org.apache.impala.common.RuntimeEnv;
+import org.apache.impala.service.BackendConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -74,7 +77,6 @@ import com.google.common.base.Preconditions;
 import com.google.common.base.Predicate;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 
 /**
@@ -156,22 +158,22 @@ public class SingleNodePlanner {
    * Checks that the given single-node plan is executable:
    * - It may not contain right or full outer joins with no equi-join conjuncts that
    *   are not inside the right child of a SubplanNode.
-   * - MT_DOP > 0 is not supported for plans with base table joins or table sinks.
+   * - MT_DOP > 0 is not supported by default for plans with base table joins or table
+   *   sinks: we only allow MT_DOP > 0 with such plans if --unlock_mt_dop=true is
+   *   specified.
    * Throws a NotImplementedException if plan validation fails.
    */
   public void validatePlan(PlanNode planNode) throws NotImplementedException {
     if (ctx_.getQueryOptions().isSetMt_dop() && ctx_.getQueryOptions().mt_dop > 0
         && !RuntimeEnv.INSTANCE.isTestEnv()
+        && !BackendConfig.INSTANCE.isMtDopUnlocked()
         && (planNode instanceof JoinNode || ctx_.hasTableSink())) {
       throw new NotImplementedException(
           "MT_DOP not supported for plans with base table joins or table sinks.");
     }
 
-    // As long as MT_DOP is unset or 0 any join can run in a single-node plan.
-    if (ctx_.isSingleNodeExec() &&
-        (!ctx_.getQueryOptions().isSetMt_dop() || ctx_.getQueryOptions().mt_dop == 0)) {
-      return;
-    }
+    // Any join can run in a single-node plan.
+    if (ctx_.isSingleNodeExec()) return;
 
     if (planNode instanceof NestedLoopJoinNode) {
       JoinNode joinNode = (JoinNode) planNode;
@@ -204,7 +206,7 @@ public class SingleNodePlanner {
    * materialize them.
    */
   private PlanNode createEmptyNode(QueryStmt stmt, Analyzer analyzer) {
-    ArrayList<TupleId> tupleIds = Lists.newArrayList();
+    List<TupleId> tupleIds = new ArrayList<>();
     stmt.getMaterializedTupleIds(tupleIds);
     if (tupleIds.isEmpty()) {
       // Constant selects do not have materialized tuples at this stage.
@@ -229,7 +231,7 @@ public class SingleNodePlanner {
    * Mark all collection-typed slots in stmt as non-materialized.
    */
   private void unmarkCollectionSlots(QueryStmt stmt) {
-    List<TableRef> tblRefs = Lists.newArrayList();
+    List<TableRef> tblRefs = new ArrayList<>();
     stmt.collectFromClauseTableRefs(tblRefs);
     for (TableRef ref: tblRefs) {
       if (!ref.isRelative()) continue;
@@ -267,7 +269,7 @@ public class SingleNodePlanner {
         List<Expr> groupingExprs = multiAggInfo != null ?
             multiAggInfo.getGroupingExprs() :
             Collections.<Expr>emptyList();
-        List<Expr> inputPartitionExprs = Lists.newArrayList();
+        List<Expr> inputPartitionExprs = new ArrayList<>();
         root = analyticPlanner.createSingleNodePlan(
             root, groupingExprs, inputPartitionExprs);
         if (multiAggInfo != null && !inputPartitionExprs.isEmpty()
@@ -294,26 +296,51 @@ public class SingleNodePlanner {
     }
 
     if (stmt.evaluateOrderBy() && sortHasMaterializedSlots) {
-      long limit = stmt.getLimit();
-      // TODO: External sort could be used for very large limits
-      // not just unlimited order-by
-      boolean useTopN = stmt.hasLimit() && !disableTopN;
-      if (useTopN) {
-        root = SortNode.createTopNSortNode(
-            ctx_.getNextNodeId(), root, stmt.getSortInfo(), stmt.getOffset());
-      } else {
-        root = SortNode.createTotalSortNode(
-            ctx_.getNextNodeId(), root, stmt.getSortInfo(), stmt.getOffset());
-      }
-      Preconditions.checkState(root.hasValidStats());
-      root.setLimit(limit);
-      root.init(analyzer);
+      root = createSortNode(analyzer, root, stmt.getSortInfo(), stmt.getLimit(),
+          stmt.getOffset(), stmt.hasLimit(), disableTopN);
     } else {
       root.setLimit(stmt.getLimit());
       root.computeStats(analyzer);
     }
 
     return root;
+  }
+
+  /**
+   * Creates and initializes either a SortNode or a TopNNode depending on various
+   * heuristics and configuration parameters.
+   */
+  private SortNode createSortNode(Analyzer analyzer, PlanNode root, SortInfo sortInfo,
+      long limit, long offset, boolean hasLimit, boolean disableTopN)
+      throws ImpalaException {
+    SortNode sortNode;
+    long topNBytesLimit = ctx_.getQueryOptions().topn_bytes_limit;
+
+    if (hasLimit && !disableTopN) {
+      if (topNBytesLimit <= 0) {
+        sortNode =
+            SortNode.createTopNSortNode(ctx_.getNextNodeId(), root, sortInfo, offset);
+      } else {
+        long topNCardinality = PlanNode.capCardinalityAtLimit(root.cardinality_, limit);
+        long estimatedTopNMaterializedSize =
+            sortInfo.estimateTopNMaterializedSize(topNCardinality, offset);
+
+        if (estimatedTopNMaterializedSize < topNBytesLimit) {
+          sortNode =
+              SortNode.createTopNSortNode(ctx_.getNextNodeId(), root, sortInfo, offset);
+        } else {
+          sortNode =
+              SortNode.createTotalSortNode(ctx_.getNextNodeId(), root, sortInfo, offset);
+        }
+      }
+    } else {
+      sortNode =
+          SortNode.createTotalSortNode(ctx_.getNextNodeId(), root, sortInfo, offset);
+    }
+    Preconditions.checkState(sortNode.hasValidStats());
+    sortNode.setLimit(limit);
+    sortNode.init(analyzer);
+    return sortNode;
   }
 
   /**
@@ -368,7 +395,7 @@ public class SingleNodePlanner {
 
     // collect eligible candidates for the leftmost input; list contains
     // (plan, materialized size)
-    ArrayList<Pair<TableRef, Long>> candidates = Lists.newArrayList();
+    List<Pair<TableRef, Long>> candidates = new ArrayList<>();
     for (Pair<TableRef, PlanNode> entry: parentRefPlans) {
       TableRef ref = entry.first;
       JoinOperator joinOp = ref.getJoinOp();
@@ -382,7 +409,7 @@ public class SingleNodePlanner {
       if (plan.getCardinality() == -1) {
         // use 0 for the size to avoid it becoming the leftmost input
         // TODO: Consider raw size of scanned partitions in the absence of stats.
-        candidates.add(new Pair(ref, new Long(0)));
+        candidates.add(new Pair<TableRef, Long>(ref, new Long(0)));
         if (LOG.isTraceEnabled()) {
           LOG.trace("candidate " + ref.getUniqueAlias() + ": 0");
         }
@@ -391,7 +418,7 @@ public class SingleNodePlanner {
       Preconditions.checkState(ref.isAnalyzed());
       long materializedSize =
           (long) Math.ceil(plan.getAvgRowSize() * (double) plan.getCardinality());
-      candidates.add(new Pair(ref, new Long(materializedSize)));
+      candidates.add(new Pair<TableRef, Long>(ref, new Long(materializedSize)));
       if (LOG.isTraceEnabled()) {
         LOG.trace(
             "candidate " + ref.getUniqueAlias() + ": " + Long.toString(materializedSize));
@@ -403,6 +430,7 @@ public class SingleNodePlanner {
     // consumption of the materialized hash tables required for the join sequence
     Collections.sort(candidates,
         new Comparator<Pair<TableRef, Long>>() {
+          @Override
           public int compare(Pair<TableRef, Long> a, Pair<TableRef, Long> b) {
             long diff = b.second - a.second;
             return (diff < 0 ? -1 : (diff > 0 ? 1 : 0));
@@ -430,7 +458,7 @@ public class SingleNodePlanner {
       LOG.trace("createJoinPlan: " + leftmostRef.getUniqueAlias());
     }
     // the refs that have yet to be joined
-    List<Pair<TableRef, PlanNode>> remainingRefs = Lists.newArrayList();
+    List<Pair<TableRef, PlanNode>> remainingRefs = new ArrayList<>();
     PlanNode root = null;  // root of accumulated join plan
     for (Pair<TableRef, PlanNode> entry: refPlans) {
       if (entry.first == leftmostRef) {
@@ -447,8 +475,8 @@ public class SingleNodePlanner {
     // (IMPALA-860), s.t. all the tables appearing to the left/right of an outer/semi
     // join in the original query still remain to the left/right after join ordering.
     // This prevents join re-ordering across outer/semi joins which is generally wrong.
-    Map<TableRef, Set<TableRef>> precedingRefs = Maps.newHashMap();
-    List<TableRef> tmpTblRefs = Lists.newArrayList();
+    Map<TableRef, Set<TableRef>> precedingRefs = new HashMap<>();
+    List<TableRef> tmpTblRefs = new ArrayList<>();
     for (Pair<TableRef, PlanNode> entry: refPlans) {
       TableRef tblRef = entry.first;
       if (tblRef.getJoinOp().isOuterJoin() || tblRef.getJoinOp().isSemiJoin()) {
@@ -589,7 +617,7 @@ public class SingleNodePlanner {
     //   process repeats itself.
     selectStmt.materializeRequiredSlots(analyzer);
 
-    ArrayList<TupleId> rowTuples = Lists.newArrayList();
+    List<TupleId> rowTuples = new ArrayList<>();
     // collect output tuples of subtrees
     for (TableRef tblRef: selectStmt.getTableRefs()) {
       rowTuples.addAll(tblRef.getMaterializedTupleIds());
@@ -612,8 +640,8 @@ public class SingleNodePlanner {
 
     // Separate table refs into parent refs (uncorrelated or absolute) and
     // subplan refs (correlated or relative), and generate their plan.
-    List<TableRef> parentRefs = Lists.newArrayList();
-    List<SubplanRef> subplanRefs = Lists.newArrayList();
+    List<TableRef> parentRefs = new ArrayList<>();
+    List<SubplanRef> subplanRefs = new ArrayList<>();
     computeParentAndSubplanRefs(
         selectStmt.getTableRefs(), analyzer.isStraightJoin(), parentRefs, subplanRefs);
     MultiAggregateInfo multiAggInfo = selectStmt.getMultiAggInfo();
@@ -706,7 +734,7 @@ public class SingleNodePlanner {
     // FROM t, (SELECT ... FROM t.c1 LEFT JOIN t.c2 ON(...) JOIN t.c3 ON (...)) v
     // Table ref t.c3 has an ordering dependency on t.c2 due to the outer join, but t.c3
     // must be placed into the subplan that materializes t.c1 and t.c2.
-    List<TupleId> planTblRefIds = Lists.newArrayList();
+    List<TupleId> planTblRefIds = new ArrayList<>();
 
     // List of materialized tuple ids in the subplan context, if any. This list must
     // remain constant in this function because the subplan context is fixed. Any
@@ -727,8 +755,8 @@ public class SingleNodePlanner {
     for (TableRef ref: tblRefs) {
       boolean isParentRef = true;
       if (ref.isRelative() || ref.isCorrelated()) {
-        List<TupleId> requiredTids = Lists.newArrayList();
-        List<TupleId> requiredTblRefIds = Lists.newArrayList();
+        List<TupleId> requiredTids = new ArrayList<>();
+        List<TupleId> requiredTblRefIds = new ArrayList<>();
         if (ref.isCorrelated()) {
           requiredTids.addAll(ref.getCorrelatedTupleIds());
         } else {
@@ -784,7 +812,7 @@ public class SingleNodePlanner {
     // create plans for our table refs; use a list here instead of a map to
     // maintain a deterministic order of traversing the TableRefs during join
     // plan generation (helps with tests)
-    List<Pair<TableRef, PlanNode>> parentRefPlans = Lists.newArrayList();
+    List<Pair<TableRef, PlanNode>> parentRefPlans = new ArrayList<>();
     for (TableRef ref: parentRefs) {
       PlanNode root = createTableRefNode(ref, aggInfo, analyzer);
       Preconditions.checkNotNull(root);
@@ -874,7 +902,7 @@ public class SingleNodePlanner {
     // List of table ref ids in 'root' as well as the table ref ids of all table refs
     // placed in 'subplanRefs' so far.
     List<TupleId> tblRefIds = Lists.newArrayList(root.getTblRefIds());
-    List<TableRef> result = Lists.newArrayList();
+    List<TableRef> result = new ArrayList<>();
     Iterator<SubplanRef> subplanRefIt = subplanRefs.iterator();
     TableRef leftTblRef = null;
     while (subplanRefIt.hasNext()) {
@@ -1002,60 +1030,6 @@ public class SingleNodePlanner {
   }
 
   /**
-   * Transform '=', '<[=]' and '>[=]' comparisons for given slot into
-   * ValueRange. Also removes those predicates which were used for the construction
-   * of ValueRange from 'conjuncts_'. Only looks at comparisons w/ string constants
-   * (ie, the bounds of the result can be evaluated with Expr::GetValue(NULL)).
-   * HBase row key filtering works only if the row key is mapped to a string column and
-   * the expression is a string constant expression.
-   * If there are multiple competing comparison predicates that could be used
-   * to construct a ValueRange, only the first one from each category is chosen.
-   */
-  private ValueRange createHBaseValueRange(SlotDescriptor d, List<Expr> conjuncts) {
-    ListIterator<Expr> i = conjuncts.listIterator();
-    ValueRange result = null;
-    while (i.hasNext()) {
-      Expr e = i.next();
-      if (!(e instanceof BinaryPredicate)) continue;
-      BinaryPredicate comp = (BinaryPredicate) e;
-      if ((comp.getOp() == BinaryPredicate.Operator.NE)
-          || (comp.getOp() == BinaryPredicate.Operator.DISTINCT_FROM)
-          || (comp.getOp() == BinaryPredicate.Operator.NOT_DISTINCT)) {
-        continue;
-      }
-      Expr slotBinding = comp.getSlotBinding(d.getId());
-      if (slotBinding == null || !slotBinding.isConstant() ||
-          !slotBinding.getType().equals(Type.STRING)) {
-        continue;
-      }
-
-      if (comp.getOp() == BinaryPredicate.Operator.EQ) {
-        i.remove();
-        return ValueRange.createEqRange(slotBinding);
-      }
-
-      if (result == null) result = new ValueRange();
-
-      // TODO: do we need copies here?
-      if (comp.getOp() == BinaryPredicate.Operator.GT
-          || comp.getOp() == BinaryPredicate.Operator.GE) {
-        if (result.getLowerBound() == null) {
-          result.setLowerBound(slotBinding);
-          result.setLowerBoundInclusive(comp.getOp() == BinaryPredicate.Operator.GE);
-          i.remove();
-        }
-      } else {
-        if (result.getUpperBound() == null) {
-          result.setUpperBound(slotBinding);
-          result.setUpperBoundInclusive(comp.getOp() == BinaryPredicate.Operator.LE);
-          i.remove();
-        }
-      }
-    }
-    return result;
-  }
-
-  /**
    * Returns plan tree for an inline view ref:
    * - predicates from the enclosing scope that can be evaluated directly within
    *   the inline-view plan are pushed down
@@ -1172,10 +1146,13 @@ public class SingleNodePlanner {
    * makes the *output* of the computation visible to the enclosing scope, so that
    * filters from the enclosing scope can be safely applied (to the grouping cols, say).
    */
-  public void migrateConjunctsToInlineView(Analyzer analyzer,
-      InlineViewRef inlineViewRef) throws ImpalaException {
+  public void migrateConjunctsToInlineView(final Analyzer analyzer,
+      final InlineViewRef inlineViewRef) throws ImpalaException {
     List<Expr> unassignedConjuncts =
         analyzer.getUnassignedConjuncts(inlineViewRef.getId().asList(), true);
+    if (LOG. isTraceEnabled()) {
+      LOG.trace("unassignedConjuncts: " + Expr.debugString(unassignedConjuncts));
+    }
     if (!canMigrateConjuncts(inlineViewRef)) {
       // mark (fully resolve) slots referenced by unassigned conjuncts as
       // materialized
@@ -1185,16 +1162,58 @@ public class SingleNodePlanner {
       return;
     }
 
-    List<Expr> preds = Lists.newArrayList();
+    List<Expr> preds = new ArrayList<>();
     for (Expr e: unassignedConjuncts) {
       if (analyzer.canEvalPredicate(inlineViewRef.getId().asList(), e)) {
         preds.add(e);
+        if (LOG. isTraceEnabled()) {
+          LOG.trace(String.format("Can evaluate %s in inline view %s", e.debugString(),
+                  inlineViewRef.getExplicitAlias()));
+        }
       }
     }
     unassignedConjuncts.removeAll(preds);
+    // Migrate the conjuncts by marking the original ones as assigned. They will either
+    // be ignored if they are identity predicates (e.g. a = a), or be substituted into
+    // new ones (viewPredicates below). The substituted ones will be re-registered.
+    analyzer.markConjunctsAssigned(preds);
     // Generate predicates to enforce equivalences among slots of the inline view
     // tuple. These predicates are also migrated into the inline view.
     analyzer.createEquivConjuncts(inlineViewRef.getId(), preds);
+
+    // Remove unregistered predicates that finally resolved to predicates reference
+    // the same slot on both sides (e.g. a = a). Such predicates have been generated from
+    // slot equivalences and may incorrectly reject rows with nulls
+    // (IMPALA-1412/IMPALA-2643/IMPALA-8386).
+    Predicate<Expr> isIdentityPredicate = new Predicate<Expr>() {
+      @Override
+      public boolean apply(Expr e) {
+        if (!org.apache.impala.analysis.Predicate.isEquivalencePredicate(e)
+            || !((BinaryPredicate) e).isInferred()) {
+          return false;
+        }
+        try {
+          BinaryPredicate finalExpr = (BinaryPredicate) e.trySubstitute(
+              inlineViewRef.getBaseTblSmap(), analyzer, false);
+          boolean isIdentity = finalExpr.hasIdenticalOperands();
+
+          // Verity that "smap[e1] == smap[e2]" => "baseTblSmap[e1] == baseTblSmap[e2]"
+          // in case we have bugs in generating baseTblSmap.
+          BinaryPredicate midExpr = (BinaryPredicate) e.trySubstitute(
+              inlineViewRef.getSmap(), analyzer, false);
+          Preconditions.checkState(!midExpr.hasIdenticalOperands() || isIdentity);
+
+          if (LOG.isTraceEnabled() && isIdentity) {
+            LOG.trace("Removed identity predicate: " + finalExpr.debugString());
+          }
+          return isIdentity;
+        } catch (Exception ex) {
+          throw new IllegalStateException(
+                  "Failed analysis after expr substitution.", ex);
+        }
+      }
+    };
+    Iterables.removeIf(preds, isIdentityPredicate);
 
     // create new predicates against the inline view's unresolved result exprs, not
     // the resolved result exprs, in order to avoid skipping scopes (and ignoring
@@ -1202,22 +1221,6 @@ public class SingleNodePlanner {
     List<Expr> viewPredicates =
         Expr.substituteList(preds, inlineViewRef.getSmap(), analyzer, false);
 
-    // Remove unregistered predicates that reference the same slot on
-    // both sides (e.g. a = a). Such predicates have been generated from slot
-    // equivalences and may incorrectly reject rows with nulls (IMPALA-1412/IMPALA-2643).
-    Predicate<Expr> isIdentityPredicate = new Predicate<Expr>() {
-      @Override
-      public boolean apply(Expr expr) {
-        return org.apache.impala.analysis.Predicate.isEquivalencePredicate(expr)
-            && ((BinaryPredicate) expr).isInferred()
-            && expr.getChild(0).equals(expr.getChild(1));
-      }
-    };
-    Iterables.removeIf(viewPredicates, isIdentityPredicate);
-
-    // Migrate the conjuncts by marking the original ones as assigned, and
-    // re-registering the substituted ones with new ids.
-    analyzer.markConjunctsAssigned(preds);
     // Unset the On-clause flag of the migrated conjuncts because the migrated conjuncts
     // apply to the post-join/agg/analytic result of the inline view.
     for (Expr e: viewPredicates) e.setIsOnClauseConjunct(false);
@@ -1253,10 +1256,31 @@ public class SingleNodePlanner {
     // Do partition pruning before deciding which slots to materialize because we might
     // end up removing some predicates.
     HdfsPartitionPruner pruner = new HdfsPartitionPruner(tupleDesc);
-    List<? extends FeFsPartition> partitions = pruner.prunePartitions(analyzer, conjuncts, false);
+    Pair<List<? extends FeFsPartition>, List<Expr>> pair =
+        pruner.prunePartitions(analyzer, conjuncts, false);
+    List<? extends FeFsPartition> partitions = pair.first;
 
     // Mark all slots referenced by the remaining conjuncts as materialized.
     analyzer.materializeSlots(conjuncts);
+
+    // TODO: Remove this section, once DATE type is supported across all fileformats.
+    // Check if there are any partitions for which DATE is not supported.
+    FeFsPartition part = findUnsupportedDateFsPartition(partitions);
+    if (part != null) {
+      FeFsTable table = (FeFsTable)hdfsTblRef.getTable();
+      HdfsFileFormat ff = part.getInputFormatDescriptor().getFileFormat();
+      // Throw an exception if tupleDesc contains a non-clustering, materialized
+      // DATE slot.
+      for (SlotDescriptor slotDesc: tupleDesc.getMaterializedSlots()) {
+        if (slotDesc.getColumn() != null
+            && !table.isClusteringColumn(slotDesc.getColumn())
+            && slotDesc.getType() == ScalarType.DATE) {
+          throw new NotImplementedException(
+              "Scanning DATE values in table '" + table.getFullName() +
+              "' is not supported for fileformat " + ff);
+        }
+      }
+    }
 
     // For queries which contain partition columns only, we may use the metadata instead
     // of table scans. This is only feasible if all materialized aggregate expressions
@@ -1268,12 +1292,12 @@ public class SingleNodePlanner {
     // If the optimization for partition key scans with metadata is enabled,
     // try evaluating with metadata first. If not, fall back to scanning.
     if (fastPartitionKeyScans && tupleDesc.hasClusteringColsOnly()) {
-      HashSet<List<Expr>> uniqueExprs = new HashSet<List<Expr>>();
+      Set<List<Expr>> uniqueExprs = new HashSet<>();
 
       for (FeFsPartition partition: partitions) {
         // Ignore empty partitions to match the behavior of the scan based approach.
         if (partition.getSize() == 0) continue;
-        List<Expr> exprs = Lists.newArrayList();
+        List<Expr> exprs = new ArrayList<>();
         for (SlotDescriptor slotDesc: tupleDesc.getSlots()) {
           // UnionNode.init() will go through all the slots in the tuple descriptor so
           // there needs to be an entry in 'exprs' for each slot. For unmaterialized
@@ -1296,12 +1320,28 @@ public class SingleNodePlanner {
       unionNode.init(analyzer);
       return unionNode;
     } else {
-      ScanNode scanNode =
+      HdfsScanNode scanNode =
           new HdfsScanNode(ctx_.getNextNodeId(), tupleDesc, conjuncts, partitions,
-              hdfsTblRef, aggInfo);
+              hdfsTblRef, aggInfo, pair.second);
       scanNode.init(analyzer);
       return scanNode;
     }
+  }
+
+  /**
+   * Looks for a filesystem-based partition in 'partitions' with no DATE support and
+   * returns the first one it finds. Right now, scanning DATE values is only supported for
+   * TEXT and PARQUET fileformats.
+   *
+   * Returns null otherwise.
+   */
+  private FeFsPartition findUnsupportedDateFsPartition(
+      List<? extends FeFsPartition> partitions) {
+    for (FeFsPartition part: partitions) {
+      HdfsFileFormat ff = part.getInputFormatDescriptor().getFileFormat();
+      if (!ff.isDateTypeSupported()) return part;
+    }
+    return null;
   }
 
   /**
@@ -1318,7 +1358,7 @@ public class SingleNodePlanner {
     ScanNode scanNode = null;
 
     // Get all predicates bound by the tuple.
-    List<Expr> conjuncts = Lists.newArrayList();
+    List<Expr> conjuncts = new ArrayList<>();
     TupleId tid = tblRef.getId();
     conjuncts.addAll(analyzer.getBoundPredicates(tid));
 
@@ -1352,6 +1392,9 @@ public class SingleNodePlanner {
     } else if (table instanceof FeHBaseTable) {
       // HBase table
       scanNode = new HBaseScanNode(ctx_.getNextNodeId(), tblRef.getDesc());
+      scanNode.addConjuncts(conjuncts);
+      scanNode.init(analyzer);
+      return scanNode;
     } else if (tblRef.getTable() instanceof FeKuduTable) {
       scanNode = new KuduScanNode(ctx_.getNextNodeId(), tblRef.getDesc(), conjuncts);
       scanNode.init(analyzer);
@@ -1360,30 +1403,6 @@ public class SingleNodePlanner {
       throw new NotImplementedException(
           "Planning not implemented for table ref class: " + tblRef.getClass());
     }
-    // TODO: move this to HBaseScanNode.init();
-    Preconditions.checkState(scanNode instanceof HBaseScanNode);
-    List<ValueRange> keyRanges = Lists.newArrayList();
-    // determine scan predicates for clustering cols
-    for (int i = 0; i < tblRef.getTable().getNumClusteringCols(); ++i) {
-      SlotDescriptor slotDesc = analyzer.getColumnSlot(
-          tblRef.getDesc(), tblRef.getTable().getColumns().get(i));
-      if (slotDesc == null || !slotDesc.getType().isStringType()) {
-        // the hbase row key is mapped to a non-string type
-        // (since it's stored in ascii it will be lexicographically ordered,
-        // and non-string comparisons won't work)
-        keyRanges.add(null);
-      } else {
-        // create ValueRange from conjuncts_ for slot; also removes conjuncts_ that were
-        // used as input for filter
-        keyRanges.add(createHBaseValueRange(slotDesc, conjuncts));
-      }
-    }
-
-    ((HBaseScanNode)scanNode).setKeyRanges(keyRanges);
-    scanNode.addConjuncts(conjuncts);
-    scanNode.init(analyzer);
-
-    return scanNode;
   }
 
   /**
@@ -1397,13 +1416,13 @@ public class SingleNodePlanner {
    * - for outer joins: same type of conjuncts as inner joins, but only from the
    *   ON or USING clause
    * Predicates that are redundant based on equivalence classes are intentionally
-   * returneded by this function because the removal of redundant predicates and the
+   * returned by this function because the removal of redundant predicates and the
    * creation of new predicates for enforcing slot equivalences go hand-in-hand
    * (see analyzer.createEquivConjuncts()).
    */
   private List<BinaryPredicate> getHashLookupJoinConjuncts(
       List<TupleId> lhsTblRefIds, List<TupleId> rhsTblRefIds, Analyzer analyzer) {
-    List<BinaryPredicate> result = Lists.newArrayList();
+    List<BinaryPredicate> result = new ArrayList<>();
     List<Expr> candidates = analyzer.getEqJoinConjuncts(lhsTblRefIds, rhsTblRefIds);
     Preconditions.checkNotNull(candidates);
     for (Expr e: candidates) {
@@ -1417,7 +1436,7 @@ public class SingleNodePlanner {
     if (!result.isEmpty()) return result;
 
     // Construct join conjuncts derived from equivalence class membership.
-    HashSet<TupleId> lhsTblRefIdsHs = new HashSet<>(lhsTblRefIds);
+    Set<TupleId> lhsTblRefIdsHs = new HashSet<>(lhsTblRefIds);
     for (TupleId rhsId: rhsTblRefIds) {
       TableRef rhsTblRef = analyzer.getTableRef(rhsId);
       Preconditions.checkNotNull(rhsTblRef);
@@ -1482,7 +1501,7 @@ public class SingleNodePlanner {
       innerRef.setJoinOp(JoinOperator.INNER_JOIN);
     }
 
-    List<Expr> otherJoinConjuncts = Lists.newArrayList();
+    List<Expr> otherJoinConjuncts = new ArrayList<>();
     if (innerRef.getJoinOp().isOuterJoin()) {
       // Also assign conjuncts from On clause. All remaining unassigned conjuncts
       // that can be evaluated by this join are assigned in createSelectPlan().

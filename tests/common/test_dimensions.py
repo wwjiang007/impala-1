@@ -113,6 +113,30 @@ def create_avro_snappy_dimension(workload):
   return ImpalaTestDimension('table_format',
       TableFormatInfo.create_from_string(dataset, 'avro/snap/block'))
 
+
+def create_beeswax_hs2_dimension():
+  return ImpalaTestDimension('protocol', 'beeswax', 'hs2')
+
+
+def create_beeswax_dimension():
+  return ImpalaTestDimension('protocol', 'beeswax')
+
+
+def hs2_parquet_constraint(v):
+  """Constraint function, used to only run HS2 against Parquet format, because file format
+  and the client protocol are orthogonal."""
+  return (v.get_value('protocol') == 'beeswax' or
+          v.get_value('table_format').file_format == 'parquet' and
+          v.get_value('table_format').compression_codec == 'none')
+
+
+def hs2_text_constraint(v):
+  """Constraint function, used to only run HS2 against uncompressed text, because file
+  format and the client protocol are orthogonal."""
+  return (v.get_value('protocol') == 'beeswax' or
+          v.get_value('table_format').file_format == 'text' and
+          v.get_value('table_format').compression_codec == 'none')
+
 # Common sets of values for the exec option vectors
 ALL_BATCH_SIZES = [0]
 
@@ -139,18 +163,19 @@ def create_exec_option_dimension(cluster_sizes=ALL_CLUSTER_SIZES,
                                  # We already run with codegen on and off explicitly -
                                  # don't need automatic toggling.
                                  disable_codegen_rows_threshold_options=[0],
-                                 debug_action_options=[None]):
+                                 debug_action_options=None):
   exec_option_dimensions = {
       'abort_on_error': [1],
       'exec_single_node_rows_threshold': exec_single_node_option,
       'batch_size': batch_sizes,
       'disable_codegen': disable_codegen_options,
       'disable_codegen_rows_threshold': disable_codegen_rows_threshold_options,
-      'debug_action': debug_action_options,
       'num_nodes': cluster_sizes}
 
   if sync_ddl is not None:
     exec_option_dimensions['sync_ddl'] = sync_ddl
+  if debug_action_options is not None:
+    exec_option_dimensions['debug_action'] = debug_action_options
   return create_exec_option_dimension_from_dict(exec_option_dimensions)
 
 def create_exec_option_dimension_from_dict(exec_option_dimensions):

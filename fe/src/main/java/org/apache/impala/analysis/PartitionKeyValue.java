@@ -17,12 +17,14 @@
 
 package org.apache.impala.analysis;
 
-import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
-
-import org.apache.impala.common.AnalysisException;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+
+import org.apache.impala.common.AnalysisException;
+import org.apache.impala.service.FeSupport;
+
+import com.google.common.base.Preconditions;
 
 /**
  * Representation of a single column:value element in the PARTITION (...) clause of an
@@ -42,14 +44,15 @@ public class PartitionKeyValue {
   }
 
   public void analyze(Analyzer analyzer) throws AnalysisException {
+    if (value_ == null) return;
     if (isStatic() && !value_.isConstant()) {
       throw new AnalysisException(
           String.format("Non-constant expressions are not supported " +
               "as static partition-key values in '%s'.", toString()));
     }
-    if (value_ == null) return;
     value_.analyze(analyzer);
-    literalValue_ = LiteralExpr.create(value_, analyzer.getQueryCtx());
+    literalValue_ = LiteralExpr.createBounded(value_, analyzer.getQueryCtx(),
+        StringLiteral.MAX_STRING_LEN);
   }
 
   public String getColName() { return colName_; }
@@ -69,7 +72,7 @@ public class PartitionKeyValue {
    */
   public String toPredicateSql() {
     String ident = ToSqlUtils.getIdentSql(colName_);
-    if (literalValue_ instanceof NullLiteral ||
+    if (Expr.IS_NULL_LITERAL.apply(literalValue_) ||
         literalValue_.getStringValue().isEmpty()) {
       return ident + " IS NULL";
     }
@@ -84,7 +87,8 @@ public class PartitionKeyValue {
   public static String getPartitionKeyValueString(LiteralExpr literalValue,
       String nullPartitionKeyValue) {
     Preconditions.checkNotNull(literalValue);
-    if (literalValue instanceof NullLiteral || literalValue.getStringValue().isEmpty()) {
+    if (Expr.IS_NULL_LITERAL.apply(literalValue) ||
+        literalValue.getStringValue().isEmpty()) {
       return nullPartitionKeyValue;
     }
     return literalValue.getStringValue();
@@ -96,7 +100,7 @@ public class PartitionKeyValue {
    */
   public static List<String> getPartitionKeyValueStringList(
       List<LiteralExpr> literals, String nullPartitionKeyValue) {
-    List<String> partValues = Lists.newArrayList();
+    List<String> partValues = new ArrayList<>();
     for (LiteralExpr partValue : literals) {
       partValues.add(getPartitionKeyValueString(partValue, nullPartitionKeyValue));
     }

@@ -124,7 +124,7 @@ class GroupingAggregator : public Aggregator {
   virtual void Codegen(RuntimeState* state) override;
   virtual Status Open(RuntimeState* state) override;
   virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) override;
-  virtual Status Reset(RuntimeState* state) override;
+  virtual Status Reset(RuntimeState* state, RowBatch* row_batch) override;
   virtual void Close(RuntimeState* state) override;
 
   virtual Status AddBatch(RuntimeState* state, RowBatch* batch) override;
@@ -346,6 +346,8 @@ class GroupingAggregator : public Aggregator {
 
     /// Initializes the hash table. 'aggregated_row_stream' must be non-NULL.
     /// Sets 'got_memory' to true if the hash table was initialised or false on OOM.
+    /// After returning, 'hash_tbl' will be non-null iff 'got_memory' is true and the
+    /// returned status is OK.
     Status InitHashTable(bool* got_memory) WARN_UNUSED_RESULT;
 
     /// Called in case we need to serialize aggregated rows. This step effectively does

@@ -65,11 +65,6 @@ under the License.
   </topicref>
   <topicref href="topics/impala_tutorial.xml"/>
   <topicref href="topics/impala_admin.xml">
-    <topicref audience="standalone" href="topics/impala_admission.xml"/>
-    <topicref audience="standalone" href="topics/impala_resource_management.xml"/>
-
-<!--<topicref href="topics/impala_howto_rm.xml"/>-->
-
     <topicref href="topics/impala_timeouts.xml"/>
     <topicref href="topics/impala_proxy.xml"/>
     <topicref href="topics/impala_disk_space.xml"/>
@@ -110,7 +105,9 @@ under the License.
       <topicref href="topics/impala_smallint.xml"/>
       <topicref href="topics/impala_string.xml"/>
       <topicref href="topics/impala_struct.xml"/>
-      <topicref href="topics/impala_timestamp.xml"/>
+      <topicref href="topics/impala_timestamp.xml">
+        <topicref href="topics/impala_custom_timezones.xml"/>
+      </topicref>
       <topicref href="topics/impala_tinyint.xml"/>
       <topicref href="topics/impala_varchar.xml"/>
       <topicref href="topics/impala_complex_types.xml"/>
@@ -129,6 +126,7 @@ under the License.
     <topicref href="topics/impala_langref_sql.xml">
       <topicref href="topics/impala_ddl.xml"/>
       <topicref href="topics/impala_dml.xml"/>
+      <topicref href="topics/impala_alter_database.xml"/>
       <topicref href="topics/impala_alter_table.xml"/>
       <topicref href="topics/impala_alter_view.xml"/>
       <topicref href="topics/impala_comment.xml"/>
@@ -154,6 +152,7 @@ under the License.
       <topicref href="topics/impala_invalidate_metadata.xml"/>
       <topicref href="topics/impala_load_data.xml"/>
       <topicref href="topics/impala_refresh.xml"/>
+      <topicref href="topics/impala_refresh_authorization.xml"/>
       <topicref href="topics/impala_refresh_functions.xml"/>
       <topicref href="topics/impala_revoke.xml"/>
       <topicref href="topics/impala_select.xml">
@@ -172,6 +171,7 @@ under the License.
       <topicref href="topics/impala_set.xml">
         <topicref href="topics/impala_query_options.xml">
           <topicref href="topics/impala_abort_on_error.xml"/>
+          <topicref href="topics/impala_allow_erasure_coded_files.xml"/>
           <topicref href="topics/impala_allow_unsupported_formats.xml"/>
           <topicref href="topics/impala_appx_count_distinct.xml"/>
           <topicref href="topics/impala_batch_size.xml"/>
@@ -180,6 +180,7 @@ under the License.
           <topicref href="topics/impala_compute_stats_min_sample_size.xml"/>
           <topicref href="topics/impala_debug_action.xml"/>
           <topicref rev="2.9.0" href="topics/impala_decimal_v2.xml"/>
+          <topicref rev="3.2.0" href="topics/impala_default_file_format.xml"/>
           <topicref rev="2.9.0 IMPALA-5381" href="topics/impala_default_join_distribution_mode.xml"/>
           <topicref rev="2.10.0 IMPALA-3200" href="topics/impala_default_spillable_buffer_size.xml"/>
           <topicref href="topics/impala_disable_codegen.xml"/>
@@ -199,6 +200,7 @@ under the License.
           <topicref href="topics/impala_live_progress.xml"/>
           <topicref href="topics/impala_live_summary.xml"/>
           <topicref href="topics/impala_max_errors.xml"/>
+          <topicref rev="3.1 IMPALA-6847" href="topics/impala_max_mem_estimate_for_admission.xml"/>
           <topicref rev="2.10.0 IMPALA-3200" href="topics/impala_max_row_size.xml"/>
           <topicref rev="2.5.0" href="topics/impala_max_num_runtime_filters.xml"/>
           <topicref href="topics/impala_max_scan_range_length.xml"/>
@@ -206,6 +208,7 @@ under the License.
           <topicref rev="2.10.0 IMPALA-3200" href="topics/impala_min_spillable_buffer_size.xml"/>
           <topicref rev="2.8.0" href="topics/impala_mt_dop.xml"/>
           <topicref href="topics/impala_num_nodes.xml"/>
+          <topicref rev="3.2" href="topics/impala_num_rows_produced_limit.xml"/>
           <topicref href="topics/impala_num_scanner_threads.xml"/>
           <topicref rev="2.5.0" href="topics/impala_optimize_partition_key_scans.xml"/>
           <topicref href="topics/impala_parquet_compression_codec.xml"/>
@@ -217,8 +220,9 @@ under the License.
           <topicref href="topics/impala_parquet_read_statistics.xml"/>
           <topicref rev="2.6.0 IMPALA-3286" href="topics/impala_prefetch_mode.xml"/>
           <topicref href="topics/impala_query_timeout_s.xml"/>
-          <topicref href="topics/impala_request_pool.xml"/>
           <topicref rev="2.7.0" href="topics/impala_replica_preference.xml"/>
+          <topicref href="topics/impala_request_pool.xml"/>
+          <topicref href="topics/impala_resource_trace_ratio.xml"/>
           <topicref rev="2.5.0" href="topics/impala_runtime_bloom_filter_size.xml"/>
           <topicref rev="2.6.0" href="topics/impala_runtime_filter_max_size.xml"/>
           <topicref rev="2.6.0" href="topics/impala_runtime_filter_min_size.xml"/>
@@ -236,9 +240,11 @@ under the License.
           <topicref href="topics/impala_thread_reservation_aggregate_limit.xml"/>
           <topicref href="topics/impala_thread_reservation_limit.xml"/>
           <topicref href="topics/impala_timezone.xml"/>
+          <topicref href="topics/impala_topn_bytes_limit.xml"/>
         </topicref>
       </topicref>
       <topicref href="topics/impala_show.xml"/>
+      <topicref href="topics/impala_shutdown.xml"/>
       <topicref href="topics/impala_truncate_table.xml"/>
       <topicref href="topics/impala_update.xml"/>
       <topicref href="topics/impala_upsert.xml"/>
@@ -266,8 +272,8 @@ under the License.
         <topicref href="topics/impala_variance.xml"/>
       </topicref>
       <topicref href="topics/impala_analytic_functions.xml"/>
-      <topicref href="topics/impala_udf.xml"/>
     </topicref>
+    <topicref href="topics/impala_udf.xml"/>
     <topicref href="topics/impala_langref_unsupported.xml"/>
     <topicref href="topics/impala_porting.xml"/>
   </topicref>
@@ -290,8 +296,14 @@ under the License.
     <topicref href="topics/impala_perf_skew.xml"/>
     <topicref audience="hidden" href="topics/impala_perf_ddl.xml"/>
   </topicref>
-  <topicref href="topics/impala_scalability.xml"/>
+  <topicref href="topics/impala_scalability.xml">
     <topicref href="topics/impala_dedicated_coordinator.xml"/>
+    <topicref href="topics/impala_metadata.xml"/>
+  </topicref>
+  <topicref href="topics/impala_resource_management.xml">
+    <topicref href="topics/impala_admission.xml"/>
+    <topicref href="topics/impala_admission_config.xml"/>
+  </topicref>
   <topicref href="topics/impala_partitioning.xml"/>
   <topicref href="topics/impala_file_formats.xml">
     <topicref href="topics/impala_txtfile.xml"/>

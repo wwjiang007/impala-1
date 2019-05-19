@@ -17,6 +17,7 @@
 
 #include "exec/partial-sort-node.h"
 
+#include "exec/exec-node-util.h"
 #include "runtime/row-batch.h"
 #include "runtime/runtime-state.h"
 #include "runtime/sorted-run-merger.h"
@@ -78,6 +79,7 @@ void PartialSortNode::Codegen(RuntimeState* state) {
 
 Status PartialSortNode::Open(RuntimeState* state) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedOpenEventAdder ea(this);
   RETURN_IF_ERROR(ExecNode::Open(state));
   RETURN_IF_CANCELLED(state);
   RETURN_IF_ERROR(QueryMaintenance(state));
@@ -90,6 +92,7 @@ Status PartialSortNode::Open(RuntimeState* state) {
 
 Status PartialSortNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedGetNextEventAdder ea(this, eos);
   RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::GETNEXT, state));
   RETURN_IF_CANCELLED(state);
   RETURN_IF_ERROR(QueryMaintenance(state));
@@ -102,8 +105,8 @@ Status PartialSortNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* 
       sorter_->Reset();
       *eos = input_eos_;
     }
-    num_rows_returned_ += row_batch->num_rows();
-    COUNTER_SET(rows_returned_counter_, num_rows_returned_);
+    IncrementNumRowsReturned(row_batch->num_rows());
+    COUNTER_SET(rows_returned_counter_, rows_returned());
     return Status::OK();
   }
 
@@ -136,14 +139,14 @@ Status PartialSortNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* 
     *eos = input_eos_;
   }
 
-  num_rows_returned_ += row_batch->num_rows();
-  COUNTER_SET(rows_returned_counter_, num_rows_returned_);
+  IncrementNumRowsReturned(row_batch->num_rows());
+  COUNTER_SET(rows_returned_counter_, rows_returned());
   return Status::OK();
 }
 
-Status PartialSortNode::Reset(RuntimeState* state) {
+Status PartialSortNode::Reset(RuntimeState* state, RowBatch* row_batch) {
   DCHECK(false) << "PartialSortNode cannot be part of a subplan.";
-  return ExecNode::Reset(state);
+  return Status("Cannot reset partial sort");
 }
 
 void PartialSortNode::Close(RuntimeState* state) {

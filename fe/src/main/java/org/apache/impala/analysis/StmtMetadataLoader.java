@@ -17,15 +17,22 @@
 
 package org.apache.impala.analysis;
 
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
 import org.apache.impala.catalog.FeCatalog;
 import org.apache.impala.catalog.FeDb;
+import org.apache.impala.catalog.FeFsTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.FeView;
+import org.apache.impala.catalog.HdfsPartition;
+import org.apache.impala.catalog.PrunablePartition;
 import org.apache.impala.common.InternalException;
+import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.service.Frontend;
 import org.apache.impala.util.EventSequence;
 import org.apache.impala.util.TUniqueIdUtil;
@@ -33,9 +40,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
-import com.google.common.collect.Sets;
 
 /**
  * Loads all table and view metadata relevant for a single SQL statement and returns the
@@ -54,8 +58,8 @@ public class StmtMetadataLoader {
   private final EventSequence timeline_;
 
   // Results of the loading process. See StmtTableCache.
-  private final Set<String> dbs_ = Sets.newHashSet();
-  private final Map<TableName, FeTable> loadedTbls_ = Maps.newHashMap();
+  private final Set<String> dbs_ = new HashSet<>();
+  private final Map<TableName, FeTable> loadedTbls_ = new HashMap<>();
 
   // Metrics for the metadata load.
   // Number of prioritizedLoad() RPCs issued to the catalogd.
@@ -153,7 +157,7 @@ public class StmtMetadataLoader {
     long startTimeMs = System.currentTimeMillis();
 
     // All tables for which we have requested a prioritized load.
-    Set<TableName> requestedTbls = Sets.newHashSet();
+    Set<TableName> requestedTbls = new HashSet<>();
 
     // Loading a fixed set of tables happens in two steps:
     // 1) Issue a loading request RPC to the catalogd.
@@ -227,8 +231,21 @@ public class StmtMetadataLoader {
           "loaded-tables=%d/%d load-requests=%d catalog-updates=%d",
           requestedTbls.size(), loadedTbls_.size(), numLoadRequestsSent_,
           numCatalogUpdatesReceived_));
+
+      if (MetastoreShim.getMajorVersion() > 2) {
+        StringBuilder validIdsBuf = new StringBuilder("Loaded ValidWriteIdLists: ");
+        for (FeTable iTbl : loadedTbls_.values()) {
+          validIdsBuf.append("\n");
+          validIdsBuf.append("           ");
+          validIdsBuf.append(iTbl.getValidWriteIds());
+        }
+        validIdsBuf.append("\n");
+        validIdsBuf.append("             ");
+        timeline_.markEvent(validIdsBuf.toString());
+      }
     }
     fe_.getImpaladTableUsageTracker().recordTableUsage(loadedTbls_.keySet());
+
     return new StmtTableCache(catalog, dbs_, loadedTbls_);
   }
 
@@ -241,8 +258,8 @@ public class StmtMetadataLoader {
    * added to 'loadedTbls_'.
    */
   private Set<TableName> getMissingTables(FeCatalog catalog, Set<TableName> tbls) {
-    Set<TableName> missingTbls = Sets.newHashSet();
-    Set<TableName> viewTbls = Sets.newHashSet();
+    Set<TableName> missingTbls = new HashSet<>();
+    Set<TableName> viewTbls = new HashSet<>();
     for (TableName tblName: tbls) {
       if (loadedTbls_.containsKey(tblName)) continue;
       FeDb db = catalog.getDb(tblName.getDb());
@@ -272,9 +289,9 @@ public class StmtMetadataLoader {
    */
   private Set<TableName> collectTableCandidates(StatementBase stmt) {
     Preconditions.checkNotNull(stmt);
-    List<TableRef> tblRefs = Lists.newArrayList();
+    List<TableRef> tblRefs = new ArrayList<>();
     stmt.collectTableRefs(tblRefs);
-    Set<TableName> tableNames = Sets.newHashSet();
+    Set<TableName> tableNames = new HashSet<>();
     for (TableRef ref: tblRefs) {
       tableNames.addAll(Path.getCandidateTables(ref.getPath(), sessionDb_));
     }

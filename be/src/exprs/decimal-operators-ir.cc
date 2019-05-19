@@ -26,6 +26,7 @@
 #include "exprs/scalar-expr.h"
 #include "exprs/timezone_db.h"
 #include "runtime/decimal-value.inline.h"
+#include "runtime/timestamp-value.inline.h"
 #include "util/decimal-util.h"
 #include "util/string-parser.h"
 
@@ -581,7 +582,8 @@ IR_ALWAYS_INLINE DecimalVal DecimalOperators::CastToDecimalVal(
     return DecimalVal::null();
   }
 
-  DCHECK(result == StringParser::PARSE_SUCCESS || StringParser::PARSE_UNDERFLOW);
+  DCHECK(result == StringParser::PARSE_SUCCESS
+      || result == StringParser::PARSE_UNDERFLOW);
   return dv;
 }
 

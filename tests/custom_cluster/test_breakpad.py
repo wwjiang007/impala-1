@@ -66,8 +66,8 @@ class TestBreakpadBase(CustomClusterTestSuite):
   def start_cluster_with_args(self, **kwargs):
     cluster_options = []
     for daemon_arg in DAEMON_ARGS:
-      daemon_options = " ".join("-%s=%s" % i for i in kwargs.iteritems())
-      cluster_options.append("""--%s='%s'""" % (daemon_arg, daemon_options))
+      daemon_options = " ".join("-{0}={1}".format(k, v) for k, v in kwargs.iteritems())
+      cluster_options.append("--{0}={1}".format(daemon_arg, daemon_options))
     self._start_impala_cluster(cluster_options)
 
   def start_cluster(self):
@@ -88,11 +88,15 @@ class TestBreakpadBase(CustomClusterTestSuite):
   def wait_for_all_processes_dead(self, processes, timeout=300):
     for process in processes:
       try:
-        pid = process.get_pid()
-        if not pid:
-          continue
-        psutil_process = psutil.Process(pid)
-        psutil_process.wait(timeout)
+        # For every process in the list we might see the original Impala process plus a
+        # forked off child that is writing the minidump. We need to catch both.
+        for pid in process.get_pids():
+          print "Checking pid %s" % pid
+          psutil_process = psutil.Process(pid)
+          psutil_process.wait(timeout)
+      except psutil.NoSuchProcess:
+        # Process has exited in the meantime
+        pass
       except psutil.TimeoutExpired:
         raise RuntimeError("Unable to kill %s (pid %d) after %d seconds." %
             (psutil_process.name, psutil_process.pid, timeout))
@@ -250,7 +254,7 @@ class TestBreakpadExhaustive(TestBreakpadBase):
     uid = os.getuid()
     # There should be a SIGTERM message in the log now
     # since we raised one above.
-    log_str = 'Caught signal: SIGTERM. Daemon will exit. Sender UID: ' + str(uid)
+    log_str = 'Caught signal: SIGTERM. Daemon will exit.'
     self.assert_impalad_log_contains('INFO', log_str, expected_count=1)
 
   @pytest.mark.execute_serially
@@ -280,8 +284,15 @@ class TestBreakpadExhaustive(TestBreakpadBase):
     # Maximum number of minidumps that the impalads should keep for this test.
     max_minidumps = 2
     self.start_cluster_with_args(minidump_path=self.tmp_dir,
-                                 max_minidumps=max_minidumps)
-    assert self.count_minidumps('impalad') == min(cluster_size, max_minidumps)
+                                 max_minidumps=max_minidumps,
+                                 logbufsecs=1)
+    # Wait for log maintenance thread to clean up minidumps asynchronously.
+    start = time.time()
+    expected_impalad_minidumps = min(cluster_size, max_minidumps)
+    while (self.count_minidumps('impalad') != expected_impalad_minidumps
+        and time.time() - start < 10):
+      time.sleep(0.1)
+    assert self.count_minidumps('impalad') == expected_impalad_minidumps
     assert self.count_minidumps('statestored') == 1
     assert self.count_minidumps('catalogd') == 1
 
@@ -301,7 +312,10 @@ class TestBreakpadExhaustive(TestBreakpadBase):
     # enough files to trigger rotation.
     for i in xrange(max_minidumps + 1):
       self.kill_cluster(SIGUSR1)
-      # Breakpad forks to write its minidump files, wait for all the clones to terminate.
+      # Breakpad forks to write its minidump files, sleep briefly to allow the forked
+      # processes to start.
+      time.sleep(1)
+      # Wait for all the clones to terminate.
       assert self.wait_for_num_processes('impalad', cluster_size) == cluster_size
       assert self.wait_for_num_processes('catalogd', 1) == 1
       assert self.wait_for_num_processes('statestored', 1) == 1

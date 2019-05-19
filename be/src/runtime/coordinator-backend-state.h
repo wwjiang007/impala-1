@@ -30,12 +30,14 @@
 #include <boost/accumulators/statistics/variance.hpp>
 #include <boost/thread/mutex.hpp>
 
+#include "gen-cpp/control_service.proxy.h"
+#include "kudu/rpc/rpc_controller.h"
 #include "runtime/coordinator.h"
 #include "scheduling/query-schedule.h"
+#include "util/error-util-internal.h"
 #include "util/progress-updater.h"
-#include "util/stopwatch.h"
 #include "util/runtime-profile.h"
-#include "gen-cpp/Types_types.h"
+#include "util/stopwatch.h"
 
 namespace impala {
 
@@ -43,9 +45,9 @@ class ProgressUpdater;
 class ObjectPool;
 class DebugOptions;
 class CountingBarrier;
+class ReportExecStatusRequestPB;
 class TUniqueId;
 class TQueryCtx;
-class TReportExecStatusParams;
 class ExecSummary;
 struct FInstanceExecParams;
 
@@ -59,10 +61,12 @@ class Coordinator::BackendState {
 
   /// Creates InstanceStats for all instance in backend_exec_params in obj_pool
   /// and installs the instance profiles as children of the corresponding FragmentStats'
-  /// root profile.
+  /// root profile. Also creates a child profile below 'host_profile_parent' that contains
+  /// counters for the backend.
   /// Separated from c'tor to simplify future handling of out-of-mem errors.
   void Init(const BackendExecParams& backend_exec_params,
-      const std::vector<FragmentStats*>& fragment_stats, ObjectPool* obj_pool);
+      const std::vector<FragmentStats*>& fragment_stats,
+      RuntimeProfile* host_profile_parent, ObjectPool* obj_pool);
 
   /// Starts query execution at this backend by issuing an ExecQueryFInstances rpc and
   /// notifies on rpc_complete_barrier when the rpc completes. Success/failure is
@@ -81,8 +85,12 @@ class Coordinator::BackendState {
   /// becomes the first reported error status. Returns true iff this update changed
   /// IsDone() from false to true, either because it was the last fragment to complete or
   /// because it was the first error received.
-  bool ApplyExecStatusReport(const TReportExecStatusParams& backend_exec_status,
-      ExecSummary* exec_summary, ProgressUpdater* scan_range_progress);
+  bool ApplyExecStatusReport(const ReportExecStatusRequestPB& backend_exec_status,
+      const TRuntimeProfileForest& thrift_profiles, ExecSummary* exec_summary,
+      ProgressUpdater* scan_range_progress, DmlExecState* dml_exec_state);
+
+  /// Merges the incoming 'thrift_profile' into this backend state's host profile.
+  void UpdateHostProfile(const TRuntimeProfileTree& thrift_profile);
 
   /// Update completion_times, rates, and avg_profile for all fragment_stats.
   void UpdateExecStats(const std::vector<FragmentStats*>& fragment_stats);
@@ -109,6 +117,10 @@ class Coordinator::BackendState {
   Status GetStatus(bool* is_fragment_failure = nullptr,
       TUniqueId* failed_instance_id = nullptr) WARN_UNUSED_RESULT;
 
+  /// Return true if execution at this backend is done. Thread-safe. Caller must not hold
+  /// lock_.
+  bool IsDone();
+
   /// Return peak memory consumption and aggregated resource usage across all fragment
   /// instances for this backend.
   ResourceUtilization ComputeResourceUtilization();
@@ -117,6 +129,7 @@ class Coordinator::BackendState {
   void MergeErrorLog(ErrorLogMap* merged);
 
   const TNetworkAddress& impalad_address() const { return host_; }
+  const TNetworkAddress& krpc_impalad_address() const { return krpc_host_; }
   int state_idx() const { return state_idx_; }
 
   /// Valid after Init().
@@ -124,6 +137,11 @@ class Coordinator::BackendState {
 
   /// Only valid after Exec().
   int64_t rpc_latency() const { return rpc_latency_; }
+
+  int64_t last_report_time_ms() {
+    boost::lock_guard<boost::mutex> l(lock_);
+    return last_report_time_ms_;
+  }
 
   /// Print host/port info for the first backend that's still in progress as a
   /// debugging aid for backend deadlocks.
@@ -137,6 +155,9 @@ class Coordinator::BackendState {
   /// adding members to 'value', including the remote host name.
   void InstanceStatsToJson(rapidjson::Value* value, rapidjson::Document* doc);
 
+  /// Returns a timestamp using monotonic time for tracking arrival of status reports.
+  static int64_t GenerateReportTimestamp() { return MonotonicMillis(); }
+
  private:
   /// Execution stats for a single fragment instance.
   /// Not thread-safe.
@@ -145,11 +166,12 @@ class Coordinator::BackendState {
     InstanceStats(const FInstanceExecParams& exec_params, FragmentStats* fragment_stats,
         ObjectPool* obj_pool);
 
-    /// Updates 'this' with exec_status, the fragment instances' TExecStats in
-    /// exec_summary, and 'progress_updater' with the number of newly completed scan
-    /// ranges. Also updates the instance's avg profile.
-    /// Caller must hold BackendState::lock_.
-    void Update(const TFragmentInstanceExecStatus& exec_status, ExecSummary* exec_summary,
+    /// Updates 'this' with exec_status and the fragment intance's thrift profile. Also
+    /// updates the fragment instance's TExecStats in exec_summary and 'progress_updater'
+    /// with the number of newly completed scan ranges. Also updates the instance's avg
+    /// profile. Caller must hold BackendState::lock_.
+    void Update(const FragmentInstanceExecStatusPB& exec_status,
+        const TRuntimeProfileTree& thrift_profile, ExecSummary* exec_summary,
         ProgressUpdater* scan_range_progress);
 
     int per_fragment_instance_idx() const {
@@ -167,8 +189,19 @@ class Coordinator::BackendState {
     /// query lifetime
     const FInstanceExecParams& exec_params_;
 
-    /// Set in Update(). Uses MonotonicMillis().
+    /// Unix time in milliseconds of the last status report update for this fragment
+    /// instance. Set in Update(). Uses UnixMillis() instead of MonotonicMillis() as
+    /// the last update time in the profile is wall clock time.
+    ///
+    /// This is also used for computing the elapsed time (presented in the debug webpage)
+    /// since the last status report update. While UnixMillis() may be prone to time
+    /// change due to clock adjustment (e.g. NTP), it's assumed that time change is not
+    /// frequent enough to seriously affect the output. Moreover, the inconsistency only
+    /// persists for the duration of one status report update (5 seconds by default).
     int64_t last_report_time_ms_ = 0;
+
+    /// The sequence number of the last report.
+    int64_t last_report_seq_no_ = 0;
 
     /// owned by coordinator object pool provided in the c'tor, created in Update()
     RuntimeProfile* profile_ = nullptr;
@@ -196,9 +229,15 @@ class Coordinator::BackendState {
     /// Collection of BYTES_READ_COUNTERs of all scan nodes in this fragment instance.
     std::vector<RuntimeProfile::Counter*> bytes_read_counters_;
 
+    /// Collection of TotalBytesSent of all data stream senders in this fragment instance.
+    std::vector<RuntimeProfile::Counter*> bytes_sent_counters_;
+
+    /// Descriptor string for the last query status report time in the profile.
+    static const char* LAST_REPORT_TIME_DESC;
+
     /// The current state of this fragment instance's execution. This gets serialized in
     /// ToJson() and is displayed in the debug webpages.
-    TFInstanceExecState::type current_state_ = TFInstanceExecState::WAITING_FOR_EXEC;
+    FInstanceExecStatePB current_state_ = FInstanceExecStatePB::WAITING_FOR_EXEC;
 
     /// Extracts scan_ranges_complete_counters_ and  bytes_read_counters_ from profile_.
     void InitCounters();
@@ -219,7 +258,15 @@ class Coordinator::BackendState {
   /// indices of fragments executing on this backend, populated in Init()
   std::unordered_set<int> fragments_;
 
+  /// Contains counters for the backend host that are not specific to a particular
+  /// fragment instance, e.g. global CPU utilization and scratch space usage.
+  /// Owned by coordinator object pool provided in the c'tor, created in Update().
+  RuntimeProfile* host_profile_ = nullptr;
+
+  /// Thrift address of execution backend.
   TNetworkAddress host_;
+  /// Krpc address of execution backend.
+  TNetworkAddress krpc_host_;
 
   /// protects fields below
   /// lock ordering: Coordinator::lock_ must only be obtained *prior* to lock_
@@ -252,7 +299,8 @@ class Coordinator::BackendState {
   /// successful.
   bool rpc_sent_ = false;
 
-  /// Set in ApplyExecStatusReport(). Uses MonotonicMillis().
+  /// Initialized in Init(), then set in each call to ApplyExecStatusReport().
+  /// Uses GenerateReportTimeout().
   int64_t last_report_time_ms_ = 0;
 
   const TQueryCtx& query_ctx() const { return coord_.query_ctx(); }
@@ -264,8 +312,8 @@ class Coordinator::BackendState {
       const FilterRoutingTable& filter_routing_table,
       TExecQueryFInstancesParams* rpc_params);
 
-  /// Return true if execution at this backend is done. Caller must hold lock_.
-  bool IsDone() const;
+  /// Version of IsDone() where caller must hold lock_ via lock;
+  bool IsDoneLocked(const boost::unique_lock<boost::mutex>& lock) const;
 
   /// Same as ComputeResourceUtilization() but caller must hold lock.
   ResourceUtilization ComputeResourceUtilizationLocked();

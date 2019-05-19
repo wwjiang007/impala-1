@@ -18,16 +18,13 @@
 from copy import copy
 import os
 import pytest
-import random
-import threading
-import time
 import tempfile
 from subprocess import call, check_call
 
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.impala_cluster import ImpalaCluster
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfLocal
+from tests.common.skip import SkipIfLocal, SkipIfCatalogV2
 from tests.common.test_dimensions import (
     create_exec_option_dimension,
     create_exec_option_dimension_from_dict,
@@ -48,11 +45,11 @@ class TestUdfBase(ImpalaTestSuite):
     raise e
 
   def _run_query_all_impalads(self, exec_options, query, expected):
-    impala_cluster = ImpalaCluster()
+    impala_cluster = ImpalaCluster.get_e2e_test_cluster()
     for impalad in impala_cluster.impalads:
       client = impalad.service.create_beeswax_client()
       result = self.execute_query_expect_success(client, query, exec_options)
-      assert result.data == expected
+      assert result.data == expected, impalad
 
   def _load_functions(self, template, vector, database, location):
     queries = template.format(database=database, location=location)
@@ -105,6 +102,11 @@ returns decimal(6,5) intermediate decimal(4,3) location '{location}'
 init_fn='AggDecimalIntermediateInit' update_fn='AggDecimalIntermediateUpdate'
 merge_fn='AggDecimalIntermediateMerge' finalize_fn='AggDecimalIntermediateFinalize';
 
+create aggregate function {database}.agg_date_intermediate(date, int)
+returns date intermediate date location '{location}'
+init_fn='AggDateIntermediateInit' update_fn='AggDateIntermediateUpdate'
+merge_fn='AggDateIntermediateMerge' finalize_fn='AggDateIntermediateFinalize';
+
 create aggregate function {database}.agg_string_intermediate(decimal(20,10), bigint, string)
 returns decimal(20,0) intermediate string location '{location}'
 init_fn='AggStringIntermediateInit' update_fn='AggStringIntermediateUpdate'
@@ -147,6 +149,10 @@ create function {database}.identity(timestamp) returns timestamp
 location '{location}'
 symbol='_Z8IdentityPN10impala_udf15FunctionContextERKNS_12TimestampValE';
 
+create function {database}.identity(date) returns date
+location '{location}'
+symbol='_Z8IdentityPN10impala_udf15FunctionContextERKNS_7DateValE';
+
 create function {database}.identity(decimal(9,0)) returns decimal(9,0)
 location '{location}'
 symbol='_Z8IdentityPN10impala_udf15FunctionContextERKNS_10DecimalValE';
@@ -160,7 +166,7 @@ location '{location}'
 symbol='_Z8IdentityPN10impala_udf15FunctionContextERKNS_10DecimalValE';
 
 create function {database}.all_types_fn(
-    string, boolean, tinyint, smallint, int, bigint, float, double, decimal(2,0))
+    string, boolean, tinyint, smallint, int, bigint, float, double, decimal(2,0), date)
 returns int
 location '{location}' symbol='AllTypes';
 
@@ -205,6 +211,9 @@ symbol='_Z7ToUpperPN10impala_udf15FunctionContextERKNS_9StringValE';
 
 create function {database}.constant_timestamp() returns timestamp
 location '{location}' symbol='ConstantTimestamp';
+
+create function {database}.constant_date() returns date
+location '{location}' symbol='ConstantDate';
 
 create function {database}.validate_arg_type(string) returns boolean
 location '{location}' symbol='ValidateArgType';
@@ -290,93 +299,13 @@ class TestUdfExecution(TestUdfBase):
       self.run_test_case('QueryTest/udf-codegen-required', vector, use_db=unique_database)
     self.run_test_case('QueryTest/uda', vector, use_db=unique_database)
     self.run_test_case('QueryTest/udf-init-close', vector, use_db=unique_database)
-    # Some tests assume determinism or non-determinism, which depends on expr rewrites.
+    # Some tests assume no expr rewrites.
     if enable_expr_rewrites:
       self.run_test_case('QueryTest/udf-init-close-deterministic', vector,
           use_db=unique_database)
     else:
-      self.run_test_case('QueryTest/udf-non-deterministic', vector,
+      self.run_test_case('QueryTest/udf-no-expr-rewrite', vector,
           use_db=unique_database)
-
-  def test_native_functions_race(self, vector, unique_database):
-    """ IMPALA-6488: stress concurrent adds, uses, and deletes of native functions.
-        Exposes a crash caused by use-after-free in lib-cache."""
-
-    # Native function used by a query. Stresses lib-cache during analysis and
-    # backend expressions.
-    create_fn_to_use = """create function {0}.use_it(string) returns string
-                          LOCATION '{1}'
-                          SYMBOL='_Z8IdentityPN10impala_udf15FunctionContextERKNS_9StringValE'"""
-    use_fn = """select * from (select max(int_col) from functional.alltypesagg
-                where {0}.use_it(string_col) = 'blah' union all
-                (select max(int_col) from functional.alltypesagg
-                 where {0}.use_it(String_col) > '1' union all
-                (select max(int_col) from functional.alltypesagg
-                 where {0}.use_it(string_col) > '1'))) v"""
-    # Reference to another native function from the same 'so' file. Creating/dropping
-    # stresses lib-cache lookup, add, and refresh.
-    create_another_fn = """create function if not exists {0}.other(float)
-                           returns float location '{1}' symbol='Identity'"""
-    drop_another_fn = """drop function if exists {0}.other(float)"""
-    udf_path = get_fs_path('/test-warehouse/libTestUdfs.so')
-
-    # Tracks number of impalads prior to tests to check that none have crashed.
-    # All impalads are assumed to be coordinators.
-    cluster = ImpalaCluster()
-    exp_num_coordinators = cluster.num_responsive_coordinators()
-
-    setup_client = self.create_impala_client()
-    setup_query = create_fn_to_use.format(unique_database, udf_path)
-    try:
-      setup_client.execute(setup_query)
-    except Exception as e:
-      print "Unable to create initial function: {0}".format(setup_query)
-      raise
-
-    errors = []
-    def use_fn_method():
-      time.sleep(1 + random.random())
-      client = self.create_impala_client()
-      query = use_fn.format(unique_database)
-      try:
-        client.execute(query)
-      except Exception as e:
-        errors.append(e)
-
-    def load_fn_method():
-      time.sleep(1 + random.random())
-      client = self.create_impala_client()
-      drop = drop_another_fn.format(unique_database)
-      create = create_another_fn.format(unique_database, udf_path)
-      try:
-        client.execute(drop)
-        client.execute(create)
-      except Exception as e:
-        errors.append(e)
-
-    # number of uses/loads needed to reliably reproduce the bug.
-    num_uses = 200
-    num_loads = 200
-
-    # create threads to use native function.
-    runner_threads = []
-    for i in xrange(num_uses):
-      runner_threads.append(threading.Thread(target=use_fn_method))
-
-    # create threads to drop/create native functions.
-    for i in xrange(num_loads):
-      runner_threads.append(threading.Thread(target=load_fn_method))
-
-    # launch all runner threads.
-    for t in runner_threads: t.start()
-
-    # join all threads.
-    for t in runner_threads: t.join();
-
-    for e in errors: print e
-
-    # Checks that no impalad has crashed.
-    assert cluster.num_responsive_coordinators() == exp_num_coordinators
 
   def test_ir_functions(self, vector, unique_database):
     if vector.get_value('exec_option')['disable_codegen']:
@@ -393,8 +322,7 @@ class TestUdfExecution(TestUdfBase):
       self.run_test_case('QueryTest/udf-init-close-deterministic', vector,
           use_db=unique_database)
     else:
-      self.run_test_case('QueryTest/udf-non-deterministic', vector,
-          use_db=unique_database)
+      self.run_test_case('QueryTest/udf-no-expr-rewrite', vector, use_db=unique_database)
 
   def test_java_udfs(self, vector, unique_database):
     self.run_test_case('QueryTest/load-java-udfs', vector, use_db=unique_database)
@@ -443,7 +371,7 @@ class TestUdfExecution(TestUdfBase):
     # It takes a long time for Impala to free up memory after this test, especially if
     # ASAN is enabled. Verify that all fragments finish executing before moving on to the
     # next test to make sure that the next test is not affected.
-    for impalad in ImpalaCluster().impalads:
+    for impalad in ImpalaCluster.get_e2e_test_cluster().impalads:
       verifier = MetricVerifier(impalad.service)
       verifier.wait_for_metric("impala-server.num-fragments-in-flight", 0)
       verifier.verify_num_unused_buffers()
@@ -516,84 +444,24 @@ class TestUdfTargeted(TestUdfBase):
       assert "Unable to find class" in str(ex)
     self.client.execute(drop_fn_stmt)
 
-  def test_concurrent_jar_drop_use(self, vector, unique_database):
-    """IMPALA-6215: race between dropping/using java udf's defined in the same jar.
-       This test runs concurrent drop/use threads that result in class not found
-       exceptions when the race is present.
-    """
-    udf_src_path = os.path.join(
-      os.environ['IMPALA_HOME'], "testdata/udfs/impala-hive-udfs.jar")
-    udf_tgt_path = get_fs_path(
-      '/test-warehouse/{0}.db/impala-hive-udfs.jar'.format(unique_database))
-
-    create_fn_to_drop = """create function {0}.foo_{1}() returns string
-                           LOCATION '{2}' SYMBOL='org.apache.impala.TestUpdateUdf'"""
-    create_fn_to_use = """create function {0}.use_it(string) returns string
-                          LOCATION '{1}' SYMBOL='org.apache.impala.TestUdf'"""
-    drop_fn = "drop function if exists {0}.foo_{1}()"
-    use_fn = """select * from (select max(int_col) from functional.alltypesagg
-                where {0}.use_it(string_col) = 'blah' union all
-                (select max(int_col) from functional.alltypesagg
-                 where {0}.use_it(String_col) > '1' union all
-                (select max(int_col) from functional.alltypesagg
-                 where {0}.use_it(string_col) > '1'))) v"""
-    num_drops = 100
-    num_uses = 100
-
-    # use a unique jar for this test to avoid interactions with other tests
-    # that use the same jar
-    check_call(["hadoop", "fs", "-put", "-f", udf_src_path, udf_tgt_path])
-
-    # create all the functions.
-    setup_client = self.create_impala_client()
-    try:
-      s = create_fn_to_use.format(unique_database, udf_tgt_path)
-      setup_client.execute(s)
-    except Exception as e:
-      print e
-      assert False
-    for i in range(0, num_drops):
-      try:
-        setup_client.execute(create_fn_to_drop.format(unique_database, i, udf_tgt_path))
-      except Exception as e:
-        print e
-        assert False
-
-    errors = []
-    def use_fn_method():
-      time.sleep(5 + random.random())
-      client = self.create_impala_client()
-      try:
-        client.execute(use_fn.format(unique_database))
-      except Exception as e: errors.append(e)
-
-    def drop_fn_method(i):
-      time.sleep(1 + random.random())
-      client = self.create_impala_client()
-      try:
-        client.execute(drop_fn.format(unique_database, i))
-      except Exception as e: errors.append(e)
-
-    # create threads to use functions.
-    runner_threads = []
-    for i in range(0, num_uses):
-      runner_threads.append(threading.Thread(target=use_fn_method))
-
-    # create threads to drop functions.
-    drop_threads = []
-    for i in range(0, num_drops):
-      runner_threads.append(threading.Thread(target=drop_fn_method, args=(i, )))
-
-    # launch all runner threads.
-    for t in runner_threads: t.start()
-
-    # join all threads.
-    for t in runner_threads: t.join();
-
-    # Check for any errors.
-    for e in errors: print e
-    assert len(errors) == 0
-
+  def test_hidden_symbol(self, vector, unique_database):
+    """Test that symbols in the test UDFs are hidden by default and that therefore
+    they cannot be used as a UDF entry point."""
+    symbol = "_Z16UnexportedSymbolPN10impala_udf15FunctionContextE"
+    ex = self.execute_query_expect_failure(self.client, """
+        create function `{0}`.unexported() returns BIGINT LOCATION '{1}'
+        SYMBOL='{2}'""".format(
+        unique_database, get_fs_path('/test-warehouse/libTestUdfs.so'), symbol))
+    assert "Could not find symbol '{0}'".format(symbol) in str(ex), str(ex)
+    # IMPALA-8196: IR UDFs ignore whether symbol is hidden or not. Exercise the current
+    # behaviour, where the UDF can be created and executed.
+    result = self.execute_query_expect_success(self.client, """
+        create function `{0}`.unexported() returns BIGINT LOCATION '{1}'
+        SYMBOL='{2}'""".format(
+        unique_database, get_fs_path('/test-warehouse/test-udfs.ll'), symbol))
+    result = self.execute_query_expect_success(self.client,
+        "select `{0}`.unexported()".format(unique_database))
+    assert result.data[0][0] == '5'
 
   @SkipIfLocal.multiple_impalad
   def test_hive_udfs_missing_jar(self, vector, unique_database):
@@ -611,7 +479,7 @@ class TestUdfTargeted(TestUdfBase):
         "create function `{0}`.`pi_missing_jar`() returns double location '{1}' "
         "symbol='org.apache.hadoop.hive.ql.udf.UDFPI'".format(unique_database, jar_path))
 
-    cluster = ImpalaCluster()
+    cluster = ImpalaCluster.get_e2e_test_cluster()
     impalad = cluster.get_any_impalad()
     client = impalad.service.create_beeswax_client()
     # Create and drop functions with sync_ddl to make sure they are reflected
@@ -639,6 +507,7 @@ class TestUdfTargeted(TestUdfBase):
   def test_libs_with_same_filenames(self, vector, unique_database):
     self.run_test_case('QueryTest/libs_with_same_filenames', vector, use_db=unique_database)
 
+  @SkipIfCatalogV2.lib_cache_invalidation_broken()
   def test_udf_update_via_drop(self, vector, unique_database):
     """Test updating the UDF binary without restarting Impala. Dropping
     the function should remove the binary from the local cache."""
@@ -672,6 +541,7 @@ class TestUdfTargeted(TestUdfBase):
     self.execute_query_expect_success(self.client, create_fn_stmt, exec_options)
     self._run_query_all_impalads(exec_options, query_stmt, ["New UDF"])
 
+  @SkipIfCatalogV2.lib_cache_invalidation_broken()
   def test_udf_update_via_create(self, vector, unique_database):
     """Test updating the UDF binary without restarting Impala. Creating a new function
     from the library should refresh the cache."""

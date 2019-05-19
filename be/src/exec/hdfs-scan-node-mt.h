@@ -47,8 +47,15 @@ class HdfsScanNodeMt : public HdfsScanNodeBase {
   virtual void Close(RuntimeState* state) override;
 
   virtual bool HasRowBatchQueue() const override { return false; }
+  virtual ExecutionModel getExecutionModel() const override { return TASK_BASED; }
 
  private:
+  /// Create and open new scanner for this partition type.
+  /// If the scanner is successfully created and opened, it is returned in 'scanner'.
+  Status CreateAndOpenScanner(HdfsPartitionDescriptor* partition,
+      ScannerContext* context, boost::scoped_ptr<HdfsScanner>* scanner)
+      WARN_UNUSED_RESULT;
+
   /// Current scan range and corresponding scanner.
   io::ScanRange* scan_range_;
   boost::scoped_ptr<ScannerContext> scanner_ctx_;

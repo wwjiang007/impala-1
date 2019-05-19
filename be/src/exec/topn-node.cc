@@ -20,14 +20,15 @@
 #include <sstream>
 
 #include "codegen/llvm-codegen.h"
+#include "exec/exec-node-util.h"
 #include "exprs/scalar-expr.h"
 #include "runtime/descriptors.h"
 #include "runtime/mem-pool.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/row-batch.h"
 #include "runtime/runtime-state.h"
-#include "runtime/tuple.h"
 #include "runtime/tuple-row.h"
+#include "runtime/tuple.h"
 #include "util/debug-util.h"
 #include "util/runtime-profile-counters.h"
 
@@ -136,6 +137,7 @@ void TopNNode::Codegen(RuntimeState* state) {
 
 Status TopNNode::Open(RuntimeState* state) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedOpenEventAdder ea(this);
   RETURN_IF_ERROR(ExecNode::Open(state));
   RETURN_IF_ERROR(
       tuple_row_less_than_->Open(pool_, state, expr_perm_pool(), expr_results_pool()));
@@ -183,6 +185,7 @@ Status TopNNode::Open(RuntimeState* state) {
 
 Status TopNNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedGetNextEventAdder ea(this, eos);
   RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::GETNEXT, state));
   RETURN_IF_CANCELLED(state);
   RETURN_IF_ERROR(QueryMaintenance(state));
@@ -199,8 +202,8 @@ Status TopNNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
     row_batch->CopyRow(src_row, dst_row);
     ++get_next_iter_;
     row_batch->CommitLastRow();
-    ++num_rows_returned_;
-    COUNTER_SET(rows_returned_counter_, num_rows_returned_);
+    IncrementNumRowsReturned(1);
+    COUNTER_SET(rows_returned_counter_, rows_returned());
   }
   *eos = get_next_iter_ == sorted_top_n_.end();
 
@@ -212,12 +215,14 @@ Status TopNNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
   return Status::OK();
 }
 
-Status TopNNode::Reset(RuntimeState* state) {
+Status TopNNode::Reset(RuntimeState* state, RowBatch* row_batch) {
   priority_queue_.clear();
   num_rows_skipped_ = 0;
+  // Transfer ownership of tuple data to output batch.
+  row_batch->tuple_data_pool()->AcquireData(tuple_pool_.get(), false);
   // We deliberately do not free the tuple_pool_ here to allow selective transferring
   // of resources in the future.
-  return ExecNode::Reset(state);
+  return ExecNode::Reset(state, row_batch);
 }
 
 void TopNNode::Close(RuntimeState* state) {

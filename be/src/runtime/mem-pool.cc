@@ -52,9 +52,6 @@ MemPool::ChunkInfo::ChunkInfo(int64_t size, uint8_t* buf)
   : data(buf),
     size(size),
     allocated_bytes(0) {
-  if (ImpaladMetrics::MEM_POOL_TOTAL_BYTES != NULL) {
-    ImpaladMetrics::MEM_POOL_TOTAL_BYTES->Increment(size);
-  }
 }
 
 MemPool::~MemPool() {
@@ -65,13 +62,11 @@ MemPool::~MemPool() {
   }
 
   DCHECK(chunks_.empty()) << "Must call FreeAll() or AcquireData() for this pool";
-  if (ImpaladMetrics::MEM_POOL_TOTAL_BYTES != NULL) {
-    ImpaladMetrics::MEM_POOL_TOTAL_BYTES->Increment(-total_bytes_released);
-  }
   DCHECK_EQ(zero_length_region_, MEM_POOL_POISON);
 }
 
 void MemPool::Clear() {
+  DFAKE_SCOPED_LOCK(mutex_);
   current_chunk_idx_ = -1;
   for (auto& chunk: chunks_) {
     chunk.allocated_bytes = 0;
@@ -82,6 +77,7 @@ void MemPool::Clear() {
 }
 
 void MemPool::FreeAll() {
+  DFAKE_SCOPED_LOCK(mutex_);
   int64_t total_bytes_released = 0;
   for (auto& chunk: chunks_) {
     total_bytes_released += chunk.size;
@@ -94,9 +90,6 @@ void MemPool::FreeAll() {
   total_reserved_bytes_ = 0;
 
   mem_tracker_->Release(total_bytes_released);
-  if (ImpaladMetrics::MEM_POOL_TOTAL_BYTES != NULL) {
-    ImpaladMetrics::MEM_POOL_TOTAL_BYTES->Increment(-total_bytes_released);
-  }
 }
 
 bool MemPool::FindChunk(int64_t min_size, bool check_limits) noexcept {
@@ -162,6 +155,7 @@ bool MemPool::FindChunk(int64_t min_size, bool check_limits) noexcept {
 }
 
 void MemPool::AcquireData(MemPool* src, bool keep_current) {
+  DFAKE_SCOPED_LOCK(mutex_);
   DCHECK(src->CheckIntegrity(false));
   int num_acquired_chunks;
   if (keep_current) {
@@ -213,6 +207,7 @@ void MemPool::AcquireData(MemPool* src, bool keep_current) {
 }
 
 void MemPool::SetMemTracker(MemTracker* new_tracker) {
+  DFAKE_SCOPED_LOCK(mutex_);
   mem_tracker_->TransferTo(new_tracker, total_reserved_bytes_);
   mem_tracker_ = new_tracker;
 }
@@ -236,6 +231,7 @@ string MemPool::DebugString() {
 }
 
 int64_t MemPool::GetTotalChunkSizes() const {
+  DFAKE_SCOPED_LOCK(mutex_);
   int64_t result = 0;
   for (int i = 0; i < chunks_.size(); ++i) {
     result += chunks_[i].size;

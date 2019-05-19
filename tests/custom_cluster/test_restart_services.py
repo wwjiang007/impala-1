@@ -19,21 +19,24 @@ import logging
 import pytest
 import psutil
 import re
+import signal
 import socket
 import time
 
-from tests.common.environ import specific_build_type_timeout
+from tests.common.environ import build_flavor_timeout
 from time import sleep
 
 from impala.error import HiveServer2Error
 from TCLIService import TCLIService
 
+from beeswaxd.BeeswaxService import QueryState
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
 from tests.common.skip import SkipIfEC
 from tests.hs2.hs2_test_suite import HS2TestSuite, needs_session
 
 LOG = logging.getLogger(__name__)
+
 
 class TestRestart(CustomClusterTestSuite):
   @classmethod
@@ -50,7 +53,7 @@ class TestRestart(CustomClusterTestSuite):
     # We need to wait for the impalad to register to the new statestored and for a
     # non-empty catalog update from the new statestored. It cannot be expressed with the
     # existing metrics yet so we wait for some time here.
-    wait_time_s = specific_build_type_timeout(60, slow_build_timeout=100)
+    wait_time_s = build_flavor_timeout(60, slow_build_timeout=100)
     sleep(wait_time_s)
     for retry in xrange(wait_time_s):
       try:
@@ -86,20 +89,93 @@ class TestRestart(CustomClusterTestSuite):
 
       client.close()
 
+  SUBSCRIBER_TIMEOUT_S = 2
+  CANCELLATION_GRACE_PERIOD_S = 5
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+    impalad_args="--statestore_subscriber_timeout_seconds={timeout_s} "
+                 "--failed_backends_query_cancellation_grace_period_ms={grace_period_ms}"
+    .format(timeout_s=SUBSCRIBER_TIMEOUT_S,
+            grace_period_ms=(CANCELLATION_GRACE_PERIOD_S * 1000)),
+    catalogd_args="--statestore_subscriber_timeout_seconds={timeout_s}".format(
+      timeout_s=SUBSCRIBER_TIMEOUT_S))
+  def test_restart_statestore_query_resilience(self):
+    """IMPALA-7665: Test that after restarting statestore a momentary inconsistent
+    cluster membership state will not result in query cancellation. Also make sure that
+    queries get cancelled if a backend actually went down while the statestore was
+    down or during the grace period."""
+    slow_query = \
+      "select distinct * from tpch_parquet.lineitem where l_orderkey > sleep(1000)"
+    impalad = self.cluster.impalads[0]
+    client = impalad.service.create_beeswax_client()
+    try:
+      handle = client.execute_async(slow_query)
+      # Make sure query starts running.
+      self.wait_for_state(handle, QueryState.RUNNING, 1000)
+      # Restart Statestore and wait till the grace period ends + some buffer.
+      self.cluster.statestored.restart()
+      self.cluster.statestored.service.wait_for_live_subscribers(4)
+      sleep(self.CANCELLATION_GRACE_PERIOD_S + 1)
+      assert client.get_state(handle) == QueryState.RUNNING
+      # Now restart statestore and kill a backend while it is down, and make sure the
+      # query fails when it comes back up.
+      start_time = time.time()
+      self.cluster.statestored.kill()
+      self.cluster.impalads[1].kill()
+      self.cluster.statestored.start()
+      try:
+        client.wait_for_finished_timeout(handle, 100)
+        assert False, "Query expected to fail"
+      except ImpalaBeeswaxException as e:
+        assert "Failed due to unreachable impalad" in str(e), str(e)
+        assert time.time() - start_time > self.CANCELLATION_GRACE_PERIOD_S + \
+                                     self.SUBSCRIBER_TIMEOUT_S, \
+          "Query got cancelled earlier than the cancellation grace period"
+      # Now restart statestore and kill a backend after it comes back up, and make sure
+      # the query eventually fails.
+      # Make sure the new statestore has received update from catalog and sent it to the
+      # impalad.
+      catalogd_version = self.cluster.catalogd.service.get_catalog_version()
+      impalad.service.wait_for_metric_value("catalog.curr-version", catalogd_version)
+      handle = client.execute_async(slow_query)
+      self.wait_for_state(handle, QueryState.RUNNING, 1000)
+      start_time = time.time()
+      self.cluster.statestored.restart()
+      # Make sure it has connected to the impalads before killing one.
+      self.cluster.statestored.service.wait_for_live_subscribers(3)
+      self.cluster.impalads[2].kill()
+      try:
+        client.wait_for_finished_timeout(handle, 100)
+        assert False, "Query expected to fail"
+      except ImpalaBeeswaxException as e:
+        assert "Failed due to unreachable impalad" in str(e), str(e)
+        assert time.time() - start_time > self.CANCELLATION_GRACE_PERIOD_S + \
+                                     self.SUBSCRIBER_TIMEOUT_S, \
+          "Query got cancelled earlier than the cancellation grace period"
+    finally:
+      client.close()
+
 
 def parse_shutdown_result(result):
   """Parse the shutdown result string and return the strings (grace left,
-  deadline left, fragment instances, queries registered)."""
+  deadline left, queries registered, queries executing)."""
   assert len(result.data) == 1
   summary = result.data[0]
-  match = re.match(r'startup grace period left: ([0-9ms]*), deadline left: ([0-9ms]*), ' +
-      r'fragment instances: ([0-9]*), queries registered: ([0-9]*)', summary)
+  match = re.match(r'shutdown grace period left: ([0-9ms]*), deadline left: ([0-9ms]*), '
+                   r'queries registered on coordinator: ([0-9]*), queries executing: '
+                   r'([0-9]*), fragment instances: [0-9]*', summary)
   assert match is not None, summary
   return match.groups()
 
 
-class TestShutdownCommand(CustomClusterTestSuite, HS2TestSuite):
+class TestGracefulShutdown(CustomClusterTestSuite, HS2TestSuite):
   IDLE_SHUTDOWN_GRACE_PERIOD_S = 1
+  IMPALA_SHUTDOWN_SIGNAL = signal.SIGRTMIN
+
+  @classmethod
+  def get_workload(cls):
+    return 'functional-query'
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
@@ -107,8 +183,8 @@ class TestShutdownCommand(CustomClusterTestSuite, HS2TestSuite):
           --hostname={hostname}".format(grace_period=IDLE_SHUTDOWN_GRACE_PERIOD_S,
             hostname=socket.gethostname()))
   def test_shutdown_idle(self):
-    """Test that idle impalads shut down in a timely manner after the startup grace period
-    elapses."""
+    """Test that idle impalads shut down in a timely manner after the shutdown grace
+    period elapses."""
     impalad1 = psutil.Process(self.cluster.impalads[0].get_pid())
     impalad2 = psutil.Process(self.cluster.impalads[1].get_pid())
     impalad3 = psutil.Process(self.cluster.impalads[2].get_pid())
@@ -116,36 +192,43 @@ class TestShutdownCommand(CustomClusterTestSuite, HS2TestSuite):
     # Test that a failed shut down from a bogus host or port fails gracefully.
     ex = self.execute_query_expect_failure(self.client,
         ":shutdown('e6c00ca5cd67b567eb96c6ecfb26f05')")
-    assert "Couldn't open transport" in str(ex)
+    assert "Could not find IPv4 address for:" in str(ex)
     ex = self.execute_query_expect_failure(self.client, ":shutdown('localhost:100000')")
-    assert "Couldn't open transport" in str(ex)
-    # Test that pointing to the wrong thrift service (the HS2 port) fails gracefully.
-    ex = self.execute_query_expect_failure(self.client, ":shutdown('localhost:21050')")
-    assert ("RPC Error: Client for localhost:21050 hit an unexpected exception: " +
-            "Invalid method name: 'RemoteShutdown'") in str(ex)
+    assert "Invalid port:" in str(ex)
+    assert ("This may be because the port specified is wrong.") not in str(ex)
+
+    # Test that pointing to the wrong thrift service (the HS2 port) fails gracefully-ish.
+    thrift_ports = [21051, 22001]  # HS2 port, old backend port.
+    for port in thrift_ports:
+      ex = self.execute_query_expect_failure(self.client,
+          ":shutdown('localhost:{0}')".format(port))
+      assert ("failed with error 'RemoteShutdown() RPC failed") in str(ex)
+      assert ("This may be because the port specified is wrong.") in str(ex)
+
     # Test RPC error handling with debug action.
-    ex = self.execute_query_expect_failure(self.client, ":shutdown('localhost:22001')",
+    ex = self.execute_query_expect_failure(self.client, ":shutdown('localhost:27001')",
         query_options={'debug_action': 'CRS_SHUTDOWN_RPC:FAIL'})
-    assert 'Debug Action: CRS_SHUTDOWN_RPC:FAIL' in str(ex)
+    assert 'Rpc to 127.0.0.1:27001 failed with error \'Debug Action: ' \
+        'CRS_SHUTDOWN_RPC:FAIL' in str(ex)
 
     # Test remote shutdown.
     LOG.info("Start remote shutdown {0}".format(time.time()))
-    self.execute_query_expect_success(self.client, ":shutdown('localhost:22001')",
+    self.execute_query_expect_success(self.client, ":shutdown('localhost:27001')",
         query_options={})
 
     # Remote shutdown does not require statestore.
     self.cluster.statestored.kill()
     self.cluster.statestored.wait_for_exit()
-    self.execute_query_expect_success(self.client, ":shutdown('localhost:22002')",
+    self.execute_query_expect_success(self.client, ":shutdown('localhost:27002')",
         query_options={})
 
     # Test local shutdown, which should succeed even with injected RPC error.
     LOG.info("Start local shutdown {0}".format(time.time()))
     self.execute_query_expect_success(self.client,
-        ":shutdown('{0}:22000')".format(socket.gethostname()),
+        ":shutdown('{0}:27000')".format(socket.gethostname()),
         query_options={'debug_action': 'CRS_SHUTDOWN_RPC:FAIL'})
 
-    # Make sure that the impala daemons exit after the startup grace period plus a 10
+    # Make sure that the impala daemons exit after the shutdown grace period plus a 10
     # second margin of error.
     start_time = time.time()
     LOG.info("Waiting for impalads to exit {0}".format(start_time))
@@ -169,8 +252,30 @@ class TestShutdownCommand(CustomClusterTestSuite, HS2TestSuite):
           --hostname={hostname}".format(grace_period=EXEC_SHUTDOWN_GRACE_PERIOD_S,
             deadline=EXEC_SHUTDOWN_DEADLINE_S, hostname=socket.gethostname()))
   def test_shutdown_executor(self):
-    """Test that shuts down and then restarts an executor. This should not disrupt any
-    queries that start after the shutdown or complete before the shutdown time limit."""
+    self.do_test_shutdown_executor(fetch_delay_s=0)
+
+  @pytest.mark.execute_serially
+  @SkipIfEC.scheduling
+  @CustomClusterTestSuite.with_args(
+      impalad_args="--shutdown_grace_period_s={grace_period} \
+          --shutdown_deadline_s={deadline} \
+          --stress_status_report_delay_ms={status_report_delay_ms} \
+          --hostname={hostname}".format(grace_period=EXEC_SHUTDOWN_GRACE_PERIOD_S,
+            deadline=EXEC_SHUTDOWN_DEADLINE_S, status_report_delay_ms=5000,
+            hostname=socket.gethostname()))
+  def test_shutdown_executor_with_delay(self):
+    """Regression test for IMPALA-7931 that adds delays to status reporting and
+    to fetching of results to trigger races that previously resulted in query failures."""
+    print self.exploration_strategy
+    if self.exploration_strategy() != 'exhaustive':
+      pytest.skip()
+    self.do_test_shutdown_executor(fetch_delay_s=5)
+
+  def do_test_shutdown_executor(self, fetch_delay_s):
+    """Implementation of test that shuts down and then restarts an executor. This should
+    not disrupt any queries that start after the shutdown or complete before the shutdown
+    time limit. The test is parameterized by 'fetch_delay_s', the amount to delay before
+    fetching from the query that must survive shutdown of an executor."""
     # Add sleeps to make sure that the query takes a couple of seconds to execute on the
     # executors.
     QUERY = "select count(*) from functional_parquet.alltypes where sleep(1) = bool_col"
@@ -180,17 +285,23 @@ class TestShutdownCommand(CustomClusterTestSuite, HS2TestSuite):
     # and only get scan ranges that don't contain the midpoint of any row group, and
     # therefore not actually produce any rows.
     SLOW_QUERY = "select count(*) from tpch.lineitem where sleep(1) = l_orderkey"
-    SHUTDOWN_EXEC2 = ": shutdown('localhost:22001')"
+    SHUTDOWN_EXEC2 = ": shutdown('localhost:27001')"
 
     # Run this query before shutdown and make sure that it executes successfully on
-    # all executors through the startup grace period without disruption.
+    # all executors through the shutdown grace period without disruption.
     before_shutdown_handle = self.__exec_and_wait_until_running(QUERY)
+
+    # Run this query which simulates getting stuck in admission control until after
+    # the shutdown grace period expires. This exercises the code path where the
+    # coordinator terminates the query before it has started up.
+    before_shutdown_admission_handle = self.execute_query_async(QUERY,
+        {'debug_action': 'CRS_BEFORE_ADMISSION:SLEEP@30000'})
 
     # Shut down and wait for the shutdown state to propagate through statestore.
     result = self.execute_query_expect_success(self.client, SHUTDOWN_EXEC2)
     assert parse_shutdown_result(result) == (
         "{0}s000ms".format(self.EXEC_SHUTDOWN_GRACE_PERIOD_S),
-        "{0}s000ms".format(self.EXEC_SHUTDOWN_DEADLINE_S), "1", "0")
+        "{0}s000ms".format(self.EXEC_SHUTDOWN_DEADLINE_S), "0", "1")
 
     # Check that the status is reflected on the debug page.
     web_json = self.cluster.impalads[1].service.get_debug_webpage_json("")
@@ -205,12 +316,22 @@ class TestShutdownCommand(CustomClusterTestSuite, HS2TestSuite):
     # this query continue running through the full shutdown and restart cycle.
     after_shutdown_handle = self.__exec_and_wait_until_running(QUERY)
 
-    # Finish executing the first query before the backend exits.
-    assert self.__fetch_and_get_num_backends(QUERY, before_shutdown_handle) == 3
-
     # Wait for the impalad to exit, then start it back up and run another query, which
     # should be scheduled on it again.
     self.cluster.impalads[1].wait_for_exit()
+
+    # Finish fetching results from the first query (which will be buffered on the
+    # coordinator) after the backend exits. Add a delay before fetching to ensure
+    # that the query is not torn down on the coordinator when the failure is
+    # detected by the statestore (see IMPALA-7931).
+    assert self.__fetch_and_get_num_backends(
+        QUERY, before_shutdown_handle, delay_s=fetch_delay_s) == 3
+
+    # Confirm that the query stuck in admission failed.
+    self.__check_deadline_expired(QUERY, before_shutdown_admission_handle)
+
+    # Start the impalad back up and run another query, which should be scheduled on it
+    # again.
     self.cluster.impalads[1].start()
     self.impalad_test_service.wait_for_num_known_live_backends(
         3, timeout=30, interval=0.2, include_shutting_down=False)
@@ -225,14 +346,14 @@ class TestShutdownCommand(CustomClusterTestSuite, HS2TestSuite):
     result = self.execute_query_expect_success(self.client, SHUTDOWN_EXEC2)
     assert parse_shutdown_result(result) == (
         "{0}s000ms".format(self.EXEC_SHUTDOWN_GRACE_PERIOD_S),
-        "{0}s000ms".format(self.EXEC_SHUTDOWN_DEADLINE_S), "1", "0")
+        "{0}s000ms".format(self.EXEC_SHUTDOWN_DEADLINE_S), "0", "1")
     self.cluster.impalads[1].wait_for_exit()
     self.__check_deadline_expired(SLOW_QUERY, deadline_expiry_handle)
 
     # Test that we can reduce the deadline after setting it to a high value.
     # Run a query that will fail as a result of the reduced deadline.
     deadline_expiry_handle = self.__exec_and_wait_until_running(SLOW_QUERY)
-    SHUTDOWN_EXEC3 = ": shutdown('localhost:22002', {0})"
+    SHUTDOWN_EXEC3 = ": shutdown('localhost:27002', {0})"
     VERY_HIGH_DEADLINE = 5000
     HIGH_DEADLINE = 1000
     LOW_DEADLINE = 5
@@ -252,9 +373,9 @@ class TestShutdownCommand(CustomClusterTestSuite, HS2TestSuite):
 
     result = self.execute_query_expect_success(
         self.client, SHUTDOWN_EXEC3.format(LOW_DEADLINE))
-    _, deadline, finstances, _ = parse_shutdown_result(result)
+    _, deadline, _, queries_executing = parse_shutdown_result(result)
     assert deadline == "{0}s000ms".format(LOW_DEADLINE)
-    assert int(finstances) > 0, "Slow query should still be running."
+    assert int(queries_executing) > 0, "Slow query should still be running."
     self.cluster.impalads[2].wait_for_exit()
     self.__check_deadline_expired(SLOW_QUERY, deadline_expiry_handle)
 
@@ -286,7 +407,7 @@ class TestShutdownCommand(CustomClusterTestSuite, HS2TestSuite):
 
     # Shut down the coordinator. Operations that start after this point should fail.
     result = self.execute_query_expect_success(self.client, SHUTDOWN)
-    grace, deadline, _, registered = parse_shutdown_result(result)
+    grace, deadline, registered, _ = parse_shutdown_result(result)
     assert grace == "{0}s000ms".format(self.COORD_SHUTDOWN_GRACE_PERIOD_S)
     assert deadline == "{0}m".format(self.COORD_SHUTDOWN_DEADLINE_S / 60), "4"
     assert registered == "3"
@@ -349,11 +470,14 @@ class TestShutdownCommand(CustomClusterTestSuite, HS2TestSuite):
                 self.client.QUERY_STATES['RUNNING'], timeout=20)
     return handle
 
-  def __fetch_and_get_num_backends(self, query, handle):
+  def __fetch_and_get_num_backends(self, query, handle, delay_s=0):
     """Fetch the results of 'query' from the beeswax handle 'handle', close the
     query and return the number of backends obtained from the profile."""
     self.impalad_test_service.wait_for_query_state(self.client, handle,
                 self.client.QUERY_STATES['FINISHED'], timeout=20)
+    if delay_s > 0:
+      LOG.info("sleeping for {0}s".format(delay_s))
+      time.sleep(delay_s)
     self.client.fetch(query, handle)
     profile = self.client.get_runtime_profile(handle)
     self.client.close_query(handle)
@@ -369,3 +493,48 @@ class TestShutdownCommand(CustomClusterTestSuite, HS2TestSuite):
       assert False, "Expected query to fail"
     except Exception, e:
       assert 'Failed due to unreachable impalad(s)' in str(e)
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+      impalad_args="--shutdown_grace_period_s={grace_period} \
+          --hostname={hostname}".format(grace_period=IDLE_SHUTDOWN_GRACE_PERIOD_S,
+            hostname=socket.gethostname()), cluster_size=1)
+  def test_shutdown_signal(self):
+    """Test that an idle impalad shuts down in a timely manner after the shutdown grace
+    period elapses."""
+    impalad = psutil.Process(self.cluster.impalads[0].get_pid())
+    LOG.info(
+      "Sending IMPALA_SHUTDOWN_SIGNAL(SIGRTMIN = {0}) signal to impalad PID = {1}",
+      self.IMPALA_SHUTDOWN_SIGNAL, impalad.pid)
+    impalad.send_signal(self.IMPALA_SHUTDOWN_SIGNAL)
+    # Make sure that the impala daemon exits after the shutdown grace period plus a 10
+    # second margin of error.
+    start_time = time.time()
+    LOG.info("Waiting for impalad to exit {0}".format(start_time))
+    impalad.wait()
+    shutdown_duration = time.time() - start_time
+    assert shutdown_duration <= self.IDLE_SHUTDOWN_GRACE_PERIOD_S + 10
+    # Make sure signal was received and the grace period and deadline are as expected.
+    self.assert_impalad_log_contains('INFO',
+      "Shutdown signal received. Current Shutdown Status: shutdown grace period left: "
+      "{0}s000ms, deadline left: 8760h".format(self.IDLE_SHUTDOWN_GRACE_PERIOD_S))
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(cluster_size=1)
+  def test_sending_multiple_shutdown_signals(self):
+    """Test that multiple IMPALA_SHUTDOWN_SIGNAL signals are all handeled without
+    crashing the process."""
+    impalad = psutil.Process(self.cluster.impalads[0].get_pid())
+    NUM_SIGNALS_TO_SEND = 10
+    LOG.info(
+      "Sending {0} IMPALA_SHUTDOWN_SIGNAL(SIGRTMIN = {1}) signals to impalad PID = {2}",
+      NUM_SIGNALS_TO_SEND, self.IMPALA_SHUTDOWN_SIGNAL, impalad.pid)
+    for i in range(NUM_SIGNALS_TO_SEND):
+      impalad.send_signal(self.IMPALA_SHUTDOWN_SIGNAL)
+    # Give shutdown thread some time to wake up and handle all the signals to avoid
+    # flakiness.
+    sleep(5)
+    # Make sure all signals were received and the process is still up.
+    self.assert_impalad_log_contains('INFO', "Shutdown signal received.",
+                                     NUM_SIGNALS_TO_SEND)
+    assert impalad.is_running(), "Impalad process should still be running."

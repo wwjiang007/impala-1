@@ -20,7 +20,6 @@ package org.apache.impala.analysis;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import java.math.BigDecimal;
-import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -44,7 +43,6 @@ import org.apache.impala.catalog.StructField;
 import org.apache.impala.catalog.StructType;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.catalog.View;
-import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.Pair;
 import org.apache.impala.thrift.TCatalogObjectType;
 import org.apache.impala.thrift.TDescribeOutputStyle;
@@ -67,7 +65,7 @@ parser code {:
 
   // list of expected tokens ids from current parsing state
   // for generating syntax error message
-  private final List<Integer> expectedTokenIds_ = new ArrayList<Integer>();
+  private final List<Integer> expectedTokenIds_ = new ArrayList<>();
 
   // Currently used to tell if it's decimal V1 or V2 mode.
   // TODO: remove when V1 code is dropped.
@@ -110,6 +108,7 @@ parser code {:
   }
 
   // override to save error token
+  @Override
   public void syntax_error(java_cup.runtime.Symbol token) {
     errorToken_ = token;
 
@@ -171,7 +170,8 @@ parser code {:
   // that parse() has been called and threw an exception
   public String getErrorMsg(String stmt) {
     if (errorToken_ == null || stmt == null) return null;
-    String[] lines = stmt.split("\n");
+    // IMPALA-8497: Fix ArrayIndexOutOfBoundsException for queries that end with '\n'
+    String[] lines = stmt.split("\n", -1);
     StringBuffer result = new StringBuffer();
     result.append(getErrorTypeMessage(errorToken_.sym) + " in line ");
     result.append(errorToken_.left);
@@ -274,31 +274,31 @@ parser code {:
 // ALL KEYWORDS ALSO NEED TO BE ADDED TO THE word PRODUCTION.
 terminal
   KW_ADD, KW_AGGREGATE, KW_ALL, KW_ALTER, KW_ANALYTIC, KW_AND, KW_ANTI, KW_API_VERSION,
-  KW_ARRAY, KW_AS, KW_ASC, KW_AVRO, KW_BETWEEN, KW_BIGINT, KW_BINARY, KW_BLOCKSIZE,
-  KW_BOOLEAN, KW_BY, KW_CACHED, KW_CASCADE, KW_CASE, KW_CAST, KW_CHANGE,
+  KW_ARRAY, KW_AS, KW_ASC, KW_AUTHORIZATION, KW_AVRO, KW_BETWEEN, KW_BIGINT, KW_BINARY,
+  KW_BLOCKSIZE, KW_BOOLEAN, KW_BY, KW_CACHED, KW_CASCADE, KW_CASE, KW_CAST, KW_CHANGE,
   KW_CHAR, KW_CLASS, KW_CLOSE_FN, KW_COLUMN, KW_COLUMNS, KW_COMMENT, KW_COMPRESSION,
-  KW_COMPUTE, KW_CREATE, KW_CROSS, KW_CURRENT, KW_DATA, KW_DATABASE, KW_DATABASES,
-  KW_DATE, KW_DATETIME, KW_DECIMAL, KW_DEFAULT, KW_DELETE, KW_DELIMITED, KW_DESC,
-  KW_DESCRIBE, KW_DISTINCT, KW_DIV, KW_DOUBLE, KW_DROP, KW_ELSE,
-  KW_ENCODING, KW_END, KW_ESCAPED, KW_EXISTS, KW_EXPLAIN, KW_EXTENDED, KW_EXTERNAL,
-  KW_FALSE, KW_FIELDS, KW_FILEFORMAT, KW_FILES, KW_FINALIZE_FN, KW_FIRST, KW_FLOAT,
-  KW_FOLLOWING, KW_FOR, KW_FORMAT, KW_FORMATTED, KW_FROM, KW_FULL, KW_FUNCTION,
-  KW_FUNCTIONS, KW_GRANT, KW_GROUP, KW_HASH, KW_IGNORE, KW_HAVING, KW_IF, KW_ILIKE,
-  KW_IN, KW_INCREMENTAL, KW_INIT_FN, KW_INNER, KW_INPATH, KW_INSERT, KW_INT,
-  KW_INTERMEDIATE, KW_INTERVAL, KW_INTO, KW_INVALIDATE, KW_IREGEXP, KW_IS, KW_JOIN,
-  KW_KUDU, KW_LAST, KW_LEFT, KW_LIKE, KW_LIMIT, KW_LINES, KW_LOAD, KW_LOCATION, KW_MAP,
-  KW_MERGE_FN, KW_METADATA, KW_NOT, KW_NULL, KW_NULLS, KW_OFFSET, KW_ON, KW_OR, KW_ORC,
-  KW_ORDER, KW_OUTER, KW_OVER, KW_OVERWRITE, KW_PARQUET, KW_PARQUETFILE, KW_PARTITION,
-  KW_PARTITIONED, KW_PARTITIONS, KW_PRECEDING, KW_PREPARE_FN, KW_PRIMARY, KW_PRODUCED,
-  KW_PURGE, KW_RANGE, KW_RCFILE, KW_RECOVER, KW_REFRESH, KW_REGEXP, KW_RENAME,
-  KW_REPEATABLE, KW_REPLACE, KW_REPLICATION, KW_RESTRICT, KW_RETURNS, KW_REVOKE,
-  KW_RIGHT, KW_RLIKE, KW_ROLE, KW_ROLES, KW_ROW, KW_ROWS, KW_SCHEMA, KW_SCHEMAS,
-  KW_SELECT, KW_SEMI, KW_SEQUENCEFILE, KW_SERDEPROPERTIES, KW_SERIALIZE_FN, KW_SET,
-  KW_SHOW, KW_SMALLINT, KW_SORT, KW_STORED, KW_STRAIGHT_JOIN, KW_STRING, KW_STRUCT,
-  KW_SYMBOL, KW_TABLE, KW_TABLES, KW_TABLESAMPLE, KW_TBLPROPERTIES, KW_TERMINATED,
-  KW_TEXTFILE, KW_THEN, KW_TIMESTAMP, KW_TINYINT, KW_TRUNCATE, KW_STATS, KW_TO, KW_TRUE,
-  KW_UNBOUNDED, KW_UNCACHED, KW_UNION, KW_UNKNOWN, KW_UPDATE, KW_UPDATE_FN, KW_UPSERT,
-  KW_USE, KW_USING, KW_VALUES, KW_VARCHAR, KW_VIEW, KW_WHEN, KW_WHERE, KW_WITH;
+  KW_COMPUTE, KW_COPY, KW_CREATE, KW_CROSS, KW_CURRENT, KW_DATA, KW_DATABASE,
+  KW_DATABASES, KW_DATE, KW_DATETIME, KW_DECIMAL, KW_DEFAULT, KW_DELETE, KW_DELIMITED,
+  KW_DESC, KW_DESCRIBE, KW_DISTINCT, KW_DIV, KW_DOUBLE, KW_DROP, KW_ELSE, KW_ENCODING,
+  KW_END, KW_ESCAPED, KW_EXISTS, KW_EXPLAIN, KW_EXTENDED, KW_EXTERNAL, KW_FALSE,
+  KW_FIELDS, KW_FILEFORMAT, KW_FILES, KW_FINALIZE_FN, KW_FIRST, KW_FLOAT, KW_FOLLOWING,
+  KW_FOR, KW_FORMAT, KW_FORMATTED, KW_FROM, KW_FULL, KW_FUNCTION, KW_FUNCTIONS, KW_GRANT,
+  KW_GROUP, KW_HASH, KW_IGNORE, KW_HAVING, KW_IF, KW_ILIKE, KW_IN, KW_INCREMENTAL,
+  KW_INIT_FN, KW_INNER, KW_INPATH, KW_INSERT, KW_INT, KW_INTERMEDIATE, KW_INTERVAL,
+  KW_INTO, KW_INVALIDATE, KW_IREGEXP, KW_IS, KW_JOIN, KW_KUDU, KW_LAST, KW_LEFT, KW_LIKE,
+  KW_LIMIT, KW_LINES, KW_LOAD, KW_LOCATION, KW_MAP, KW_MERGE_FN, KW_METADATA, KW_NOT,
+  KW_NULL, KW_NULLS, KW_OFFSET, KW_ON, KW_OR, KW_ORC, KW_ORDER, KW_OUTER, KW_OVER,
+  KW_OVERWRITE, KW_PARQUET, KW_PARQUETFILE, KW_PARTITION, KW_PARTITIONED, KW_PARTITIONS,
+  KW_PRECEDING, KW_PREPARE_FN, KW_PRIMARY, KW_PRODUCED, KW_PURGE, KW_RANGE, KW_RCFILE,
+  KW_RECOVER, KW_REFRESH, KW_REGEXP, KW_RENAME, KW_REPEATABLE, KW_REPLACE, KW_REPLICATION,
+  KW_RESTRICT, KW_RETURNS, KW_REVOKE, KW_RIGHT, KW_RLIKE, KW_ROLE, KW_ROLES, KW_ROW,
+  KW_ROWS, KW_SCHEMA, KW_SCHEMAS, KW_SELECT, KW_SEMI, KW_SEQUENCEFILE, KW_SERDEPROPERTIES,
+  KW_SERIALIZE_FN, KW_SET, KW_SHOW, KW_SMALLINT, KW_SORT, KW_STORED, KW_STRAIGHT_JOIN,
+  KW_STRING, KW_STRUCT, KW_SYMBOL, KW_TABLE, KW_TABLES, KW_TABLESAMPLE, KW_TBLPROPERTIES,
+  KW_TERMINATED, KW_TEXTFILE, KW_THEN, KW_TIMESTAMP, KW_TINYINT, KW_TRUNCATE, KW_STATS,
+  KW_TO, KW_TRUE, KW_UNBOUNDED, KW_UNCACHED, KW_UNION, KW_UNKNOWN, KW_UPDATE,
+  KW_UPDATE_FN, KW_UPSERT, KW_USE, KW_USING, KW_VALUES, KW_VARCHAR, KW_VIEW, KW_WHEN,
+  KW_WHERE, KW_WITH;
 
 terminal UNUSED_RESERVED_WORD;
 
@@ -365,10 +365,10 @@ nonterminal SelectList select_list;
 nonterminal SelectListItem select_list_item;
 nonterminal SelectListItem star_expr;
 nonterminal Expr expr, non_pred_expr, arithmetic_expr, timestamp_arithmetic_expr;
-nonterminal ArrayList<Expr> expr_list;
+nonterminal List<Expr> expr_list;
 nonterminal String alias_clause;
-nonterminal ArrayList<String> ident_list, primary_keys;
-nonterminal ArrayList<String> opt_ident_list, opt_sort_cols;
+nonterminal List<String> ident_list, primary_keys;
+nonterminal List<String> opt_ident_list, opt_sort_cols;
 nonterminal TableName table_name;
 nonterminal ColumnName column_name;
 nonterminal FunctionName function_name;
@@ -376,9 +376,9 @@ nonterminal Expr where_clause;
 nonterminal Expr predicate, bool_test_expr;
 nonterminal Predicate between_predicate, comparison_predicate, compound_predicate,
   in_predicate, like_predicate, exists_predicate;
-nonterminal ArrayList<Expr> group_by_clause, opt_partition_by_clause;
+nonterminal List<Expr> group_by_clause, opt_partition_by_clause;
 nonterminal Expr having_clause;
-nonterminal ArrayList<OrderByElement> order_by_elements, opt_order_by_clause;
+nonterminal List<OrderByElement> order_by_elements, opt_order_by_clause;
 nonterminal OrderByElement order_by_element;
 nonterminal Boolean opt_order_param;
 nonterminal Boolean opt_nulls_order_param;
@@ -393,15 +393,15 @@ nonterminal AnalyticWindow.Boundary window_boundary;
 nonterminal LiteralExpr literal;
 nonterminal NumericLiteral numeric_literal;
 nonterminal CaseExpr case_expr;
-nonterminal ArrayList<CaseWhenClause> case_when_clause_list;
+nonterminal List<CaseWhenClause> case_when_clause_list;
 nonterminal FunctionParams function_params;
-nonterminal ArrayList<String> dotted_path;
+nonterminal List<String> dotted_path;
 nonterminal SlotRef slot_ref;
 nonterminal FromClause from_clause;
-nonterminal ArrayList<TableRef> table_ref_list;
+nonterminal List<TableRef> table_ref_list;
 nonterminal TableSampleClause opt_tablesample;
 nonterminal WithClause opt_with_clause;
-nonterminal ArrayList<View> with_view_def_list;
+nonterminal List<View> with_view_def_list;
 nonterminal View with_view_def;
 nonterminal TableRef table_ref;
 nonterminal Subquery subquery;
@@ -415,7 +415,7 @@ nonterminal Expr sign_chain_expr;
 nonterminal InsertStmt insert_stmt, upsert_stmt;
 nonterminal UpdateStmt update_stmt;
 nonterminal DeleteStmt delete_stmt;
-nonterminal ArrayList<Pair<SlotRef, Expr>> update_set_expr_list;
+nonterminal List<Pair<SlotRef, Expr>> update_set_expr_list;
 nonterminal StatementBase explain_stmt;
 // Optional partition spec
 nonterminal PartitionSpec opt_partition_spec;
@@ -425,9 +425,9 @@ nonterminal PartitionSpec partition_spec;
 nonterminal PartitionSet opt_partition_set;
 // Required partition set
 nonterminal PartitionSet partition_set;
-nonterminal ArrayList<PartitionKeyValue> partition_clause;
-nonterminal ArrayList<PartitionKeyValue> static_partition_key_value_list;
-nonterminal ArrayList<PartitionKeyValue> partition_key_value_list;
+nonterminal List<PartitionKeyValue> partition_clause;
+nonterminal List<PartitionKeyValue> static_partition_key_value_list;
+nonterminal List<PartitionKeyValue> partition_key_value_list;
 nonterminal PartitionKeyValue partition_key_value;
 nonterminal PartitionKeyValue static_partition_key_value;
 nonterminal Qualifier union_op;
@@ -462,13 +462,13 @@ nonterminal List<RangePartition> range_params_list;
 nonterminal RangePartition range_param;
 nonterminal Pair<List<Expr>, Boolean> opt_lower_range_val,
    opt_upper_range_val;
-nonterminal ArrayList<KuduPartitionParam> hash_partition_param_list;
-nonterminal ArrayList<KuduPartitionParam> partition_param_list;
+nonterminal List<KuduPartitionParam> hash_partition_param_list;
+nonterminal List<KuduPartitionParam> partition_param_list;
 nonterminal KuduPartitionParam range_partition_param;
 nonterminal ColumnDef column_def, view_column_def;
-nonterminal ArrayList<ColumnDef> column_def_list, partition_column_defs,
+nonterminal List<ColumnDef> column_def_list, partition_column_defs,
   view_column_def_list, view_column_defs;
-nonterminal ArrayList<StructField> struct_field_def_list;
+nonterminal List<StructField> struct_field_def_list;
 // Options for DDL commands - CREATE/DROP/ALTER
 nonterminal HdfsCachingOp cache_op_val, opt_cache_op_val;
 nonterminal BigDecimal opt_cache_op_replication;
@@ -481,7 +481,6 @@ nonterminal THdfsFileFormat file_format_create_table_val;
 nonterminal Boolean if_exists_val;
 nonterminal Boolean if_not_exists_val;
 nonterminal Boolean is_primary_key_val;
-nonterminal Boolean replace_existing_cols_val;
 nonterminal HdfsUri location_val;
 nonterminal RowFormat row_format_val, opt_row_format_val;
 nonterminal String field_terminator_val;
@@ -522,7 +521,6 @@ nonterminal PrivilegeSpec privilege_spec;
 nonterminal TPrivilegeLevel privilege;
 nonterminal Boolean opt_with_grantopt;
 nonterminal Boolean opt_grantopt_for;
-nonterminal Boolean opt_kw_role;
 
 // To avoid creating common keywords such as 'SERVER' or 'SOURCES' we treat them as
 // identifiers rather than keywords. Throws a parse exception if the identifier does not
@@ -534,6 +532,7 @@ nonterminal Boolean server_ident;
 nonterminal Boolean source_ident;
 nonterminal Boolean sources_ident;
 nonterminal Boolean uri_ident;
+nonterminal testcase_ident;
 
 // For Create/Drop/Show function ddl
 nonterminal FunctionArgs function_def_args;
@@ -549,6 +548,9 @@ nonterminal CreateUdaStmt create_uda_stmt;
 nonterminal ShowFunctionsStmt show_functions_stmt;
 nonterminal DropFunctionStmt drop_function_stmt;
 nonterminal TFunctionCategory opt_function_category;
+
+// Query testcase export/load
+nonterminal CopyTestCaseStmt copy_testcase_stmt;
 
 // Admin statements.
 nonterminal AdminFnStmt admin_fn_stmt;
@@ -635,6 +637,8 @@ stmt ::=
   {: RESULT = alter_view; :}
   | compute_stats_stmt:compute_stats
   {: RESULT = compute_stats; :}
+  | copy_testcase_stmt:copy_testcase
+  {: RESULT = copy_testcase; :}
   | drop_stats_stmt:drop_stats
   {: RESULT = drop_stats; :}
   | create_tbl_as_select_stmt:create_tbl_as_select
@@ -715,15 +719,17 @@ overwrite_val ::=
 
 reset_metadata_stmt ::=
   KW_INVALIDATE KW_METADATA
-  {: RESULT = ResetMetadataStmt.createInvalidateStmt(null); :}
+  {: RESULT = ResetMetadataStmt.createInvalidateStmt(); :}
   | KW_INVALIDATE KW_METADATA table_name:table
   {: RESULT = ResetMetadataStmt.createInvalidateStmt(table); :}
   | KW_REFRESH table_name:table
-  {: RESULT = ResetMetadataStmt.createRefreshTableStmt(table, null); :}
+  {: RESULT = ResetMetadataStmt.createRefreshTableStmt(table); :}
   | KW_REFRESH table_name:table partition_spec:partition
-  {: RESULT = ResetMetadataStmt.createRefreshTableStmt(table, partition); :}
+  {: RESULT = ResetMetadataStmt.createRefreshPartitionStmt(table, partition); :}
   | KW_REFRESH KW_FUNCTIONS ident_or_default:db
   {: RESULT = ResetMetadataStmt.createRefreshFunctionsStmt(db); :}
+  | KW_REFRESH KW_AUTHORIZATION
+  {: RESULT = ResetMetadataStmt.createRefreshAuthorizationStmt(); :}
   ;
 
 explain_stmt ::=
@@ -756,6 +762,17 @@ explain_stmt ::=
   {:
      delete.setIsExplain();
      RESULT = delete;
+  :}
+  ;
+
+copy_testcase_stmt ::=
+  KW_COPY testcase_ident:testcase KW_TO STRING_LITERAL:path query_stmt:query
+  {:
+    RESULT = CopyTestCaseStmt.to(query, new HdfsUri(path));
+  :}
+  | KW_COPY testcase_ident:testcase KW_FROM STRING_LITERAL:path
+  {:
+    RESULT = CopyTestCaseStmt.from(new HdfsUri(path));
   :}
   ;
 
@@ -839,7 +856,7 @@ update_stmt ::=
 update_set_expr_list ::=
   slot_ref:slot EQUAL expr:e
   {:
-    ArrayList<Pair<SlotRef, Expr>> tmp =
+    List<Pair<SlotRef, Expr>> tmp =
         Lists.newArrayList(new Pair<SlotRef, Expr>(slot, e));
     RESULT = tmp;
   :}
@@ -906,7 +923,7 @@ opt_ident_list ::=
   ident_list:ident
   {: RESULT = ident; :}
   | /* empty */
-  {: RESULT = Lists.newArrayList(); :}
+  {: RESULT = new ArrayList<>(); :}
   ;
 
 opt_kw_table ::=
@@ -944,6 +961,14 @@ show_grant_principal_stmt ::=
     RESULT = new ShowGrantPrincipalStmt(name, type,
         PrivilegeSpec.createTableScopedPriv(TPrivilegeLevel.ALL, tbl_name));
   :}
+  | KW_SHOW KW_GRANT principal_type:type ident_or_default:name KW_ON KW_COLUMN
+  column_name:col_name
+  {:
+    RESULT = new ShowGrantPrincipalStmt(name, type,
+        PrivilegeSpec.createColumnScopedPriv(TPrivilegeLevel.SELECT,
+            col_name.getTableName(),
+            Collections.singletonList(col_name.getColumnName())));
+  :}
   | KW_SHOW KW_GRANT principal_type:type ident_or_default:name KW_ON uri_ident:uri_kw
     STRING_LITERAL:uri
   {:
@@ -969,16 +994,44 @@ revoke_role_stmt ::=
   {: RESULT = new GrantRevokeRoleStmt(role, group, false); :}
   ;
 
+// For backwards compatibility, a grant without the principal type will default to
+// TPrincipalType.ROLE
 grant_privilege_stmt ::=
-  KW_GRANT privilege_spec:priv KW_TO opt_kw_role:opt_role ident_or_default:role
+  KW_GRANT privilege_spec:priv KW_TO KW_ROLE ident_or_default:role
   opt_with_grantopt:grant_opt
-  {: RESULT = new GrantRevokePrivStmt(role, priv, true, grant_opt); :}
+  {: RESULT = new GrantRevokePrivStmt(role, priv, true, grant_opt, TPrincipalType.ROLE); :}
+  | KW_GRANT privilege_spec:priv KW_TO ident_or_default:role
+    opt_with_grantopt:grant_opt
+  {: RESULT = new GrantRevokePrivStmt(role, priv, true, grant_opt, TPrincipalType.ROLE); :}
+  | KW_GRANT privilege_spec:priv KW_TO IDENT:user_id ident_or_default:user
+    opt_with_grantopt:grant_opt
+  {:
+    parser.checkIdentKeyword("USER", user_id);
+    RESULT = new GrantRevokePrivStmt(user, priv, true, grant_opt, TPrincipalType.USER);
+  :}
+  | KW_GRANT privilege_spec:priv KW_TO KW_GROUP ident_or_default:group
+    opt_with_grantopt:grant_opt
+  {: RESULT = new GrantRevokePrivStmt(group, priv, true, grant_opt, TPrincipalType.GROUP); :}
   ;
 
+// For backwards compatibility, a revoke without the principal type will default to
+// TPrincipalType.ROLE
 revoke_privilege_stmt ::=
   KW_REVOKE opt_grantopt_for:grant_opt privilege_spec:priv KW_FROM
-  opt_kw_role:opt_role ident_or_default:role
-  {: RESULT = new GrantRevokePrivStmt(role, priv, false, grant_opt); :}
+  KW_ROLE ident_or_default:role
+  {: RESULT = new GrantRevokePrivStmt(role, priv, false, grant_opt, TPrincipalType.ROLE); :}
+  | KW_REVOKE opt_grantopt_for:grant_opt privilege_spec:priv KW_FROM
+    ident_or_default:role
+  {: RESULT = new GrantRevokePrivStmt(role, priv, false, grant_opt, TPrincipalType.ROLE); :}
+  | KW_REVOKE opt_grantopt_for:grant_opt privilege_spec:priv KW_FROM
+    IDENT:user_id ident_or_default:user
+  {:
+    parser.checkIdentKeyword("USER", user_id);
+    RESULT = new GrantRevokePrivStmt(user, priv, false, grant_opt, TPrincipalType.USER);
+  :}
+  | KW_REVOKE opt_grantopt_for:grant_opt privilege_spec:priv KW_FROM
+    KW_GROUP ident_or_default:group
+  {: RESULT = new GrantRevokePrivStmt(group, priv, false, grant_opt, TPrincipalType.GROUP); :}
   ;
 
 privilege_spec ::=
@@ -1016,6 +1069,8 @@ privilege ::=
 principal_type ::=
   KW_ROLE
   {: RESULT = TPrincipalType.ROLE; :}
+  | KW_GROUP
+  {: RESULT = TPrincipalType.GROUP; :}
   | IDENT:user
   {:
     parser.checkIdentKeyword("USER", user);
@@ -1035,11 +1090,6 @@ opt_with_grantopt ::=
   {: RESULT = true; :}
   | /* empty */
   {: RESULT = false; :}
-  ;
-
-opt_kw_role ::=
-  KW_ROLE
-  | /* empty */
   ;
 
 partition_def ::=
@@ -1094,9 +1144,19 @@ alter_db_stmt ::=
 // a partition clause does not make sense for this stmt. If a partition
 // is given, manually throw a parse error.
 alter_tbl_stmt ::=
-  KW_ALTER KW_TABLE table_name:table replace_existing_cols_val:replace KW_COLUMNS
-  LPAREN column_def_list:col_defs RPAREN
-  {: RESULT = new AlterTableAddReplaceColsStmt(table, col_defs, replace); :}
+  KW_ALTER KW_TABLE table_name:table KW_ADD KW_COLUMN if_not_exists_val:if_not_exists
+  column_def:col_def
+  {:
+    List<ColumnDef> list = new ArrayList<>();
+    list.add(col_def);
+    RESULT = new AlterTableAddColsStmt(table, if_not_exists, list);
+  :}
+  | KW_ALTER KW_TABLE table_name:table KW_ADD if_not_exists_val:if_not_exists KW_COLUMNS
+    LPAREN column_def_list:col_defs RPAREN
+  {: RESULT = new AlterTableAddColsStmt(table, if_not_exists, col_defs); :}
+  | KW_ALTER KW_TABLE table_name:table KW_REPLACE KW_COLUMNS
+    LPAREN column_def_list:col_defs RPAREN
+  {: RESULT = new AlterTableReplaceColsStmt(table, col_defs); :}
   | KW_ALTER KW_TABLE table_name:table KW_ADD if_not_exists_val:if_not_exists
     partition_def_list:partitions
   {: RESULT = new AlterTableAddPartitionStmt(table, if_not_exists, partitions); :}
@@ -1198,13 +1258,6 @@ opt_kw_column ::=
   | /* empty */
   ;
 
-replace_existing_cols_val ::=
-  KW_REPLACE
-  {: RESULT = true; :}
-  | KW_ADD
-  {: RESULT = false; :}
-  ;
-
 create_db_stmt ::=
   KW_CREATE db_or_schema_kw if_not_exists_val:if_not_exists ident_or_default:db_name
   opt_comment_val:comment location_val:location
@@ -1299,7 +1352,7 @@ create_tbl_stmt ::=
     if (tbl_def.isExternal()) {
       parser.parseError("external", SqlParserSymbols.KW_EXTERNAL);
     }
-    tbl_def.setOptions(new TableDef.Options(comment));
+    tbl_def.setOptions(new TableDef.Options(comment, parser.getQueryOptions()));
     RESULT = new CreateTableDataSrcStmt(new CreateTableStmt(tbl_def),
         data_src_name, init_string);
   :}
@@ -1380,8 +1433,9 @@ tbl_options ::=
   {:
     CreateTableStmt.unescapeProperties(serde_props);
     CreateTableStmt.unescapeProperties(tbl_props);
+
     RESULT = new TableDef.Options(sort_cols, comment, row_format, serde_props,
-        file_format, location, cache_op, tbl_props);
+        file_format, location, cache_op, tbl_props, parser.getQueryOptions());
   :}
   ;
 
@@ -1442,7 +1496,7 @@ hash_partition_param ::=
   {: RESULT = KuduPartitionParam.createHashParam(cols, numPartitions.intValue()); :}
   | KW_HASH KW_PARTITIONS INTEGER_LITERAL:numPartitions
   {:
-    RESULT = KuduPartitionParam.createHashParam(Lists.<String>newArrayList(),
+    RESULT = KuduPartitionParam.createHashParam(new ArrayList<>(),
         numPartitions.intValue());
   :}
   ;
@@ -1719,7 +1773,7 @@ properties_map ::=
 column_def_list ::=
   column_def:col_def
   {:
-    ArrayList<ColumnDef> list = Lists.newArrayList();
+    List<ColumnDef> list = new ArrayList<>();
     list.add(col_def);
     RESULT = list;
   :}
@@ -1881,6 +1935,15 @@ server_ident ::=
   :}
   ;
 
+testcase_ident ::=
+  IDENT:ident
+  {:
+    if (!ident.toUpperCase().equals("TESTCASE")) {
+      parser.parseError("identifier", SqlParserSymbols.IDENT, "TESTCASE");
+    }
+  :}
+  ;
+
 option_ident ::=
   IDENT:ident
   {:
@@ -1901,7 +1964,7 @@ view_column_defs ::=
 view_column_def_list ::=
   view_column_def:col_def
   {:
-    ArrayList<ColumnDef> list = new ArrayList<ColumnDef>();
+    List<ColumnDef> list = new ArrayList<>();
     list.add(col_def);
     RESULT = list;
   :}
@@ -2025,7 +2088,7 @@ partition_clause ::=
 partition_key_value_list ::=
   partition_key_value:item
   {:
-    ArrayList<PartitionKeyValue> list = new ArrayList<PartitionKeyValue>();
+    List<PartitionKeyValue> list = new ArrayList<>();
     list.add(item);
     RESULT = list;
   :}
@@ -2071,7 +2134,7 @@ opt_partition_spec ::=
 static_partition_key_value_list ::=
   static_partition_key_value:item
   {:
-    ArrayList<PartitionKeyValue> list = new ArrayList<PartitionKeyValue>();
+    List<PartitionKeyValue> list = new ArrayList<>();
     list.add(item);
     RESULT = list;
   :}
@@ -2241,7 +2304,7 @@ with_view_def ::=
 with_view_def_list ::=
   with_view_def:v
   {:
-    ArrayList<View> list = new ArrayList<View>();
+    List<View> list = new ArrayList<>();
     list.add(v);
     RESULT = list;
   :}
@@ -2307,7 +2370,7 @@ union_operand ::=
 union_operand_list ::=
   union_operand:operand
   {:
-    List<UnionOperand> operands = new ArrayList<UnionOperand>();
+    List<UnionOperand> operands = new ArrayList<>();
     operands.add(new UnionOperand(operand, null));
     RESULT = operands;
   :}
@@ -2345,7 +2408,7 @@ values_stmt ::=
 values_operand_list ::=
   LPAREN select_list:selectList RPAREN
   {:
-    List<UnionOperand> operands = new ArrayList<UnionOperand>();
+    List<UnionOperand> operands = new ArrayList<>();
     operands.add(new UnionOperand(
         new SelectStmt(selectList, null, null, null, null, null, null), null));
     RESULT = operands;
@@ -2608,7 +2671,7 @@ from_clause ::=
 table_ref_list ::=
   table_ref:table opt_plan_hints:hints
   {:
-    ArrayList<TableRef> list = new ArrayList<TableRef>();
+    List<TableRef> list = new ArrayList<>();
     table.setTableHints(hints);
     list.add(table);
     RESULT = list;
@@ -2703,7 +2766,7 @@ opt_plan_hints ::=
   plan_hints:hints
   {: RESULT = hints; :}
   | /* empty */
-  {: RESULT = Lists.newArrayList(); :}
+  {: RESULT = new ArrayList<>(); :}
   ;
 
 plan_hints ::=
@@ -2731,7 +2794,7 @@ plan_hint ::=
 plan_hint_list ::=
   plan_hint:hint
   {:
-    ArrayList<PlanHint> hints = Lists.newArrayList(hint);
+    List<PlanHint> hints = Lists.newArrayList(hint);
     RESULT = hints;
   :}
   | plan_hint_list:hints COMMA plan_hint:hint
@@ -2754,7 +2817,7 @@ opt_tablesample ::=
 ident_list ::=
   ident_or_default:ident
   {:
-    ArrayList<String> list = new ArrayList<String>();
+    List<String> list = new ArrayList<>();
     list.add(ident);
     RESULT = list;
   :}
@@ -2768,7 +2831,7 @@ ident_list ::=
 expr_list ::=
   expr:e
   {:
-    ArrayList<Expr> list = new ArrayList<Expr>();
+    List<Expr> list = new ArrayList<>();
     list.add(e);
     RESULT = list;
   :}
@@ -2810,7 +2873,7 @@ opt_order_by_clause ::=
 order_by_elements ::=
   order_by_element:e
   {:
-    ArrayList<OrderByElement> list = new ArrayList<OrderByElement>();
+    List<OrderByElement> list = new ArrayList<>();
     list.add(e);
     RESULT = list;
   :}
@@ -2891,7 +2954,7 @@ case_expr ::=
 case_when_clause_list ::=
   KW_WHEN expr:whenExpr KW_THEN expr:thenExpr
   {:
-    ArrayList<CaseWhenClause> list = new ArrayList<CaseWhenClause>();
+    List<CaseWhenClause> list = new ArrayList<>();
     list.add(new CaseWhenClause(whenExpr, thenExpr));
     RESULT = list;
   :}
@@ -2916,7 +2979,7 @@ sign_chain_expr ::=
     // integrate signs into literals
     // integer literals require analysis to set their type, so the instance check below
     // is not equivalent to e.getType().isNumericType()
-    if (e.isLiteral() && e instanceof NumericLiteral) {
+    if (e instanceof NumericLiteral) {
       ((LiteralExpr)e).swapSign();
       RESULT = e;
     } else {
@@ -2985,7 +3048,7 @@ function_call_expr ::=
   function_name:fn_name LPAREN RPAREN
   {:
     RESULT = FunctionCallExpr.createExpr(
-        fn_name, new FunctionParams(new ArrayList<Expr>()), parser.getQueryOptions());
+        fn_name, new FunctionParams(new ArrayList<>()), parser.getQueryOptions());
   :}
   | function_name:fn_name LPAREN function_params:params RPAREN
   {: RESULT = FunctionCallExpr.createExpr(fn_name, params, parser.getQueryOptions()); :}
@@ -3112,7 +3175,7 @@ timestamp_arithmetic_expr ::=
       // Report parsing failure on keyword interval.
       parser.parseError("interval", SqlParserSymbols.KW_INTERVAL);
     }
-    ArrayList<String> fnNamePath = functionName.getFnNamePath();
+    List<String> fnNamePath = functionName.getFnNamePath();
     if (fnNamePath.size() > 1) {
       // This production should not accept fully qualified function names
       throw new Exception("interval should not be qualified by database name");
@@ -3133,6 +3196,8 @@ literal ::=
   {: RESULT = l; :}
   | STRING_LITERAL:l
   {: RESULT = new StringLiteral(l); :}
+  | KW_DATE STRING_LITERAL:l
+  {: RESULT = new DateLiteral(l); :}
   | KW_TRUE
   {: RESULT = new BoolLiteral(true); :}
   | KW_FALSE
@@ -3318,7 +3383,7 @@ slot_ref ::=
 dotted_path ::=
   ident_or_default:ident
   {:
-    ArrayList<String> list = new ArrayList<String>();
+    List<String> list = new ArrayList<>();
     list.add(ident);
     RESULT = list;
   :}
@@ -3390,7 +3455,7 @@ struct_field_def ::=
 struct_field_def_list ::=
   struct_field_def:field_def
   {:
-    ArrayList<StructField> list = new ArrayList<StructField>();
+    List<StructField> list = new ArrayList<>();
     list.add(field_def);
     RESULT = list;
   :}
@@ -3433,6 +3498,8 @@ word ::=
   {: RESULT = r.toString(); :}
   | KW_ASC:r
   {: RESULT = r.toString(); :}
+  | KW_AUTHORIZATION:r
+  {: RESULT = r.toString(); :}
   | KW_AVRO:r
   {: RESULT = r.toString(); :}
   | KW_BETWEEN:r
@@ -3472,6 +3539,8 @@ word ::=
   | KW_COMPRESSION:r
   {: RESULT = r.toString(); :}
   | KW_COMPUTE:r
+  {: RESULT = r.toString(); :}
+  | KW_COPY:r
   {: RESULT = r.toString(); :}
   | KW_CREATE:r
   {: RESULT = r.toString(); :}

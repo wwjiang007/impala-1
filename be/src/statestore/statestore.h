@@ -142,11 +142,15 @@ class Statestore : public CacheLineAligned {
   /// Registers a new subscriber with the given unique subscriber ID, running a subscriber
   /// service at the given location, with the provided list of topic subscriptions.
   /// The registration_id output parameter is the unique ID for this registration, used to
-  /// distinguish old registrations from new ones for the same subscriber.
-  //
-  /// If a registration already exists for this subscriber, the old registration is removed
+  /// distinguish old registrations from new ones for the same subscriber. On successful
+  /// registration, the subscriber is added to the update queue, with an immediate
+  /// schedule.
+  ///
+  /// If a registration already exists for this subscriber, the old registration is
+  /// removed
   /// and a new one is created. Subscribers may receive an update intended for the old
-  /// registration, since one may be in flight when a new RegisterSubscriber() is received.
+  /// registration, since one may be in flight when a new RegisterSubscriber() is
+  /// received.
   Status RegisterSubscriber(const SubscriberId& subscriber_id,
       const TNetworkAddress& location,
       const std::vector<TTopicRegistration>& topic_registrations,
@@ -156,6 +160,11 @@ class Statestore : public CacheLineAligned {
 
   /// The main processing loop. Runs infinitely.
   void MainLoop();
+
+  /// Shut down some background threads. Only used for testing. Note that this is not
+  /// a clean shutdown because we can't correctly tear down 'thrift_server_', so
+  /// not all background threads are stopped and this object cannot be destroyed.
+  void ShutdownForTesting();
 
   /// Returns the Thrift API interface that proxies requests onto the local Statestore.
   const boost::shared_ptr<StatestoreServiceIf>& thrift_iface() const {
@@ -690,7 +699,7 @@ class Statestore : public CacheLineAligned {
   ///   "value_size": "9.54 MB",
   ///   "total_size": "9.58 MB"
   /// }, ]
-  void TopicsHandler(const Webserver::ArgumentMap& args, rapidjson::Document* document);
+  void TopicsHandler(const Webserver::WebRequest& req, rapidjson::Document* document);
 
   /// Webpage handler: upon return 'document' will contain a list of subscribers as
   /// follows:
@@ -703,7 +712,7 @@ class Statestore : public CacheLineAligned {
   ///   "registration_id": "414d28c84930d987:abcffd70b3346fb7"
   ///   }
   /// ]
-  void SubscribersHandler(const Webserver::ArgumentMap& args,
+  void SubscribersHandler(const Webserver::WebRequest& req,
       rapidjson::Document* document);
 
   /// Monitors the heartbeats of all subscribers every
@@ -713,6 +722,6 @@ class Statestore : public CacheLineAligned {
   [[noreturn]] void MonitorSubscriberHeartbeat();
 };
 
-}
+} // namespace impala
 
 #endif

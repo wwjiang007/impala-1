@@ -17,10 +17,14 @@
 
 package org.apache.impala.util;
 
-import static org.junit.Assert.*;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 
 import org.apache.impala.common.PrintUtils;
 import org.junit.Test;
+
+import com.google.common.collect.ImmutableList;
 
 /**
  * Unit tests for PrintUtils functions.
@@ -77,5 +81,80 @@ public class PrintUtilsTest {
     // TODO: fix this behaviour if needed.
     assertEquals("-10B", PrintUtils.printBytesRoundedToMb(-10L));
     assertEquals("-123456789B", PrintUtils.printBytesRoundedToMb(-123456789L));
+  }
+
+  /**
+   * Wrap length for testWrapText() - less than 80 to make test layout nicer.
+   */
+  private static final int WRAP_LENGTH = 60;
+
+  /**
+   * Test for PrintUtils.wrapString().
+   */
+  @Test
+  public void testWrapText() {
+    // Simple query wrapping.
+    assertWrap(
+        "Analyzed query: SELECT * FROM functional_kudu.alltypestiny WHERE CAST(bigint_col"
+            + " AS DOUBLE) < CAST(10 AS DOUBLE)",
+        "Analyzed query: SELECT * FROM functional_kudu.alltypestiny\n"
+            + "WHERE CAST(bigint_col AS DOUBLE) < CAST(10 AS DOUBLE)");
+    // test that a long string of blanks prints OK, some may be lost for clarity
+    assertWrap("insert into foo values ('                                      "
+            + "                                                                          "
+            + "                                ')",
+        "insert into foo values ('                                   \n"
+            + "')");
+    // test that long words are broken up for clarity
+    assertWrap("select xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            + "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            + "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "select\n"
+            + "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
+            + "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
+            + "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
+            + "xxxxxxxxxxxxxxxxxxxxxxxxx");
+  }
+
+  /**
+   * Check that code that has been wrapped is correctly formatted.
+   * @param expected what it should be
+   */
+  private void assertWrap(String input, String expected) {
+    String actual = PrintUtils.wrapString(input, WRAP_LENGTH);
+    assertEquals(expected, actual);
+    assertNoBlankLines(actual);
+    assertNoTerminatingNewline(actual);
+    assertNoLongLines(actual);
+  }
+
+  /**
+   * Assert that all lines of wrapped output are 80 chars or less.
+   */
+  private void assertNoLongLines(String s) {
+    for (String line : s.split("\n")) {
+      assertTrue("line too long: " + line, line.length() <= WRAP_LENGTH);
+    }
+  }
+
+  /**
+   * Assert that the wrapped output does not end in a newline.
+   */
+  private void assertNoTerminatingNewline(String s) {
+    assertFalse("wrapped string ends in newline: " + s, s.endsWith("\n"));
+  }
+
+  /**
+   * Assert that there are no blank lines embedded in the wrapped output.
+   */
+  private void assertNoBlankLines(String s) {
+    assertFalse("output contains blank line " + s, s.contains("\n\n"));
+  }
+
+  @Test
+  public void testJoinQuoted() {
+    assertEquals("", PrintUtils.joinQuoted(ImmutableList.of()));
+    assertEquals("'a'", PrintUtils.joinQuoted(ImmutableList.of("a")));
+    assertEquals("'a', 'b'", PrintUtils.joinQuoted(ImmutableList.of("a", "b")));
   }
 }

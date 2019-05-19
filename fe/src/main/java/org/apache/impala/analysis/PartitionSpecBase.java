@@ -24,11 +24,13 @@ import org.apache.impala.catalog.FeTable;
 import org.apache.impala.common.AnalysisException;
 import com.google.common.base.Preconditions;
 
+import static org.apache.impala.analysis.ToSqlOptions.DEFAULT;
+
 /**
  * Base class for PartitionSpec and PartitionSet containing the partition
  * specifications of related DDL operations.
  */
-public abstract class PartitionSpecBase implements ParseNode {
+public abstract class PartitionSpecBase extends StmtNode {
   protected FeFsTable table_;
   protected TableName tableName_;
   protected Boolean partitionShouldExist_;
@@ -74,7 +76,8 @@ public abstract class PartitionSpecBase implements ParseNode {
     // be audited outside of the PartitionSpec.
     FeTable table;
     try {
-      table = analyzer.getTable(tableName_, false, privilegeRequirement_);
+      table = analyzer.getTable(tableName_, /* add access event */ false,
+          /* add column-level privilege */ false, privilegeRequirement_);
     } catch (TableLoadingException e) {
       throw new AnalysisException(e.getMessage(), e);
     }
@@ -91,5 +94,10 @@ public abstract class PartitionSpecBase implements ParseNode {
   }
 
   @Override
-  public abstract String toSql();
+  public final String toSql() {
+    return toSql(DEFAULT);
+  }
+
+  @Override
+  public abstract String toSql(ToSqlOptions options);
 }

@@ -21,12 +21,15 @@
 #include <limits>
 #include <gutil/strings/substitute.h>
 
+#include "common/status.h"
+#include "exec/kudu-util.h"
+#include "kudu/rpc/rpc_controller.h"
 #include "runtime/backend-client.h"
 #include "runtime/coordinator.h"
+#include "runtime/exec-env.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/row-batch.h"
 #include "runtime/runtime-state.h"
-#include "runtime/exec-env.h"
 #include "scheduling/admission-controller.h"
 #include "scheduling/scheduler.h"
 #include "service/frontend.h"
@@ -40,19 +43,23 @@
 
 #include "gen-cpp/CatalogService.h"
 #include "gen-cpp/CatalogService_types.h"
+#include "gen-cpp/control_service.pb.h"
+#include "gen-cpp/control_service.proxy.h"
 
 #include <thrift/Thrift.h>
 
 #include "common/names.h"
+#include "control-service.h"
 
 using boost::algorithm::iequals;
 using boost::algorithm::join;
+using kudu::rpc::RpcController;
 using namespace apache::hive::service::cli::thrift;
 using namespace apache::thrift;
 using namespace beeswax;
 using namespace strings;
 
-DECLARE_int32(be_port);
+DECLARE_int32(krpc_port);
 DECLARE_int32(catalog_service_port);
 DECLARE_string(catalog_service_host);
 DECLARE_int64(max_result_cache_size);
@@ -77,6 +84,7 @@ ClientRequestState::ClientRequestState(
     coord_exec_called_(false),
     // Profile is assigned name w/ id after planning
     profile_(RuntimeProfile::Create(&profile_pool_, "Query")),
+    frontend_profile_(RuntimeProfile::Create(&profile_pool_, "Frontend")),
     server_profile_(RuntimeProfile::Create(&profile_pool_, "ImpalaServer")),
     summary_profile_(RuntimeProfile::Create(&profile_pool_, "Summary")),
     frontend_(frontend),
@@ -118,6 +126,8 @@ ClientRequestState::ClientRequestState(
       "Sql Statement", query_ctx_.client_request.stmt);
   summary_profile_->AddInfoString("Coordinator",
       TNetworkAddressToString(exec_env->GetThriftBackendAddress()));
+
+  summary_profile_->AddChild(frontend_profile_);
 }
 
 ClientRequestState::~ClientRequestState() {
@@ -136,6 +146,13 @@ Status ClientRequestState::SetResultCache(QueryResultSet* cache,
   }
   result_cache_max_size_ = max_size;
   return Status::OK();
+}
+
+void ClientRequestState::SetFrontendProfile(TRuntimeProfileNode profile) {
+  // Should we defer creating and adding the child until here? probably.
+  TRuntimeProfileTree prof_tree;
+  prof_tree.nodes.emplace_back(std::move(profile));
+  frontend_profile_->Update(prof_tree);
 }
 
 Status ClientRequestState::Exec(TExecRequest* exec_request) {
@@ -160,9 +177,14 @@ Status ClientRequestState::Exec(TExecRequest* exec_request) {
           exec_request_.explain_result.results));
       break;
     }
+    case TStmtType::TESTCASE: {
+      DCHECK(exec_request_.__isset.testcase_data_path);
+      SetResultSet(vector<string>(1, exec_request_.testcase_data_path));
+      break;
+    }
     case TStmtType::DDL: {
       DCHECK(exec_request_.__isset.catalog_op_request);
-      RETURN_IF_ERROR(ExecDdlRequest());
+      LOG_AND_RETURN_IF_ERROR(ExecDdlRequest());
       break;
     }
     case TStmtType::LOAD: {
@@ -332,18 +354,6 @@ Status ClientRequestState::ExecLocalCatalogOp(
     }
     case TCatalogOpType::SHOW_ROLES: {
       const TShowRolesParams& params = catalog_op.show_roles_params;
-      if (params.is_admin_op) {
-        // Verify the user has privileges to perform this operation by checking against
-        // the Sentry Service (via the Catalog Server).
-        catalog_op_executor_.reset(new CatalogOpExecutor(exec_env_, frontend_,
-            server_profile_));
-
-        TSentryAdminCheckRequest req;
-        req.__set_header(TCatalogServiceRequestHeader());
-        req.header.__set_requesting_user(effective_user());
-        RETURN_IF_ERROR(catalog_op_executor_->SentryAdminCheck(req));
-      }
-
       // If we have made it here, the user has privileges to execute this operation.
       // Return the results.
       TShowRolesResult result;
@@ -353,18 +363,6 @@ Status ClientRequestState::ExecLocalCatalogOp(
     }
     case TCatalogOpType::SHOW_GRANT_PRINCIPAL: {
       const TShowGrantPrincipalParams& params = catalog_op.show_grant_principal_params;
-      if (params.is_admin_op) {
-        // Verify the user has privileges to perform this operation by checking against
-        // the Sentry Service (via the Catalog Server).
-        catalog_op_executor_.reset(new CatalogOpExecutor(exec_env_, frontend_,
-            server_profile_));
-
-        TSentryAdminCheckRequest req;
-        req.__set_header(TCatalogServiceRequestHeader());
-        req.header.__set_requesting_user(effective_user());
-        RETURN_IF_ERROR(catalog_op_executor_->SentryAdminCheck(req));
-      }
-
       TResultSet response;
       RETURN_IF_ERROR(frontend_->GetPrincipalPrivileges(params, &response));
       // Set the result set and its schema from the response.
@@ -496,13 +494,14 @@ void ClientRequestState::FinishExecQueryOrDmlRequest() {
   DebugActionNoFail(schedule_->query_options(), "CRS_BEFORE_ADMISSION");
 
   DCHECK(exec_env_->admission_controller() != nullptr);
-  Status admit_status = ExecEnv::GetInstance()->admission_controller()->AdmitQuery(
-      schedule_.get(), &admit_outcome_);
+  Status admit_status =
+      ExecEnv::GetInstance()->admission_controller()->SubmitForAdmission(
+          schedule_.get(), &admit_outcome_);
   {
     lock_guard<mutex> l(lock_);
     if (!UpdateQueryStatus(admit_status).ok()) return;
   }
-  coord_.reset(new Coordinator(*schedule_, query_events_));
+  coord_.reset(new Coordinator(this, *schedule_, query_events_));
   Status exec_status = coord_->Exec();
 
   DebugActionNoFail(schedule_->query_options(), "CRS_AFTER_COORD_STARTS");
@@ -549,15 +548,24 @@ Status ClientRequestState::ExecDdlRequest() {
   if (ddl_type() == TDdlType::COMPUTE_STATS) {
     TComputeStatsParams& compute_stats_params =
         exec_request_.catalog_op_request.ddl_params.compute_stats_params;
+    RuntimeProfile* child_profile =
+        RuntimeProfile::Create(&profile_pool_, "Child Queries");
+    profile_->AddChild(child_profile);
     // Add child queries for computing table and column stats.
     vector<ChildQuery> child_queries;
     if (compute_stats_params.__isset.tbl_stats_query) {
-      child_queries.push_back(
-          ChildQuery(compute_stats_params.tbl_stats_query, this, parent_server_));
+      RuntimeProfile* profile =
+          RuntimeProfile::Create(&profile_pool_, "Table Stats Query");
+      child_profile->AddChild(profile);
+      child_queries.emplace_back(compute_stats_params.tbl_stats_query, this,
+          parent_server_, profile, &profile_pool_);
     }
     if (compute_stats_params.__isset.col_stats_query) {
-      child_queries.push_back(
-          ChildQuery(compute_stats_params.col_stats_query, this, parent_server_));
+      RuntimeProfile* profile =
+          RuntimeProfile::Create(&profile_pool_, "Column Stats Query");
+      child_profile->AddChild(profile);
+      child_queries.emplace_back(compute_stats_params.col_stats_query, this,
+          parent_server_, profile, &profile_pool_);
     }
 
     if (child_queries.size() > 0) {
@@ -610,39 +618,72 @@ Status ClientRequestState::ExecDdlRequest() {
 
 Status ClientRequestState::ExecShutdownRequest() {
   const TShutdownParams& request = exec_request_.admin_request.shutdown_params;
-  int port = request.__isset.backend && request.backend.port != 0 ? request.backend.port :
-                                                                    FLAGS_be_port;
+  bool backend_port_specified = request.__isset.backend && request.backend.port != 0;
+  int port = backend_port_specified ? request.backend.port : FLAGS_krpc_port;
   // Use the local shutdown code path if the host is unspecified or if it exactly matches
   // the configured host/port. This avoids the possibility of RPC errors preventing
   // shutdown.
   if (!request.__isset.backend
-      || (request.backend.hostname == FLAGS_hostname && port == FLAGS_be_port)) {
-    TShutdownStatus shutdown_status;
+      || (request.backend.hostname == FLAGS_hostname && port == FLAGS_krpc_port)) {
+    ShutdownStatusPB shutdown_status;
     int64_t deadline_s = request.__isset.deadline_s ? request.deadline_s : -1;
     RETURN_IF_ERROR(parent_server_->StartShutdown(deadline_s, &shutdown_status));
     SetResultSet({ImpalaServer::ShutdownStatusToString(shutdown_status)});
     return Status::OK();
   }
-  TNetworkAddress addr = MakeNetworkAddress(request.backend.hostname, port);
 
-  TRemoteShutdownParams params;
-  if (request.__isset.deadline_s) params.__set_deadline_s(request.deadline_s);
-  TRemoteShutdownResult resp;
-  VLOG_QUERY << "Sending Shutdown RPC to " << TNetworkAddressToString(addr);
-  ImpalaBackendConnection::RpcStatus rpc_status = ImpalaBackendConnection::DoRpcWithRetry(
-      ExecEnv::GetInstance()->impalad_client_cache(), addr,
-      &ImpalaBackendClient::RemoteShutdown, params,
-      [this]() { return DebugAction(query_options(), "CRS_SHUTDOWN_RPC"); }, &resp);
-  if (!rpc_status.status.ok()) {
-    VLOG_QUERY << "RemoteShutdown query_id= " << PrintId(query_id())
-               << " failed to send RPC to " << TNetworkAddressToString(addr) << " :"
-               << rpc_status.status.msg().msg();
-    return rpc_status.status;
+  // KRPC relies on resolved IP address, so convert hostname.
+  IpAddr ip_address;
+  Status ip_status = HostnameToIpAddr(request.backend.hostname, &ip_address);
+  if (!ip_status.ok()) {
+    VLOG(1) << "Could not convert hostname " << request.backend.hostname
+            << " to ip address, error: " << ip_status.GetDetail();
+    return ip_status;
+  }
+  TNetworkAddress addr = MakeNetworkAddress(ip_address, port);
+
+  std::unique_ptr<ControlServiceProxy> proxy;
+  Status get_proxy_status = ControlService::GetProxy(addr, addr.hostname, &proxy);
+  if (!get_proxy_status.ok()) {
+    return Status(
+        Substitute("Could not get Proxy to ControlService at $0 with error: $1.",
+            TNetworkAddressToString(addr), get_proxy_status.msg().msg()));
   }
 
-  Status shutdown_status(resp.status);
+  RemoteShutdownParamsPB params;
+  if (request.__isset.deadline_s) params.set_deadline_s(request.deadline_s);
+  RemoteShutdownResultPB resp;
+  VLOG_QUERY << "Sending Shutdown RPC to " << TNetworkAddressToString(addr);
+
+  auto shutdown_rpc = [&](RpcController* rpc_controller) -> kudu::Status {
+    return proxy->RemoteShutdown(params, &resp, rpc_controller);
+  };
+
+  Status rpc_status = ControlService::DoRpcWithRetry(
+      shutdown_rpc, query_ctx_, "CRS_SHUTDOWN_RPC", "RemoteShutdown() RPC failed", 3, 10);
+
+  if (!rpc_status.ok()) {
+    const string& msg = rpc_status.msg().msg();
+    VLOG_QUERY << "RemoteShutdown query_id= " << PrintId(query_id())
+               << " failed to send RPC to " << TNetworkAddressToString(addr) << " :"
+               << msg;
+    string err_string = Substitute(
+        "Rpc to $0 failed with error '$1'", TNetworkAddressToString(addr), msg);
+    // Attempt to detect if the the failure is because of not using a KRPC port.
+    if (backend_port_specified
+        && msg.find("RemoteShutdown() RPC failed: Timed out: connection negotiation to")
+            != string::npos) {
+      // Prior to IMPALA-7985 :shutdown() used the backend port.
+      err_string.append(" This may be because the port specified is wrong. You may have"
+                        " specified the backend (thrift) port which :shutdown() can no"
+                        " longer use. Please make sure the correct KRPC port is being"
+                        " used, or don't specify any port in the :shutdown() command.");
+    }
+    return Status(err_string);
+  }
+  Status shutdown_status(resp.status());
   RETURN_IF_ERROR(shutdown_status);
-  SetResultSet({ImpalaServer::ShutdownStatusToString(resp.shutdown_status)});
+  SetResultSet({ImpalaServer::ShutdownStatusToString(resp.shutdown_status())});
   return Status::OK();
 }
 
@@ -669,14 +710,9 @@ void ClientRequestState::Done() {
     }
   }
 
+  UpdateEndTime();
   unique_lock<mutex> l(lock_);
-  end_time_us_ = UnixMicros();
-  // Certain API clients expect Start Time and End Time to be date-time strings
-  // of nanosecond precision, so we explicitly specify the precision here.
-  summary_profile_->AddInfoString("End Time", ToStringFromUnixMicros(end_time_us(),
-      TimePrecision::Nanosecond));
   query_events_->MarkEvent("Unregister query");
-
   // Update result set cache metrics, and update mem limit accounting before tearing
   // down the coordinator.
   ClearResultCache();
@@ -1043,6 +1079,7 @@ Status ClientRequestState::UpdateCatalog() {
 
       catalog_update.target_table = finalize_params.table_name;
       catalog_update.db_name = finalize_params.table_db;
+      catalog_update.is_overwrite = finalize_params.is_overwrite;
 
       Status cnxn_status;
       const TNetworkAddress& address =
@@ -1238,13 +1275,24 @@ beeswax::QueryState::type ClientRequestState::BeeswaxQueryState() const {
 // to call concurrently with Coordinator::Exec(). See comments for 'coord_' and
 // 'coord_exec_called_' for more details.
 Status ClientRequestState::UpdateBackendExecStatus(
-    const TReportExecStatusParams& params) {
+    const ReportExecStatusRequestPB& request,
+    const TRuntimeProfileForest& thrift_profiles) {
   DCHECK(coord_.get());
-  return coord_->UpdateBackendExecStatus(params);
+  return coord_->UpdateBackendExecStatus(request, thrift_profiles);
 }
 
 void ClientRequestState::UpdateFilter(const TUpdateFilterParams& params) {
   DCHECK(coord_.get());
   coord_->UpdateFilter(params);
+}
+
+void ClientRequestState::UpdateEndTime() {
+  // Update the query's end time only if it isn't set previously.
+  if (end_time_us_.CompareAndSwap(0, UnixMicros())) {
+    // Certain API clients expect Start Time and End Time to be date-time strings
+    // of nanosecond precision, so we explicitly specify the precision here.
+    summary_profile_->AddInfoString(
+        "End Time", ToStringFromUnixMicros(end_time_us(), TimePrecision::Nanosecond));
+  }
 }
 }

@@ -123,14 +123,16 @@ Status ScannerContext::Stream::GetNextBuffer(int64_t read_past_size) {
 
   if (!scan_range_eosr_) {
     // Get the next buffer from 'scan_range_'.
-    SCOPED_TIMER(parent_->state_->total_storage_wait_timer());
+    SCOPED_TIMER2(parent_->state_->total_storage_wait_timer(),
+        parent_->scan_node_->scanner_io_wait_time());
     Status status = scan_range_->GetNext(&io_buffer_);
     DCHECK(!status.ok() || io_buffer_ != nullptr);
     RETURN_IF_ERROR(status);
     scan_range_eosr_ = io_buffer_->eosr();
   } else {
     // Already got all buffers from 'scan_range_' - reading past end.
-    SCOPED_TIMER(parent_->state_->total_storage_wait_timer());
+    SCOPED_TIMER2(parent_->state_->total_storage_wait_timer(),
+        parent_->scan_node_->scanner_io_wait_time());
 
     int64_t read_past_buffer_size = 0;
     int64_t max_buffer_size = io_mgr->max_buffer_size();
@@ -155,7 +157,8 @@ Status ScannerContext::Stream::GetNextBuffer(int64_t read_past_size) {
     int64_t partition_id = parent_->partition_descriptor()->id();
     ScanRange* range = parent_->scan_node_->AllocateScanRange(
         scan_range_->fs(), filename(), read_past_buffer_size, offset, partition_id,
-        scan_range_->disk_id(), false, BufferOpts::Uncached());
+        scan_range_->disk_id(), false, scan_range_->is_erasure_coded(),
+        BufferOpts::Uncached());
     bool needs_buffers;
     RETURN_IF_ERROR(
         parent_->scan_node_->reader_context()->StartScanRange(range, &needs_buffers));

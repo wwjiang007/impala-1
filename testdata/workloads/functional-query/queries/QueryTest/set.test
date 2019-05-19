@@ -25,6 +25,7 @@ set all;
 'PARQUET_FILE_SIZE','0','ADVANCED'
 'REQUEST_POOL','','REGULAR'
 'SYNC_DDL','0','REGULAR'
+'DEFAULT_FILE_FORMAT','TEXT','REGULAR'
 ---- TYPES
 STRING, STRING, STRING
 ====
@@ -50,6 +51,7 @@ set all;
 'PARQUET_FILE_SIZE','0','ADVANCED'
 'REQUEST_POOL','','REGULAR'
 'SYNC_DDL','0','REGULAR'
+'DEFAULT_FILE_FORMAT','TEXT','REGULAR'
 ---- TYPES
 STRING, STRING, STRING
 ====
@@ -75,6 +77,7 @@ set all;
 'PARQUET_FILE_SIZE','0','ADVANCED'
 'REQUEST_POOL','','REGULAR'
 'SYNC_DDL','0','REGULAR'
+'DEFAULT_FILE_FORMAT','TEXT','REGULAR'
 ---- TYPES
 STRING, STRING, STRING
 ====
@@ -91,7 +94,52 @@ Invalid query option: foo
 ---- QUERY
 set parquet_compression_codec=bar
 ---- CATCH
-Invalid compression codec: bar
+Invalid compression codec: 'bar'. Valid values are NONE(0), DEFAULT(1), GZIP(2), DEFLATE(3), BZIP2(4), SNAPPY(5), SNAPPY_BLOCKED(6), LZO(7), LZ4(8), ZLIB(9), ZSTD(10).
+====
+---- QUERY
+set explain_level=bar
+---- CATCH
+Invalid explain level: 'bar'. Valid values are MINIMAL(0), STANDARD(1), EXTENDED(2), VERBOSE(3).
+====
+---- QUERY
+set runtime_filter_mode=bar
+---- CATCH
+Invalid runtime filter mode: 'bar'. Valid values are OFF(0), LOCAL(1), GLOBAL(2).
+====
+---- QUERY
+set replica_preference=bar
+---- CATCH
+Invalid replica memory distance preference: 'bar'. Valid values are CACHE_LOCAL(0), DISK_LOCAL(2), REMOTE(4).
+====
+---- QUERY
+set parquet_fallback_schema_resolution=bar
+---- CATCH
+Invalid parquet fallback schema resolution: 'bar'. Valid values are POSITION(0), NAME(1).
+====
+---- QUERY
+set parquet_array_resolution=bar
+---- CATCH
+Invalid parquet array resolution: 'bar'. Valid values are THREE_LEVEL(0), TWO_LEVEL(1), TWO_LEVEL_THEN_THREE_LEVEL(2).
+====
+---- QUERY
+set prefetch_mode=bar
+---- CATCH
+Invalid prefetch mode: 'bar'. Valid values are NONE(0), HT_BUCKET(1).
+====
+---- QUERY
+set default_join_distribution_mode=bar
+---- CATCH
+Invalid default join distribution mode: 'bar'. Valid values are BROADCAST(0), SHUFFLE(1).
+====
+---- QUERY
+set kudu_read_mode=bar
+---- CATCH
+Invalid Kudu read mode: 'bar'. Valid values are DEFAULT(0), READ_LATEST(1), READ_AT_SNAPSHOT(2).
+====
+---- QUERY
+set default_file_format=bar
+---- CATCH
+Invalid default file format: 'bar'. Valid values are TEXT(0), RC_FILE(1), SEQUENCE_FILE(2), AVRO(3), PARQUET(4), KUDU(5), ORC(6).
 ====
 ---- QUERY
 # Test that SET actually does change the mem_limit.
@@ -143,7 +191,7 @@ explain select min(month), max(year), ndv(day) from functional.alltypesagg;
 '03:AGGREGATE [FINALIZE]'
 '02:EXCHANGE [UNPARTITIONED]'
 '01:AGGREGATE'
-'00:SCAN HDFS [functional.alltypesagg]'
+'00:SCAN $FILESYSTEM_NAME [functional.alltypesagg]'
 ====
 ---- QUERY
 set explain_level=0;
@@ -153,7 +201,7 @@ explain select min(month), max(year), ndv(day) from functional.alltypesagg;
 '03:AGGREGATE [FINALIZE]'
 '02:EXCHANGE [UNPARTITIONED]'
 '01:AGGREGATE'
-'00:SCAN HDFS [functional.alltypesagg]'
+'00:SCAN $FILESYSTEM_NAME [functional.alltypesagg]'
 ====
 ---- QUERY
 set explain_level=0;
@@ -166,7 +214,7 @@ explain select count(distinct double_col) from functional.alltypesagg;
 '04:AGGREGATE'
 '03:EXCHANGE [HASH(double_col)]'
 '01:AGGREGATE [STREAMING]'
-'00:SCAN HDFS [functional.alltypesagg]'
+'00:SCAN $FILESYSTEM_NAME [functional.alltypesagg]'
 ====
 ---- QUERY
 set explain_level=0;
@@ -179,7 +227,7 @@ explain select count(distinct double_col) from functional.alltypesagg;
 '04:AGGREGATE'
 '03:EXCHANGE [HASH(double_col)]'
 '01:AGGREGATE [STREAMING]'
-'00:SCAN HDFS [functional.alltypesagg]'
+'00:SCAN $FILESYSTEM_NAME [functional.alltypesagg]'
 ====
 ---- QUERY
 set explain_level=0;
@@ -192,7 +240,7 @@ explain select count(distinct double_col) from functional.alltypesagg;
 '04:AGGREGATE'
 '03:EXCHANGE [HASH(double_col)]'
 '01:AGGREGATE'
-'00:SCAN HDFS [functional.alltypesagg]'
+'00:SCAN $FILESYSTEM_NAME [functional.alltypesagg]'
 ====
 ---- QUERY
 set explain_level=0;
@@ -205,7 +253,7 @@ explain select count(distinct double_col) from functional.alltypesagg;
 '04:AGGREGATE'
 '03:EXCHANGE [HASH(double_col)]'
 '01:AGGREGATE'
-'00:SCAN HDFS [functional.alltypesagg]'
+'00:SCAN $FILESYSTEM_NAME [functional.alltypesagg]'
 ====
 ---- QUERY
 set max_row_size=-1;

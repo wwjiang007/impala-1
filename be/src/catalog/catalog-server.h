@@ -90,8 +90,14 @@ class CatalogServer {
   /// Metric that tracks the amount of time taken preparing a catalog update.
   StatsMetric<double>* topic_processing_time_metric_;
 
+  /// Tracks the partial fetch RPC call queue length on the Catalog server.
+  IntGauge* partial_fetch_rpc_queue_len_metric_;
+
   /// Thread that polls the catalog for any updates.
   std::unique_ptr<Thread> catalog_update_gathering_thread_;
+
+  /// Thread that periodically wakes up and refreshes certain Catalog metrics.
+  std::unique_ptr<Thread> catalog_metrics_refresh_thread_;
 
   /// Protects catalog_update_cv_, pending_topic_updates_,
   /// catalog_objects_to/from_version_, and last_sent_catalog_version.
@@ -143,6 +149,9 @@ class CatalogServer {
   /// Also, explicitly releases free memory back to the OS after each complete iteration.
   [[noreturn]] void GatherCatalogUpdatesThread();
 
+  /// Executed by the catalog_metrics_refresh_thread_. Refreshes certain catalog metrics.
+  [[noreturn]] void RefreshMetrics();
+
   /// Example output:
   /// "databases": [
   ///         {
@@ -161,7 +170,7 @@ class CatalogServer {
   ///             ]
   ///         }
   ///     ]
-  void CatalogUrlCallback(const Webserver::ArgumentMap& args,
+  void CatalogUrlCallback(const Webserver::WebRequest& req,
       rapidjson::Document* document);
 
   /// Debug webpage handler that is used to dump the internal state of catalog objects.
@@ -169,13 +178,14 @@ class CatalogServer {
   /// will get the matching TCatalogObject struct, if one exists.
   /// For example, to dump table "bar" in database "foo":
   /// <host>:25020/catalog_objects?object_type=TABLE&object_name=foo.bar
-  void CatalogObjectsUrlCallback(const Webserver::ArgumentMap& args,
+  void CatalogObjectsUrlCallback(const Webserver::WebRequest& req,
       rapidjson::Document* document);
 
   /// Retrieves from the FE information about the current catalog usage and populates
   /// the /catalog debug webpage. The catalog usage includes information about the TOP-N
-  /// frequently used (in terms of number of metadata operations) tables as well as the
-  /// TOP-N tables with the highest memory requirements.
+  /// frequently used (in terms of number of metadata operations) tables, the TOP-N
+  /// tables with the highest memory requirements and the TOP-N tables with the most
+  /// number of files.
   ///
   /// Example output:
   /// "large_tables": [
@@ -190,6 +200,12 @@ class CatalogServer {
   ///        "frequency": 10
   ///      }
   ///  ]
+  ///  "high_file_count_tables": [
+  ///      {
+  ///        "name": functional.alltypesagg",
+  ///        "num_files": 30
+  ///      }
+  ///  ]
   void GetCatalogUsage(rapidjson::Document* document);
 
   /// Debug webpage handler that is used to dump all the registered metrics of a
@@ -198,8 +214,13 @@ class CatalogServer {
   /// table. For example, to get the table metrics of table "bar" in database
   /// "foo":
   /// <host>:25020/table_metrics?name=foo.bar
-  void TableMetricsUrlCallback(const Webserver::ArgumentMap& args,
+  void TableMetricsUrlCallback(const Webserver::WebRequest& req,
       rapidjson::Document* document);
+
+  // url handler for the metastore events page. It calls into JniCatalog to get the latest
+  // metastore event processor metrics and adds it to the document
+  void EventMetricsUrlCallback(
+      const Webserver::WebRequest& req, rapidjson::Document* document);
 };
 
 }

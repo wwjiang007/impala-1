@@ -24,11 +24,15 @@
 #include "util/condition-variable.h"
 
 namespace impala {
+
+/// Location at which a new ScanRange would be enqueued.
+enum class EnqueueLocation { HEAD, TAIL };
+
 namespace io {
 
-// Mode argument for AddRangeToDisk().
+/// Mode argument for AddRangeToDisk().
 enum class ScheduleMode {
-  IMMEDIATELY, UPON_GETNEXT, BY_CALLER
+  IMMEDIATELY, UPON_GETNEXT_HEAD, UPON_GETNEXT_TAIL, BY_CALLER
 };
 /// A request context is used to group together I/O requests belonging to a client of the
 /// I/O manager for management and scheduling.
@@ -99,8 +103,11 @@ class RequestContext {
   /// Adds the scan ranges to this context's queues, but does not start scheduling it.
   /// The range can be scheduled by a thread calling GetNextUnstartedRange(). This call
   /// is non-blocking. The caller must not deallocate the scan range pointers before
-  /// UnregisterContext(). 'ranges' must not be empty.
-  Status AddScanRanges(const std::vector<ScanRange*>& ranges) WARN_UNUSED_RESULT;
+  /// UnregisterContext(). 'ranges' must not be empty. Depnending on the enqueue_loction,
+  /// the scan ranges would be added with ScheduleMode::UPON_GETNEXT_HEAD or
+  /// ScheduleMode::UPON_GETNEXT_TAIL.
+  Status AddScanRanges(const std::vector<ScanRange*>& ranges,
+      EnqueueLocation enqueue_location) WARN_UNUSED_RESULT;
 
   /// Tries to get an unstarted scan range that was added to this context with
   /// AddScanRanges(). On success, returns OK and returns the range in '*range'.
@@ -175,6 +182,36 @@ class RequestContext {
 
   void set_disks_accessed_bitmap(RuntimeProfile::Counter* disks_accessed_bitmap) {
     disks_accessed_bitmap_ = disks_accessed_bitmap;
+  }
+
+  void set_data_cache_hit_counter(RuntimeProfile::Counter* counter) {
+    data_cache_hit_counter_ = counter;
+  }
+
+  void set_data_cache_partial_hit_counter(RuntimeProfile::Counter* counter) {
+    data_cache_partial_hit_counter_ = counter;
+  }
+
+  void set_data_cache_miss_counter(RuntimeProfile::Counter* counter) {
+    data_cache_miss_counter_ = counter;
+  }
+
+  void set_data_cache_hit_bytes_counter(RuntimeProfile::Counter* counter) {
+    data_cache_hit_bytes_counter_ = counter;
+  }
+
+  void set_data_cache_miss_bytes_counter(RuntimeProfile::Counter* counter) {
+    data_cache_miss_bytes_counter_ = counter;
+  }
+
+  TUniqueId instance_id() const { return instance_id_; }
+  void set_instance_id(const TUniqueId& instance_id) {
+    instance_id_ = instance_id;
+  }
+
+  TUniqueId query_id() const { return query_id_; }
+  void set_query_id(const TUniqueId& query_id) {
+    query_id_ = query_id;
   }
 
  private:
@@ -262,9 +299,9 @@ class RequestContext {
   ///
   /// Scan ranges can have different 'schedule_mode' values. If IMMEDIATELY, the range is
   /// immediately added to the 'in_flight_ranges_' queue where it will be processed
-  /// asynchronously by disk threads. If UPON_GETNEXT, the range is added to the
-  /// 'unstarted_ranges_' queue, from which it can be returned to a client by
-  /// GetNextUnstartedRange(). If BY_CALLER, the scan range is not added to
+  /// asynchronously by disk threads. If UPON_GETNEXT_HEAD or UPON_GETNEXT_TAIL, the
+  /// range is added to the 'unstarted_ranges_' queue, from which it can be returned to a
+  /// client by GetNextUnstartedRange(). If BY_CALLER, the scan range is not added to
   /// any queues. The range will be scheduled later as a separate step, e.g. when it is
   /// unblocked by adding buffers to it. Caller must hold 'lock_' via 'lock'.
   void AddRangeToDisk(const boost::unique_lock<boost::mutex>& lock, RequestRange* range,
@@ -280,6 +317,14 @@ class RequestContext {
   void RemoveActiveScanRange(ScanRange* range);
   void RemoveActiveScanRangeLocked(
       const boost::unique_lock<boost::mutex>& lock, ScanRange* range);
+
+  /// Try to read the scan range from the cache. '*read_succeeded' is set to true if the
+  /// scan range can be found in the cache, otherwise false.
+  /// If '*needs_buffers' is returned as true, the caller must call
+  /// AllocateBuffersForRange() to add buffers for the data to be read into before the
+  /// range can be scheduled.
+  Status TryReadFromCache(const boost::unique_lock<boost::mutex>& lock, ScanRange* range,
+      bool* read_succeeded, bool* needs_buffers);
 
   // Counters are updated by other classes - expose to other io:: classes for convenience.
 
@@ -299,6 +344,13 @@ class RequestContext {
   /// TODO: we can only support up to 64 disks with this bitmap but it lets us use a
   /// builtin atomic instruction. Probably good enough for now.
   RuntimeProfile::Counter* disks_accessed_bitmap_ = nullptr;
+
+  /// Data cache counters.
+  RuntimeProfile::Counter* data_cache_hit_counter_ = nullptr;
+  RuntimeProfile::Counter* data_cache_partial_hit_counter_ = nullptr;
+  RuntimeProfile::Counter* data_cache_miss_counter_ = nullptr;
+  RuntimeProfile::Counter* data_cache_hit_bytes_counter_ = nullptr;
+  RuntimeProfile::Counter* data_cache_miss_bytes_counter_ = nullptr;
 
   /// Total number of bytes read locally, updated at end of each range scan
   AtomicInt64 bytes_read_local_{0};
@@ -381,6 +433,9 @@ class RequestContext {
   /// Per disk states to synchronize multiple disk threads accessing the same request
   /// context. One state per IoMgr disk queue.
   std::vector<PerDiskState> disk_states_;
+
+  TUniqueId instance_id_;
+  TUniqueId query_id_;
 };
 }
 }

@@ -18,24 +18,20 @@
 package org.apache.impala.catalog;
 
 import static org.apache.impala.catalog.HdfsPartition.comparePartitionKeyValues;
-import static org.junit.Assert.*;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
-import java.math.BigDecimal;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.LocatedFileStatus;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.fs.RemoteIterator;
 import org.apache.impala.analysis.BoolLiteral;
 import org.apache.impala.analysis.LiteralExpr;
 import org.apache.impala.analysis.NullLiteral;
 import org.apache.impala.analysis.NumericLiteral;
 import org.apache.impala.analysis.StringLiteral;
 import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
-import org.apache.impala.catalog.HdfsTable.FileMetadataLoadStats;
 import org.apache.impala.service.FeSupport;
 import org.apache.impala.thrift.TNetworkAddress;
 import org.apache.impala.util.ListMap;
@@ -49,36 +45,36 @@ public class HdfsPartitionTest {
     FeSupport.loadLibrary();
   }
 
-  private List<LiteralExpr> valuesNull_= Lists.newArrayList();
-  private List<LiteralExpr> valuesDecimal_ = Lists.newArrayList();
-  private List<LiteralExpr> valuesDecimal1_ = Lists.newArrayList();
-  private List<LiteralExpr> valuesDecimal2_ = Lists.newArrayList();
-  private List<LiteralExpr> valuesMixed_= Lists.newArrayList();
-  private List<LiteralExpr> valuesMixed1_ = Lists.newArrayList();
-  private List<LiteralExpr> valuesMixed2_ = Lists.newArrayList();
+  private List<LiteralExpr> valuesNull_= new ArrayList<>();
+  private List<LiteralExpr> valuesDecimal_ = new ArrayList<>();
+  private List<LiteralExpr> valuesDecimal1_ = new ArrayList<>();
+  private List<LiteralExpr> valuesDecimal2_ = new ArrayList<>();
+  private List<LiteralExpr> valuesMixed_= new ArrayList<>();
+  private List<LiteralExpr> valuesMixed1_ = new ArrayList<>();
+  private List<LiteralExpr> valuesMixed2_ = new ArrayList<>();
 
   public HdfsPartitionTest() {
     valuesNull_.add(NullLiteral.create(Type.BIGINT));
 
-    valuesDecimal_.add(new NumericLiteral(BigDecimal.valueOf(1)));
-    valuesDecimal1_.add(new NumericLiteral(BigDecimal.valueOf(3)));
-    valuesDecimal2_.add(new NumericLiteral(BigDecimal.valueOf(5)));
+    valuesDecimal_.add(NumericLiteral.create(1));
+    valuesDecimal1_.add(NumericLiteral.create(3));
+    valuesDecimal2_.add(NumericLiteral.create(5));
 
-    valuesMixed_.add(new NumericLiteral(BigDecimal.valueOf(3)));
+    valuesMixed_.add(NumericLiteral.create(3));
     valuesMixed_.add(NullLiteral.create(Type.BIGINT));
 
-    valuesMixed1_.add(new NumericLiteral(BigDecimal.valueOf(1)));
+    valuesMixed1_.add(NumericLiteral.create(1));
     valuesMixed1_.add(NullLiteral.create(Type.STRING));
     valuesMixed1_.add(new BoolLiteral(true));
 
-    valuesMixed2_.add(new NumericLiteral(BigDecimal.valueOf(1)));
+    valuesMixed2_.add(NumericLiteral.create(1));
     valuesMixed2_.add(new StringLiteral("Large"));
     valuesMixed2_.add(new BoolLiteral(false));
   }
 
   @Test
   public void testCompare() {
-    List<List<LiteralExpr>> allLists = Lists.newArrayList();
+    List<List<LiteralExpr>> allLists = new ArrayList<>();
     allLists.add(valuesNull_);
     allLists.add(valuesDecimal_);
     allLists.add(valuesDecimal1_);
@@ -97,8 +93,8 @@ public class HdfsPartitionTest {
       }
     }
 
-    List<LiteralExpr> valuesTest = Lists.newArrayList();
-    valuesTest.add(new NumericLiteral(BigDecimal.valueOf(3)));
+    List<LiteralExpr> valuesTest = new ArrayList<>();
+    valuesTest.add(NumericLiteral.create(3));
     verifyAntiSymmetric(valuesDecimal1_, valuesTest, valuesNull_);
     valuesTest.add(NullLiteral.create(Type.BIGINT));
     verifyAntiSymmetric(valuesMixed_, valuesTest, valuesDecimal_);
@@ -110,6 +106,7 @@ public class HdfsPartitionTest {
     assertTrue(Integer.signum(comparePartitionKeyValues(o1, o2)) ==
         -Integer.signum(comparePartitionKeyValues(o2, o1)));
   }
+
   private void verifyTransitive(List<LiteralExpr> o1, List<LiteralExpr> o2,
                                 List<LiteralExpr> o3) {
     // ((compare(x, y)>0) && (compare(y, z)>0)) implies compare(x, z)>0
@@ -118,10 +115,12 @@ public class HdfsPartitionTest {
       assertTrue(comparePartitionKeyValues(o1, o3) > 0);
     }
   }
+
   private void verifyReflexive(List<LiteralExpr> o1) {
     // (compare(x, x)==0) is always true
     assertTrue(comparePartitionKeyValues(o1, o1) == 0);
   }
+
   private void verifyAntiSymmetric(List<LiteralExpr> o1, List<LiteralExpr> o2,
                                    List<LiteralExpr> o3) {
     // compare(x, y)==0 implies that sgn(compare(x, z))==sgn(compare(y, z)) for all z.
@@ -150,11 +149,11 @@ public class HdfsPartitionTest {
   public void testCloneWithNewHostIndex() throws Exception {
     // Fetch some metadata from a directory in HDFS.
     Path p = new Path("hdfs://localhost:20500/test-warehouse/schemas");
-    FileSystem fs = p.getFileSystem(new Configuration());
-    RemoteIterator<LocatedFileStatus> iter = fs.listLocatedStatus(p);
     ListMap<TNetworkAddress> origIndex = new ListMap<>();
-    List<FileDescriptor> fileDescriptors = HdfsTable.createFileDescriptors(fs, iter,
-        origIndex, new FileMetadataLoadStats(p));
+    FileMetadataLoader fml = new FileMetadataLoader(p, /* recursive= */false,
+        Collections.emptyList(), origIndex);
+    fml.load();
+    List<FileDescriptor> fileDescriptors = fml.getLoadedFds();
     assertTrue(!fileDescriptors.isEmpty());
 
     FileDescriptor fd = fileDescriptors.get(0);

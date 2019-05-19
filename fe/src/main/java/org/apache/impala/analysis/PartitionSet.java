@@ -17,6 +17,8 @@
 
 package org.apache.impala.analysis;
 
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
@@ -33,8 +35,6 @@ import org.apache.impala.thrift.TPartitionKeyValue;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Sets;
 
 /**
  * Represents a set of partitions resulting from evaluating a list of partition conjuncts
@@ -55,7 +55,7 @@ public class PartitionSet extends PartitionSpecBase {
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
     super.analyze(analyzer);
-    List<Expr> conjuncts = Lists.newArrayList();
+    List<Expr> conjuncts = new ArrayList<>();
     // Do not register column-authorization requests.
     analyzer.setEnablePrivChecks(false);
     for (Expr e: partitionExprs_) {
@@ -86,7 +86,7 @@ public class PartitionSet extends PartitionSpecBase {
 
     try {
       HdfsPartitionPruner pruner = new HdfsPartitionPruner(desc);
-      partitions_ = pruner.prunePartitions(analyzer, transformedConjuncts, true);
+      partitions_ = pruner.prunePartitions(analyzer, transformedConjuncts, true).first;
     } catch (ImpalaException e) {
       if (e instanceof AnalysisException) throw (AnalysisException) e;
       throw new AnalysisException("Partition expr evaluation failed in the backend.", e);
@@ -109,7 +109,7 @@ public class PartitionSet extends PartitionSpecBase {
   private void addIfExists(
       Analyzer analyzer, FeTable table, List<Expr> conjuncts) {
     boolean add = false;
-    Set<String> partColNames = Sets.newHashSet();
+    Set<String> partColNames = new HashSet<>();
     Reference<SlotRef> slotRef = new Reference<>();
     for (Expr e : conjuncts) {
       if (e instanceof BinaryPredicate) {
@@ -144,7 +144,7 @@ public class PartitionSet extends PartitionSpecBase {
   // partition pruner.
   private List<Expr> transformPartitionConjuncts(Analyzer analyzer, List<Expr> conjuncts)
       throws AnalysisException {
-    List<Expr> transformedConjuncts = Lists.newArrayList();
+    List<Expr> transformedConjuncts = new ArrayList<>();
     for (Expr e : conjuncts) {
       Expr result = e;
       if (e instanceof BinaryPredicate) {
@@ -152,7 +152,7 @@ public class PartitionSet extends PartitionSpecBase {
         if (bp.getOp() == Operator.EQ) {
           SlotRef leftChild =
               bp.getChild(0) instanceof SlotRef ? ((SlotRef) bp.getChild(0)) : null;
-          NullLiteral nullChild = bp.getChild(1) instanceof NullLiteral ?
+          NullLiteral nullChild = Expr.IS_NULL_LITERAL.apply(bp.getChild(1)) ?
               ((NullLiteral) bp.getChild(1)) : null;
           StringLiteral stringChild = bp.getChild(1) instanceof StringLiteral ?
               ((StringLiteral) bp.getChild(1)) : null;
@@ -172,9 +172,9 @@ public class PartitionSet extends PartitionSpecBase {
   }
 
   public List<List<TPartitionKeyValue>> toThrift() {
-    List<List<TPartitionKeyValue>> thriftPartitionSet = Lists.newArrayList();
+    List<List<TPartitionKeyValue>> thriftPartitionSet = new ArrayList<>();
     for (FeFsPartition hdfsPartition : partitions_) {
-      List<TPartitionKeyValue> thriftPartitionSpec = Lists.newArrayList();
+      List<TPartitionKeyValue> thriftPartitionSpec = new ArrayList<>();
       for (int i = 0; i < table_.getNumClusteringCols(); ++i) {
         String key = table_.getColumns().get(i).getName();
         String value = PartitionKeyValue.getPartitionKeyValueString(
@@ -187,10 +187,10 @@ public class PartitionSet extends PartitionSpecBase {
   }
 
   @Override
-  public String toSql() {
-    List<String> partitionExprStr = Lists.newArrayList();
+  public String toSql(ToSqlOptions options) {
+    List<String> partitionExprStr = new ArrayList<>();
     for (Expr e : partitionExprs_) {
-      partitionExprStr.add(e.toSql());
+      partitionExprStr.add(e.toSql(options));
     }
     return String.format("PARTITION (%s)", Joiner.on(", ").join(partitionExprStr));
   }

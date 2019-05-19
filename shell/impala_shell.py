@@ -45,7 +45,7 @@ from shell_output import OverwritingStdErrOutputStream
 from subprocess import call
 
 VERSION_FORMAT = "Impala Shell v%(version)s (%(git_hash)s) built on %(build_date)s"
-VERSION_STRING = "build version not available"
+VERSION_STRING = "impala shell build version not available"
 READLINE_UNAVAILABLE_ERROR = "The readline module was either not found or disabled. " \
                              "Command history will not be collected."
 
@@ -168,7 +168,7 @@ class ImpalaShell(object, cmd.Cmd):
     self.ldap_password = options.ldap_password
     self.ldap_password_cmd = options.ldap_password_cmd
     self.use_ldap = options.use_ldap
-
+    self.client_connect_timeout_ms = options.client_connect_timeout_ms
     self.verbose = options.verbose
     self.prompt = ImpalaShell.DISCONNECTED_PROMPT
     self.server_version = ImpalaShell.UNKNOWN_SERVER_VERSION
@@ -518,12 +518,12 @@ class ImpalaShell(object, cmd.Cmd):
     return ImpalaClient(self.impalad, self.kerberos_host_fqdn, self.use_kerberos,
                         self.kerberos_service_name, self.use_ssl,
                         self.ca_cert, self.user, self.ldap_password,
-                        self.use_ldap)
+                        self.use_ldap, self.client_connect_timeout_ms, self.verbose)
 
   def _signal_handler(self, signal, frame):
     """Handles query cancellation on a Ctrl+C event"""
     if self.last_query_handle is None or self.query_handle_closed:
-      return
+      raise KeyboardInterrupt()
     # Create a new connection to the impalad and cancel the query.
     for cancel_try in xrange(ImpalaShell.CANCELLATION_TRIES):
       try:
@@ -542,32 +542,6 @@ class ImpalaShell(object, cmd.Cmd):
           break
         print_to_stderr("Failed to reconnect and close (try %i/%i): %s" % (
             cancel_try + 1, ImpalaShell.CANCELLATION_TRIES, err_msg))
-
-  def _replace_variables(self, query):
-    """Replaces variable within the query text with their corresponding values"""
-    errors = False
-    matches = set(map(lambda v: v.upper(), re.findall(r'(?<!\\)\${([^}]+)}', query)))
-    for name in matches:
-      value = None
-      # Check if syntax is correct
-      var_name = self._get_var_name(name)
-      if var_name is None:
-        print_to_stderr('Error: Unknown substitution syntax (%s). ' % (name,) + \
-                        'Use ${VAR:var_name}.')
-        errors = True
-      else:
-        # Replaces variable value
-        if self.set_variables and var_name in self.set_variables:
-          value = self.set_variables[var_name]
-          regexp = re.compile(r'(?<!\\)\${%s}' % (name,), re.IGNORECASE)
-          query = regexp.sub(value, query)
-        else:
-          print_to_stderr('Error: Unknown variable %s' % (var_name))
-          errors = True
-    if errors:
-      return None
-    else:
-      return query
 
   def set_prompt(self, db):
     self.prompt = ImpalaShell.PROMPT_FORMAT.format(
@@ -598,7 +572,7 @@ class ImpalaShell(object, cmd.Cmd):
        the interactive case, when cmdloop is called.
     """
     # Replace variables in the statement before it's executed
-    line = self._replace_variables(line)
+    line = replace_variables(self.set_variables, line)
     # Cmd is an old-style class, hence we need to call the method directly
     # instead of using super()
     # TODO: This may have to be changed to a super() call once we move to Python 3
@@ -673,18 +647,6 @@ class ImpalaShell(object, cmd.Cmd):
     except KeyError:
       return False
 
-  def _get_var_name(self, name):
-    """Look for a namespace:var_name pattern in an option name.
-       Return the variable name if it's a match or None otherwise.
-    """
-    ns_match = re.match(r'^([^:]*):(.*)', name)
-    if ns_match is not None:
-      ns = ns_match.group(1)
-      var_name = ns_match.group(2)
-      if ns in ImpalaShell.VAR_PREFIXES:
-        return var_name
-    return None
-
   def _print_with_set(self, print_level):
     self._print_options(print_level)
     print "\nVariables:"
@@ -721,7 +683,7 @@ class ImpalaShell(object, cmd.Cmd):
         return CmdStatus.ERROR
     option_upper = tokens[0].upper()
     # Check if it's a variable
-    var_name = self._get_var_name(option_upper)
+    var_name = get_var_name(option_upper)
     if var_name is not None:
       # Set the variable
       self.set_variables[var_name] = tokens[1]
@@ -745,7 +707,7 @@ class ImpalaShell(object, cmd.Cmd):
       return CmdStatus.ERROR
     option = args.upper()
     # Check if it's a variable
-    var_name = self._get_var_name(option)
+    var_name = get_var_name(option)
     if var_name is not None:
       if self.set_variables.get(var_name):
         print 'Unsetting variable %s' % var_name
@@ -829,12 +791,20 @@ class ImpalaShell(object, cmd.Cmd):
 
     # Use a temporary to avoid changing set_query_options during iteration.
     new_query_options = {}
+    default_query_option_keys = set(self.imp_client.default_query_options)
     for set_option, value in self.set_query_options.iteritems():
-      if set_option not in set(self.imp_client.default_query_options):
+      if set_option not in default_query_option_keys:
         print ('%s is not supported for the impalad being '
                'connected to, ignoring.' % set_option)
       else:
         new_query_options[set_option] = value
+
+    if "CLIENT_IDENTIFIER" not in new_query_options \
+        and "CLIENT_IDENTIFIER" in default_query_option_keys:
+      # Programmatically set default CLIENT_IDENTIFIER to our version string,
+      # if the Impala version supports this option.
+      new_query_options["CLIENT_IDENTIFIER"] = VERSION_STRING
+
     self.set_query_options = new_query_options
 
   def _connect(self):
@@ -856,12 +826,13 @@ class ImpalaShell(object, cmd.Cmd):
       print_to_stderr("Unable to import the python 'ssl' module. It is"
       " required for an SSL-secured connection.")
       sys.exit(1)
-    except socket.error, (code, e):
+    except socket.error, e:
       # if the socket was interrupted, reconnect the connection with the client
-      if code == errno.EINTR:
+      if e.errno == errno.EINTR:
         self._reconnect_cancellation()
       else:
-        print_to_stderr("Socket error %s: %s" % (code, e))
+        print_to_stderr("Socket error %s: %s" % (e.errno, e))
+        self.imp_client.close_connection()
         self.prompt = self.DISCONNECTED_PROMPT
     except Exception, e:
       if self.ldap_password_cmd and \
@@ -869,6 +840,9 @@ class ImpalaShell(object, cmd.Cmd):
           self.ldap_password.endswith('\n'):
         print_to_stderr("Warning: LDAP password contains a trailing newline. "
                       "Did you use 'echo' instead of 'echo -n'?")
+      if self.use_ssl and sys.version_info < (2,7,9) \
+          and "EOF occurred in violation of protocol" in str(e):
+        print_to_stderr("Warning: TLSv1.2 is not supported for Python < 2.7.9")
       print_to_stderr("Error connecting: %s, %s" % (type(e).__name__, e))
       # A secure connection may still be open. So we explicitly close it.
       self.imp_client.close_connection()
@@ -1000,7 +974,16 @@ class ImpalaShell(object, cmd.Cmd):
     checkpoint = time.time()
     if checkpoint - self.last_summary > self.PROGRESS_UPDATE_INTERVAL:
       summary = self.imp_client.get_summary(self.last_query_handle)
-      if summary and summary.progress:
+      if not summary:
+        return
+
+      if summary.is_queued:
+        queued_msg = "Query queued. Latest queuing reason: %s\n" % summary.queued_reason
+        self.progress_stream.write(queued_msg)
+        self.last_summary = time.time()
+        return
+
+      if summary.progress:
         progress = summary.progress
 
         # If the data is not complete return and wait for a good result.
@@ -1172,16 +1155,14 @@ class ImpalaShell(object, cmd.Cmd):
   def do_with(self, args):
     """Executes a query with a WITH clause, fetching all rows"""
     query = self._create_beeswax_query(args)
-    # Set posix=True and add "'" to escaped quotes
-    # to deal with escaped quotes in string literals
-    lexer = shlex.shlex(strip_comments(query.query.lstrip())
-                        .encode('utf-8'), posix=True)
-    lexer.escapedquotes += "'"
+    # Use shlex to deal with escape quotes in string literals.
+    # Set posix=False to preserve the quotes.
+    tokens = shlex.split(strip_comments(query.query.lstrip()).encode('utf-8'),
+                         posix=False)
     try:
       # Because the WITH clause may precede DML or SELECT queries,
       # just checking the first token is insufficient.
       is_dml = False
-      tokens = list(lexer)
       if filter(self.DML_REGEX.match, tokens): is_dml = True
       return self._execute_stmt(query, is_dml=is_dml, print_web_link=True)
     except ValueError as e:
@@ -1358,6 +1339,8 @@ class ImpalaShell(object, cmd.Cmd):
     """
     leading_comment, line = ImpalaShell.strip_leading_comment(line.strip())
     line = line.encode('utf-8')
+    if leading_comment:
+      leading_comment = leading_comment.encode('utf-8')
     if line and line[0] == '@':
       line = 'rerun ' + line[1:]
     return super(ImpalaShell, self).parseline(line) + (leading_comment,)
@@ -1539,8 +1522,52 @@ def parse_variables(keyvals):
         parser.print_help()
         sys.exit(1)
       else:
-        vars[match.groups()[0].upper()] = match.groups()[1]
+        vars[match.groups()[0].upper()] = replace_variables(vars, match.groups()[1])
   return vars
+
+
+def replace_variables(set_variables, string):
+  """Replaces variable within the string with their corresponding values using the
+     given set_variables."""
+  errors = False
+  matches = set(map(lambda v: v.upper(), re.findall(r'(?<!\\)\${([^}]+)}', string)))
+  for name in matches:
+    value = None
+    # Check if syntax is correct
+    var_name = get_var_name(name)
+    if var_name is None:
+      print_to_stderr('Error: Unknown substitution syntax (%s). ' % (name,) +
+                      'Use ${VAR:var_name}.')
+      errors = True
+    else:
+      # Replaces variable value
+      if set_variables and var_name in set_variables:
+        value = set_variables[var_name]
+        if value is None:
+          errors = True
+        else:
+          regexp = re.compile(r'(?<!\\)\${%s}' % (name,), re.IGNORECASE)
+          string = regexp.sub(value, string)
+      else:
+        print_to_stderr('Error: Unknown variable %s' % (var_name))
+        errors = True
+  if errors:
+    return None
+  else:
+    return string
+
+
+def get_var_name(name):
+  """Looks for a namespace:var_name pattern in an option name.
+     Returns the variable name if it's a match or None otherwise.
+  """
+  ns_match = re.match(r'^([^:]*):(.*)', name)
+  if ns_match is not None:
+    ns = ns_match.group(1)
+    var_name = ns_match.group(2)
+    if ns in ImpalaShell.VAR_PREFIXES:
+      return var_name
+  return None
 
 def execute_queries_non_interactive_mode(options, query_options):
   """Run queries in non-interactive mode."""
@@ -1604,12 +1631,11 @@ if __name__ == "__main__":
     print_to_stderr('%s not found.\n' % user_config)
     sys.exit(1)
 
-  query_options = {}
-
   # default shell options loaded in from impala_shell_config_defaults.py
   # options defaults overwritten by those in config file
   try:
-    loaded_shell_options, query_options = get_config_from_file(config_to_load)
+    loaded_shell_options, query_options = get_config_from_file(config_to_load,
+                                                               parser.option_list)
     impala_shell_defaults.update(loaded_shell_options)
   except Exception, e:
     print_to_stderr(e)
@@ -1717,7 +1743,7 @@ if __name__ == "__main__":
       try:
         shell.cmdloop(intro)
       except KeyboardInterrupt:
-        intro = '\n'
+        print_to_stderr('^C')
       # A last measure against any exceptions thrown by an rpc
       # not caught in the shell
       except socket.error, (code, e):

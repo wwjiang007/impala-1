@@ -60,7 +60,7 @@ class KrpcDataStreamSender : public DataSink {
   /// per-channel's accumulating row batch before it will be sent.
   /// NOTE: supported partition types are UNPARTITIONED (broadcast), HASH_PARTITIONED,
   /// and RANDOM.
-  KrpcDataStreamSender(int sender_id, const RowDescriptor* row_desc,
+  KrpcDataStreamSender(TDataSinkId sink_id, int sender_id, const RowDescriptor* row_desc,
       const TDataStreamSink& tsink,
       const std::vector<TPlanFragmentDestination>& destinations,
       int per_channel_buffer_size, RuntimeState* state);
@@ -95,6 +95,9 @@ class KrpcDataStreamSender : public DataSink {
   /// Shutdown all existing channels to destination hosts. Further FlushFinal() calls are
   /// illegal after calling Close().
   virtual void Close(RuntimeState* state) override;
+
+  /// Counters shared with other parts of the code
+  static const char* TOTAL_BYTES_SENT_COUNTER;
 
  protected:
   friend class DataStreamTest;

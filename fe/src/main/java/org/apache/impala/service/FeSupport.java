@@ -24,7 +24,6 @@ import java.util.Set;
 
 import org.apache.impala.analysis.BoolLiteral;
 import org.apache.impala.analysis.Expr;
-import org.apache.impala.analysis.NullLiteral;
 import org.apache.impala.analysis.SlotRef;
 import org.apache.impala.analysis.TableName;
 import org.apache.impala.common.InternalException;
@@ -39,6 +38,7 @@ import org.apache.impala.thrift.TErrorCode;
 import org.apache.impala.thrift.TExprBatch;
 import org.apache.impala.thrift.TGetPartitionStatsRequest;
 import org.apache.impala.thrift.TGetPartitionStatsResponse;
+import org.apache.impala.thrift.TParseDateStringResult;
 import org.apache.impala.thrift.TPrioritizeLoadRequest;
 import org.apache.impala.thrift.TPrioritizeLoadResponse;
 import org.apache.impala.thrift.TQueryCtx;
@@ -47,7 +47,6 @@ import org.apache.impala.thrift.TResultRow;
 import org.apache.impala.thrift.TSymbolLookupParams;
 import org.apache.impala.thrift.TSymbolLookupResult;
 import org.apache.impala.thrift.TTable;
-import org.apache.impala.thrift.TUniqueId;
 import org.apache.impala.util.NativeLibUtil;
 import org.apache.thrift.TDeserializer;
 import org.apache.thrift.TException;
@@ -77,7 +76,7 @@ public class FeSupport {
 
   // Returns a serialized TResultRow
   public native static byte[] NativeEvalExprsWithoutRow(
-      byte[] thriftExprBatch, byte[] thriftQueryGlobals);
+      byte[] thriftExprBatch, byte[] thriftQueryGlobals, long maxResultSize);
 
   // Returns a serialized TSymbolLookupResult
   public native static byte[] NativeLookupSymbol(byte[] thriftSymbolLookup);
@@ -116,6 +115,9 @@ public class FeSupport {
 
   public native static byte[] NativeUpdateTableUsage(byte[] thriftReq);
 
+  // Does an RPC to the Catalog Server to check if the given user is a Sentry admin.
+  public native static byte[] NativeSentryAdminCheck(byte[] thriftReq);
+
   // Parses a string of comma-separated key=value query options ('csvQueryOptions'),
   // updates the existing query options ('queryOptions') with them and returns the
   // resulting serialized TQueryOptions object.
@@ -129,6 +131,11 @@ public class FeSupport {
       byte[] queryOptions);
 
   public native static int MinLogSpaceForBloomFilter(long ndv, double fpp);
+
+  // Parses date string, verifies if it is valid and returns the resulting
+  // TParseDateStringResult object. Different date string variations are accepted.
+  // E.g.: '2011-01-01', '2011-01-1', '2011-1-01', '2011-01-01'.
+  public native static byte[] nativeParseDateString(String date);
 
   /**
    * Locally caches the jar at the specified HDFS location.
@@ -165,16 +172,27 @@ public class FeSupport {
     return NativeCacheJar(thriftParams);
   }
 
+  /**
+   * If it is known that the size of the evaluated expression is fixed, e.g.,
+   * the size of an integer, then this method will be called to perform the evaluation.
+   * Otherwise, the method EvalExprWithoutRowBounded that takes an additional argument
+   * specifying the upper bound on the size of evaluated expression should be invoked.
+   */
   public static TColumnValue EvalExprWithoutRow(Expr expr, TQueryCtx queryCtx)
-      throws InternalException {
+    throws InternalException {
+    return EvalExprWithoutRowBounded(expr, queryCtx, 0);
+  }
+
+  public static TColumnValue EvalExprWithoutRowBounded(Expr expr, TQueryCtx queryCtx,
+    int maxResultSize) throws InternalException {
     Preconditions.checkState(!expr.contains(SlotRef.class));
     TExprBatch exprBatch = new TExprBatch();
     exprBatch.addToExprs(expr.treeToThrift());
     TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
     byte[] result;
     try {
-      result = EvalExprsWithoutRow(
-          serializer.serialize(exprBatch), serializer.serialize(queryCtx));
+      result = EvalExprsWithoutRowBounded(
+          serializer.serialize(exprBatch), serializer.serialize(queryCtx), maxResultSize);
       Preconditions.checkNotNull(result);
       TDeserializer deserializer = new TDeserializer(new TBinaryProtocol.Factory());
       TResultRow val = new TResultRow();
@@ -215,21 +233,33 @@ public class FeSupport {
     }
   }
 
+  /**
+   * If it is known that the size of the evaluated expression is fixed, e.g.,
+   * the size of an integer, then this method will be called to perform the evaluation.
+   * Otherwise, the method EvalExprsWithoutRowBounded that takes an additional argument
+   * specifying the upper bound on the size of rewritten expression should be invoked.
+   */
   private static byte[] EvalExprsWithoutRow(
       byte[] thriftExprBatch, byte[] thriftQueryContext) {
+    return EvalExprsWithoutRowBounded(thriftExprBatch, thriftQueryContext, 0);
+  }
+
+  private static byte[] EvalExprsWithoutRowBounded(
+      byte[] thriftExprBatch, byte[] thriftQueryContext, int maxResultSize) {
     try {
-      return NativeEvalExprsWithoutRow(thriftExprBatch, thriftQueryContext);
+      return NativeEvalExprsWithoutRow(thriftExprBatch, thriftQueryContext,
+        maxResultSize);
     } catch (UnsatisfiedLinkError e) {
       loadLibrary();
     }
-    return NativeEvalExprsWithoutRow(thriftExprBatch, thriftQueryContext);
+    return NativeEvalExprsWithoutRow(thriftExprBatch, thriftQueryContext, maxResultSize);
   }
 
   public static boolean EvalPredicate(Expr pred, TQueryCtx queryCtx)
       throws InternalException {
     // Shortcuts to avoid expensive BE evaluation.
     if (pred instanceof BoolLiteral) return ((BoolLiteral) pred).getValue();
-    if (pred instanceof NullLiteral) return false;
+    if (Expr.IS_NULL_LITERAL.apply(pred)) return false;
     Preconditions.checkState(pred.getType().isBoolean());
     TColumnValue val = EvalExprWithoutRow(pred, queryCtx);
     // Return false if pred evaluated to false or NULL. True otherwise.
@@ -246,7 +276,7 @@ public class FeSupport {
    * exprs. In the future, we can extend it to support arbitrary exprs without
    * SlotRefs.
    */
-  public static TResultRow EvalPredicateBatch(ArrayList<Expr> exprs,
+  public static TResultRow EvalPredicateBatch(List<Expr> exprs,
       TQueryCtx queryCtx) throws InternalException {
     TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
     TExprBatch exprBatch = new TExprBatch();
@@ -414,6 +444,43 @@ public class FeSupport {
     return NativeGetPartialCatalogObject(thriftReq);
   }
 
+  public static byte[] CheckSentryAdmin(byte[] thriftReq) {
+    try {
+      return NativeSentryAdminCheck(thriftReq);
+    } catch (UnsatisfiedLinkError e) {
+      loadLibrary();
+    }
+    return NativeSentryAdminCheck(thriftReq);
+  }
+
+  private static byte[] parseDateStringUtil(String date) {
+    try {
+      return nativeParseDateString(date);
+    } catch (UnsatisfiedLinkError e) {
+      loadLibrary();
+    }
+    return nativeParseDateString(date);
+  }
+
+  /**
+   * Parses date string, verifies if it is valid and returns the resulting
+   * TParseDateStringResult object. Different date string variations are accepted.
+   * E.g.: '2011-01-01', '2011-01-1', '2011-1-01', '2011-01-01'.
+   */
+  public static TParseDateStringResult parseDateString(String date)
+      throws InternalException {
+    Preconditions.checkNotNull(date);
+    try {
+      byte[] result = parseDateStringUtil(date);
+      Preconditions.checkNotNull(result);
+      TDeserializer deserializer = new TDeserializer(new TBinaryProtocol.Factory());
+      TParseDateStringResult res = new TParseDateStringResult();
+      deserializer.deserialize(res, result);
+      return res;
+    } catch (TException e) {
+      throw new InternalException("Could not parse date string: " + e.getMessage(), e);
+    }
+  }
 
   /**
    * This function should be called explicitly by the FeSupport to ensure that

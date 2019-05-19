@@ -27,17 +27,6 @@
 #include "gen-cpp/Frontend_types.h"
 #include "gutil/macros.h"
 
-#define THROW_IF_ERROR_WITH_LOGGING(stmt, env, adaptor) \
-  do { \
-    const Status& _status = (stmt); \
-    if (!_status.ok()) { \
-      (adaptor)->WriteErrorLog(); \
-      (adaptor)->WriteFileErrors(); \
-      (env)->ThrowNew((adaptor)->impala_exc_cl(), _status.GetDetail().c_str()); \
-      return; \
-    } \
-  } while (false)
-
 #define THROW_IF_ERROR(stmt, env, impala_exc_cl) \
   do { \
     const Status& _status = (stmt); \
@@ -56,57 +45,25 @@
     } \
   } while (false)
 
-#define THROW_IF_EXC(env, exc_class) \
-  do { \
-    jthrowable exc = (env)->ExceptionOccurred(); \
-    if (exc != NULL) { \
-      DCHECK((throwable_to_string_id_) != NULL); \
-      jstring stack = (jstring) env->CallStaticObjectMethod(JniUtil::jni_util_class(), \
-          (JniUtil::throwable_to_stack_trace_id()), exc); \
-      jboolean is_copy; \
-      const char* c_stack = \
-          reinterpret_cast<const char*>((env)->GetStringUTFChars(stack, &is_copy)); \
-      (env)->ExceptionClear(); \
-      (env)->ThrowNew((exc_class), c_stack); \
-      return; \
-    } \
-  } while (false)
-
-#define RETURN_IF_EXC(env) \
-  do { \
-    jthrowable exc = (env)->ExceptionOccurred(); \
-    if (exc != NULL) { \
-      jstring stack = (jstring) env->CallStaticObjectMethod(JniUtil::jni_util_class(), \
-          (JniUtil::throwable_to_stack_trace_id()), exc); \
-      jboolean is_copy; \
-      const char* c_stack = \
-          reinterpret_cast<const char*>((env)->GetStringUTFChars(stack, &is_copy)); \
-      VLOG(1) << string(c_stack); \
-      return; \
-    } \
-  } while (false)
-
-#define EXIT_IF_EXC(env) \
-  do { \
-    jthrowable exc = (env)->ExceptionOccurred(); \
-    if (exc != NULL) { \
-      jstring stack = (jstring) env->CallStaticObjectMethod(JniUtil::jni_util_class(), \
-          (JniUtil::throwable_to_stack_trace_id()), exc); \
-      jboolean is_copy; \
-      const char* c_stack = \
-          reinterpret_cast<const char*>((env)->GetStringUTFChars(stack, &is_copy)); \
-      LOG(FATAL) << string(c_stack); \
-    } \
-  } while (false)
-
 #define RETURN_ERROR_IF_EXC(env) \
   do { \
     jthrowable exc = (env)->ExceptionOccurred(); \
-    if (exc != NULL) return JniUtil::GetJniExceptionMsg(env);\
+    if (exc != nullptr) return JniUtil::GetJniExceptionMsg(env);\
   } while (false)
 
-/// C linkage for helper functions in hdfsJniHelper.h
-extern  "C" { extern JNIEnv* getJNIEnv(void); }
+// If there's an exception in 'env', log the backtrace at FATAL level and abort the
+// process. This will generate a core dump if core dumps are enabled, so this should
+// generally only be called for internal errors where the coredump is useful for
+// diagnostics.
+#define ABORT_IF_EXC(env) do { ABORT_IF_ERROR(JniUtil::GetJniExceptionMsg(env)); } while (false)
+
+// If there's an exception in 'env', log the backtrace at ERROR level and exit the process
+// cleanly with status 1.
+#define CLEAN_EXIT_IF_EXC(env) \
+  do { \
+    Status s = JniUtil::GetJniExceptionMsg(env); \
+    if (!s.ok()) CLEAN_EXIT_WITH_ERROR(s.GetDetail()); \
+  } while (false)
 
 namespace impala {
 
@@ -118,8 +75,8 @@ class Status;
 /// the corresponding objects.
 class JniLocalFrame {
  public:
-  JniLocalFrame(): env_(NULL) {}
-  ~JniLocalFrame() { if (env_ != NULL) env_->PopLocalFrame(NULL); }
+  JniLocalFrame(): env_(nullptr) {}
+  ~JniLocalFrame() { if (env_ != nullptr) env_->PopLocalFrame(nullptr); }
 
   JniLocalFrame(JniLocalFrame&& other) noexcept
     : env_(other.env_) {
@@ -252,11 +209,7 @@ class JniCall {
   Status Call(T* result) WARN_UNUSED_RESULT;
 
  private:
-  explicit JniCall(jmethodID method)
-    : method_(method),
-      env_(getJNIEnv()) {
-    status_ = frame_.push(env_);
-  }
+  explicit JniCall(jmethodID method);
 
   explicit JniCall(jmethodID method, jclass cls) : JniCall(method) {
     class_ = DCHECK_NOTNULL(cls);
@@ -301,11 +254,18 @@ class JniCall {
 ///    to explicitly create a global reference to them.
 class JniUtil {
  public:
+  /// Init JniUtil. This should be called prior to any other calls.
+  static Status Init() WARN_UNUSED_RESULT;
+
   /// Call this prior to any libhdfs calls.
   static void InitLibhdfs();
 
-  /// Find JniUtil class, and get JniUtil.throwableToString method id
-  static Status Init() WARN_UNUSED_RESULT;
+  /// Returns the JNIEnv attached to the current thread, attaching it
+  /// if necessary. Always returns a valid non-NULL value.
+  static JNIEnv* GetJNIEnv() {
+    if (tls_env_) return tls_env_;
+    return GetJNIEnvSlowPath();
+  }
 
   /// Initializes the JvmPauseMonitor.
   static Status InitJvmPauseMonitor() WARN_UNUSED_RESULT;
@@ -418,6 +378,9 @@ class JniUtil {
       R* response) WARN_UNUSED_RESULT;
 
  private:
+  // Slow-path for GetJNIEnv, used on the first call by any thread.
+  static JNIEnv* GetJNIEnvSlowPath();
+
   // Set in Init() once the JVM is initialized.
   static bool jvm_inited_;
   static jclass jni_util_cl_;
@@ -427,6 +390,9 @@ class JniUtil {
   static jmethodID get_jvm_metrics_id_;
   static jmethodID get_jvm_threads_id_;
   static jmethodID get_jmx_json_;
+
+  // Thread-local cache of the JNIEnv for this thread.
+  static __thread JNIEnv* tls_env_;
 };
 
 /// Convert a C++ primitive to a JNI 'jvalue' union.
@@ -468,6 +434,12 @@ template <typename R>
 inline Status JniUtil::CallJniMethod(const jobject& obj, const jmethodID& method,
     R* response) {
   return JniCall::instance_method(obj, method).Call(response);
+}
+
+inline JniCall::JniCall(jmethodID method)
+  : method_(method),
+    env_(JniUtil::GetJNIEnv()) {
+  status_ = frame_.push(env_);
 }
 
 template<class T>

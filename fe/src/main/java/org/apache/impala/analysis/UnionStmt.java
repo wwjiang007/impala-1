@@ -29,7 +29,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
 
 /**
  * Representation of a union with its list of operands, and optional order by and limit.
@@ -136,12 +135,12 @@ public class UnionStmt extends QueryStmt {
 
   // filled during analyze(); contains all operands that need to go through
   // distinct aggregation
-  protected final List<UnionOperand> distinctOperands_ = Lists.newArrayList();
+  protected final List<UnionOperand> distinctOperands_ = new ArrayList<>();
 
   // filled during analyze(); contains all operands that can be aggregated with
   // a simple merge without duplicate elimination (also needs to merge the output
   // of the DISTINCT operands)
-  protected final List<UnionOperand> allOperands_ = Lists.newArrayList();
+  protected final List<UnionOperand> allOperands_ = new ArrayList<>();
 
   protected MultiAggregateInfo distinctAggInfo_; // only set if we have DISTINCT ops
 
@@ -156,13 +155,19 @@ public class UnionStmt extends QueryStmt {
 
   // List of output expressions produced by the union without the ORDER BY portion
   // (if any). Same as resultExprs_ if there is no ORDER BY.
-  private List<Expr> unionResultExprs_ = Lists.newArrayList();
+  private List<Expr> unionResultExprs_ = new ArrayList<>();
+
+  // List of expressions produced by analyzer.castToUnionCompatibleTypes().
+  // Contains a list of exprs such that for every i-th expr in that list, it is the first
+  // widest compatible expression encountered among all i-th exprs in every result expr
+  // list of the union operands.
+  protected List<Expr> widestExprs_ = new ArrayList<>();
 
   // END: Members that need to be reset()
   /////////////////////////////////////////
 
   public UnionStmt(List<UnionOperand> operands,
-      ArrayList<OrderByElement> orderByElements, LimitElement limitElement) {
+      List<OrderByElement> orderByElements, LimitElement limitElement) {
     super(orderByElements, limitElement);
     Preconditions.checkNotNull(operands);
     Preconditions.checkState(operands.size() > 0);
@@ -175,7 +180,7 @@ public class UnionStmt extends QueryStmt {
   protected UnionStmt(UnionStmt other) {
     super(other.cloneOrderByElements(),
         (other.limitElement_ == null) ? null : other.limitElement_.clone());
-    operands_ = Lists.newArrayList();
+    operands_ = new ArrayList<>();
     if (analyzer_ != null) {
       for (UnionOperand o: other.distinctOperands_) distinctOperands_.add(o.clone());
       for (UnionOperand o: other.allOperands_) allOperands_.add(o.clone());
@@ -192,6 +197,7 @@ public class UnionStmt extends QueryStmt {
     hasAnalyticExprs_ = other.hasAnalyticExprs_;
     withClause_ = (other.withClause_ != null) ? other.withClause_.clone() : null;
     unionResultExprs_ = Expr.cloneList(other.unionResultExprs_);
+    widestExprs_ = other.widestExprs_;
   }
 
   public List<UnionOperand> getOperands() { return operands_; }
@@ -238,11 +244,11 @@ public class UnionStmt extends QueryStmt {
     }
 
     // Collect all result expr lists and cast the exprs as necessary.
-    List<List<Expr>> resultExprLists = Lists.newArrayList();
+    List<List<Expr>> resultExprLists = new ArrayList<>();
     for (UnionOperand op: operands_) {
       resultExprLists.add(op.getQueryStmt().getResultExprs());
     }
-    analyzer.castToUnionCompatibleTypes(resultExprLists);
+    widestExprs_ = analyzer.castToUnionCompatibleTypes(resultExprLists);
 
     // Create tuple descriptor materialized by this UnionStmt, its resultExprs, and
     // its sortInfo if necessary.
@@ -255,7 +261,7 @@ public class UnionStmt extends QueryStmt {
     // Create distinctAggInfo, if necessary.
     if (!distinctOperands_.isEmpty()) {
       // Aggregate produces exactly the same tuple as the original union stmt.
-      ArrayList<Expr> groupingExprs = Expr.cloneList(resultExprs_);
+      List<Expr> groupingExprs = Expr.cloneList(resultExprs_);
       try {
         distinctAggInfo_ = MultiAggregateInfo.createDistinct(
             groupingExprs, analyzer.getTupleDesc(tupleId_), analyzer);
@@ -308,7 +314,7 @@ public class UnionStmt extends QueryStmt {
 
     // collect operands' result exprs
     List<SlotDescriptor> outputSlots = tupleDesc.getSlots();
-    List<Expr> exprs = Lists.newArrayList();
+    List<Expr> exprs = new ArrayList<>();
     for (int i = 0; i < outputSlots.size(); ++i) {
       SlotDescriptor slotDesc = outputSlots.get(i);
       if (!slotDesc.isMaterialized()) continue;
@@ -466,7 +472,7 @@ public class UnionStmt extends QueryStmt {
     List<Expr> firstSelectExprs = operands_.get(0).getQueryStmt().getResultExprs();
 
     // Compute column stats for the materialized slots from the source exprs.
-    List<ColumnStats> columnStats = Lists.newArrayList();
+    List<ColumnStats> columnStats = new ArrayList<>();
     for (int i = 0; i < operands_.size(); ++i) {
       List<Expr> selectExprs = operands_.get(i).getQueryStmt().getResultExprs();
       for (int j = 0; j < selectExprs.size(); ++j) {
@@ -532,7 +538,7 @@ public class UnionStmt extends QueryStmt {
   }
 
   @Override
-  public void getMaterializedTupleIds(ArrayList<TupleId> tupleIdList) {
+  public void getMaterializedTupleIds(List<TupleId> tupleIdList) {
     // Return the sort tuple if there is an evaluated order by.
     if (evaluateOrderBy_) {
       tupleIdList.add(sortInfo_.getSortTupleDescriptor().getId());
@@ -558,25 +564,25 @@ public class UnionStmt extends QueryStmt {
   }
 
   @Override
-  public String toSql(boolean rewritten) {
-    if (!rewritten && toSqlString_ != null) return toSqlString_;
+  public String toSql(ToSqlOptions options) {
+    if (!options.showRewritten() && toSqlString_ != null) return toSqlString_;
 
     StringBuilder strBuilder = new StringBuilder();
     Preconditions.checkState(operands_.size() > 0);
 
     if (withClause_ != null) {
-      strBuilder.append(withClause_.toSql(rewritten));
+      strBuilder.append(withClause_.toSql(options));
       strBuilder.append(" ");
     }
 
-    strBuilder.append(operands_.get(0).getQueryStmt().toSql(rewritten));
+    strBuilder.append(operands_.get(0).getQueryStmt().toSql(options));
     for (int i = 1; i < operands_.size() - 1; ++i) {
       strBuilder.append(" UNION " +
           ((operands_.get(i).getQualifier() == Qualifier.ALL) ? "ALL " : ""));
       if (operands_.get(i).getQueryStmt() instanceof UnionStmt) {
         strBuilder.append("(");
       }
-      strBuilder.append(operands_.get(i).getQueryStmt().toSql(rewritten));
+      strBuilder.append(operands_.get(i).getQueryStmt().toSql(options));
       if (operands_.get(i).getQueryStmt() instanceof UnionStmt) {
         strBuilder.append(")");
       }
@@ -591,21 +597,21 @@ public class UnionStmt extends QueryStmt {
             !lastQueryStmt.hasLimit() && !lastQueryStmt.hasOffset() &&
             !lastQueryStmt.hasOrderByClause())) {
       strBuilder.append("(");
-      strBuilder.append(lastQueryStmt.toSql(rewritten));
+      strBuilder.append(lastQueryStmt.toSql(options));
       strBuilder.append(")");
     } else {
-      strBuilder.append(lastQueryStmt.toSql(rewritten));
+      strBuilder.append(lastQueryStmt.toSql(options));
     }
     // Order By clause
     if (hasOrderByClause()) {
       strBuilder.append(" ORDER BY ");
       for (int i = 0; i < orderByElements_.size(); ++i) {
-        strBuilder.append(orderByElements_.get(i).toSql());
+        strBuilder.append(orderByElements_.get(i).toSql(options));
         strBuilder.append((i+1 != orderByElements_.size()) ? ", " : "");
       }
     }
     // Limit clause.
-    strBuilder.append(limitElement_.toSql());
+    strBuilder.append(limitElement_.toSql(options));
     return strBuilder.toString();
   }
 
@@ -616,6 +622,8 @@ public class UnionStmt extends QueryStmt {
   }
 
   public List<Expr> getUnionResultExprs() { return unionResultExprs_; }
+
+  public List<Expr> getWidestExprs() { return widestExprs_; }
 
   @Override
   public UnionStmt clone() { return new UnionStmt(this); }
@@ -638,5 +646,6 @@ public class UnionStmt extends QueryStmt {
     toSqlString_ = null;
     hasAnalyticExprs_ = false;
     unionResultExprs_.clear();
+    widestExprs_ = null;
   }
 }

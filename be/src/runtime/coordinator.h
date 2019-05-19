@@ -30,27 +30,27 @@
 #include "gen-cpp/Frontend_types.h"
 #include "gen-cpp/Types_types.h"
 #include "runtime/dml-exec-state.h"
+#include "util/counting-barrier.h"
 #include "util/progress-updater.h"
 #include "util/runtime-profile-counters.h"
 #include "util/spinlock.h"
 
 namespace impala {
 
-class CountingBarrier;
+class ClientRequestState;
+class FragmentInstanceState;
+class MemTracker;
 class ObjectPool;
-class RuntimeState;
-class TUpdateCatalogRequest;
-class TReportExecStatusParams;
-class TPlanExecRequest;
-class TRuntimeProfileTree;
-class RuntimeProfile;
+class PlanRootSink;
 class QueryResultSet;
 class QuerySchedule;
-class MemTracker;
-class PlanRootSink;
-class FragmentInstanceState;
 class QueryState;
-
+class ReportExecStatusRequestPB;
+class RuntimeProfile;
+class RuntimeState;
+class TPlanExecRequest;
+class TRuntimeProfileTree;
+class TUpdateCatalogRequest;
 
 /// Query coordinator: handles execution of fragment instances on remote nodes, given a
 /// TQueryExecRequest. As part of that, it handles all interactions with the executing
@@ -91,14 +91,15 @@ class QueryState;
 /// Lock ordering: (lower-numbered acquired before higher-numbered)
 /// 1. wait_lock_
 /// 2. filter_lock_
-/// 3. exec_state_lock_, backend_states_init_lock_, filter_update_lock_,
-///    ExecSummary::lock (leafs)
+/// 3. exec_state_lock_, backend_states_init_lock_, filter_update_lock_, ExecSummary::lock
+/// 4. Coordinator::BackendState::lock_ (leafs)
 ///
 /// TODO: move into separate subdirectory and move nested classes into separate files
 /// and unnest them
 class Coordinator { // NOLINT: The member variables could be re-ordered to save space
  public:
-  Coordinator(const QuerySchedule& schedule, RuntimeProfile::EventSequence* events);
+  Coordinator(ClientRequestState* parent, const QuerySchedule& schedule,
+      RuntimeProfile::EventSequence* events);
   ~Coordinator();
 
   /// Initiate asynchronous execution of a query with the given schedule. When it
@@ -127,11 +128,18 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
   /// query is still executing. Idempotent.
   void Cancel();
 
-  /// Called by the report status RPC handler to update execution status of a
-  /// particular backend as well as dml_exec_state_ and the profile. This may block if
-  /// exec RPCs are pending.
-  Status UpdateBackendExecStatus(const TReportExecStatusParams& params)
-      WARN_UNUSED_RESULT;
+  /// Called by the report status RPC handler to update execution status of a particular
+  /// backend as well as dml_exec_state_ and the profile. This may block if exec RPCs are
+  /// pending. 'request' contains details of the status update. 'thrift_profiles' contains
+  /// Thrift runtime profiles of all fragment instances from the backend.
+  Status UpdateBackendExecStatus(const ReportExecStatusRequestPB& request,
+      const TRuntimeProfileForest& thrift_profiles) WARN_UNUSED_RESULT;
+
+  /// Returns the time in ms since the latest report was received for the backend which
+  /// has gone the longest without a report being received, and sets 'address' to the host
+  /// for that backend. May return 0, for example if the backends are not initialized yet
+  /// or if all of them have already completed, in which case 'address' will not be set.
+  int64_t GetMaxBackendStateLagMs(TNetworkAddress* address);
 
   /// Get cumulative profile aggregated over all fragments of the query.
   /// This is a snapshot of the current state of execution and will change in
@@ -148,7 +156,7 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
   /// individual fragment instances are merged into a single output to retain readability.
   std::string GetErrorLog();
 
-  const ProgressUpdater& progress() { return progress_; }
+  const ProgressUpdater& progress() const { return progress_; }
 
   /// Get a copy of the current exec summary. Thread-safe.
   void GetTExecSummary(TExecSummary* exec_summary);
@@ -179,6 +187,12 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
     /// Total bytes read across all scan nodes.
     int64_t bytes_read = 0;
 
+    /// Total bytes sent by instances that did not contain a scan node.
+    int64_t exchange_bytes_sent = 0;
+
+    /// Total bytes sent by instances that contained a scan node.
+    int64_t scan_bytes_sent = 0;
+
     /// Total user cpu consumed.
     int64_t cpu_user_ns = 0;
 
@@ -190,6 +204,8 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
       peak_per_host_mem_consumption =
           std::max(peak_per_host_mem_consumption, other.peak_per_host_mem_consumption);
       bytes_read += other.bytes_read;
+      exchange_bytes_sent += other.exchange_bytes_sent;
+      scan_bytes_sent += other.scan_bytes_sent;
       cpu_user_ns += other.cpu_user_ns;
       cpu_sys_ns += other.cpu_sys_ns;
     }
@@ -199,11 +215,20 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
   /// latest status reports received from those backends).
   ResourceUtilization ComputeQueryResourceUtilization();
 
+  /// Return the backends in 'candidates' that still have at least one fragment instance
+  /// executing on them. The returned backends may not be in the same order as the input.
+  std::vector<TNetworkAddress> GetActiveBackends(
+      const std::vector<TNetworkAddress>& candidates);
+
  private:
   class BackendState;
   struct FilterTarget;
   class FilterState;
   class FragmentStats;
+
+  /// The parent ClientRequestState object for this coordinator. The reference is set in
+  /// the constructor. It always outlives the this coordinator.
+  ClientRequestState* parent_request_state_;
 
   /// owned by the ClientRequestState that owns this coordinator
   const QuerySchedule& schedule_;
@@ -250,6 +275,11 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
   /// Aggregate counters for the entire query. Lives in 'obj_pool_'. Set in Exec().
   RuntimeProfile* query_profile_ = nullptr;
 
+  /// Aggregate counters for backend host resource usage and other per-host information.
+  /// Will contain a child profile for each backend host that participates in the query
+  /// execution. Lives in 'obj_pool_'. Set in Exec().
+  RuntimeProfile* host_profiles_ = nullptr;
+
   /// Total time spent in finalization (typically 0 except for INSERT into hdfs
   /// tables). Set in Exec().
   RuntimeProfile::Counter* finalization_timer_ = nullptr;
@@ -281,6 +311,9 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
     /// A mapping of plan node ids to index into thrift_exec_summary.nodes
     boost::unordered_map<TPlanNodeId, int> node_id_to_idx_map;
 
+    /// A mapping of fragment data sink ids to index into thrift_exec_summary.nodes
+    boost::unordered_map<TPlanNodeId, int> data_sink_id_to_idx_map;
+
     void Init(const QuerySchedule& query_schedule);
   };
 
@@ -300,9 +333,8 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
   /// sequentially, without synchronization.
   std::vector<FragmentStats*> fragment_stats_;
 
-  /// Barrier that is released when all calls to BackendState::Exec() have
-  /// returned. Initialized in StartBackendExec().
-  boost::scoped_ptr<CountingBarrier> exec_rpcs_complete_barrier_;
+  /// Barrier that is released when all calls to BackendState::Exec() have returned.
+  CountingBarrier exec_rpcs_complete_barrier_;
 
   /// Barrier that is released when all backends have indicated execution completion,
   /// or when all backends are cancelled due to an execution error or client requested

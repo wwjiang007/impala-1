@@ -178,6 +178,14 @@ public class FunctionCallExpr extends Expr {
 
   public boolean isMergeAggFn() { return mergeAggInputFn_ != null; }
 
+  /**
+   *  Returns true if this is a call to an Impala builtin cast function.
+   */
+  private boolean isBuiltinCastFunction() {
+    return fnName_.isBuiltin() &&
+        fnName_.getFunction().startsWith(CastExpr.CAST_FUNCTION_PREFIX);
+  }
+
   @Override
   public void resetAnalysisState() {
     super.resetAnalysisState();
@@ -199,7 +207,7 @@ public class FunctionCallExpr extends Expr {
   }
 
   @Override
-  public String toSqlImpl() {
+  public String toSqlImpl(ToSqlOptions options) {
     if (label_ != null) return label_;
     // Merge agg fns should have an explicit label.
     Preconditions.checkState(!isMergeAggFn());
@@ -207,7 +215,7 @@ public class FunctionCallExpr extends Expr {
     sb.append(fnName_).append("(");
     if (params_.isStar()) sb.append("*");
     if (params_.isDistinct()) sb.append("DISTINCT ");
-    sb.append(Joiner.on(", ").join(childrenToSql()));
+    sb.append(Joiner.on(", ").join(childrenToSql(options)));
     if (params_.isIgnoreNulls()) sb.append(" IGNORE NULLS");
     sb.append(")");
     return sb.toString();
@@ -224,7 +232,6 @@ public class FunctionCallExpr extends Expr {
         .toString();
   }
 
-  public FunctionParams getParams() { return params_; }
   public boolean isScalarFunction() {
     Preconditions.checkNotNull(fn_);
     return fn_ instanceof ScalarFunction ;
@@ -263,16 +270,14 @@ public class FunctionCallExpr extends Expr {
     return ((AggregateFunction)fn_).ignoresDistinct();
   }
 
+  public FunctionParams getParams() { return params_; }
   public FunctionName getFnName() { return fnName_; }
   public void setIsAnalyticFnCall(boolean v) { isAnalyticFnCall_ = v; }
   public void setIsInternalFnCall(boolean v) { isInternalFnCall_ = v; }
 
   static boolean isNondeterministicBuiltinFnName(String fnName) {
-    if (fnName.equalsIgnoreCase("rand") || fnName.equalsIgnoreCase("random")
-        || fnName.equalsIgnoreCase("uuid")) {
-      return true;
-    }
-    return false;
+    return fnName.equalsIgnoreCase("rand") || fnName.equalsIgnoreCase("random") ||
+           fnName.equalsIgnoreCase("uuid");
   }
 
   /**
@@ -421,7 +426,7 @@ public class FunctionCallExpr extends Expr {
         // The second argument to these functions is the desired scale, otherwise
         // the default is 0.
         Preconditions.checkState(children_.size() == 2);
-        if (children_.get(1).isNullLiteral()) {
+        if (IS_NULL_VALUE.apply(children_.get(1))) {
           throw new AnalysisException(fnName_.getFunction() +
               "() cannot be called with a NULL second argument.");
         }
@@ -488,6 +493,11 @@ public class FunctionCallExpr extends Expr {
       throw new AnalysisException(fnName_ + "() unknown");
     }
 
+    if (isBuiltinCastFunction()) {
+      throw new AnalysisException(toSql() +
+          " is reserved for internal use only. Use 'cast(expr AS type)' instead.");
+    }
+
     if (fnName_.getFunction().equals("count") && params_.isDistinct()) {
       // Treat COUNT(DISTINCT ...) special because of how we do the rewrite.
       // There is no version of COUNT() that takes more than 1 argument but after
@@ -546,7 +556,7 @@ public class FunctionCallExpr extends Expr {
 
     if (isAggregateFunction()) {
       // subexprs must not contain aggregates
-      if (TreeNode.contains(children_, Expr.isAggregatePredicate())) {
+      if (TreeNode.contains(children_, Expr.IS_AGGREGATE)) {
         throw new AnalysisException(
             "aggregate function must not contain aggregate parameters: " + this.toSql());
       }

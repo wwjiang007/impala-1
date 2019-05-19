@@ -62,7 +62,7 @@ class ScalarExprEvaluator;
 /// and consumer. See IMPALA-4268.
 class PlanRootSink : public DataSink {
  public:
-  PlanRootSink(const RowDescriptor* row_desc, RuntimeState* state);
+  PlanRootSink(TDataSinkId sink_id, const RowDescriptor* row_desc, RuntimeState* state);
 
   /// Sends a new batch. Ownership of 'batch' remains with the sender. Blocks until the
   /// consumer has consumed 'batch' by calling GetNext().
@@ -119,9 +119,11 @@ class PlanRootSink : public DataSink {
   /// Set by GetNext() to indicate to Send() how many rows it should write to results_.
   int num_rows_requested_ = 0;
 
-  /// Writes a single row into 'result' and 'scales' by evaluating
-  /// output_expr_evals_ over 'row'.
-  void GetRowValue(TupleRow* row, std::vector<void*>* result, std::vector<int>* scales);
+  /// Updated by Send() to indicate the total number of rows produced by query execution.
+  int64_t num_rows_produced_ = 0;
+
+  /// Limit on the number of rows produced by this query, initialized by the constructor.
+  const int64_t num_rows_produced_limit_;
 };
 }
 

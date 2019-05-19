@@ -20,8 +20,9 @@
 
 #include <boost/algorithm/string.hpp>
 #include <cmath>
-#include <sstream>
 #include <iomanip>
+#include <limits>
+#include <sstream>
 
 #include "gen-cpp/RuntimeProfile_types.h"
 #include "util/cpu-info.h"
@@ -106,7 +107,7 @@ class PrettyPrinter {
       }
 
       case TUnit::TIME_S: {
-        PrintTimeMs(value * 1000, &ss);
+        PrintTimeMs(value * THOUSAND, &ss);
         break;
       }
 
@@ -129,10 +130,16 @@ class PrettyPrinter {
         break;
       }
 
-      /// TODO: Remove DOUBLE_VALUE. IMPALA-1649
       case TUnit::DOUBLE_VALUE: {
         double output = *reinterpret_cast<double*>(&value);
         ss << std::setprecision(PRECISION) << output << " ";
+        break;
+      }
+
+      // Printed as integer values
+      case TUnit::BASIS_POINTS: {
+        DCHECK_LE(value, 10000);
+        ss << (value / 100);
         break;
       }
 

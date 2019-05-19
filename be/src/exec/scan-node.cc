@@ -131,6 +131,7 @@ Status ScanNode::Prepare(RuntimeState* state) {
 void ScanNode::AddBytesReadCounters() {
   bytes_read_counter_ =
       ADD_COUNTER(runtime_profile(), BYTES_READ_COUNTER, TUnit::BYTES);
+  runtime_state()->AddBytesReadCounter(bytes_read_counter_);
   bytes_read_timeseries_counter_ = ADD_TIME_SERIES_COUNTER(runtime_profile(),
       BYTES_READ_COUNTER, bytes_read_counter_);
   total_throughput_counter_ = runtime_profile()->AddRateCounter(
@@ -161,13 +162,14 @@ void ScanNode::Close(RuntimeState* state) {
 }
 
 bool ScanNode::WaitForRuntimeFilters() {
-  int32 wait_time_ms = FLAGS_runtime_filter_wait_time_ms;
+  int32_t wait_time_ms = FLAGS_runtime_filter_wait_time_ms;
   if (runtime_state_->query_options().runtime_filter_wait_time_ms > 0) {
     wait_time_ms = runtime_state_->query_options().runtime_filter_wait_time_ms;
   }
   vector<string> arrived_filter_ids;
   vector<string> missing_filter_ids;
-  int32_t start = MonotonicMillis();
+  int32_t max_arrival_delay = 0;
+  int64_t start = MonotonicMillis();
   for (auto& ctx: filter_ctxs_) {
     string filter_id = Substitute("$0", ctx.filter->id());
     if (ctx.filter->WaitForArrival(wait_time_ms)) {
@@ -175,20 +177,24 @@ bool ScanNode::WaitForRuntimeFilters() {
     } else {
       missing_filter_ids.push_back(filter_id);
     }
+    max_arrival_delay = max(max_arrival_delay, ctx.filter->arrival_delay_ms());
   }
-  int32_t end = MonotonicMillis();
+  int64_t end = MonotonicMillis();
   const string& wait_time = PrettyPrinter::Print(end - start, TUnit::TIME_MS);
+  const string& arrival_delay = PrettyPrinter::Print(max_arrival_delay, TUnit::TIME_MS);
 
   if (arrived_filter_ids.size() == filter_ctxs_.size()) {
     runtime_profile()->AddInfoString("Runtime filters",
-        Substitute("All filters arrived. Waited $0", wait_time));
+        Substitute("All filters arrived. Waited $0. Maximum arrival delay: $1.",
+                                         wait_time, arrival_delay));
     VLOG(2) << "Filters arrived. Waited " << wait_time;
     return true;
   }
 
-  const string& filter_str = Substitute(
-      "Not all filters arrived (arrived: [$0], missing [$1]), waited for $2",
-      join(arrived_filter_ids, ", "), join(missing_filter_ids, ", "), wait_time);
+  const string& filter_str = Substitute("Not all filters arrived (arrived: [$0], missing "
+                                        "[$1]), waited for $2. Arrival delay: $3.",
+      join(arrived_filter_ids, ", "), join(missing_filter_ids, ", "), wait_time,
+      arrival_delay);
   runtime_profile()->AddInfoString("Runtime filters", filter_str);
   VLOG(2) << filter_str;
   return false;

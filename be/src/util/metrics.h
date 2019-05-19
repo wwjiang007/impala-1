@@ -26,6 +26,7 @@
 #include <boost/function.hpp>
 #include <boost/scoped_ptr.hpp>
 #include <boost/thread/locks.hpp>
+#include <gtest/gtest_prod.h> // for FRIEND_TEST
 
 #include "common/atomic.h"
 #include "common/logging.h"
@@ -225,18 +226,18 @@ class AtomicMetric : public ScalarMetric<int64_t, metric_kind_t> {
 
   /// Atomically reads the current value. May be overridden by derived classes.
   /// The default implementation just atomically loads 'value_'. Derived classes
-  /// which derive the return value from mutliple sources other than 'value_'
+  /// which derive the return value from multiple sources other than 'value_'
   /// need to take care of synchronization among sources.
   virtual int64_t GetValue() override { return value_.Load(); }
 
   /// Atomically sets the value.
   void SetValue(const int64_t& value) { value_.Store(value); }
 
-  /// Adds 'delta' to the current value atomically.
-  void Increment(int64_t delta) {
+  /// Adds 'delta' to the current value atomically and returns the new value.
+  int64_t Increment(int64_t delta) {
     DCHECK(metric_kind_t != TMetricKind::COUNTER || delta >= 0)
         << "Can't decrement value of COUNTER metric: " << this->key();
-    value_.Add(delta);
+    return value_.Add(delta);
   }
 
  protected:
@@ -247,6 +248,64 @@ class AtomicMetric : public ScalarMetric<int64_t, metric_kind_t> {
 /// We write 'Int' as a placeholder for all integer types.
 typedef class AtomicMetric<TMetricKind::GAUGE> IntGauge;
 typedef class AtomicMetric<TMetricKind::COUNTER> IntCounter;
+
+/// An AtomicMetric that keeps track of the highest value seen and the current value.
+///
+/// Implementation notes:
+/// The hwm_value_ member maintains the HWM while the current_value_ metric member
+/// maintains the current value. Note that since two separate atomics are used
+/// for maintaining the current value and HWM, they could be out of sync for a short
+/// duration. This behavior is acceptable for current use case. However, it is very
+/// important that both the hwm_value_ and current_value_ members are updated together
+/// using the interfaces from this class.
+class AtomicHighWaterMarkGauge : public ScalarMetric<int64_t, TMetricKind::GAUGE> {
+ public:
+  AtomicHighWaterMarkGauge(
+      const TMetricDef& metric_def, int64_t initial_value, IntGauge* current_value)
+    : ScalarMetric<int64_t, TMetricKind::GAUGE>(metric_def),
+      hwm_value_(initial_value),
+      current_value_(current_value) {
+    DCHECK(current_value_ != NULL && initial_value == current_value->GetValue());
+  }
+
+  ~AtomicHighWaterMarkGauge() {}
+
+  /// Returns the current high water mark value.
+  int64_t GetValue() override { return hwm_value_.Load(); }
+
+  /// Atomically sets the current value and atomically sets the high water mark value.
+  void SetValue(const int64_t& value) {
+    current_value_->SetValue(value);
+    UpdateMax(value);
+  }
+
+  /// Adds 'delta' to the current value atomically.
+  /// The hwm value is also updated atomically.
+  void Increment(int64_t delta) {
+    const int64_t new_val = current_value_->Increment(delta);
+    UpdateMax(new_val);
+  }
+
+ private:
+  FRIEND_TEST(MetricsTest, AtomicHighWaterMarkGauge);
+  friend class TmpFileMgrTest;
+
+  /// Set 'hwm_value_' to 'v' if 'v' is larger than 'hwm_value_'. The entire operation is
+  /// atomic.
+  void UpdateMax(int64_t v) {
+    while (true) {
+      int64_t old_max = hwm_value_.Load();
+      int64_t new_max = std::max(old_max, v);
+      if (new_max == old_max) break; // Avoid atomic update.
+      if (LIKELY(hwm_value_.CompareAndSwap(old_max, new_max))) break;
+    }
+  }
+
+  /// The high water mark value.
+  AtomicInt64 hwm_value_;
+  /// The metric representing the current value.
+  IntGauge* current_value_;
+};
 
 /// Gauge metric that computes the sum of several gauges.
 class SumGauge : public IntGauge {
@@ -313,7 +372,7 @@ class MetricGroup {
     M* mt = obj_pool_->Add(metric);
 
     boost::lock_guard<SpinLock> l(lock_);
-    DCHECK(metric_map_.find(metric->key_) == metric_map_.end());
+    DCHECK(metric_map_.find(metric->key_) == metric_map_.end()) << metric->key_;
     metric_map_[metric->key_] = mt;
     return mt;
   }
@@ -339,6 +398,15 @@ class MetricGroup {
   IntCounter* AddCounter(const std::string& key, const int64_t value,
       const std::string& metric_def_arg = "") {
     return RegisterMetric(new IntCounter(MetricDefs::Get(key, metric_def_arg), value));
+  }
+
+  AtomicHighWaterMarkGauge* AddHWMGauge(const std::string& key_hwm,
+      const std::string& key_curent_value, const int64_t value,
+      const std::string& metric_def_arg = "") {
+    IntGauge* current_value_metric = RegisterMetric(
+        new IntGauge(MetricDefs::Get(key_curent_value, metric_def_arg), value));
+    return RegisterMetric(new AtomicHighWaterMarkGauge(
+        MetricDefs::Get(key_hwm, metric_def_arg), value, current_value_metric));
   }
 
   /// Returns a metric by key. All MetricGroups reachable from this group are searched in
@@ -405,13 +473,13 @@ class MetricGroup {
   /// metric group, and each including a list of metrics, and a list of immediate
   /// children.  If args contains a paramater 'metric', only the json for that metric is
   /// returned.
-  void TemplateCallback(const Webserver::ArgumentMap& args,
+  void TemplateCallback(const Webserver::WebRequest& req,
       rapidjson::Document* document);
 
   /// Legacy webpage callback for CM 5.0 and earlier. Produces a flattened map of (key,
   /// value) pairs for all metrics in this hierarchy.
   /// If args contains a paramater 'metric', only the json for that metric is returned.
-  void CMCompatibleCallback(const Webserver::ArgumentMap& args,
+  void CMCompatibleCallback(const Webserver::WebRequest& req,
       rapidjson::Document* document);
 };
 

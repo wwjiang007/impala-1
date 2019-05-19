@@ -16,12 +16,11 @@
 // under the License.
 
 #include <boost/algorithm/string/join.hpp>
-
 #include <ostream>
 
 #include "common/status.h"
-#include "util/debug-util.h"
 
+#include "util/debug-util.h"
 #include "common/names.h"
 #include "gen-cpp/common.pb.h"
 #include "gen-cpp/ErrorCodes_types.h"
@@ -52,76 +51,72 @@ Status Status::CancelledInternal(const char* subsystem) {
   return Status(ErrorMsg::Init(TErrorCode::CANCELLED_INTERNALLY, subsystem));
 }
 
-Status::Status(TErrorCode::type code)
-    : msg_(new ErrorMsg(code)) {
-  VLOG(1) << msg_->msg() << "\n" << GetStackTrace();
+Status::Status(bool silent, TErrorCode::type code) : msg_(new ErrorMsg(code)) {
+  if (!silent) VLOG(1) << msg_->msg() << "\n" << GetStackTrace();
 }
 
-Status::Status(TErrorCode::type code, const ArgType& arg0)
-    : msg_(new ErrorMsg(code, arg0)) {
-  VLOG(1) << msg_->msg() << "\n" << GetStackTrace();
+Status::Status(bool silent, TErrorCode::type code, const ArgType& arg0)
+  : msg_(new ErrorMsg(code, arg0)) {
+  if (!silent) VLOG(1) << msg_->msg() << "\n" << GetStackTrace();
 }
 
-Status::Status(TErrorCode::type code, const ArgType& arg0, const ArgType& arg1)
-    : msg_(new ErrorMsg(code, arg0, arg1)) {
-  VLOG(1) << msg_->msg() << "\n" << GetStackTrace();
+Status::Status(
+    bool silent, TErrorCode::type code, const ArgType& arg0, const ArgType& arg1)
+  : msg_(new ErrorMsg(code, arg0, arg1)) {
+  if (!silent) VLOG(1) << msg_->msg() << "\n" << GetStackTrace();
 }
 
-Status::Status(TErrorCode::type code, const ArgType& arg0, const ArgType& arg1,
-    const ArgType& arg2)
-    : msg_(new ErrorMsg(code, arg0, arg1, arg2)) {
-  VLOG(1) << msg_->msg() << "\n" << GetStackTrace();
+Status::Status(bool silent, TErrorCode::type code, const ArgType& arg0,
+    const ArgType& arg1, const ArgType& arg2)
+  : msg_(new ErrorMsg(code, arg0, arg1, arg2)) {
+  if (!silent) VLOG(1) << msg_->msg() << "\n" << GetStackTrace();
 }
-Status::Status(TErrorCode::type code, const ArgType& arg0, const ArgType& arg1,
-    const ArgType& arg2, const ArgType& arg3)
-    : msg_(new ErrorMsg(code, arg0, arg1, arg2, arg3)) {
-  VLOG(1) << msg_->msg() << "\n" << GetStackTrace();
-}
-
-Status::Status(TErrorCode::type code, const ArgType& arg0, const ArgType& arg1,
-    const ArgType& arg2, const ArgType& arg3, const ArgType& arg4)
-    : msg_(new ErrorMsg(code, arg0, arg1, arg2, arg3, arg4)) {
-  VLOG(1) << msg_->msg() << "\n" << GetStackTrace();
+Status::Status(bool silent, TErrorCode::type code, const ArgType& arg0,
+    const ArgType& arg1, const ArgType& arg2, const ArgType& arg3)
+  : msg_(new ErrorMsg(code, arg0, arg1, arg2, arg3)) {
+  if (!silent) VLOG(1) << msg_->msg() << "\n" << GetStackTrace();
 }
 
-Status::Status(TErrorCode::type code, const ArgType& arg0, const ArgType& arg1,
-    const ArgType& arg2, const ArgType& arg3, const ArgType& arg4,
+Status::Status(bool silent, TErrorCode::type code, const ArgType& arg0,
+    const ArgType& arg1, const ArgType& arg2, const ArgType& arg3, const ArgType& arg4)
+  : msg_(new ErrorMsg(code, arg0, arg1, arg2, arg3, arg4)) {
+  if (!silent) VLOG(1) << msg_->msg() << "\n" << GetStackTrace();
+}
+
+Status::Status(bool silent, TErrorCode::type code, const ArgType& arg0,
+    const ArgType& arg1, const ArgType& arg2, const ArgType& arg3, const ArgType& arg4,
     const ArgType& arg5)
-    : msg_(new ErrorMsg(code, arg0, arg1, arg2, arg3, arg4, arg5)) {
-  VLOG(1) << msg_->msg() << "\n" << GetStackTrace();
+  : msg_(new ErrorMsg(code, arg0, arg1, arg2, arg3, arg4, arg5)) {
+  if (!silent) VLOG(1) << msg_->msg() << "\n" << GetStackTrace();
 }
 
-Status::Status(TErrorCode::type code, const ArgType& arg0, const ArgType& arg1,
-    const ArgType& arg2, const ArgType& arg3, const ArgType& arg4,
+Status::Status(bool silent, TErrorCode::type code, const ArgType& arg0,
+    const ArgType& arg1, const ArgType& arg2, const ArgType& arg3, const ArgType& arg4,
     const ArgType& arg5, const ArgType& arg6)
-    : msg_(new ErrorMsg(code, arg0, arg1, arg2, arg3, arg4, arg5, arg6)) {
-  VLOG(1) << msg_->msg() << "\n" << GetStackTrace();
+  : msg_(new ErrorMsg(code, arg0, arg1, arg2, arg3, arg4, arg5, arg6)) {
+  if (!silent) VLOG(1) << msg_->msg() << "\n" << GetStackTrace();
 }
 
-Status::Status(TErrorCode::type code, const ArgType& arg0, const ArgType& arg1,
-    const ArgType& arg2, const ArgType& arg3, const ArgType& arg4,
+Status::Status(bool silent, TErrorCode::type code, const ArgType& arg0,
+    const ArgType& arg1, const ArgType& arg2, const ArgType& arg3, const ArgType& arg4,
     const ArgType& arg5, const ArgType& arg6, const ArgType& arg7)
-    : msg_(new ErrorMsg(code, arg0, arg1, arg2, arg3, arg4, arg5, arg6,
-    arg7)) {
-  VLOG(1) << msg_->msg() << "\n" << GetStackTrace();
+  : msg_(new ErrorMsg(code, arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7)) {
+  if (!silent) VLOG(1) << msg_->msg() << "\n" << GetStackTrace();
 }
 
-Status::Status(TErrorCode::type code, const ArgType& arg0, const ArgType& arg1,
-    const ArgType& arg2, const ArgType& arg3, const ArgType& arg4,
-    const ArgType& arg5, const ArgType& arg6, const ArgType& arg7,
-    const ArgType& arg8)
-    : msg_(new ErrorMsg(code, arg0, arg1, arg2, arg3, arg4, arg5, arg6,
-     arg7, arg8)) {
-  VLOG(1) << msg_->msg() << "\n" << GetStackTrace();
+Status::Status(bool silent, TErrorCode::type code, const ArgType& arg0,
+    const ArgType& arg1, const ArgType& arg2, const ArgType& arg3, const ArgType& arg4,
+    const ArgType& arg5, const ArgType& arg6, const ArgType& arg7, const ArgType& arg8)
+  : msg_(new ErrorMsg(code, arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8)) {
+  if (!silent) VLOG(1) << msg_->msg() << "\n" << GetStackTrace();
 }
 
-Status::Status(TErrorCode::type code, const ArgType& arg0, const ArgType& arg1,
-    const ArgType& arg2, const ArgType& arg3, const ArgType& arg4,
-    const ArgType& arg5, const ArgType& arg6, const ArgType& arg7,
-    const ArgType& arg8, const ArgType& arg9)
-    : msg_(new ErrorMsg(code, arg0, arg1, arg2, arg3, arg4, arg5, arg6,
-    arg7, arg8, arg9)) {
-  VLOG(1) << msg_->msg() << "\n" << GetStackTrace();
+Status::Status(bool silent, TErrorCode::type code, const ArgType& arg0,
+    const ArgType& arg1, const ArgType& arg2, const ArgType& arg3, const ArgType& arg4,
+    const ArgType& arg5, const ArgType& arg6, const ArgType& arg7, const ArgType& arg8,
+    const ArgType& arg9)
+  : msg_(new ErrorMsg(code, arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9)) {
+  if (!silent) VLOG(1) << msg_->msg() << "\n" << GetStackTrace();
 }
 
 Status::Status(const string& error_msg)
@@ -164,22 +159,8 @@ Status::Status(const apache::hive::service::cli::thrift::TStatus& hs2_status)
   : msg_(
       hs2_status.statusCode
         == apache::hive::service::cli::thrift::TStatusCode::SUCCESS_STATUS ? NULL
-          : new ErrorMsg(
-              static_cast<TErrorCode::type>(hs2_status.statusCode),
+          : new ErrorMsg(HS2TStatusCodeToTErrorCode(hs2_status.statusCode),
               hs2_status.errorMessage)) {
-}
-
-Status& Status::operator=(
-    const apache::hive::service::cli::thrift::TStatus& hs2_status) {
-  delete msg_;
-  if (hs2_status.statusCode
-        == apache::hive::service::cli::thrift::TStatusCode::SUCCESS_STATUS) {
-    msg_ = NULL;
-  } else {
-    msg_ = new ErrorMsg(
-        static_cast<TErrorCode::type>(hs2_status.statusCode), hs2_status.errorMessage);
-  }
-  return *this;
 }
 
 Status Status::Expected(const ErrorMsg& error_msg) {
@@ -188,6 +169,62 @@ Status Status::Expected(const ErrorMsg& error_msg) {
 
 Status Status::Expected(const std::string& error_msg) {
   return Status(error_msg, true);
+}
+
+Status Status::Expected(TErrorCode::type code) {
+  return Status(true, code);
+}
+
+Status Status::Expected(TErrorCode::type code, const ArgType& arg0) {
+  return Status(true, code, arg0);
+}
+
+Status Status::Expected(TErrorCode::type code, const ArgType& arg0, const ArgType& arg1) {
+  return Status(true, code, arg0, arg1);
+}
+
+Status Status::Expected(TErrorCode::type code, const ArgType& arg0, const ArgType& arg1,
+    const ArgType& arg2) {
+  return Status(true, code, arg0, arg1, arg2);
+}
+
+Status Status::Expected(TErrorCode::type code, const ArgType& arg0, const ArgType& arg1,
+    const ArgType& arg2, const ArgType& arg3) {
+  return Status(true, code, arg0, arg1, arg2, arg3);
+}
+
+Status Status::Expected(TErrorCode::type code, const ArgType& arg0, const ArgType& arg1,
+    const ArgType& arg2, const ArgType& arg3, const ArgType& arg4) {
+  return Status(true, code, arg0, arg1, arg2, arg3, arg4);
+}
+
+Status Status::Expected(TErrorCode::type code, const ArgType& arg0, const ArgType& arg1,
+    const ArgType& arg2, const ArgType& arg3, const ArgType& arg4, const ArgType& arg5) {
+  return Status(true, code, arg0, arg1, arg2, arg3, arg4, arg5);
+}
+
+Status Status::Expected(TErrorCode::type code, const ArgType& arg0, const ArgType& arg1,
+    const ArgType& arg2, const ArgType& arg3, const ArgType& arg4, const ArgType& arg5,
+    const ArgType& arg6) {
+  return Status(true, code, arg0, arg1, arg2, arg3, arg4, arg5, arg6);
+}
+
+Status Status::Expected(TErrorCode::type code, const ArgType& arg0, const ArgType& arg1,
+    const ArgType& arg2, const ArgType& arg3, const ArgType& arg4, const ArgType& arg5,
+    const ArgType& arg6, const ArgType& arg7) {
+  return Status(true, code, arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7);
+}
+
+Status Status::Expected(TErrorCode::type code, const ArgType& arg0, const ArgType& arg1,
+    const ArgType& arg2, const ArgType& arg3, const ArgType& arg4, const ArgType& arg5,
+    const ArgType& arg6, const ArgType& arg7, const ArgType& arg8) {
+  return Status(true, code, arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8);
+}
+
+Status Status::Expected(TErrorCode::type code, const ArgType& arg0, const ArgType& arg1,
+    const ArgType& arg2, const ArgType& arg3, const ArgType& arg4, const ArgType& arg5,
+    const ArgType& arg6, const ArgType& arg7, const ArgType& arg8, const ArgType& arg9) {
+  return Status(true, code, arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9);
 }
 
 void Status::AddDetail(const std::string& msg) {

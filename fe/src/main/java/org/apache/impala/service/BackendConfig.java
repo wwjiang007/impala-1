@@ -23,7 +23,6 @@ import static org.apache.hadoop.fs.CommonConfigurationKeysPublic
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.security.authentication.util.KerberosName;
 import org.apache.impala.analysis.SqlScanner;
-import org.apache.impala.catalog.HdfsFileFormat;
 import org.apache.impala.thrift.TBackendGflags;
 
 import com.google.common.base.Preconditions;
@@ -46,7 +45,6 @@ public class BackendConfig {
     Preconditions.checkNotNull(cfg);
     INSTANCE = new BackendConfig(cfg);
     SqlScanner.init(cfg.getReserved_words_version());
-    HdfsFileFormat.init(cfg.isEnable_orc_scanner());
     initAuthToLocal();
   }
 
@@ -65,6 +63,7 @@ public class BackendConfig {
   }
   public int getKuduClientTimeoutMs() { return backendCfg_.kudu_operation_timeout_ms; }
 
+  public String getImpalaBuildVersion() { return backendCfg_.impala_build_version; }
   public int getImpalaLogLevel() { return backendCfg_.impala_log_lvl; }
   public int getNonImpalaJavaVlogLevel() { return backendCfg_.non_impala_java_vlog; }
   public long getSentryCatalogPollingFrequency() {
@@ -85,10 +84,6 @@ public class BackendConfig {
 
   public boolean isAuthorizedProxyGroupEnabled() {
     return !Strings.isNullOrEmpty(backendCfg_.authorized_proxy_group_config);
-  }
-
-  public boolean isAuthorizationFileSet() {
-    return !Strings.isNullOrEmpty(backendCfg_.authorization_policy_file);
   }
 
   public boolean disableCatalogDataOpsDebugOnly() {
@@ -117,6 +112,53 @@ public class BackendConfig {
 
   public int getLocalCatalogMaxFetchRetries() {
     return backendCfg_.local_catalog_max_fetch_retries;
+  }
+
+  public int getCatalogMaxParallelPartialFetchRpc() {
+    return backendCfg_.catalog_max_parallel_partial_fetch_rpc;
+  }
+
+  public long getCatalogPartialFetchRpcQueueTimeoutS() {
+    return backendCfg_.catalog_partial_fetch_rpc_queue_timeout_s;
+  }
+
+  public long getHMSPollingIntervalInSeconds() {
+    return backendCfg_.hms_event_polling_interval_s;
+  }
+
+  public boolean isOrcScannerEnabled() {
+    return backendCfg_.enable_orc_scanner;
+  }
+
+  /**
+   * Returns the value of the `authorization_factory_class` flag or `null` if
+   * the flag was not specified.
+   *
+   * @return value of the `authorization_factory_class` flag or `null` if not specified
+   */
+  public String getAuthorizationFactoryClass() {
+    final String val =  backendCfg_.getAuthorization_factory_class();
+    return "".equals(val) ? null : val;
+  }
+
+  public boolean isMtDopUnlocked() {
+    return backendCfg_.unlock_mt_dop;
+  }
+
+  public boolean recursivelyListPartitions() {
+    return backendCfg_.recursively_list_partitions;
+  }
+
+  public String getRangerServiceType() {
+    return backendCfg_.getRanger_service_type();
+  }
+
+  public String getRangerAppId() {
+    return backendCfg_.getRanger_app_id();
+  }
+
+  public String getAuthorizationProvider() {
+    return backendCfg_.getAuthorization_provider();
   }
 
   // Inits the auth_to_local configuration in the static KerberosName class.

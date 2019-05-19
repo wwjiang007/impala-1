@@ -50,6 +50,36 @@
     "key": "admission-controller.pool-max-queued.$0"
   },
   {
+    "description": "Resource Pool $0 Max Query Memory Limit",
+    "contexts": [
+      "RESOURCE_POOL"
+    ],
+    "label": "Resource Pool $0 Max Query Memory Limit",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "admission-controller.pool-max-query-mem-limit.$0"
+  },
+  {
+    "description": "Resource Pool $0 Min Query Memory Limit",
+    "contexts": [
+      "RESOURCE_POOL"
+    ],
+    "label": "Resource Pool $0 Min Query Memory Limit",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "admission-controller.pool-min-query-mem-limit.$0"
+  },
+  {
+    "description": "If false, the mem_limit query option will not be bounded by the max/min query mem limits specified for the pool",
+    "contexts": [
+      "RESOURCE_POOL"
+    ],
+    "label": "Resource Pool $0 Clamp 'MEM_LIMIT' Query Option Flag",
+    "units": "NONE",
+    "kind": "PROPERTY",
+    "key": "admission-controller.pool-clamp-mem-limit-query-option.$0"
+  },
+  {
     "description": "Resource Pool $0 Aggregate Queue Size",
     "contexts": [
       "RESOURCE_POOL"
@@ -330,16 +360,6 @@
     "key": "impala-server.backends.client-cache.total-clients"
   },
   {
-    "description": "The current size of all allocated hash tables.",
-    "contexts": [
-      "IMPALAD"
-    ],
-    "label": "Hash Tables Size",
-    "units": "BYTES",
-    "kind": "GAUGE",
-    "key": "impala-server.hash-table.total-bytes"
-  },
-  {
     "description": "The total number of bytes read by the IO manager.",
     "contexts": [
       "IMPALAD"
@@ -378,6 +398,46 @@
     "units": "BYTES",
     "kind": "COUNTER",
     "key": "impala-server.io-mgr.local-bytes-read"
+  },
+  {
+    "description": "Total number of bytes of hits in the remote data cache.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Remote Data Cache Hit In Bytes",
+    "units": "BYTES",
+    "kind": "COUNTER",
+    "key": "impala-server.io-mgr.remote-data-cache-hit-bytes"
+  },
+  {
+    "description": "Total number of bytes of misses in the remote data cache.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Remote Data Cache Miss In Bytes",
+    "units": "BYTES",
+    "kind": "COUNTER",
+    "key": "impala-server.io-mgr.remote-data-cache-miss-bytes"
+  },
+  {
+    "description": "Current byte size of the remote data cache.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Remote Data Cache Bytes Size",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "impala-server.io-mgr.remote-data-cache-total-bytes"
+  },
+  {
+    "description": "Total number of bytes not inserted in remote data cache due to concurrency limit.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Remote Data Cache Bytes Not Inserted Due To Concurrency limit",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "impala-server.io-mgr.remote-data-cache-dropped-bytes"
   },
   {
     "description": "The number of allocated IO buffers. IO buffers are shared by all queries.",
@@ -430,16 +490,6 @@
     "key": "impala-server.io-mgr.total-bytes"
   },
   {
-    "description": "The current size of the memory pool shared by all queries",
-    "contexts": [
-      "IMPALAD"
-    ],
-    "label": "Memory Pool Size",
-    "units": "BYTES",
-    "kind": "GAUGE",
-    "key": "impala-server.mem-pool.total-bytes"
-  },
-  {
     "description": "The number of HDFS files currently open for writing.",
     "contexts": [
       "IMPALAD"
@@ -450,21 +500,41 @@
     "key": "impala-server.num-files-open-for-insert"
   },
   {
+    "description": "The total number of queries that executed on this backend over the life of the process.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Queries Executed On Backend",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "impala-server.backend-num-queries-executed"
+  },
+  {
+    "description": "The number of queries currently executing on this backend.",
+    "contexts": [
+        "IMPALAD"
+    ],
+    "label": "Queries Executing On Backend",
+    "units": "UNIT",
+    "kind": "GAUGE",
+    "key": "impala-server.backend-num-queries-executing"
+  },
+  {
     "description": "The total number of query fragments processed over the life of the process.",
     "contexts": [
       "IMPALAD"
     ],
-    "label": "Query Fragments",
+    "label": "Query Fragment Instances",
     "units": "UNIT",
     "kind": "COUNTER",
     "key": "impala-server.num-fragments"
   },
   {
-    "description": "The number of query fragments currently executing.",
+    "description": "The number of query fragment instances currently executing.",
     "contexts": [
         "IMPALAD"
     ],
-    "label": "Query Fragments",
+    "label": "Query Fragment Instances Executing",
     "units": "UNIT",
     "kind": "GAUGE",
     "key": "impala-server.num-fragments-in-flight"
@@ -662,6 +732,16 @@
     "key": "impala.thrift-server.CatalogService.connection-setup-queue-size"
   },
   {
+    "description": "The number of connection requests to the Catalog Service that have been timed out waiting to be setup.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Catalog Service Connection Requests Timed Out",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "impala.thrift-server.CatalogService.timedout-cnxn-requests"
+  },
+  {
     "description": "The number of active connections to this StateStore's StateStore service.",
     "contexts": [
       "STATESTORE"
@@ -690,6 +770,16 @@
     "units": "NONE",
     "kind": "GAUGE",
     "key": "impala.thrift-server.StatestoreService.connection-setup-queue-size"
+  },
+  {
+    "description": "The number of connection requests to the Statestore Service that have been timed out waiting to be setup.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Statestore Service Connection Requests Timed Out",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "impala.thrift-server.StatestoreService.timedout-cnxn-requests"
   },
   {
     "description": "The number of active Impala Backend client connections to this Impala Daemon.",
@@ -722,6 +812,16 @@
     "key": "impala.thrift-server.backend.connection-setup-queue-size"
   },
   {
+    "description": "The number of connection requests to the Impala Backend Server that have been timed out waiting to be setup.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Backend Server Connection Requests Timed Out",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "impala.thrift-server.backend.timedout-cnxn-requests"
+  },
+  {
     "description": "The number of active Beeswax API connections to this Impala Daemon.",
     "contexts": [
       "IMPALAD"
@@ -752,6 +852,16 @@
     "key": "impala.thrift-server.beeswax-frontend.connection-setup-queue-size"
   },
   {
+    "description": "The number of Beeswax API connection requests to this Impala Daemon that have been timed out waiting to be setup.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Beeswax API Connection Requests Timed Out",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "impala.thrift-server.beeswax-frontend.timedout-cnxn-requests"
+  },
+  {
     "description": "The number of active HiveServer2 API connections to this Impala Daemon.",
     "contexts": [
       "IMPALAD"
@@ -780,6 +890,16 @@
     "units": "NONE",
     "kind": "GAUGE",
     "key": "impala.thrift-server.hiveserver2-frontend.connection-setup-queue-size"
+  },
+  {
+    "description": "The number of HiveServer2 API connection requests to this Impala Daemon that have been timed out waiting to be setup.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "HiveServer2 API Connection Requests Timed Out",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "impala.thrift-server.hiveserver2-frontend.timedout-cnxn-requests"
   },
   {
     "description": "The amount of memory freed by the last memory tracker garbage collection.",
@@ -1297,6 +1417,86 @@
     "key": "buffer-pool.clean-page-bytes"
   },
   {
+    "description": "Total time the buffer pool spent in the system allocator for this arena.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Buffer Pool System Allocation Time.",
+    "units": "TIME_NS",
+    "kind": "COUNTER",
+    "key": "buffer-pool.$0.system-alloc-time"
+  },
+  {
+    "description": "Number of times a free buffer was recycled from this core's arena to fulfil an allocation.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Buffer Pool Local Arena Free Buffer Hit Count.",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "buffer-pool.$0.local-arena-free-buffer-hits"
+  },
+  {
+    "description": "Number of times a new buffer was directly allocated from the system allocator to fulfil an allocation.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Buffer Pool Direct Allocation Count.",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "buffer-pool.$0.direct-alloc-count"
+  },
+  {
+    "description": "Statistics for buffer sizes allocated from the system. Only a subset of allocations are counted in this metric to reduce overhead.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Buffer Pool Allocated Buffer Sizes.",
+    "units": "BYTES",
+    "kind": "HISTOGRAM",
+    "key": "buffer-pool.$0.allocated-buffer-sizes"
+  },
+  {
+    "description": "Number of times that a recycled buffer within the same NUMA node was used to fulfil an allocation.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Buffer Pool Numa Free Buffer Hits.",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "buffer-pool.$0.numa-arena-free-buffer-hits"
+  },
+  {
+    "description": "Number of times a clean page was evicted to fulfil an allocation.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Buffer Pool Clean Page Hits.",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "buffer-pool.$0.clean-page-hits"
+  },
+  {
+    "description": "Number of times the allocator had to scavenge to fulfil an allocation.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Buffer Pool Scavenge Count.",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "buffer-pool.$0.num-scavenges"
+  },
+  {
+    "description": "Number of times the allocator had to lock all arenas and scavenge to fulfil an allocation.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Buffer Pool Final Scavenge Count.",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "buffer-pool.$0.num-final-scavenges"
+  },
+  {
     "description": "Total memory currently used by TCMalloc and buffer pool.",
     "contexts": [
       "STATESTORE",
@@ -1660,6 +1860,26 @@
     "key": "tmp-file-mgr.active-scratch-dirs.list"
   },
   {
+    "description": "The current total spilled bytes across all scratch directories.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Spilled bytes for scratch directories",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "tmp-file-mgr.scratch-space-bytes-used"
+  },
+  {
+    "description": "The high water mark for spilled bytes across all scratch directories.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Spilled bytes HWM for scratch directories",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "tmp-file-mgr.scratch-space-bytes-used-high-water-mark"
+  },
+  {
     "description": "Number of senders waiting for receiving fragment to initialize",
     "contexts": [
       "IMPALAD"
@@ -1860,5 +2080,95 @@
     "units": "TIME_NS",
     "kind": "COUNTER",
     "key": "catalog.cache.total-load-time"
+  },
+  {
+    "description": "RPC queue length for partial object fetches.",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "RPC queue length for partial object fetch requests.",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "catalog.partial-fetch-rpc.queue-len"
+  },
+  {
+    "description": "Metastore event processor status",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "The status of Metastore event processor",
+    "units": "NONE",
+    "kind": "PROPERTY",
+    "key": "events-processor.status"
+  },
+  {
+    "description": "Total number of metastore events received",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Total number of metastore events received",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "events-processor.events-received"
+  },
+  {
+    "description": "Total number of metastore events skipped",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Total number of metastore events skipped",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "events-processor.events-skipped"
+  },
+  {
+    "description": "Average time taken to fetch a batch of metastore events",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Average duration to fetch metastore events",
+    "units": "TIME_S",
+    "kind": "GAUGE",
+    "key": "events-processor.avg-events-fetch-duration"
+  },
+  {
+    "description": "Average time taken to process a batch of events received from metastore",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Average duration to process a batch of metastore events",
+    "units": "TIME_S",
+    "kind": "GAUGE",
+    "key": "events-processor.avg-events-process-duration"
+  },
+  {
+    "description": "Exponentially weighted moving average (EWMA) of number of events received in last 1 min",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "EWMA of events received in last 1 min",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "events-processor.events-received-1min-rate"
+  },
+  {
+    "description": "Exponentially weighted moving average (EWMA) of number of events received in last 5 min",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "EWMA of number of events received in last 5 min",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "events-processor.events-received-5min-rate"
+  },
+  {
+    "description": "Exponentially weighted moving average (EWMA) of number of events received in last 15 min",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "EWMA of number of events received in last 15 min",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "events-processor.events-received-15min-rate"
   }
 ]

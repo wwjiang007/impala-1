@@ -21,67 +21,94 @@ import com.google.common.base.Preconditions;
 
 /**
  * Class that helps build PrivilegeRequest objects.
- * For example:
- * PrivilegeRequestBuilder builder = new PrivilegeRequestBuilder();
- * PrivilegeRequest = builder.allOf(Privilege.SELECT).onTable("db", "tbl").toRequest();
  *
- * TODO: In the future, this class could be extended to provide the option to specify
- * multiple permissions. For example:
- * builder.allOf(SELECT, INSERT).onTable(..);
- * It could also be extended to support an "anyOf" to check if the user has any of the
- * permissions specified:
- * builder.anyOf(SELECT, INSERT).onTable(...);
+ * For example:
+ * PrivilegeRequestBuilder builder = new PrivilegeRequestBuilder(
+ *     new AuthorizableFactory(AuthorizationProvider.SENTRY));
+ * PrivilegeRequest = builder.allOf(Privilege.SELECT).onTable("db", "tbl").build();
  */
 public class PrivilegeRequestBuilder {
-  Authorizeable authorizeable_;
-  Privilege privilege_;
-  boolean grantOption_ = false;
+  private final AuthorizableFactory authzFactory_;
+  private Authorizable authorizable_;
+  private Privilege privilege_;
+  private boolean grantOption_ = false;
+
+  public PrivilegeRequestBuilder(AuthorizableFactory authzFactory) {
+    Preconditions.checkNotNull(authzFactory);
+    authzFactory_ = authzFactory;
+  }
 
   /**
-   * Sets the authorizeable object to be a column.
+   * Sets the authorizable object to be a function.
+   */
+  public PrivilegeRequestBuilder onFunction(String dbName, String fnName) {
+    Preconditions.checkState(authorizable_ == null);
+    authorizable_ = authzFactory_.newFunction(dbName, fnName);
+    return this;
+  }
+
+  /**
+   * Sets the authorizable object to be a URI.
+   */
+  public PrivilegeRequestBuilder onUri(String uriName) {
+    Preconditions.checkState(authorizable_ == null);
+    authorizable_ = authzFactory_.newUri(uriName);
+    return this;
+  }
+
+  /**
+   * Sets the authorizable object to be a column.
    */
   public PrivilegeRequestBuilder onColumn(String dbName, String tableName,
       String columnName) {
-    authorizeable_ = new AuthorizeableColumn(dbName, tableName, columnName);
+    Preconditions.checkState(authorizable_ == null);
+    authorizable_ = authzFactory_.newColumn(dbName, tableName, columnName);
     return this;
   }
 
   /**
-   * Sets the authorizeable object to be a table.
+   * Sets the authorizable object to be a table.
    */
   public PrivilegeRequestBuilder onTable(String dbName, String tableName) {
-    authorizeable_ = new AuthorizeableTable(dbName, tableName);
+    Preconditions.checkState(authorizable_ == null);
+    authorizable_ = authzFactory_.newTable(dbName, tableName);
     return this;
   }
 
   /**
-   * Sets the authorizeable object to be a server.
+   * Sets the authorizable object to be a server.
    */
   public PrivilegeRequestBuilder onServer(String serverName) {
-    authorizeable_ = new AuthorizeableServer(serverName);
+    Preconditions.checkState(authorizable_ == null);
+    authorizable_ = authzFactory_.newServer(serverName);
     return this;
   }
 
   /**
-   * Sets the authorizeable object to be a database.
+   * Sets the authorizable object to be a database.
    */
   public PrivilegeRequestBuilder onDb(String dbName) {
-    authorizeable_ = new AuthorizeableDb(dbName);
+    Preconditions.checkState(authorizable_ == null);
+    authorizable_ = authzFactory_.newDatabase(dbName);
     return this;
-  }
-
-  /**
-   * Specifies that permissions on any table in the given database.
-   */
-  public PrivilegeRequestBuilder onAnyTable(String dbName) {
-    return onTable(dbName, AuthorizeableTable.ANY_TABLE_NAME);
   }
 
   /**
    * Specifies that permissions on any column in the given table.
    */
   public PrivilegeRequestBuilder onAnyColumn(String dbName, String tableName) {
-    return onColumn(dbName, tableName, AuthorizeableColumn.ANY_COLUMN_NAME);
+    Preconditions.checkState(authorizable_ == null);
+    authorizable_ = authzFactory_.newColumn(dbName, tableName);
+    return this;
+  }
+
+  /**
+   * Specifies that permissions on any column in any table.
+   */
+  public PrivilegeRequestBuilder onAnyColumn(String dbName) {
+    Preconditions.checkState(authorizable_ == null);
+    authorizable_ = authzFactory_.newColumn(dbName);
+    return this;
   }
 
   /**
@@ -117,12 +144,12 @@ public class PrivilegeRequestBuilder {
   }
 
   /**
-   * Builds a PrivilegeRequest object based on the current Authorizeable object
+   * Builds a PrivilegeRequest object based on the current Authorizable object
    * and privilege settings.
    */
-  public PrivilegeRequest toRequest() {
-    Preconditions.checkNotNull(authorizeable_);
+  public PrivilegeRequest build() {
+    Preconditions.checkNotNull(authorizable_);
     Preconditions.checkNotNull(privilege_);
-    return new PrivilegeRequest(authorizeable_, privilege_, grantOption_);
+    return new PrivilegeRequest(authorizable_, privilege_, grantOption_);
   }
 }

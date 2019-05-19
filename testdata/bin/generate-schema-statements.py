@@ -119,7 +119,7 @@ parser.add_option("--hive_warehouse_dir", dest="hive_warehouse_dir",
                   default="/test-warehouse",
                   help="The HDFS path to the base Hive test warehouse directory")
 parser.add_option("-w", "--workload", dest="workload",
-                  help="The workload to generate schema for: tpch, hive-benchmark, ...")
+                  help="The workload to generate schema for: tpch, tpcds, ...")
 parser.add_option("-s", "--scale_factor", dest="scale_factor", default="",
                   help="An optional scale factor to generate the schema for")
 parser.add_option("-f", "--force_reload", dest="force_reload", action="store_true",
@@ -281,12 +281,7 @@ def build_table_template(file_format, columns, partition_columns, row_format,
     assert not partitioned_by, "Kudu table shouldn't have partition cols defined"
     partitioned_by = "partition by hash partitions 3"
 
-    # Fetch KUDU host and port from environment
-    kudu_master = os.getenv("KUDU_MASTER_HOSTS", "127.0.0.1")
-    kudu_master_port = os.getenv("KUDU_MASTER_PORT", "7051")
     row_format_stmt = str()
-    tblproperties["kudu.master_addresses"] = \
-      "{0}:{1}".format(kudu_master, kudu_master_port)
     primary_keys_clause = ", PRIMARY KEY (%s)" % columns.split("\n")[0].split(" ")[0]
     # Kudu's test tables are managed.
     external = ""
@@ -390,8 +385,11 @@ def avro_schema(columns):
       type = {"type": "bytes", "logicalType": "decimal", "precision": precision,
               "scale": scale}
     else:
-      hive_type = column_spec.split()[1]
-      type = HIVE_TO_AVRO_TYPE_MAP[hive_type.upper()]
+      hive_type = column_spec.split()[1].upper()
+      if hive_type.startswith('CHAR(') or hive_type.startswith('VARCHAR('):
+        type = 'string'
+      else:
+        type = HIVE_TO_AVRO_TYPE_MAP[hive_type]
 
     record["fields"].append(
       {'name': name,
@@ -624,15 +622,12 @@ def generate_statements(output_name, test_vectors, sections,
           file_format == 'kudu'
 
       hdfs_location = '{0}.{1}{2}'.format(db_name, table_name, db_suffix)
-      # hdfs file names for hive-benchmark and functional datasets are stored
+      # hdfs file names for functional datasets are stored
       # directly under /test-warehouse
       # TODO: We should not need to specify the hdfs file path in the schema file.
       # This needs to be done programmatically.
-      if data_set in ['hive-benchmark', 'functional']:
+      if data_set == 'functional':
         hdfs_location = hdfs_location.split('.')[-1]
-      # hive does not allow hyphenated table names.
-      if data_set == 'hive-benchmark':
-        db_name = '{0}{1}'.format('hivebenchmark', options.scale_factor)
       data_path = os.path.join(options.hive_warehouse_dir, hdfs_location)
 
       # Empty tables (tables with no "LOAD" sections) are assumed to be used for insert

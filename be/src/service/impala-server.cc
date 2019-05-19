@@ -43,10 +43,12 @@
 #include "catalog/catalog-server.h"
 #include "catalog/catalog-util.h"
 #include "common/logging.h"
+#include "common/thread-debug-info.h"
 #include "common/version.h"
 #include "exec/external-data-source-executor.h"
 #include "exprs/timezone_db.h"
 #include "gen-cpp/CatalogService_constants.h"
+#include "kudu/util/random_util.h"
 #include "rpc/authentication.h"
 #include "rpc/rpc-trace.h"
 #include "rpc/thrift-thread.h"
@@ -55,11 +57,12 @@
 #include "runtime/coordinator.h"
 #include "runtime/exec-env.h"
 #include "runtime/lib-cache.h"
-#include "runtime/mem-tracker.h"
 #include "runtime/timestamp-value.h"
 #include "runtime/timestamp-value.inline.h"
 #include "runtime/tmp-file-mgr.h"
+#include "scheduling/admission-controller.h"
 #include "scheduling/scheduler.h"
+#include "service/cancellation-work.h"
 #include "service/impala-http-handler.h"
 #include "service/impala-internal-service.h"
 #include "service/client-request-state.h"
@@ -103,6 +106,7 @@ using boost::get_system_time;
 using boost::system_time;
 using boost::uuids::random_generator;
 using boost::uuids::uuid;
+using kudu::GetRandomSeed32;
 using namespace apache::hive::service::cli::thrift;
 using namespace apache::thrift;
 using namespace apache::thrift::transport;
@@ -205,6 +209,17 @@ DEFINE_int32(idle_query_timeout, 0, "The time, in seconds, that a query may be i
     "QUERY_TIMEOUT_S overrides this setting, but, if set, --idle_query_timeout represents"
     " the maximum allowable timeout.");
 
+DEFINE_int32(status_report_interval_ms, 5000, "(Advanced) Interval between profile "
+    "reports in milliseconds. If set to <= 0, periodic reporting is disabled and only "
+    "the final report is sent.");
+DEFINE_int32(status_report_max_retry_s, 600, "(Advanced) Max amount of time in seconds "
+    "for a backend to attempt to send a status report before cancelling. This must be > "
+    "--status_report_interval_ms. Effective only if --status_report_interval_ms > 0.");
+DEFINE_int32(status_report_cancellation_padding, 20, "(Advanced) The coordinator will "
+    "wait --status_report_max_retry_s * (1 + --status_report_cancellation_padding / 100) "
+    "without receiving a status report before deciding that a backend is unresponsive "
+    "and the query should be cancelled. This must be > 0.");
+
 DEFINE_bool(is_coordinator, true, "If true, this Impala daemon can accept and coordinate "
     "queries from clients. If false, it will refuse client connections.");
 DEFINE_bool(is_executor, true, "If true, this Impala daemon will execute query "
@@ -223,11 +238,23 @@ DEFINE_int64(shutdown_deadline_s, 60 * 60, "Default time limit in seconds for th
     "down process. If this duration elapses after the shut down process is started, "
     "the daemon shuts down regardless of any running queries.");
 
+DEFINE_int64_hidden(failed_backends_query_cancellation_grace_period_ms, 30000L,
+    "Grace period since last successful subscriber registration that impala server is "
+    "willing to wait before initiating cancellation of queries running on backends not "
+    "included in the latest membership update. This value should be large enough to give "
+    "the statestore enough time to get a consistent view of cluster membership after "
+    "recovery.");
+
 #ifndef NDEBUG
   DEFINE_int64(stress_metadata_loading_pause_injection_ms, 0, "Simulates metadata loading"
       "for a given query by injecting a sleep equivalent to this configuration in "
       "milliseconds. Only used for testing.");
 #endif
+
+DEFINE_int64(accepted_client_cnxn_timeout, 300000,
+    "(Advanced) The amount of time in milliseconds an accepted connection will wait in "
+    "the post-accept, pre-setup connection queue before it is timed out and the "
+    "connection request is rejected. A value of 0 means there is no timeout.");
 
 DECLARE_bool(compact_catalog_topic);
 
@@ -257,40 +284,7 @@ const char* ImpalaServer::SQLSTATE_OPTIONAL_FEATURE_NOT_IMPLEMENTED = "HYC00";
 // Interval between checks for query expiration.
 const int64_t EXPIRATION_CHECK_INTERVAL_MS = 1000L;
 
-// Work item for ImpalaServer::cancellation_thread_pool_.
-class CancellationWork {
- public:
-  CancellationWork(const TUniqueId& query_id, const Status& cause, bool unregister)
-      : query_id_(query_id), cause_(cause), unregister_(unregister) {
-  }
-
-  CancellationWork() {
-  }
-
-  const TUniqueId& query_id() const { return query_id_; }
-  const Status& cause() const { return cause_; }
-  bool unregister() const { return unregister_; }
-
-  bool operator<(const CancellationWork& other) const {
-    return query_id_ < other.query_id_;
-  }
-
-  bool operator==(const CancellationWork& other) const {
-    return query_id_ == other.query_id_;
-  }
-
- private:
-  // Id of query to be canceled.
-  TUniqueId query_id_;
-
-  // Error status containing a list of failed impalads causing the cancellation.
-  Status cause_;
-
-  // If true, unregister the query rather than cancelling it. Calling UnregisterQuery()
-  // does call CancelInternal eventually, but also ensures that the query is torn down and
-  // archived.
-  bool unregister_;
-};
+ThreadSafeRandom ImpalaServer::rng_(GetRandomSeed32());
 
 ImpalaServer::ImpalaServer(ExecEnv* exec_env)
     : exec_env_(exec_env),
@@ -308,7 +302,7 @@ ImpalaServer::ImpalaServer(ExecEnv* exec_env)
     }
   }
 
-  status = exec_env->tmp_file_mgr()->Init(exec_env->metrics());
+  status = exec_env_->tmp_file_mgr()->Init(exec_env_->metrics());
   if (!status.ok()) {
     LOG(ERROR) << status.GetDetail();
     if (FLAGS_abort_on_config_error) {
@@ -360,14 +354,11 @@ ImpalaServer::ImpalaServer(ExecEnv* exec_env)
     ERR_load_crypto_strings();
   }
 
-  http_handler_.reset(new ImpalaHttpHandler(this));
-  http_handler_->RegisterHandlers(exec_env->webserver());
-
   // Initialize impalad metrics
   ImpaladMetrics::CreateMetrics(
-      exec_env->metrics()->GetOrCreateChildGroup("impala-server"));
+      exec_env_->metrics()->GetOrCreateChildGroup("impala-server"));
 
-  ABORT_IF_ERROR(ExternalDataSourceExecutor::InitJNI(exec_env->metrics()));
+  ABORT_IF_ERROR(ExternalDataSourceExecutor::InitJNI(exec_env_->metrics()));
 
   // Register the membership callback if running in a real cluster.
   if (!TestInfo::is_test()) {
@@ -375,7 +366,7 @@ ImpalaServer::ImpalaServer(ExecEnv* exec_env)
         vector<TTopicDelta>* topic_updates) {
       this->MembershipCallback(state, topic_updates);
     };
-    ABORT_IF_ERROR(exec_env->subscriber()->AddTopic(
+    ABORT_IF_ERROR(exec_env_->subscriber()->AddTopic(
         Statestore::IMPALA_MEMBERSHIP_TOPIC, /* is_transient=*/ true,
         /* populate_min_subscriber_topic_version=*/ false,
         /* filter_prefix=*/"", cb));
@@ -418,9 +409,30 @@ ImpalaServer::ImpalaServer(ExecEnv* exec_env)
   ABORT_IF_ERROR(Thread::Create("impala-server", "query-expirer",
       bind<void>(&ImpalaServer::ExpireQueries, this), &query_expiration_thread_));
 
+  // Only enable the unresponsive backend thread if periodic status reporting is enabled.
+  if (FLAGS_status_report_interval_ms > 0) {
+    if (FLAGS_status_report_max_retry_s * 1000 <= FLAGS_status_report_interval_ms) {
+      const string& err = "Since --status_report_max_retry_s <= "
+          "--status_report_interval_ms, most queries will likely be cancelled.";
+      LOG(ERROR) << err;
+      if (FLAGS_abort_on_config_error) {
+        CLEAN_EXIT_WITH_ERROR(Substitute("Aborting Impala Server startup: $0", err));
+      }
+    }
+    if (FLAGS_status_report_cancellation_padding <= 0) {
+      const string& err = "--status_report_cancellationn_padding should be > 0.";
+      LOG(ERROR) << err;
+      if (FLAGS_abort_on_config_error) {
+        CLEAN_EXIT_WITH_ERROR(Substitute("Aborting Impala Server startup: $0", err));
+      }
+    }
+    ABORT_IF_ERROR(Thread::Create("impala-server", "unresponsive-backend-thread",
+        bind<void>(&ImpalaServer::UnresponsiveBackendThread, this),
+        &unresponsive_backend_thread_));
+  }
+
   is_coordinator_ = FLAGS_is_coordinator;
   is_executor_ = FLAGS_is_executor;
-  exec_env_->SetImpalaServer(this);
 }
 
 Status ImpalaServer::PopulateAuthorizedProxyConfig(
@@ -508,7 +520,8 @@ int ImpalaServer::GetHS2Port() {
   return hs2_server_->port();
 }
 
-const ImpalaServer::BackendDescriptorMap& ImpalaServer::GetKnownBackends() {
+const ImpalaServer::BackendDescriptorMap ImpalaServer::GetKnownBackends() {
+  lock_guard<mutex> l(known_backends_lock_);
   return known_backends_;
 }
 
@@ -684,8 +697,9 @@ Status ImpalaServer::InitProfileLogging() {
   return Status::OK();
 }
 
-Status ImpalaServer::GetRuntimeProfileStr(const TUniqueId& query_id,
-    const string& user, bool base64_encoded, stringstream* output) {
+Status ImpalaServer::GetRuntimeProfileOutput(const TUniqueId& query_id,
+    const string& user, TRuntimeProfileFormat::type format, stringstream* output,
+    TRuntimeProfileTree* thrift_output) {
   DCHECK(output != nullptr);
   // Search for the query id in the active query map
   {
@@ -698,9 +712,15 @@ Status ImpalaServer::GetRuntimeProfileStr(const TUniqueId& query_id,
       lock_guard<mutex> l(*request_state->lock());
       RETURN_IF_ERROR(CheckProfileAccess(user, request_state->effective_user(),
           request_state->user_has_profile_access()));
-      if (base64_encoded) {
+      if (request_state->GetCoordinator() != nullptr) {
+        UpdateExecSummary(request_state);
+      }
+      if (format == TRuntimeProfileFormat::BASE64) {
         RETURN_IF_ERROR(request_state->profile()->SerializeToArchiveString(output));
+      } else if (format == TRuntimeProfileFormat::THRIFT) {
+        request_state->profile()->ToThrift(thrift_output);
       } else {
+        DCHECK(format == TRuntimeProfileFormat::STRING);
         request_state->profile()->PrettyPrint(output);
       }
       return Status::OK();
@@ -719,9 +739,13 @@ Status ImpalaServer::GetRuntimeProfileStr(const TUniqueId& query_id,
     }
     RETURN_IF_ERROR(CheckProfileAccess(user, query_record->second->effective_user,
         query_record->second->user_has_profile_access));
-    if (base64_encoded) {
+    if (format == TRuntimeProfileFormat::BASE64) {
       (*output) << query_record->second->encoded_profile_str;
+    } else if (format == TRuntimeProfileFormat::THRIFT) {
+      RETURN_IF_ERROR(RuntimeProfile::DeserializeFromArchiveString(
+          query_record->second->encoded_profile_str, thrift_output));
     } else {
+      DCHECK(format == TRuntimeProfileFormat::STRING);
       (*output) << query_record->second->profile_str;
     }
   }
@@ -738,6 +762,18 @@ Status ImpalaServer::GetExecSummary(const TUniqueId& query_id, const string& use
       RETURN_IF_ERROR(CheckProfileAccess(user, request_state->effective_user(),
           request_state->user_has_profile_access()));
       if (request_state->operation_state() == TOperationState::PENDING_STATE) {
+        const string* admission_result = request_state->summary_profile()->GetInfoString(
+            AdmissionController::PROFILE_INFO_KEY_ADMISSION_RESULT);
+        if (admission_result != nullptr) {
+          if (*admission_result == AdmissionController::PROFILE_INFO_VAL_QUEUED) {
+            result->__set_is_queued(true);
+            const string* queued_reason = request_state->summary_profile()->GetInfoString(
+                AdmissionController::PROFILE_INFO_KEY_LAST_QUEUED_REASON);
+            if (queued_reason != nullptr) {
+              result->__set_queued_reason(*queued_reason);
+            }
+          }
+        }
         return Status::OK();
       } else if (request_state->GetCoordinator() != nullptr) {
         request_state->GetCoordinator()->GetTExecSummary(result);
@@ -909,6 +945,7 @@ Status ImpalaServer::Execute(TQueryCtx* query_ctx,
     shared_ptr<SessionState> session_state,
     shared_ptr<ClientRequestState>* request_state) {
   PrepareQueryContext(query_ctx);
+  ScopedThreadContext debug_ctx(GetThreadDebugInfo(), query_ctx->query_id);
   ImpaladMetrics::IMPALA_SERVER_NUM_QUERIES->Increment(1L);
 
   // Redact the SQL stmt and update the query context
@@ -965,6 +1002,7 @@ Status ImpalaServer::ExecuteInternal(
     (*request_state)->set_user_profile_access(result.user_has_profile_access);
     (*request_state)->summary_profile()->AddEventSequence(
         result.timeline.name, result.timeline);
+    (*request_state)->SetFrontendProfile(result.profile);
     if (result.__isset.result_set_metadata) {
       (*request_state)->set_result_metadata(result.result_set_metadata);
     }
@@ -994,11 +1032,12 @@ Status ImpalaServer::ExecuteInternal(
 }
 
 void ImpalaServer::PrepareQueryContext(TQueryCtx* query_ctx) {
-  PrepareQueryContext(GetThriftBackendAddress(), query_ctx);
+  PrepareQueryContext(GetThriftBackendAddress(),
+      ExecEnv::GetInstance()->krpc_address(), query_ctx);
 }
 
-void ImpalaServer::PrepareQueryContext(
-    const TNetworkAddress& backend_addr, TQueryCtx* query_ctx) {
+void ImpalaServer::PrepareQueryContext(const TNetworkAddress& backend_addr,
+    const TNetworkAddress& krpc_addr, TQueryCtx* query_ctx) {
   query_ctx->__set_pid(getpid());
   int64_t now_us = UnixMicros();
   const Timezone& utc_tz = TimezoneDatabase::GetUtcTimezone();
@@ -1017,14 +1056,22 @@ void ImpalaServer::PrepareQueryContext(
   query_ctx->__set_now_string(ToStringFromUnixMicros(now_us, *local_tz));
   query_ctx->__set_start_unix_millis(now_us / MICROS_PER_MILLI);
   query_ctx->__set_coord_address(backend_addr);
+  query_ctx->__set_coord_krpc_address(krpc_addr);
   query_ctx->__set_local_time_zone(local_tz_name);
+  query_ctx->__set_status_report_interval_ms(FLAGS_status_report_interval_ms);
+  query_ctx->__set_status_report_max_retry_s(FLAGS_status_report_max_retry_s);
 
   // Creating a random_generator every time is not free, but
   // benchmarks show it to be slightly cheaper than contending for a
   // single generator under a lock (since random_generator is not
   // thread-safe).
   query_ctx->query_id = UuidToQueryId(random_generator()());
+  GetThreadDebugInfo()->SetQueryId(query_ctx->query_id);
 
+  const double trace_ratio = query_ctx->client_request.query_options.resource_trace_ratio;
+  if (trace_ratio > 0 && rng_.NextDoubleFraction() < trace_ratio) {
+    query_ctx->__set_trace_resource_usage(true);
+  }
 }
 
 Status ImpalaServer::RegisterQuery(shared_ptr<SessionState> session_state,
@@ -1040,8 +1087,9 @@ Status ImpalaServer::RegisterQuery(shared_ptr<SessionState> session_state,
   }
   const TUniqueId& query_id = request_state->query_id();
   {
+    DCHECK_EQ(this, ExecEnv::GetInstance()->impala_server());
     ScopedShardedMapRef<std::shared_ptr<ClientRequestState>> map_ref(query_id,
-        &ExecEnv::GetInstance()->impala_server()->client_request_state_map_);
+        &client_request_state_map_);
     DCHECK(map_ref.get() != nullptr);
 
     auto entry = map_ref->find(query_id);
@@ -1121,6 +1169,18 @@ Status ImpalaServer::SetQueryInflight(shared_ptr<SessionState> session_state,
   return Status::OK();
 }
 
+void ImpalaServer::UpdateExecSummary(
+    std::shared_ptr<ClientRequestState> request_state) const {
+  DCHECK(request_state->GetCoordinator() != nullptr);
+  TExecSummary t_exec_summary;
+  request_state->GetCoordinator()->GetTExecSummary(&t_exec_summary);
+  request_state->summary_profile()->SetTExecSummary(t_exec_summary);
+  string exec_summary = PrintExecSummary(t_exec_summary);
+  request_state->summary_profile()->AddInfoStringRedacted("ExecSummary", exec_summary);
+  request_state->summary_profile()->AddInfoStringRedacted("Errors",
+      request_state->GetCoordinator()->GetErrorLog());
+}
+
 Status ImpalaServer::UnregisterQuery(const TUniqueId& query_id, bool check_inflight,
     const Status* cause) {
   VLOG_QUERY << "UnregisterQuery(): query_id=" << PrintId(query_id);
@@ -1129,8 +1189,9 @@ Status ImpalaServer::UnregisterQuery(const TUniqueId& query_id, bool check_infli
 
   shared_ptr<ClientRequestState> request_state;
   {
+    DCHECK_EQ(this, ExecEnv::GetInstance()->impala_server());
     ScopedShardedMapRef<std::shared_ptr<ClientRequestState>> map_ref(query_id,
-        &ExecEnv::GetInstance()->impala_server()->client_request_state_map_);
+        &client_request_state_map_);
     DCHECK(map_ref.get() != nullptr);
 
     auto entry = map_ref->find(query_id);
@@ -1164,12 +1225,7 @@ Status ImpalaServer::UnregisterQuery(const TUniqueId& query_id, bool check_infli
   }
 
   if (request_state->GetCoordinator() != nullptr) {
-    TExecSummary t_exec_summary;
-    request_state->GetCoordinator()->GetTExecSummary(&t_exec_summary);
-    string exec_summary = PrintExecSummary(t_exec_summary);
-    request_state->summary_profile()->AddInfoStringRedacted("ExecSummary", exec_summary);
-    request_state->summary_profile()->AddInfoStringRedacted("Errors",
-        request_state->GetCoordinator()->GetErrorLog());
+    UpdateExecSummary(request_state);
   }
 
   if (request_state->schedule() != nullptr) {
@@ -1321,27 +1377,6 @@ Status ImpalaServer::GetSessionState(const TUniqueId& session_id,
   }
 }
 
-void ImpalaServer::ReportExecStatus(
-    TReportExecStatusResult& return_val, const TReportExecStatusParams& params) {
-  VLOG_FILE << "ReportExecStatus() coord_state_idx=" << params.coord_state_idx;
-  // TODO: implement something more efficient here, we're currently
-  // acquiring/releasing the map lock and doing a map lookup for
-  // every report (assign each query a local int32_t id and use that to index into a
-  // vector of ClientRequestStates, w/o lookup or locking?)
-  shared_ptr<ClientRequestState> request_state =
-      GetClientRequestState(params.query_id);
-  if (request_state.get() == nullptr) {
-    // This is expected occasionally (since a report RPC might be in flight while
-    // cancellation is happening). Return an error to the caller to get it to stop.
-    const string& err = Substitute("ReportExecStatus(): Received report for unknown "
-        "query ID (probably closed or cancelled): $0", PrintId(params.query_id));
-    VLOG(1) << err;
-    Status::Expected(err).SetTStatus(&return_val);
-    return;
-  }
-  request_state->UpdateBackendExecStatus(params).SetTStatus(&return_val);
-}
-
 void ImpalaServer::InitializeConfigVariables() {
   // Set idle_session_timeout here to let the SET command return the value of
   // the command line option FLAGS_idle_session_timeout
@@ -1414,16 +1449,57 @@ TQueryOptions ImpalaServer::SessionState::QueryOptions() {
 
 void ImpalaServer::CancelFromThreadPool(uint32_t thread_id,
     const CancellationWork& cancellation_work) {
+  const TUniqueId& query_id = cancellation_work.query_id();
+  shared_ptr<ClientRequestState> request_state = GetClientRequestState(query_id);
+  // Query was already unregistered.
+  if (request_state == nullptr) {
+    VLOG_QUERY << "CancelFromThreadPool(): query " << PrintId(query_id)
+               << " already unregistered.";
+    return;
+  }
+
+  Status error;
+  switch (cancellation_work.cause()) {
+    case CancellationWorkCause::TERMINATED_BY_SERVER:
+      error = cancellation_work.error();
+      break;
+    case CancellationWorkCause::BACKEND_FAILED: {
+      // We only want to proceed with cancellation if the backends are still in use for
+      // the query.
+      vector<TNetworkAddress> active_backends;
+      Coordinator* coord = request_state->GetCoordinator();
+      if (coord == nullptr) {
+        // Query hasn't started yet - it still will run on all backends.
+        active_backends = cancellation_work.failed_backends();
+      } else {
+        active_backends = coord->GetActiveBackends(cancellation_work.failed_backends());
+      }
+      if (active_backends.empty()) {
+        VLOG_QUERY << "CancelFromThreadPool(): all failed backends already completed for "
+                   << "query " << PrintId(query_id);
+        return;
+      }
+      stringstream msg;
+      for (int i = 0; i < active_backends.size(); ++i) {
+        msg << TNetworkAddressToString(active_backends[i]);
+        if (i + 1 != active_backends.size()) msg << ", ";
+      }
+      error = Status::Expected(TErrorCode::UNREACHABLE_IMPALADS, msg.str());
+      break;
+    }
+    default:
+      DCHECK(false) << static_cast<int>(cancellation_work.cause());
+  }
+
   if (cancellation_work.unregister()) {
-    Status status = UnregisterQuery(cancellation_work.query_id(), true,
-        &cancellation_work.cause());
+    Status status = UnregisterQuery(cancellation_work.query_id(), true, &error);
     if (!status.ok()) {
       VLOG_QUERY << "Query de-registration (" << PrintId(cancellation_work.query_id())
                  << ") failed";
     }
   } else {
-    Status status = CancelInternal(cancellation_work.query_id(), true,
-        &cancellation_work.cause());
+    VLOG_QUERY << "CancelFromThreadPool(): cancelling query_id=" << PrintId(query_id);
+    Status status = request_state->Cancel(true, &error);
     if (!status.ok()) {
       VLOG_QUERY << "Query cancellation (" << PrintId(cancellation_work.query_id())
                  << ") did not succeed: " << status.GetDetail();
@@ -1448,8 +1524,9 @@ Status ImpalaServer::AuthorizeProxyUser(const string& user, const string& do_as_
   if (authorized_proxy_user_config_.size() == 0 &&
       authorized_proxy_group_config_.size() == 0) {
     error_msg << " User/group delegation is disabled.";
-    VLOG(1) << error_msg;
-    return Status::Expected(error_msg.str());
+    string error_msg_str = error_msg.str();
+    VLOG(1) << error_msg_str;
+    return Status::Expected(error_msg_str);
   }
 
   // Get the short version of the user name (the user name up to the first '/' or '@')
@@ -1501,8 +1578,9 @@ Status ImpalaServer::AuthorizeProxyUser(const string& user, const string& do_as_
     }
   }
 
-  VLOG(1) << error_msg;
-  return Status::Expected(error_msg.str());
+  string error_msg_str = error_msg.str();
+  VLOG(1) << error_msg_str;
+  return Status::Expected(error_msg_str);
 }
 
 void ImpalaServer::CatalogUpdateVersionInfo::UpdateCatalogVersionMetrics()
@@ -1610,10 +1688,10 @@ void ImpalaServer::WaitForMinCatalogUpdate(const int64_t min_req_catalog_object_
       catalog_update_info_.min_catalog_object_version;
   // TODO: Set a timeout to eventually break out of this loop is something goes
   // wrong?
-  VLOG_QUERY << "Waiting for minimum catalog object version: "
-      << min_req_catalog_object_version << " current version: "
+  VLOG_QUERY << "Waiting for local minimum catalog object version to be > "
+      << min_req_catalog_object_version << ", current local minimum version: "
       << min_catalog_object_version;
-  while (catalog_update_info_.min_catalog_object_version < min_req_catalog_object_version
+  while (catalog_update_info_.min_catalog_object_version <= min_req_catalog_object_version
       && catalog_update_info_.catalog_service_id == catalog_service_id) {
     catalog_version_update_cv_.Wait(unique_lock);
   }
@@ -1677,15 +1755,20 @@ void ImpalaServer::MembershipCallback(
   // statestore heartbeat less frequently.
   StatestoreSubscriber::TopicDeltaMap::const_iterator topic =
       incoming_topic_deltas.find(Statestore::IMPALA_MEMBERSHIP_TOPIC);
+  if (topic == incoming_topic_deltas.end()) return;
 
-  if (topic != incoming_topic_deltas.end()) {
-    const TTopicDelta& delta = topic->second;
+  const TTopicDelta& delta = topic->second;
+  // Create a set of known backend network addresses. Used to test for cluster
+  // membership by network address.
+  set<TNetworkAddress> current_membership;
+  {
+    lock_guard<mutex> l(known_backends_lock_);
     // If this is not a delta, the update should include all entries in the topic so
     // clear the saved mapping of known backends.
     if (!delta.is_delta) known_backends_.clear();
 
     // Process membership additions/deletions.
-    for (const TTopicItem& item: delta.topic_entries) {
+    for (const TTopicItem& item : delta.topic_entries) {
       if (item.deleted) {
         auto entry = known_backends_.find(item.key);
         // Remove stale connections to removed members.
@@ -1697,8 +1780,9 @@ void ImpalaServer::MembershipCallback(
       }
       uint32_t len = item.value.size();
       TBackendDescriptor backend_descriptor;
-      Status status = DeserializeThriftMsg(reinterpret_cast<const uint8_t*>(
-          item.value.data()), &len, false, &backend_descriptor);
+      Status status =
+          DeserializeThriftMsg(reinterpret_cast<const uint8_t*>(item.value.data()),
+              &len, false, &backend_descriptor);
       if (!status.ok()) {
         VLOG(2) << "Error deserializing topic item with key: " << item.key;
         continue;
@@ -1712,18 +1796,15 @@ void ImpalaServer::MembershipCallback(
       }
     }
 
-    // Register the local backend in the statestore and update the list of known backends.
-    // Only register if all ports have been opened and are ready.
+    // Register the local backend in the statestore and update the list of known
+    // backends. Only register if all ports have been opened and are ready.
     if (services_started_.load()) AddLocalBackendToStatestore(subscriber_topic_updates);
 
-    // Create a set of known backend network addresses. Used to test for cluster
-    // membership by network address.
-    set<TNetworkAddress> current_membership;
     // Also reflect changes to the frontend. Initialized only if any_changes is true.
     // Only send the hostname and ip_address of the executors to the frontend.
     TUpdateExecutorMembershipRequest update_req;
     bool any_changes = !delta.topic_entries.empty() || !delta.is_delta;
-    for (const BackendDescriptorMap::value_type& backend: known_backends_) {
+    for (const BackendDescriptorMap::value_type& backend : known_backends_) {
       current_membership.insert(backend.second.address);
       if (any_changes && backend.second.is_executor) {
         update_req.hostnames.insert(backend.second.address.hostname);
@@ -1738,60 +1819,69 @@ void ImpalaServer::MembershipCallback(
                      << status.GetDetail();
       }
     }
+  }
 
-    // Maps from query id (to be cancelled) to a list of failed Impalads that are
-    // the cause of the cancellation.
-    map<TUniqueId, vector<TNetworkAddress>> queries_to_cancel;
-    {
-      // Build a list of queries that are running on failed hosts (as evidenced by their
-      // absence from the membership list).
-      // TODO: crash-restart failures can give false negatives for failed Impala demons.
-      lock_guard<mutex> l(query_locations_lock_);
-      QueryLocations::const_iterator loc_entry = query_locations_.begin();
-      while (loc_entry != query_locations_.end()) {
-        if (current_membership.find(loc_entry->first) == current_membership.end()) {
-          unordered_set<TUniqueId>::const_iterator query_id = loc_entry->second.begin();
-          // Add failed backend locations to all queries that ran on that backend.
-          for(; query_id != loc_entry->second.end(); ++query_id) {
-            vector<TNetworkAddress>& failed_hosts = queries_to_cancel[*query_id];
-            failed_hosts.push_back(loc_entry->first);
-          }
-          // We can remove the location wholesale once we know backend's failed. To do so
-          // safely during iteration, we have to be careful not in invalidate the current
-          // iterator, so copy the iterator to do the erase(..) and advance the original.
-          QueryLocations::const_iterator failed_backend = loc_entry;
-          ++loc_entry;
-          query_locations_.erase(failed_backend);
-        } else {
-          ++loc_entry;
+  // Only initiate cancellation after a grace period since last successful registration.
+  if (exec_env_->subscriber()->MilliSecondsSinceLastRegistration()
+      >= FLAGS_failed_backends_query_cancellation_grace_period_ms) {
+    CancelQueriesOnFailedBackends(current_membership);
+  }
+}
+
+void ImpalaServer::CancelQueriesOnFailedBackends(
+    const set<TNetworkAddress>& current_membership) {
+  // Maps from query id (to be cancelled) to a list of failed Impalads that are
+  // the cause of the cancellation.
+  map<TUniqueId, vector<TNetworkAddress>> queries_to_cancel;
+  {
+    // Build a list of queries that are running on failed hosts (as evidenced by their
+    // absence from the membership list).
+    // TODO: crash-restart failures can give false negatives for failed Impala demons.
+    lock_guard<mutex> l(query_locations_lock_);
+    QueryLocations::const_iterator loc_entry = query_locations_.begin();
+    while (loc_entry != query_locations_.end()) {
+      if (current_membership.find(loc_entry->first) == current_membership.end()) {
+        unordered_set<TUniqueId>::const_iterator query_id = loc_entry->second.begin();
+        // Add failed backend locations to all queries that ran on that backend.
+        for(; query_id != loc_entry->second.end(); ++query_id) {
+          vector<TNetworkAddress>& failed_hosts = queries_to_cancel[*query_id];
+          failed_hosts.push_back(loc_entry->first);
         }
+        // We can remove the location wholesale once we know backend's failed. To do so
+        // safely during iteration, we have to be careful not in invalidate the current
+        // iterator, so copy the iterator to do the erase(..) and advance the original.
+        QueryLocations::const_iterator failed_backend = loc_entry;
+        ++loc_entry;
+        query_locations_.erase(failed_backend);
+      } else {
+        ++loc_entry;
       }
     }
+  }
 
-    if (cancellation_thread_pool_->GetQueueSize() + queries_to_cancel.size() >
-        MAX_CANCELLATION_QUEUE_SIZE) {
-      // Ignore the cancellations - we'll be able to process them on the next heartbeat
-      // instead.
-      LOG_EVERY_N(WARNING, 60) << "Cancellation queue is full";
-    } else {
-      // Since we are the only producer for this pool, we know that this cannot block
-      // indefinitely since the queue is large enough to accept all new cancellation
-      // requests.
-      map<TUniqueId, vector<TNetworkAddress>>::iterator cancellation_entry;
-      for (cancellation_entry = queries_to_cancel.begin();
-          cancellation_entry != queries_to_cancel.end();
-          ++cancellation_entry) {
-        stringstream cause_msg;
-        cause_msg << "Failed due to unreachable impalad(s): ";
-        for (int i = 0; i < cancellation_entry->second.size(); ++i) {
-          cause_msg << TNetworkAddressToString(cancellation_entry->second[i]);
-          if (i + 1 != cancellation_entry->second.size()) cause_msg << ", ";
-        }
-        string cause_str = cause_msg.str();
-        LOG(INFO) << "Query " << PrintId(cancellation_entry->first) << ": " << cause_str;
-        cancellation_thread_pool_->Offer(CancellationWork(cancellation_entry->first,
-            Status::Expected(cause_msg.str()), false));
+  if (cancellation_thread_pool_->GetQueueSize() + queries_to_cancel.size() >
+      MAX_CANCELLATION_QUEUE_SIZE) {
+    // Ignore the cancellations - we'll be able to process them on the next heartbeat
+    // instead.
+    LOG_EVERY_N(WARNING, 60) << "Cancellation queue is full";
+  } else {
+    // Since we are the only producer for this pool, we know that this cannot block
+    // indefinitely since the queue is large enough to accept all new cancellation
+    // requests.
+    map<TUniqueId, vector<TNetworkAddress>>::iterator cancellation_entry;
+    for (cancellation_entry = queries_to_cancel.begin();
+        cancellation_entry != queries_to_cancel.end();
+        ++cancellation_entry) {
+      stringstream backends_ss;
+      for (int i = 0; i < cancellation_entry->second.size(); ++i) {
+        backends_ss << TNetworkAddressToString(cancellation_entry->second[i]);
+        if (i + 1 != cancellation_entry->second.size()) backends_ss << ", ";
       }
+      VLOG_QUERY << "Backends failed for query " << PrintId(cancellation_entry->first)
+                 << ", adding to queue to check for cancellation: "
+                 << backends_ss.str();
+      cancellation_thread_pool_->Offer(CancellationWork::BackendFailure(
+          cancellation_entry->first, cancellation_entry->second));
     }
   }
 }
@@ -1808,17 +1898,11 @@ void ImpalaServer::AddLocalBackendToStatestore(
     return;
   }
 
-  TBackendDescriptor local_backend_descriptor;
-  local_backend_descriptor.__set_is_coordinator(FLAGS_is_coordinator);
-  local_backend_descriptor.__set_is_executor(FLAGS_is_executor);
-  local_backend_descriptor.__set_address(exec_env_->GetThriftBackendAddress());
-  local_backend_descriptor.ip_address = exec_env_->ip_address();
-  local_backend_descriptor.__set_proc_mem_limit(
-      exec_env_->process_mem_tracker()->limit());
+  TBackendDescriptor local_backend_descriptor =
+      Scheduler::BuildLocalBackendDescriptor(exec_env_->webserver(),
+          exec_env_->GetThriftBackendAddress(), exec_env_->krpc_address(),
+          exec_env_->ip_address(), exec_env_->admit_mem_limit());
   local_backend_descriptor.__set_is_quiescing(is_quiescing);
-  const TNetworkAddress& krpc_address = exec_env_->krpc_address();
-  DCHECK(IsResolvedAddress(krpc_address));
-  local_backend_descriptor.__set_krpc_address(krpc_address);
 
   subscriber_topic_updates->emplace_back(TTopicDelta());
   TTopicDelta& update = subscriber_topic_updates->back();
@@ -1827,7 +1911,8 @@ void ImpalaServer::AddLocalBackendToStatestore(
 
   TTopicItem& item = update.topic_entries.back();
   item.key = local_backend_id;
-  Status status = thrift_serializer_.Serialize(&local_backend_descriptor, &item.value);
+  Status status = thrift_serializer_.SerializeToString(&local_backend_descriptor,
+      &item.value);
   if (!status.ok()) {
     LOG(WARNING) << "Failed to serialize Impala backend descriptor for statestore topic:"
                  << " " << status.GetDetail();
@@ -2035,9 +2120,10 @@ void ImpalaServer::UnregisterSessionTimeout(int32_t session_timeout) {
               session_state.second->inflight_queries.end());
         }
         // Unregister all open queries from this session.
-        Status status = Status::Expected("Session expired due to inactivity");
-        for (const TUniqueId& query_id: inflight_queries) {
-          cancellation_thread_pool_->Offer(CancellationWork(query_id, status, true));
+        Status status = Status::Expected(TErrorCode::INACTIVE_SESSION_EXPIRED);
+        for (const TUniqueId& query_id : inflight_queries) {
+          cancellation_thread_pool_->Offer(
+              CancellationWork::TerminatedByServer(query_id, status, true));
         }
       }
     }
@@ -2100,11 +2186,10 @@ void ImpalaServer::UnregisterSessionTimeout(int32_t session_timeout) {
           int32_t exec_time_limit_s = crs->query_options().exec_time_limit_s;
           VLOG_QUERY << "Expiring query " << PrintId(expiration_event->query_id)
                      << " due to execution time limit of " << exec_time_limit_s << "s.";
-          const string& err_msg = Substitute(
-              "Query $0 expired due to execution time limit of $1",
-              PrintId(expiration_event->query_id),
-              PrettyPrinter::Print(exec_time_limit_s, TUnit::TIME_S));
-          ExpireQuery(crs.get(), Status::Expected(err_msg));
+          ExpireQuery(crs.get(),
+              Status::Expected(TErrorCode::EXEC_TIME_LIMIT_EXCEEDED,
+                  PrintId(expiration_event->query_id),
+                  PrettyPrinter::Print(exec_time_limit_s, TUnit::TIME_S)));
           expiration_event = queries_by_timestamp_.erase(expiration_event);
           continue;
         }
@@ -2139,15 +2224,13 @@ void ImpalaServer::UnregisterSessionTimeout(int32_t session_timeout) {
           }
         } else if (!crs->is_active()) {
           // Otherwise time to expire this query
-          VLOG_QUERY
-              << "Expiring query due to client inactivity: "
-              << PrintId(expiration_event->query_id) << ", last activity was at: "
-              << ToStringFromUnixMillis(crs->last_active_ms());
-          const string& err_msg = Substitute(
-              "Query $0 expired due to client inactivity (timeout is $1)",
-              PrintId(expiration_event->query_id),
-              PrettyPrinter::Print(idle_timeout_s, TUnit::TIME_S));
-          ExpireQuery(crs.get(), Status::Expected(err_msg));
+          VLOG_QUERY << "Expiring query due to client inactivity: "
+                     << PrintId(expiration_event->query_id) << ", last activity was at: "
+                     << ToStringFromUnixMillis(crs->last_active_ms());
+          ExpireQuery(crs.get(),
+              Status::Expected(TErrorCode::INACTIVE_QUERY_EXPIRED,
+                  PrintId(expiration_event->query_id),
+                  PrettyPrinter::Print(idle_timeout_s, TUnit::TIME_S)));
           expiration_event = queries_by_timestamp_.erase(expiration_event);
         } else {
           // Iterator is moved on in every other branch.
@@ -2163,6 +2246,41 @@ void ImpalaServer::UnregisterSessionTimeout(int32_t session_timeout) {
   }
 }
 
+[[noreturn]] void ImpalaServer::UnresponsiveBackendThread() {
+  int64_t max_lag_ms = FLAGS_status_report_max_retry_s * 1000
+      * (1 + FLAGS_status_report_cancellation_padding / 100.0);
+  DCHECK_GT(max_lag_ms, 0);
+  VLOG(1) << "Queries will be cancelled if a backend has not reported its status in "
+          << "more than " << max_lag_ms << "ms.";
+  while (true) {
+    vector<CancellationWork> to_cancel;
+    client_request_state_map_.DoFuncForAllEntries(
+        [&](const std::shared_ptr<ClientRequestState>& request_state) {
+          Coordinator* coord = request_state->GetCoordinator();
+          if (coord != nullptr) {
+            TNetworkAddress address;
+            int64_t lag_time_ms = coord->GetMaxBackendStateLagMs(&address);
+            if (lag_time_ms > max_lag_ms) {
+              to_cancel.push_back(
+                  CancellationWork::TerminatedByServer(request_state->query_id(),
+                      Status(TErrorCode::UNRESPONSIVE_BACKEND,
+                          PrintId(request_state->query_id()),
+                          TNetworkAddressToString(address), lag_time_ms, max_lag_ms),
+                      false /* unregister */));
+            }
+          }
+        });
+
+    // We call Offer() outside of DoFuncForAllEntries() to ensure that if the
+    // cancellation_thread_pool_ queue is full, we're not blocked while holding one of the
+    // 'client_request_state_map_' shard locks.
+    for (auto cancellation_work : to_cancel) {
+      cancellation_thread_pool_->Offer(cancellation_work);
+    }
+    SleepForMs(max_lag_ms * 0.1);
+  }
+}
+
 Status ImpalaServer::CheckResourceLimits(ClientRequestState* crs) {
   Coordinator* coord = crs->GetCoordinator();
   // Coordinator may be null if query has not started executing, check again later.
@@ -2174,20 +2292,19 @@ Status ImpalaServer::CheckResourceLimits(ClientRequestState* crs) {
   int64_t cpu_limit_s = crs->query_options().cpu_limit_s;
   int64_t cpu_limit_ns = cpu_limit_s * 1000'000'000L;
   if (cpu_limit_ns > 0 && cpu_time_ns > cpu_limit_ns) {
-    const string& err_msg = Substitute("Query $0 terminated due to CPU limit of $1",
+    Status err = Status::Expected(TErrorCode::CPU_LIMIT_EXCEEDED,
         PrintId(crs->query_id()), PrettyPrinter::Print(cpu_limit_s, TUnit::TIME_S));
-    VLOG_QUERY << err_msg;
-    return Status::Expected(err_msg);
+    VLOG_QUERY << err.msg().msg();
+    return err;
   }
 
   int64_t scan_bytes = utilization.bytes_read;
   int64_t scan_bytes_limit = crs->query_options().scan_bytes_limit;
   if (scan_bytes_limit > 0 && scan_bytes > scan_bytes_limit) {
-    const string& err_msg = Substitute(
-        "Query $0 terminated due to scan bytes limit of $1", PrintId(crs->query_id()),
-        PrettyPrinter::Print(scan_bytes_limit, TUnit::BYTES));
-    VLOG_QUERY << err_msg;
-    return Status::Expected(err_msg);
+    Status err = Status::Expected(TErrorCode::SCAN_BYTES_LIMIT_EXCEEDED,
+        PrintId(crs->query_id()), PrettyPrinter::Print(scan_bytes_limit, TUnit::BYTES));
+    VLOG_QUERY << err.msg().msg();
+    return err;
   }
   // Query is within the resource limits, check again later.
   return Status::OK();
@@ -2195,7 +2312,8 @@ Status ImpalaServer::CheckResourceLimits(ClientRequestState* crs) {
 
 void ImpalaServer::ExpireQuery(ClientRequestState* crs, const Status& status) {
   DCHECK(!status.ok());
-  cancellation_thread_pool_->Offer(CancellationWork(crs->query_id(), status, false));
+  cancellation_thread_pool_->Offer(
+      CancellationWork::TerminatedByServer(crs->query_id(), status, false));
   ImpaladMetrics::NUM_QUERIES_EXPIRED->Increment(1L);
   crs->set_expired();
 }
@@ -2203,6 +2321,12 @@ void ImpalaServer::ExpireQuery(ClientRequestState* crs, const Status& status) {
 Status ImpalaServer::Start(int32_t thrift_be_port, int32_t beeswax_port,
    int32_t hs2_port) {
   exec_env_->SetImpalaServer(this);
+
+  // We must register the HTTP handlers after registering the ImpalaServer with the
+  // ExecEnv. Otherwise the HTTP handlers will try to resolve the ImpalaServer through the
+  // ExecEnv singleton and will receive a nullptr.
+  http_handler_.reset(new ImpalaHttpHandler(this));
+  http_handler_->RegisterHandlers(exec_env_->webserver());
 
   if (!FLAGS_is_coordinator && !FLAGS_is_executor) {
     return Status("Impala does not have a valid role configured. "
@@ -2271,6 +2395,7 @@ Status ImpalaServer::Start(int32_t thrift_be_port, int32_t beeswax_port,
           builder.auth_provider(AuthManager::GetInstance()->GetExternalAuthProvider())
           .metrics(exec_env_->metrics())
           .max_concurrent_connections(FLAGS_fe_service_threads)
+          .queue_timeout(FLAGS_accepted_client_cnxn_timeout)
           .Build(&server));
       beeswax_server_.reset(server);
       beeswax_server_->SetConnectionHandler(this);
@@ -2298,6 +2423,7 @@ Status ImpalaServer::Start(int32_t thrift_be_port, int32_t beeswax_port,
           builder.auth_provider(AuthManager::GetInstance()->GetExternalAuthProvider())
           .metrics(exec_env_->metrics())
           .max_concurrent_connections(FLAGS_fe_service_threads)
+          .queue_timeout(FLAGS_accepted_client_cnxn_timeout)
           .Build(&server));
       hs2_server_.reset(server);
       hs2_server_->SetConnectionHandler(this);
@@ -2343,8 +2469,9 @@ void ImpalaServer::Join() {
 
 shared_ptr<ClientRequestState> ImpalaServer::GetClientRequestState(
     const TUniqueId& query_id) {
+  DCHECK_EQ(this, ExecEnv::GetInstance()->impala_server());
   ScopedShardedMapRef<std::shared_ptr<ClientRequestState>> map_ref(query_id,
-      &ExecEnv::GetInstance()->impala_server()->client_request_state_map_);
+      &client_request_state_map_);
   DCHECK(map_ref.get() != nullptr);
 
   auto entry = map_ref->find(query_id);
@@ -2374,34 +2501,39 @@ Status ImpalaServer::CheckNotShuttingDown() const {
       TErrorCode::SERVER_SHUTTING_DOWN, ShutdownStatusToString(GetShutdownStatus())));
 }
 
-TShutdownStatus ImpalaServer::GetShutdownStatus() const {
-  TShutdownStatus result;
+ShutdownStatusPB ImpalaServer::GetShutdownStatus() const {
+  ShutdownStatusPB result;
   int64_t shutdown_time = shutting_down_.Load();
   DCHECK_GT(shutdown_time, 0);
   int64_t shutdown_deadline = shutdown_deadline_.Load();
   DCHECK_GT(shutdown_time, 0);
   int64_t now = MonotonicMillis();
   int64_t elapsed_ms = now - shutdown_time;
-  result.grace_remaining_ms =
-      max<int64_t>(0, FLAGS_shutdown_grace_period_s * 1000 - elapsed_ms);
-  result.deadline_remaining_ms =
-      max<int64_t>(0, shutdown_deadline - now);
-  result.finstances_executing =
-      ImpaladMetrics::IMPALA_SERVER_NUM_FRAGMENTS_IN_FLIGHT->GetValue();
-  result.client_requests_registered = ImpaladMetrics::NUM_QUERIES_REGISTERED->GetValue();
+  result.set_grace_remaining_ms(
+      max<int64_t>(0, FLAGS_shutdown_grace_period_s * 1000 - elapsed_ms));
+  result.set_deadline_remaining_ms(max<int64_t>(0, shutdown_deadline - now));
+  result.set_finstances_executing(
+      ImpaladMetrics::IMPALA_SERVER_NUM_FRAGMENTS_IN_FLIGHT->GetValue());
+  result.set_client_requests_registered(
+      ImpaladMetrics::NUM_QUERIES_REGISTERED->GetValue());
+  result.set_backend_queries_executing(
+      ImpaladMetrics::BACKEND_NUM_QUERIES_EXECUTING->GetValue());
   return result;
 }
 
-string ImpalaServer::ShutdownStatusToString(const TShutdownStatus& shutdown_status) {
-  return Substitute("startup grace period left: $0, deadline left: $1, "
-      "fragment instances: $2, queries registered: $3",
-      PrettyPrinter::Print(shutdown_status.grace_remaining_ms, TUnit::TIME_MS),
-      PrettyPrinter::Print(shutdown_status.deadline_remaining_ms, TUnit::TIME_MS),
-      shutdown_status.finstances_executing, shutdown_status.client_requests_registered);
+string ImpalaServer::ShutdownStatusToString(const ShutdownStatusPB& shutdown_status) {
+  return Substitute("shutdown grace period left: $0, deadline left: $1, "
+                    "queries registered on coordinator: $2, queries executing: $3, "
+                    "fragment instances: $4",
+      PrettyPrinter::Print(shutdown_status.grace_remaining_ms(), TUnit::TIME_MS),
+      PrettyPrinter::Print(shutdown_status.deadline_remaining_ms(), TUnit::TIME_MS),
+      shutdown_status.client_requests_registered(),
+      shutdown_status.backend_queries_executing(),
+      shutdown_status.finstances_executing());
 }
 
 Status ImpalaServer::StartShutdown(
-    int64_t relative_deadline_s, TShutdownStatus* shutdown_status) {
+    int64_t relative_deadline_s, ShutdownStatusPB* shutdown_status) {
   DCHECK_GE(relative_deadline_s, -1);
   if (relative_deadline_s == -1) relative_deadline_s = FLAGS_shutdown_deadline_s;
   int64_t now = MonotonicMillis();
@@ -2435,22 +2567,24 @@ Status ImpalaServer::StartShutdown(
   // Show the full grace/limit times to avoid showing confusing intermediate values
   // to the person running the statement.
   if (set_grace) {
-    shutdown_status->grace_remaining_ms = FLAGS_shutdown_grace_period_s * 1000L;
+    shutdown_status->set_grace_remaining_ms(FLAGS_shutdown_grace_period_s * 1000L);
   }
-  if (set_deadline) shutdown_status->deadline_remaining_ms = relative_deadline_s * 1000L;
+  if (set_deadline) {
+    shutdown_status->set_deadline_remaining_ms(relative_deadline_s * 1000L);
+  }
   return Status::OK();
 }
 
 [[noreturn]] void ImpalaServer::ShutdownThread() {
   while (true) {
     SleepForMs(1000);
-    TShutdownStatus shutdown_status = GetShutdownStatus();
+    const ShutdownStatusPB& shutdown_status = GetShutdownStatus();
     LOG(INFO) << "Shutdown status: " << ShutdownStatusToString(shutdown_status);
-    if (shutdown_status.grace_remaining_ms <= 0
-        && shutdown_status.finstances_executing == 0
-        && shutdown_status.client_requests_registered == 0) {
+    if (shutdown_status.grace_remaining_ms() <= 0
+        && shutdown_status.backend_queries_executing() == 0
+        && shutdown_status.client_requests_registered() == 0) {
       break;
-    } else if (shutdown_status.deadline_remaining_ms <= 0) {
+    } else if (shutdown_status.deadline_remaining_ms() <= 0) {
       break;
     }
   }

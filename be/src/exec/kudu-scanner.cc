@@ -106,6 +106,7 @@ void KuduScanner::KeepKuduScannerAlive() {
 }
 
 Status KuduScanner::GetNext(RowBatch* row_batch, bool* eos) {
+  SCOPED_TIMER(scan_node_->materialize_tuple_timer());
   int64_t tuple_buffer_size;
   uint8_t* tuple_buffer;
   RETURN_IF_ERROR(
@@ -124,7 +125,7 @@ Status KuduScanner::GetNext(RowBatch* row_batch, bool* eos) {
       if (row_batch->AtCapacity()) break;
     }
 
-    if (scanner_->HasMoreRows() && !scan_node_->ReachedLimit()) {
+    if (scanner_->HasMoreRows() && !scan_node_->ReachedLimitShared()) {
       RETURN_IF_ERROR(GetNextScannerBatch());
       continue;
     }
@@ -237,7 +238,7 @@ Status KuduScanner::OpenNextScanToken(const string& scan_token, bool* eos) {
   }
 
   {
-    SCOPED_TIMER(state_->total_storage_wait_timer());
+    SCOPED_TIMER2(state_->total_storage_wait_timer(), scan_node_->kudu_client_time());
     KUDU_RETURN_IF_ERROR(scanner_->Open(), BuildErrorString("Unable to open scanner"));
   }
   *eos = false;
@@ -332,7 +333,7 @@ Status KuduScanner::DecodeRowsIntoRowBatch(RowBatch* row_batch, Tuple** tuple_me
     row->SetTuple(0, *tuple_mem);
     row_batch->CommitLastRow();
     // If we've reached the capacity, or the LIMIT for the scan, return.
-    if (row_batch->AtCapacity() || scan_node_->ReachedLimit()) break;
+    if (row_batch->AtCapacity() || scan_node_->ReachedLimitShared()) break;
     // Move to the next tuple in the tuple buffer.
     *tuple_mem = next_tuple(*tuple_mem);
   }
@@ -343,7 +344,7 @@ Status KuduScanner::DecodeRowsIntoRowBatch(RowBatch* row_batch, Tuple** tuple_me
 }
 
 Status KuduScanner::GetNextScannerBatch() {
-  SCOPED_TIMER(state_->total_storage_wait_timer());
+  SCOPED_TIMER2(state_->total_storage_wait_timer(), scan_node_->kudu_client_time());
   int64_t now = MonotonicMicros();
   KUDU_RETURN_IF_ERROR(scanner_->NextBatch(&cur_kudu_batch_),
       BuildErrorString("Unable to advance iterator"));

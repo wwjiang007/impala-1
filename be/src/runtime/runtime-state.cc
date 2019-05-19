@@ -70,27 +70,33 @@ RuntimeState::RuntimeState(QueryState* query_state, const TPlanFragmentCtx& frag
     fragment_ctx_(&fragment_ctx),
     instance_ctx_(&instance_ctx),
     now_(new TimestampValue(TimestampValue::Parse(query_state->query_ctx().now_string))),
-    utc_timestamp_(new TimestampValue(TimestampValue::Parse(
-        query_state->query_ctx().utc_timestamp_string))),
+    utc_timestamp_(new TimestampValue(
+        TimestampValue::Parse(query_state->query_ctx().utc_timestamp_string))),
     local_time_zone_(&TimezoneDatabase::GetUtcTimezone()),
     profile_(RuntimeProfile::Create(
-          obj_pool(), "Fragment " + PrintId(instance_ctx.fragment_instance_id))),
-    instance_buffer_reservation_(new ReservationTracker) {
+        obj_pool(), "Fragment " + PrintId(instance_ctx.fragment_instance_id))),
+    instance_buffer_reservation_(obj_pool()->Add(new ReservationTracker)) {
   Init();
 }
 
 // Constructor for standalone RuntimeState for test execution and fe-support.cc.
-// Sets up a dummy local QueryState to allow evaluating exprs, etc.
+// Sets up a dummy local QueryState (with mem_limit picked up from the query options)
+// to allow evaluating exprs, etc.
 RuntimeState::RuntimeState(
     const TQueryCtx& qctx, ExecEnv* exec_env, DescriptorTbl* desc_tbl)
-  : query_state_(new QueryState(qctx, "test-pool")),
+  : query_state_(new QueryState(qctx, qctx.client_request.query_options.__isset.mem_limit
+                && qctx.client_request.query_options.mem_limit > 0 ?
+            qctx.client_request.query_options.mem_limit :
+            -1,
+        "test-pool")),
     fragment_ctx_(nullptr),
     instance_ctx_(nullptr),
     local_query_state_(query_state_),
     now_(new TimestampValue(TimestampValue::Parse(qctx.now_string))),
     utc_timestamp_(new TimestampValue(TimestampValue::Parse(qctx.utc_timestamp_string))),
     local_time_zone_(&TimezoneDatabase::GetUtcTimezone()),
-    profile_(RuntimeProfile::Create(obj_pool(), "<unnamed>")) {
+    profile_(RuntimeProfile::Create(obj_pool(), "<unnamed>")),
+    instance_buffer_reservation_(nullptr) {
   // We may use execution resources while evaluating exprs, etc. Decremented in
   // ReleaseResources() to release resources.
   local_query_state_->AcquireBackendResourceRefcount();
@@ -103,6 +109,10 @@ RuntimeState::RuntimeState(
 
 RuntimeState::~RuntimeState() {
   DCHECK(released_resources_) << "Must call ReleaseResources()";
+  // IMPALA-8270: run local_query_state_ destructor *before* other destructors so that
+  // teardown order for the TestEnv/fe-support RuntimeState matches the teardown order
+  // for the "real" RuntimeState. The previous divergence lead to hard-to-find bugs.
+  if (local_query_state_ != nullptr) local_query_state_.reset();
 }
 
 void RuntimeState::Init() {
@@ -121,12 +131,12 @@ void RuntimeState::Init() {
   total_network_send_timer_ = ADD_TIMER(runtime_profile(), "TotalNetworkSendTime");
   total_network_receive_timer_ = ADD_TIMER(runtime_profile(), "TotalNetworkReceiveTime");
 
-  instance_mem_tracker_.reset(new MemTracker(
+  instance_mem_tracker_ = obj_pool()->Add(new MemTracker(
       runtime_profile(), -1, runtime_profile()->name(), query_mem_tracker()));
 
   if (instance_buffer_reservation_ != nullptr) {
     instance_buffer_reservation_->InitChildTracker(profile_,
-        query_state_->buffer_reservation(), instance_mem_tracker_.get(),
+        query_state_->buffer_reservation(), instance_mem_tracker_,
         numeric_limits<int64_t>::max());
   }
 
@@ -158,16 +168,16 @@ Status RuntimeState::CreateCodegen() {
   if (codegen_.get() != NULL) return Status::OK();
   // TODO: add the fragment ID to the codegen ID as well
   RETURN_IF_ERROR(LlvmCodeGen::CreateImpalaCodegen(this,
-      instance_mem_tracker_.get(), PrintId(fragment_instance_id()), &codegen_));
+      instance_mem_tracker_, PrintId(fragment_instance_id()), &codegen_));
   codegen_->EnableOptimizations(true);
   profile_->AddChild(codegen_->runtime_profile());
   return Status::OK();
 }
 
-Status RuntimeState::CodegenScalarFns() {
-  for (ScalarFnCall* scalar_fn : scalar_fns_to_codegen_) {
+Status RuntimeState::CodegenScalarExprs() {
+  for (auto& item : scalar_exprs_to_codegen_) {
     llvm::Function* fn;
-    RETURN_IF_ERROR(scalar_fn->GetCodegendComputeFn(codegen_.get(), &fn));
+    RETURN_IF_ERROR(item.first->GetCodegendComputeFn(codegen_.get(), item.second, &fn));
   }
   return Status::OK();
 }
@@ -179,11 +189,6 @@ Status RuntimeState::StartSpilling(MemTracker* mem_tracker) {
 string RuntimeState::ErrorLog() {
   lock_guard<SpinLock> l(error_log_lock_);
   return PrintErrorMapToString(error_log_);
-}
-
-void RuntimeState::GetErrors(ErrorLogMap* errors) {
-  lock_guard<SpinLock> l(error_log_lock_);
-  *errors = error_log_;
 }
 
 bool RuntimeState::LogError(const ErrorMsg& message, int vlog_level) {
@@ -199,9 +204,12 @@ bool RuntimeState::LogError(const ErrorMsg& message, int vlog_level) {
   return false;
 }
 
-void RuntimeState::GetUnreportedErrors(ErrorLogMap* new_errors) {
+void RuntimeState::GetUnreportedErrors(ErrorLogMapPB* new_errors) {
+  new_errors->clear();
   lock_guard<SpinLock> l(error_log_lock_);
-  *new_errors = error_log_;
+  for (const ErrorLogMap::value_type& v : error_log_) {
+    (*new_errors)[v.first] = v.second;
+  }
   // Reset all messages, but keep all already reported keys so that we do not report the
   // same errors multiple times.
   ClearErrorMap(error_log_);
@@ -216,12 +224,23 @@ Status RuntimeState::LogOrReturnError(const ErrorMsg& message) {
       || message.error() == TErrorCode::CANCELLED_INTERNALLY
       || message.error() == TErrorCode::MEM_LIMIT_EXCEEDED
       || message.error() == TErrorCode::INTERNAL_ERROR
-      || message.error() == TErrorCode::DISK_IO_ERROR) {
+      || message.error() == TErrorCode::DISK_IO_ERROR
+      || message.error() == TErrorCode::THREAD_POOL_SUBMIT_FAILED
+      || message.error() == TErrorCode::THREAD_POOL_TASK_TIMED_OUT) {
     return Status(message);
   }
   // Otherwise, add the error to the error log and continue.
   LogError(message);
   return Status::OK();
+}
+
+double RuntimeState::ComputeExchangeScanRatio() const {
+  int64_t bytes_read = 0;
+  for (const auto& c : bytes_read_counters_) bytes_read += c->value();
+  if (bytes_read == 0) return 0;
+  int64_t bytes_sent = 0;
+  for (const auto& c : bytes_sent_counters_) bytes_sent += c->value();
+  return (double)bytes_sent / bytes_read;
 }
 
 void RuntimeState::SetMemLimitExceeded(MemTracker* tracker,
@@ -255,7 +274,7 @@ void RuntimeState::SetMemLimitExceeded(MemTracker* tracker,
 Status RuntimeState::CheckQueryState() {
   DCHECK(instance_mem_tracker_ != nullptr);
   if (UNLIKELY(instance_mem_tracker_->AnyLimitExceeded(MemLimit::HARD))) {
-    SetMemLimitExceeded(instance_mem_tracker_.get());
+    SetMemLimitExceeded(instance_mem_tracker_);
   }
   return GetQueryStatus();
 }

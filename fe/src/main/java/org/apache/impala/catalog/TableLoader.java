@@ -18,12 +18,17 @@
 package org.apache.impala.catalog;
 
 import java.util.EnumSet;
+import java.util.concurrent.TimeUnit;
 
 import org.apache.hadoop.hive.metastore.TableType;
 import org.apache.hadoop.hive.metastore.api.NoSuchObjectException;
+import org.apache.impala.compat.MetastoreShim;
 import org.apache.log4j.Logger;
 
+import com.google.common.base.Stopwatch;
+
 import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
+import org.apache.impala.util.ThreadNameAnnotator;
 
 /**
  * Class that implements the logic for how a table's metadata should be loaded from
@@ -31,10 +36,6 @@ import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
  */
 public class TableLoader {
   private static final Logger LOG = Logger.getLogger(TableLoader.class);
-
-  // Set of supported table types.
-  private static EnumSet<TableType> SUPPORTED_TABLE_TYPES = EnumSet.of(
-      TableType.EXTERNAL_TABLE, TableType.MANAGED_TABLE, TableType.VIRTUAL_VIEW);
 
   private final CatalogServiceCatalog catalog_;
 
@@ -54,11 +55,14 @@ public class TableLoader {
    * an IncompleteTable will be returned that contains details on the error.
    */
   public Table load(Db db, String tblName) {
+    Stopwatch sw = new Stopwatch().start();
     String fullTblName = db.getName() + "." + tblName;
-    LOG.info("Loading metadata for: " + fullTblName);
+    String annotation = "Loading metadata for: " + fullTblName;
+    LOG.info(annotation);
     Table table;
     // turn all exceptions into TableLoadingException
-    try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
+    try (ThreadNameAnnotator tna = new ThreadNameAnnotator(annotation);
+         MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
       org.apache.hadoop.hive.metastore.api.Table msTbl = null;
       // All calls to getTable() need to be serialized due to HIVE-5457.
       synchronized (metastoreAccessLock_) {
@@ -66,7 +70,7 @@ public class TableLoader {
       }
       // Check that the Hive TableType is supported
       TableType tableType = TableType.valueOf(msTbl.getTableType());
-      if (!SUPPORTED_TABLE_TYPES.contains(tableType)) {
+      if (!MetastoreShim.IMPALA_SUPPORTED_TABLE_TYPES.contains(tableType)) {
         throw new TableLoadingException(String.format(
             "Unsupported table type '%s' for: %s", tableType, fullTblName));
       }
@@ -94,7 +98,8 @@ public class TableLoader {
           "Failed to load metadata for table: " + fullTblName + ". Running " +
           "'invalidate metadata " + fullTblName + "' may resolve this problem.", e));
     }
-    LOG.info("Loaded metadata for: " + fullTblName);
+    LOG.info("Loaded metadata for: " + fullTblName + " (" +
+        sw.elapsedTime(TimeUnit.MILLISECONDS) + "ms)");
     return table;
   }
 }

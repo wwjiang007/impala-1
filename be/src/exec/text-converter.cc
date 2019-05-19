@@ -109,7 +109,7 @@ Status TextConverter::CodegenWriteSlot(LlvmCodeGen* codegen,
     const char* null_col_val, int len, bool check_null, bool strict_mode) {
   DCHECK(fn != nullptr);
   if (slot_desc->type().type == TYPE_CHAR) {
-    return Status("TextConverter::CodegenWriteSlot(): Char isn't supported for"
+    return Status::Expected("TextConverter::CodegenWriteSlot(): Char isn't supported for"
         " CodegenWriteSlot");
   }
 
@@ -229,6 +229,9 @@ Status TextConverter::CodegenWriteSlot(LlvmCodeGen* codegen,
         break;
       case TYPE_TIMESTAMP:
         parse_fn_enum = IRFunction::STRING_TO_TIMESTAMP;
+        break;
+      case TYPE_DATE:
+        parse_fn_enum = IRFunction::STRING_TO_DATE;
         break;
       case TYPE_DECIMAL:
         switch (slot_desc->slot_size()) {

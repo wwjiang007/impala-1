@@ -171,6 +171,18 @@ class Cluster(object):
       self._init_impala()
     return self._impala
 
+  def print_version(self):
+    """
+    Print the cluster impalad version info to the console sorted by hostname.
+    """
+    def _sorter(i1, i2):
+      return cmp(i1.host_name, i2.host_name)
+
+    version_info = self.impala.get_version_info()
+    print("Cluster Impalad Version Info:")
+    for impalad in sorted(version_info.keys(), cmp=_sorter):
+      print("{0}: {1}".format(impalad.host_name, version_info[impalad]))
+
 
 class MiniCluster(Cluster):
 
@@ -845,8 +857,10 @@ class MiniClusterImpalad(Impalad):
 
   def find_pid(self):
     # Need to filter results to avoid pgrep picking up its parent bash script.
-    pid = self.shell("pgrep -f -a 'impalad.*%s' | grep -v pgrep | "
-        "grep -o '^[0-9]*' || true" % self.hs2_port)
+    # Test with:
+    # sh -c "pgrep -l -f 'impala.*21050' | grep [i]mpalad | grep -o '^[0-9]*' || true"
+    pid = self.shell("pgrep -l -f 'impalad.*%s' | grep [i]mpalad | "
+                     "grep -o '^[0-9]*' || true" % self.hs2_port)
     if pid:
       return int(pid)
 

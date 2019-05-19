@@ -17,6 +17,7 @@
 
 package org.apache.impala.planner;
 
+import java.util.ArrayList;
 import java.util.List;
 
 import org.apache.impala.analysis.SlotDescriptor;
@@ -25,19 +26,28 @@ import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.HdfsFileFormat;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.NotImplementedException;
+import org.apache.impala.common.PrintUtils;
+import org.apache.impala.common.RuntimeEnv;
 import org.apache.impala.thrift.TNetworkAddress;
+import org.apache.impala.thrift.TQueryOptions;
 import org.apache.impala.thrift.TScanRangeSpec;
 import org.apache.impala.thrift.TTableStats;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
 
 /**
  * Representation of the common elements of all scan nodes.
  */
 abstract public class ScanNode extends PlanNode {
+
+  // Factor capturing the worst-case deviation from a uniform distribution of scan ranges
+  // among nodes. The factor of 1.2 means that a particular node may have 20% more
+  // scan ranges than would have been estimated assuming a uniform distribution.
+  // Used for HDFS and Kudu Scan node estimations.
+  protected static final double SCAN_RANGE_SKEW_FACTOR = 1.2;
+
   protected final TupleDescriptor desc_;
 
   // Total number of rows this node is expected to process
@@ -102,12 +112,12 @@ abstract public class ScanNode extends PlanNode {
    * when the string returned by this method is embedded in a query's explain plan.
    */
   protected String getTableStatsExplainString(String prefix) {
-    StringBuilder output = new StringBuilder();
     TTableStats tblStats = desc_.getTable().getTTableStats();
-    String numRows = String.valueOf(tblStats.num_rows);
-    if (tblStats.num_rows == -1) numRows = "unavailable";
-    output.append(prefix + "table: rows=" + numRows);
-    return output.toString();
+    return new StringBuilder()
+      .append(prefix)
+      .append("table: rows=")
+      .append(PrintUtils.printEstCardinality(tblStats.num_rows))
+      .toString();
   }
 
   /**
@@ -117,18 +127,19 @@ abstract public class ScanNode extends PlanNode {
    */
   protected String getColumnStatsExplainString(String prefix) {
     StringBuilder output = new StringBuilder();
-    List<String> columnsMissingStats = Lists.newArrayList();
+    List<String> columnsMissingStats = new ArrayList<>();
     for (SlotDescriptor slot: desc_.getSlots()) {
       if (!slot.getStats().hasStats() && slot.getColumn() != null) {
         columnsMissingStats.add(slot.getColumn().getName());
       }
     }
+    output.append(prefix);
     if (columnsMissingStats.isEmpty()) {
-      output.append(prefix + "columns: all");
+      output.append("columns: all");
     } else if (columnsMissingStats.size() == desc_.getSlots().size()) {
-      output.append(prefix + "columns: unavailable");
+      output.append("columns: unavailable");
     } else {
-      output.append(String.format("%scolumns missing stats: %s", prefix,
+      output.append(String.format("columns missing stats: %s",
           Joiner.on(", ").join(columnsMissingStats)));
     }
     return output.toString();
@@ -205,7 +216,7 @@ abstract public class ScanNode extends PlanNode {
   @Override
   protected String getDisplayLabelDetail() {
     FeTable table = desc_.getTable();
-    List<String> path = Lists.newArrayList();
+    List<String> path = new ArrayList<>();
     path.add(table.getDb().getName());
     path.add(table.getName());
     Preconditions.checkNotNull(desc_.getPath());
@@ -216,6 +227,35 @@ abstract public class ScanNode extends PlanNode {
     }
   }
 
+  /**
+   * Helper function that returns the estimated number of scan ranges that would
+   * be assigned to each host based on the total number of scan ranges.
+   */
+  protected int estimatePerHostScanRanges(long totalNumOfScanRanges) {
+    return (int) Math.ceil(((double) totalNumOfScanRanges / (double) numNodes_) *
+        SCAN_RANGE_SKEW_FACTOR);
+  }
+
+  /**
+   * Helper function that returns the max number of scanner threads that can be
+   * spawned by a scan node.
+   */
+  protected int computeMaxNumberOfScannerThreads(TQueryOptions queryOptions,
+      int perHostScanRanges) {
+    // The non-MT scan node requires at least one scanner thread.
+    if (queryOptions.getMt_dop() >= 1) {
+      return 1;
+    }
+    int maxScannerThreads = Math.min(perHostScanRanges,
+        RuntimeEnv.INSTANCE.getNumCores());
+    // Account for the max scanner threads query option.
+    if (queryOptions.isSetNum_scanner_threads() &&
+        queryOptions.getNum_scanner_threads() > 0) {
+      maxScannerThreads = Math.min(maxScannerThreads,
+          queryOptions.getNum_scanner_threads());
+    }
+    return maxScannerThreads;
+  }
   /**
    * Returns true if this node has conjuncts to be evaluated by Impala against the scan
    * tuple.

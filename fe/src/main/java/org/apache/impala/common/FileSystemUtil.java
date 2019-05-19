@@ -21,6 +21,9 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
+import java.util.Map;
+import java.util.NoSuchElementException;
+import java.util.Stack;
 import java.util.UUID;
 
 import org.apache.commons.io.IOUtils;
@@ -33,6 +36,8 @@ import org.apache.hadoop.fs.LocatedFileStatus;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.RemoteIterator;
 import org.apache.hadoop.fs.s3a.S3AFileSystem;
+import org.apache.hadoop.fs.azurebfs.AzureBlobFileSystem;
+import org.apache.hadoop.fs.azurebfs.SecureAzureBlobFileSystem;
 import org.apache.hadoop.fs.adl.AdlFileSystem;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
 import org.apache.hadoop.hdfs.client.HdfsAdmin;
@@ -41,8 +46,8 @@ import org.apache.impala.catalog.HdfsCompression;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableMap;
 
 /**
  * Common utility functions for operating on FileSystem objects.
@@ -306,6 +311,7 @@ public class FileSystemUtil {
     if (isDistributedFileSystem(fs)) return true;
     // Blacklist FileSystems that are known to not to include storage UUIDs.
     return !(fs instanceof S3AFileSystem || fs instanceof LocalFileSystem ||
+        fs instanceof AzureBlobFileSystem || fs instanceof SecureAzureBlobFileSystem ||
         fs instanceof AdlFileSystem);
   }
 
@@ -338,6 +344,26 @@ public class FileSystemUtil {
   }
 
   /**
+   * Returns true iff the filesystem is AzureBlobFileSystem or
+   * SecureAzureBlobFileSystem. This function is unique in that there are 2
+   * distinct classes it checks for, but the ony functional difference is the
+   * use of wire encryption. Some features like OAuth authentication do require
+   * wire encryption but that does not matter in usages of this function.
+   */
+  public static boolean isABFSFileSystem(FileSystem fs) {
+    return fs instanceof AzureBlobFileSystem
+        || fs instanceof SecureAzureBlobFileSystem;
+  }
+
+  /**
+   * Returns true iff the path is on AzureBlobFileSystem or
+   * SecureAzureBlobFileSystem.
+   */
+  public static boolean isABFSFileSystem(Path path) throws IOException {
+    return isABFSFileSystem(path.getFileSystem(CONF));
+  }
+
+  /**
    * Returns true iff the filesystem is an instance of LocalFileSystem.
    */
   public static boolean isLocalFileSystem(FileSystem fs) {
@@ -365,10 +391,57 @@ public class FileSystemUtil {
     return isDistributedFileSystem(path.getFileSystem(CONF));
   }
 
+  /**
+   * Represents the type of filesystem being used. Typically associated with a
+   * {@link org.apache.hadoop.fs.FileSystem} instance that is used to read data.
+   *
+   * <p>
+   *   Unlike the {@code is*FileSystem} methods above. A FsType is more
+   *   generic in that it is capable of grouping different filesystems to the
+   *   same type. For example, the FsType {@link FsType#ADLS} maps to
+   *   multiple filesystems: {@link AdlFileSystem},
+   *   {@link AzureBlobFileSystem}, and {@link SecureAzureBlobFileSystem}.
+   * </p>
+   */
+  public enum FsType {
+    ADLS,
+    HDFS,
+    LOCAL,
+    S3;
+
+    private static final Map<String, FsType> SCHEME_TO_FS_MAPPING =
+        ImmutableMap.<String, FsType>builder()
+            .put("abfs", ADLS)
+            .put("abfss", ADLS)
+            .put("adl", ADLS)
+            .put("file", LOCAL)
+            .put("hdfs", HDFS)
+            .put("s3a", S3)
+            .build();
+
+    /**
+     * Provides a mapping between filesystem schemes and filesystems types. This can be
+     * useful as there are often multiple filesystem connectors for a give fs, each
+     * with its own scheme (e.g. abfs, abfss, adl are all ADLS connectors).
+     * Returns the {@link FsType} associated with a given filesystem scheme (e.g. local,
+     * hdfs, s3a, etc.)
+     */
+    public static FsType getFsType(String scheme) {
+      return SCHEME_TO_FS_MAPPING.get(scheme);
+    }
+  }
+
   public static FileSystem getDefaultFileSystem() throws IOException {
     Path path = new Path(FileSystem.getDefaultUri(CONF));
     FileSystem fs = path.getFileSystem(CONF);
     return fs;
+  }
+
+  /**
+   * Returns the FileSystem object for a given path using the cached config.
+   */
+  public static FileSystem getFileSystemForPath(Path p) throws IOException {
+    return p.getFileSystem(CONF);
   }
 
   public static DistributedFileSystem getDistributedFileSystem() throws IOException {
@@ -458,6 +531,7 @@ public class FileSystemUtil {
     return (FileSystemUtil.isDistributedFileSystem(path) ||
         FileSystemUtil.isLocalFileSystem(path) ||
         FileSystemUtil.isS3AFileSystem(path) ||
+        FileSystemUtil.isABFSFileSystem(path) ||
         FileSystemUtil.isADLFileSystem(path));
   }
 
@@ -467,9 +541,34 @@ public class FileSystemUtil {
    * the file does not exist and also saves an RPC as the caller need not do a separate
    * exists check for the path. Returns null if the path does not exist.
    */
-  public static FileStatus[] listStatus(FileSystem fs, Path p) throws IOException {
+  public static RemoteIterator<? extends FileStatus> listStatus(FileSystem fs, Path p,
+      boolean recursive) throws IOException {
     try {
-      return fs.listStatus(p);
+      if (recursive) {
+        // The Hadoop FileSystem API doesn't provide a recursive listStatus call that
+        // doesn't also fetch block locations, and fetching block locations is expensive.
+        // Here, our caller specifically doesn't need block locations, so we don't want to
+        // call the expensive 'listFiles' call on HDFS. Instead, we need to "manually"
+        // recursively call FileSystem.listStatusIterator().
+        //
+        // Note that this "manual" recursion is not actually any slower than the recursion
+        // provided by the HDFS 'listFiles(recursive=true)' API, since the HDFS wire
+        // protocol doesn't provide any such recursive support anyway. In other words,
+        // the API that looks like a single recursive call is just as bad as what we're
+        // doing here.
+        //
+        // However, S3 actually implements 'listFiles(recursive=true)' with a faster path
+        // which natively recurses. In that case, it's quite preferable to use 'listFiles'
+        // even though it returns LocatedFileStatus objects with "fake" blocks which we
+        // will ignore.
+        if (isS3AFileSystem(fs)) {
+          return listFiles(fs, p, recursive);
+        }
+
+        return new RecursingIterator(fs, p);
+      }
+
+      return fs.listStatusIterator(p);
     } catch (FileNotFoundException e) {
       if (LOG.isWarnEnabled()) LOG.warn("Path does not exist: " + p.toString(), e);
       return null;
@@ -486,6 +585,80 @@ public class FileSystemUtil {
     } catch (FileNotFoundException e) {
       if (LOG.isWarnEnabled()) LOG.warn("Path does not exist: " + p.toString(), e);
       return null;
+    }
+  }
+
+  /**
+   * Returns true if the path 'p' is a directory, false otherwise.
+   */
+  public static boolean isDir(Path p) throws IOException {
+    FileSystem fs = getFileSystemForPath(p);
+    return fs.isDirectory(p);
+  }
+
+  /**
+   * Iterator which recursively visits directories on a FileSystem, yielding
+   * files in an unspecified order. Only files are yielded -- not directories.
+   */
+  private static class RecursingIterator implements RemoteIterator<FileStatus> {
+    private final FileSystem fs_;
+    private final Stack<RemoteIterator<FileStatus>> iters_ = new Stack<>();
+    private RemoteIterator<FileStatus> curIter_;
+    private FileStatus curFile_;
+
+    private RecursingIterator(FileSystem fs, Path startPath) throws IOException {
+      this.fs_ = Preconditions.checkNotNull(fs);
+      curIter_ = fs.listStatusIterator(Preconditions.checkNotNull(startPath));
+    }
+
+    @Override
+    public boolean hasNext() throws IOException {
+      // Pull the next file to be returned into 'curFile'. If we've already got one,
+      // we don't need to do anything (extra calls to hasNext() must not affect
+      // state)
+      while (curFile_ == null) {
+        if (curIter_.hasNext()) {
+          // Consume the next file or directory from the current iterator.
+          handleFileStat(curIter_.next());
+        } else if (!iters_.empty()) {
+          // We ran out of entries in the current one, but we might still have
+          // entries at a higher level of recursion.
+          curIter_ = iters_.pop();
+        } else {
+          // No iterators left to process, so we are entirely done.
+          return false;
+        }
+      }
+      return true;
+    }
+
+    /**
+     * Process the input stat.
+     * If it is a file, return the file stat.
+     * If it is a directory, traverse the directory if recursive is true;
+     * ignore it if recursive is false.
+     * @param fileStatus input status
+     * @throws IOException if any IO error occurs
+     */
+    private void handleFileStat(FileStatus fileStatus) throws IOException {
+      if (fileStatus.isFile()) { // file
+        curFile_ = fileStatus;
+      } else { // directory
+        iters_.push(curIter_);
+        curIter_ = fs_.listStatusIterator(fileStatus.getPath());
+      }
+    }
+
+    @Override
+    public FileStatus next() throws IOException {
+      if (hasNext()) {
+        FileStatus result = curFile_;
+        // Reset back to 'null' so that hasNext() will pull a new entry on the next
+        // call.
+        curFile_ = null;
+        return result;
+      }
+      throw new NoSuchElementException("No more entries");
     }
   }
 }

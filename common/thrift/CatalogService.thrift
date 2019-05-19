@@ -145,6 +145,9 @@ struct TDdlExecRequest {
 
   // Parameters for ALTER DATABASE
   24: optional JniCatalog.TAlterDbParams alter_db_params
+
+  // Parameters for replaying an exported testcase.
+  25: optional JniCatalog.TCopyTestCaseReq copy_test_case_params
 }
 
 // Response from executing a TDdlExecRequest
@@ -186,6 +189,9 @@ struct TUpdateCatalogRequest {
   // List of partitions that are new and need to be created. May
   // include the root partition (represented by the empty string).
   6: required set<string> created_partitions;
+
+  // True if the update corresponds to an "insert overwrite" operation
+  7: required bool is_overwrite;
 }
 
 // Response from a TUpdateCatalogRequest
@@ -216,6 +222,9 @@ struct TResetMetadataRequest {
 
   // True if SYNC_DDL is set in query options
   7: required bool sync_ddl
+
+  // If set, refreshes authorization metadata.
+  8: optional bool authorization
 }
 
 // Response from TResetMetadataRequest
@@ -378,7 +387,13 @@ enum CatalogLookupStatus {
   OK,
   DB_NOT_FOUND,
   TABLE_NOT_FOUND,
-  FUNCTION_NOT_FOUND
+  TABLE_NOT_LOADED,
+  FUNCTION_NOT_FOUND,
+  // Partial fetch RPCs currently look up partitions by IDs instead of names. These IDs
+  // change over the lifetime of a table with queries like invalidate metadata. In such
+  // cases this lookup status is set and the caller can retry the fetch.
+  // TODO: Fix partition lookup logic to not do it with IDs.
+  PARTITION_NOT_FOUND
 }
 
 // RPC response for GetPartialCatalogObject.
@@ -466,9 +481,11 @@ struct TSentryAdminCheckRequest {
 }
 
 struct TSentryAdminCheckResponse {
-  // Contains an error if the user does not have privileges to access the Sentry Service
-  // or if the Sentry Service is unavailable. Returns OK if the operation was successful.
+  // Returns OK if the operation was successful.
   1: optional Status.TStatus status
+
+  // Returns true if the user is a Sentry admin user.
+  2: required bool is_admin
 }
 
 struct TTableUsage {

@@ -36,6 +36,7 @@
 #include "util/debug-util.h"
 #include "util/logging-support.h"
 #include "util/openssl-util.h"
+#include "util/test-info.h"
 #include "util/time.h"
 #include "util/uid-util.h"
 #include "util/webserver.h"
@@ -486,17 +487,17 @@ void Statestore::RegisterWebpages(Webserver* webserver) {
   Webserver::UrlCallback topics_callback =
       bind<void>(mem_fn(&Statestore::TopicsHandler), this, _1, _2);
   webserver->RegisterUrlCallback("/topics", "statestore_topics.tmpl",
-      topics_callback);
+      topics_callback, true);
 
   Webserver::UrlCallback subscribers_callback =
       bind<void>(&Statestore::SubscribersHandler, this, _1, _2);
   webserver->RegisterUrlCallback("/subscribers", "statestore_subscribers.tmpl",
-      subscribers_callback);
+      subscribers_callback, true);
 
   RegisterLogLevelCallbacks(webserver, false);
 }
 
-void Statestore::TopicsHandler(const Webserver::ArgumentMap& args,
+void Statestore::TopicsHandler(const Webserver::WebRequest& req,
     Document* document) {
   lock_guard<mutex> l(subscribers_lock_);
   shared_lock<shared_mutex> t(topics_map_lock_);
@@ -518,7 +519,7 @@ void Statestore::TopicsHandler(const Webserver::ArgumentMap& args,
   document->AddMember("topics", topics, document->GetAllocator());
 }
 
-void Statestore::SubscribersHandler(const Webserver::ArgumentMap& args,
+void Statestore::SubscribersHandler(const Webserver::WebRequest& req,
     Document* document) {
   lock_guard<mutex> l(subscribers_lock_);
   Value subscribers(kArrayType);
@@ -831,6 +832,7 @@ const char* Statestore::GetUpdateKindName(UpdateKind kind) {
       return "heartbeat";
   }
   DCHECK(false);
+  return "";
 }
 
 ThreadPool<Statestore::ScheduledSubscriberUpdate>* Statestore::GetThreadPool(
@@ -844,6 +846,7 @@ ThreadPool<Statestore::ScheduledSubscriberUpdate>* Statestore::GetThreadPool(
       return &subscriber_heartbeat_threadpool_;
   }
   DCHECK(false);
+  return nullptr;
 }
 
 Status Statestore::SendHeartbeat(Subscriber* subscriber) {
@@ -929,7 +932,9 @@ void Statestore::DoSubscriberUpdate(UpdateKind update_kind, int thread_id,
 
     deadline_ms = UnixMillis() + FLAGS_statestore_heartbeat_frequency_ms;
   } else {
-    bool update_skipped;
+    // Initialize to false so that we don't consider the update skipped when
+    // SendTopicUpdate() fails.
+    bool update_skipped = false;
     status = SendTopicUpdate(subscriber.get(), update_kind, &update_skipped);
     if (status.code() == TErrorCode::RPC_RECV_TIMEOUT) {
       // Add details to status to make it more useful, while preserving the stack
@@ -1046,6 +1051,16 @@ void Statestore::UnregisterSubscriber(Subscriber* subscriber) {
 }
 
 void Statestore::MainLoop() {
+  subscriber_topic_update_threadpool_.Join();
+  subscriber_priority_topic_update_threadpool_.Join();
+  subscriber_heartbeat_threadpool_.Join();
+}
+
+void Statestore::ShutdownForTesting() {
+  CHECK(TestInfo::is_be_test()) << "Only valid to call in backend tests.";
+  subscriber_topic_update_threadpool_.Shutdown();
+  subscriber_priority_topic_update_threadpool_.Shutdown();
+  subscriber_heartbeat_threadpool_.Shutdown();
   subscriber_topic_update_threadpool_.Join();
   subscriber_priority_topic_update_threadpool_.Join();
   subscriber_heartbeat_threadpool_.Join();

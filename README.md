@@ -40,8 +40,7 @@ See bin/bootstrap_build.sh.
 
 ### Detailed Build Notes
 
-Impala can be built with pre-built components, downloaded from S3, or can be
-built with an in-place toolchain located in the thirdparty directory (not recommended).
+Impala can be built with pre-built components or components downloaded from S3.
 The components needed to build Impala are Apache Hadoop, Hive, HBase, and Sentry.
 If you need to manually override the locations or versions of these components, you
 can do so through the environment variables and scripts listed below.
@@ -66,7 +65,7 @@ can do so through the environment variables and scripts listed below.
 | IMPALA_TOOLCHAIN     | "${IMPALA_HOME}/toolchain" | Native toolchain directory (for compilers, libraries, etc.) |
 | SKIP_TOOLCHAIN_BOOTSTRAP | "false" | Skips downloading the toolchain any python dependencies if "true" |
 | CDH_BUILD_NUMBER | | Identifier to indicate the CDH build number
-| CDH_COMPONENTS_HOME | "${IMPALA_HOME}/toolchain/cdh_components-${CDH_BUILD_NUMBER}" OR "${IMPALA_HOME}/thirdparty" (if detected) | If a thirdparty directory is present, components found here will override anything in IMPALA_TOOLCHAIN. |
+| CDH_COMPONENTS_HOME | "${IMPALA_HOME}/toolchain/cdh_components-${CDH_BUILD_NUMBER}" | Location of the CDH components within the toolchain. |
 | CDH_MAJOR_VERSION | "5" | Identifier used to uniqueify paths for potentially incompatible component builds. |
 | IMPALA_CONFIG_SOURCED | "1" |  Set by ${IMPALA_HOME}/bin/impala-config.sh (internal use) |
 | JAVA_HOME | "/usr/lib/jvm/${JAVA_VERSION}" | Used to locate Java |
@@ -101,7 +100,6 @@ can do so through the environment variables and scripts listed below.
 | HADOOP_INCLUDE_DIR   | "${HADOOP_HOME}/include" | For 'hdfs.h' |
 | HADOOP_LIB_DIR       | "${HADOOP_HOME}/lib" | For 'libhdfs.a' or 'libhdfs.so' |
 | HIVE_HOME            | "${CDH_COMPONENTS_HOME}/{hive-${IMPALA_HIVE_VERSION}/" | |
-| HIVE_SRC_DIR         | "${HIVE_HOME}/src" | Used to find Hive thrift files. |
 | HBASE_HOME           | "${CDH_COMPONENTS_HOME}/hbase-${IMPALA_HBASE_VERSION}/" | |
 | SENTRY_HOME          | "${CDH_COMPONENTS_HOME}/sentry-${IMPALA_SENTRY_VERSION}/" | Used to setup test data |
 | THRIFT_HOME          | "${IMPALA_TOOLCHAIN}/thrift-${IMPALA_THRIFT_VERSION}" | |

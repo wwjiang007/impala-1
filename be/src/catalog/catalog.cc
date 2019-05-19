@@ -61,21 +61,23 @@ Catalog::Catalog() {
     {"getTableMetrics", "([B)Ljava/lang/String;", &get_table_metrics_id_},
     {"getDbs", "([B)[B", &get_dbs_id_},
     {"getFunctions", "([B)[B", &get_functions_id_},
-    {"checkUserSentryAdmin", "([B)V", &sentry_admin_check_id_},
+    {"checkUserSentryAdmin", "([B)[B", &sentry_admin_check_id_},
     {"getCatalogObject", "([B)[B", &get_catalog_object_id_},
     {"getPartialCatalogObject", "([B)[B", &get_partial_catalog_object_id_},
     {"getCatalogDelta", "([B)[B", &get_catalog_delta_id_},
     {"getCatalogUsage", "()[B", &get_catalog_usage_id_},
     {"getCatalogVersion", "()J", &get_catalog_version_id_},
+    {"getCatalogServerMetrics", "()[B", &get_catalog_server_metrics_},
+    {"getEventProcessorSummary", "()[B", &get_event_processor_summary_},
     {"prioritizeLoad", "([B)V", &prioritize_load_id_},
     {"getPartitionStats", "([B)[B", &get_partition_stats_id_},
     {"updateTableUsage", "([B)V", &update_table_usage_id_},
   };
 
-  JNIEnv* jni_env = getJNIEnv();
+  JNIEnv* jni_env = JniUtil::GetJNIEnv();
   // Create an instance of the java class JniCatalog
   catalog_class_ = jni_env->FindClass("org/apache/impala/service/JniCatalog");
-  EXIT_IF_EXC(jni_env);
+  ABORT_IF_EXC(jni_env);
 
   uint32_t num_methods = sizeof(methods) / sizeof(methods[0]);
   for (int i = 0; i < num_methods; ++i) {
@@ -86,7 +88,7 @@ Catalog::Catalog() {
   ABORT_IF_ERROR(GetThriftBackendGflags(jni_env, &cfg_bytes));
 
   jobject catalog = jni_env->NewObject(catalog_class_, catalog_ctor_, cfg_bytes);
-  EXIT_IF_EXC(jni_env);
+  CLEAN_EXIT_IF_EXC(jni_env);
   ABORT_IF_ERROR(JniUtil::LocalToGlobalRef(jni_env, catalog, &catalog_));
 }
 
@@ -101,10 +103,11 @@ Status Catalog::GetPartialCatalogObject(const TGetPartialCatalogObjectRequest& r
 }
 
 Status Catalog::GetCatalogVersion(long* version) {
-  JNIEnv* jni_env = getJNIEnv();
+  JNIEnv* jni_env = JniUtil::GetJNIEnv();
   JniLocalFrame jni_frame;
   RETURN_IF_ERROR(jni_frame.push(jni_env));
   *version = jni_env->CallLongMethod(catalog_, get_catalog_version_id_);
+  RETURN_ERROR_IF_EXC(jni_env);
   return Status::OK();
 }
 
@@ -158,6 +161,15 @@ Status Catalog::GetCatalogUsage(TGetCatalogUsageResponse* response) {
   return JniUtil::CallJniMethod(catalog_, get_catalog_usage_id_, response);
 }
 
+Status Catalog::GetEventProcessorSummary(
+    TEventProcessorMetricsSummaryResponse* response) {
+  return JniUtil::CallJniMethod(catalog_, get_event_processor_summary_, response);
+}
+
+Status Catalog::GetCatalogServerMetrics(TGetCatalogServerMetricsResponse* response) {
+  return JniUtil::CallJniMethod(catalog_, get_catalog_server_metrics_, response);
+}
+
 Status Catalog::GetFunctions(const TGetFunctionsRequest& request,
     TGetFunctionsResponse *response) {
   return JniUtil::CallJniMethod(catalog_, get_functions_id_, request, response);
@@ -172,8 +184,9 @@ Status Catalog::GetPartitionStats(
   return JniUtil::CallJniMethod(catalog_, get_partition_stats_id_, req, resp);
 }
 
-Status Catalog::SentryAdminCheck(const TSentryAdminCheckRequest& req) {
-  return JniUtil::CallJniMethod(catalog_, sentry_admin_check_id_, req);
+Status Catalog::SentryAdminCheck(const TSentryAdminCheckRequest& req,
+    TSentryAdminCheckResponse* resp) {
+  return JniUtil::CallJniMethod(catalog_, sentry_admin_check_id_, req, resp);
 }
 
 Status Catalog::UpdateTableUsage(const TUpdateTableUsageRequest& req) {

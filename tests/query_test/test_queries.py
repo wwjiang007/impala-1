@@ -17,13 +17,15 @@
 
 # General Impala query tests
 
-import copy
 import pytest
 import re
+from copy import deepcopy
 
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfEC
-from tests.common.test_dimensions import create_uncompressed_text_dimension, extend_exec_option_dimension
+from tests.common.skip import SkipIfEC, SkipIfCatalogV2
+from tests.common.test_dimensions import (
+    create_uncompressed_text_dimension, extend_exec_option_dimension,
+    create_beeswax_hs2_dimension, hs2_parquet_constraint)
 from tests.common.test_vector import ImpalaTestVector
 
 class TestQueries(ImpalaTestSuite):
@@ -33,6 +35,11 @@ class TestQueries(ImpalaTestSuite):
     if cls.exploration_strategy() == 'core':
       cls.ImpalaTestMatrix.add_constraint(lambda v:\
           v.get_value('table_format').file_format == 'parquet')
+    # Run these queries through both beeswax and HS2 to get coverage of both protocols.
+    # Don't run all combinations of table format and protocol - the dimensions should
+    # be orthogonal.
+    cls.ImpalaTestMatrix.add_dimension(create_beeswax_hs2_dimension())
+    cls.ImpalaTestMatrix.add_constraint(hs2_parquet_constraint)
 
     # Adding a test dimension here to test the small query opt in exhaustive.
     if cls.exploration_strategy() == 'exhaustive':
@@ -102,6 +109,11 @@ class TestQueries(ImpalaTestSuite):
   def test_subquery(self, vector):
     self.run_test_case('QueryTest/subquery', vector)
 
+  def test_subquery_single_node(self, vector):
+    new_vector = deepcopy(vector)
+    new_vector.get_value('exec_option')['num_nodes'] = 1
+    self.run_test_case('QueryTest/subquery-single-node', new_vector)
+
   def test_alias(self, vector):
     self.run_test_case('QueryTest/alias', vector)
 
@@ -158,6 +170,7 @@ class TestQueriesTextTables(ImpalaTestSuite):
     vector.get_value('exec_option')['abort_on_error'] = 1
     self.run_test_case('QueryTest/strict-mode-abort', vector)
 
+  @SkipIfCatalogV2.data_sources_unsupported()
   def test_data_source_tables(self, vector):
     self.run_test_case('QueryTest/data-source-tables', vector)
 

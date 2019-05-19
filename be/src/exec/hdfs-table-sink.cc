@@ -16,22 +16,22 @@
 // under the License.
 
 #include "exec/hdfs-table-sink.h"
+#include "exec/exec-node.h"
 #include "exec/hdfs-table-writer.h"
 #include "exec/hdfs-text-table-writer.h"
-#include "exec/hdfs-parquet-table-writer.h"
-#include "exec/exec-node.h"
-#include "gen-cpp/ImpalaInternalService_constants.h"
-#include "util/hdfs-util.h"
-#include "exprs/scalar-expr.h"
+#include "exec/parquet/hdfs-parquet-table-writer.h"
 #include "exprs/scalar-expr-evaluator.h"
+#include "exprs/scalar-expr.h"
+#include "gen-cpp/ImpalaInternalService_constants.h"
 #include "runtime/hdfs-fs-cache.h"
+#include "runtime/mem-tracker.h"
 #include "runtime/raw-value.inline.h"
 #include "runtime/row-batch.h"
 #include "runtime/runtime-state.h"
 #include "runtime/string-value.inline.h"
-#include "util/impalad-metrics.h"
-#include "runtime/mem-tracker.h"
 #include "util/coding-util.h"
+#include "util/hdfs-util.h"
+#include "util/impalad-metrics.h"
 
 #include <limits>
 #include <vector>
@@ -52,12 +52,9 @@ using namespace strings;
 
 namespace impala {
 
-const static string& ROOT_PARTITION_KEY =
-    g_ImpalaInternalService_constants.ROOT_PARTITION_KEY;
-
-HdfsTableSink::HdfsTableSink(const RowDescriptor* row_desc, const TDataSink& tsink,
-    RuntimeState* state)
-  : DataSink(row_desc, "HdfsTableSink", state),
+HdfsTableSink::HdfsTableSink(TDataSinkId sink_id, const RowDescriptor* row_desc,
+    const TDataSink& tsink, RuntimeState* state)
+  : DataSink(sink_id, row_desc, "HdfsTableSink", state),
     table_desc_(nullptr),
     prototype_partition_(nullptr),
     table_id_(tsink.table_sink.target_table_id),
@@ -378,6 +375,7 @@ Status HdfsTableSink::CreateNewTmpFile(RuntimeState* state,
   }
 
   if (IsS3APath(output_partition->current_file_name.c_str()) ||
+      IsABFSPath(output_partition->current_file_name.c_str()) ||
       IsADLSPath(output_partition->current_file_name.c_str())) {
     // On S3A, the file cannot be stat'ed until after it's closed, and even so, the block
     // size reported will be just the filesystem default. Similarly, the block size
@@ -610,8 +608,8 @@ Status HdfsTableSink::Send(RuntimeState* state, RowBatch* batch) {
   return Status::OK();
 }
 
-Status HdfsTableSink::FinalizePartitionFile(RuntimeState* state,
-                                            OutputPartition* partition) {
+Status HdfsTableSink::FinalizePartitionFile(
+    RuntimeState* state, OutputPartition* partition) {
   if (partition->tmp_hdfs_file == nullptr && !overwrite_) return Status::OK();
   SCOPED_TIMER(ADD_TIMER(profile(), "FinalizePartitionFileTimer"));
 

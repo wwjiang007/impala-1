@@ -17,6 +17,7 @@
 
 package org.apache.impala.planner;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
@@ -40,8 +41,6 @@ import org.apache.impala.thrift.TPlanNode;
 import org.apache.impala.thrift.TPlanNodeType;
 import org.apache.impala.thrift.TQueryOptions;
 import org.apache.impala.util.BitUtil;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
@@ -51,14 +50,15 @@ import com.google.common.collect.Lists;
  *
  */
 public class AggregationNode extends PlanNode {
-  private final static Logger LOG = LoggerFactory.getLogger(AggregationNode.class);
-
   // Default per-instance memory requirement used if no valid stats are available.
   // TODO: Come up with a more useful heuristic.
   private final static long DEFAULT_PER_INSTANCE_MEM = 128L * 1024L * 1024L;
 
   // Conservative minimum size of hash table for low-cardinality aggregations.
   private final static long MIN_HASH_TBL_MEM = 10L * 1024L * 1024L;
+
+  // Default skew factor to account for data skew among fragment instances.
+  private final static double DEFAULT_SKEW_FACTOR = 1.5;
 
   private final MultiAggregateInfo multiAggInfo_;
   private final AggPhase aggPhase_;
@@ -249,7 +249,7 @@ public class AggregationNode extends PlanNode {
         cardinality_ = Math.min(getChild(0).getCardinality(), cardinality_);
       }
     }
-    cardinality_ = capAtLimit(cardinality_);
+    cardinality_ = capCardinalityAtLimit(cardinality_);
   }
 
   /**
@@ -330,9 +330,9 @@ public class AggregationNode extends PlanNode {
     }
     if (maxNumExprs == 0) return Collections.emptyList();
 
-    List<Expr> result = Lists.newArrayList();
+    List<Expr> result = new ArrayList<>();
     for (int i = 0; i < maxNumExprs; ++i) {
-      List<CaseWhenClause> caseWhenClauses = Lists.newArrayList();
+      List<CaseWhenClause> caseWhenClauses = new ArrayList<>();
       for (AggregateInfo aggInfo : aggInfos_) {
         TupleId tid;
         if (aggInfo.isDistinctAgg()) {
@@ -373,7 +373,7 @@ public class AggregationNode extends PlanNode {
     msg.agg_node.setEstimated_input_cardinality(getChild(0).getCardinality());
     for (int i = 0; i < aggInfos_.size(); ++i) {
       AggregateInfo aggInfo = aggInfos_.get(i);
-      List<TExpr> aggregateFunctions = Lists.newArrayList();
+      List<TExpr> aggregateFunctions = new ArrayList<>();
       for (FunctionCallExpr e : aggInfo.getMaterializedAggregateExprs()) {
         aggregateFunctions.add(e.treeToThrift());
       }
@@ -406,38 +406,41 @@ public class AggregationNode extends PlanNode {
 
     if (detailLevel.ordinal() >= TExplainLevel.STANDARD.ordinal()) {
       if (aggInfos_.size() == 1) {
-        output.append(getAggInfoExplainString(detailPrefix, aggInfos_.get(0)));
+        output.append(
+            getAggInfoExplainString(detailPrefix, aggInfos_.get(0), detailLevel));
       } else {
         for (int i = 0; i < aggInfos_.size(); ++i) {
           AggregateInfo aggInfo = aggInfos_.get(i);
           output.append(String.format("%sClass %d\n", detailPrefix, i));
-          output.append(getAggInfoExplainString(detailPrefix + "  ", aggInfo));
+          output.append(
+              getAggInfoExplainString(detailPrefix + "  ", aggInfo, detailLevel));
         }
       }
       if (!conjuncts_.isEmpty()) {
         output.append(detailPrefix)
             .append("having: ")
-            .append(getExplainString(conjuncts_))
+            .append(getExplainString(conjuncts_, detailLevel))
             .append("\n");
       }
     }
     return output.toString();
   }
 
-  private StringBuilder getAggInfoExplainString(String prefix, AggregateInfo aggInfo) {
+  private StringBuilder getAggInfoExplainString(
+      String prefix, AggregateInfo aggInfo, TExplainLevel detailLevel) {
     StringBuilder output = new StringBuilder();
     List<FunctionCallExpr> aggExprs = aggInfo.getMaterializedAggregateExprs();
     List<Expr> groupingExprs = aggInfo.getGroupingExprs();
     if (!aggExprs.isEmpty()) {
       output.append(prefix)
           .append("output: ")
-          .append(getExplainString(aggExprs))
+          .append(getExplainString(aggExprs, detailLevel))
           .append("\n");
     }
     if (!groupingExprs.isEmpty()) {
       output.append(prefix)
           .append("group by: ")
-          .append(getExplainString(groupingExprs))
+          .append(getExplainString(groupingExprs, detailLevel))
           .append("\n");
     }
     return output;
@@ -471,9 +474,22 @@ public class AggregationNode extends PlanNode {
     if (perInstanceCardinality == -1) {
       perInstanceMemEstimate = DEFAULT_PER_INSTANCE_MEM;
     } else {
-      // Per-instance cardinality cannot be greater than the total output cardinality.
-      if (cardinality_ != -1) {
-        perInstanceCardinality = Math.min(perInstanceCardinality, cardinality_);
+      // Per-instance cardinality cannot be greater than the total input cardinality.
+      long inputCardinality = getChild(0).getCardinality();
+      if (inputCardinality != -1) {
+        // Calculate the input cardinality distributed across fragment instances.
+        long numInstances = fragment_.getNumInstances(queryOptions.getMt_dop());
+        long perInstanceInputCardinality;
+        if (numInstances > 1) {
+          perInstanceInputCardinality =
+              (long) Math.ceil((inputCardinality / numInstances) * DEFAULT_SKEW_FACTOR);
+        } else {
+          // When numInstances is 1 or unknown(-1), perInstanceInputCardinality is the
+          // same as inputCardinality.
+          perInstanceInputCardinality = inputCardinality;
+        }
+        perInstanceCardinality =
+            Math.min(perInstanceCardinality, perInstanceInputCardinality);
       }
       perInstanceDataBytes = (long)Math.ceil(perInstanceCardinality * avgRowSize_);
       perInstanceMemEstimate = (long)Math.max(perInstanceDataBytes *

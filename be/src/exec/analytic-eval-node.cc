@@ -19,10 +19,11 @@
 
 #include <gutil/strings/substitute.h>
 
-#include "exprs/agg-fn.h"
+#include "exec/exec-node-util.h"
 #include "exprs/agg-fn-evaluator.h"
-#include "exprs/scalar-expr.h"
+#include "exprs/agg-fn.h"
 #include "exprs/scalar-expr-evaluator.h"
+#include "exprs/scalar-expr.h"
 #include "runtime/buffered-tuple-stream.inline.h"
 #include "runtime/descriptors.h"
 #include "runtime/mem-tracker.h"
@@ -174,6 +175,7 @@ Status AnalyticEvalNode::Prepare(RuntimeState* state) {
 
 Status AnalyticEvalNode::Open(RuntimeState* state) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedOpenEventAdder ea(this);
   RETURN_IF_ERROR(ExecNode::Open(state));
   RETURN_IF_CANCELLED(state);
   RETURN_IF_ERROR(QueryMaintenance(state));
@@ -394,7 +396,8 @@ inline Status AnalyticEvalNode::TryAddResultTupleForPrevRow(
            << " idx=" << stream_idx;
   if (fn_scope_ != ROWS && (next_partition
         || (fn_scope_ == RANGE && window_.__isset.window_end
-            && !PrevRowCompare(order_by_eq_expr_eval_, child_tuple_cmp_row)))) {
+            && !(order_by_eq_expr_eval_ == nullptr ||
+                 PrevRowCompare(order_by_eq_expr_eval_, child_tuple_cmp_row))))) {
     RETURN_IF_ERROR(AddResultTuple(stream_idx - 1));
   }
   return Status::OK();
@@ -722,7 +725,7 @@ Status AnalyticEvalNode::GetNextOutputBatch(
     input_batch.CopyRow(input_batch.GetRow(i), dest);
     dest->SetTuple(num_child_tuples, result_tuples_.front().second);
     output_batch->CommitLastRow();
-    ++num_rows_returned_;
+    IncrementNumRowsReturned(1);
 
     // Remove the head of result_tuples_ if all rows using that evaluated tuple
     // have been returned.
@@ -754,6 +757,7 @@ inline int64_t AnalyticEvalNode::NumOutputRowsReady() const {
 
 Status AnalyticEvalNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedGetNextEventAdder ea(this, eos);
   RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::GETNEXT, state));
   RETURN_IF_CANCELLED(state);
   RETURN_IF_ERROR(QueryMaintenance(state));
@@ -805,11 +809,11 @@ Status AnalyticEvalNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool*
     prev_pool_last_window_idx_ = -1;
   }
 
-  COUNTER_SET(rows_returned_counter_, num_rows_returned_);
+  COUNTER_SET(rows_returned_counter_, rows_returned());
   return Status::OK();
 }
 
-Status AnalyticEvalNode::Reset(RuntimeState* state) {
+Status AnalyticEvalNode::Reset(RuntimeState* state, RowBatch* row_batch) {
   result_tuples_.clear();
   window_tuples_.clear();
   last_result_idx_ = -1;
@@ -817,11 +821,9 @@ Status AnalyticEvalNode::Reset(RuntimeState* state) {
   prev_pool_last_result_idx_ = -1;
   prev_pool_last_window_idx_ = -1;
   input_eos_ = false;
-  // TODO: The Reset() contract allows calling Reset() even if eos has not been reached,
-  // but the analytic eval node currently does not support that. In practice, we only
-  // call Reset() after eos.
-  DCHECK_EQ(curr_tuple_pool_->total_allocated_bytes(), 0);
-  DCHECK_EQ(prev_tuple_pool_->total_allocated_bytes(), 0);
+  // Transfer the ownership of all row-backing resources.
+  row_batch->tuple_data_pool()->AcquireData(prev_tuple_pool_.get(), false);
+  row_batch->tuple_data_pool()->AcquireData(curr_tuple_pool_.get(), false);
   // Call Finalize() to clear evaluator allocations, but do not Close() them,
   // so we can keep evaluating them.
   if (curr_tuple_init_) {
@@ -830,12 +832,14 @@ Status AnalyticEvalNode::Reset(RuntimeState* state) {
   }
   // The following members will be re-created in Open().
   // input_stream_ should have been closed by last GetNext() call.
-  DCHECK(input_stream_ == nullptr || input_stream_->is_closed());
+  if (input_stream_ != nullptr && !input_stream_->is_closed()) {
+    input_stream_->Close(row_batch, RowBatch::FlushMode::FLUSH_RESOURCES);
+  }
   input_stream_.reset();
   prev_input_tuple_ = nullptr;
   prev_input_tuple_pool_->Clear();
   curr_child_batch_->Reset();
-  return ExecNode::Reset(state);
+  return ExecNode::Reset(state, row_batch);
 }
 
 void AnalyticEvalNode::Close(RuntimeState* state) {

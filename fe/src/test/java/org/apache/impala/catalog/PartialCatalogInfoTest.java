@@ -22,11 +22,20 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.hadoop.hive.metastore.api.ColumnStatisticsObj;
 import org.apache.impala.common.InternalException;
+import org.apache.impala.service.BackendConfig;
 import org.apache.impala.testutil.CatalogServiceTestCatalog;
+import org.apache.impala.thrift.CatalogLookupStatus;
 import org.apache.impala.thrift.TCatalogInfoSelector;
 import org.apache.impala.thrift.TCatalogObject;
 import org.apache.impala.thrift.TCatalogObjectType;
@@ -40,18 +49,39 @@ import org.apache.impala.thrift.TTableInfoSelector;
 import org.apache.thrift.TDeserializer;
 import org.apache.thrift.TException;
 import org.apache.thrift.TSerializer;
+import org.junit.AfterClass;
 import org.junit.Test;
 
+import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 
 public class PartialCatalogInfoTest {
   private static CatalogServiceCatalog catalog_ =
       CatalogServiceTestCatalog.create();
 
+  @AfterClass
+  public static void cleanUp() { catalog_.close(); }
+
+  /**
+   * A Callable wrapper around getPartialCatalogObject() call.
+   */
+  private class CallableGetPartialCatalogObjectRequest
+      implements Callable<TGetPartialCatalogObjectResponse> {
+    private final TGetPartialCatalogObjectRequest request_;
+
+    CallableGetPartialCatalogObjectRequest(TGetPartialCatalogObjectRequest request) {
+      request_ = request;
+    }
+
+    @Override
+    public TGetPartialCatalogObjectResponse call() throws Exception {
+      return sendRequest(request_);
+    }
+  }
+
   private TGetPartialCatalogObjectResponse sendRequest(
       TGetPartialCatalogObjectRequest req)
       throws CatalogException, InternalException, TException {
-    System.err.println("req: " + req);
     TGetPartialCatalogObjectResponse resp;
     resp = catalog_.getPartialCatalogObject(req);
     // Round-trip the response through serialization, so if we accidentally forgot to
@@ -59,8 +89,24 @@ public class PartialCatalogInfoTest {
     byte[] respBytes = new TSerializer().serialize(resp);
     resp.clear();
     new TDeserializer().deserialize(resp, respBytes);
-    System.err.println("resp: " + resp);
     return resp;
+  }
+
+  /**
+   * Sends the same 'request' from 'requestCount' threads in parallel and waits for
+   * them to finish.
+   */
+  private void sendParallelRequests(TGetPartialCatalogObjectRequest request, int
+      requestCount) throws Exception {
+    Preconditions.checkState(requestCount > 0);
+    final ExecutorService threadPoolExecutor = Executors.newFixedThreadPool(requestCount);
+    final List<Future<TGetPartialCatalogObjectResponse>> tasksToWaitFor =
+        new ArrayList<>();
+    for (int i = 0; i < requestCount; ++i) {
+      tasksToWaitFor.add(threadPoolExecutor.submit(new
+          CallableGetPartialCatalogObjectRequest(request)));
+    }
+    for (Future<?> task: tasksToWaitFor) task.get();
   }
 
   @Test
@@ -134,12 +180,8 @@ public class PartialCatalogInfoTest {
     req.table_info_selector = new TTableInfoSelector();
     req.table_info_selector.want_partition_metadata = true;
     req.table_info_selector.partition_ids = ImmutableList.of(-12345L); // non-existent
-    try {
-      sendRequest(req);
-      fail("did not throw exception for missing partition");
-    } catch (IllegalArgumentException iae) {
-      assertEquals("Partition id -12345 does not exist", iae.getMessage());
-    }
+    TGetPartialCatalogObjectResponse resp = sendRequest(req);
+    assertEquals(resp.lookup_status, CatalogLookupStatus.PARTITION_NOT_FOUND);
   }
 
   @Test
@@ -159,7 +201,25 @@ public class PartialCatalogInfoTest {
     assertEquals(11, stats.size());
     assertEquals("ColumnStatisticsObj(colName:id, colType:INT, " +
         "statsData:<ColumnStatisticsData longStats:LongColumnStatsData(" +
-        "numNulls:-1, numDVs:7300)>)", stats.get(0).toString());
+        "numNulls:0, numDVs:7300)>)", stats.get(0).toString());
+  }
+
+  @Test
+  public void testDateTableStats() throws Exception {
+    TGetPartialCatalogObjectRequest req = new TGetPartialCatalogObjectRequest();
+    req.object_desc = new TCatalogObject();
+    req.object_desc.setType(TCatalogObjectType.TABLE);
+    req.object_desc.table = new TTable("functional", "date_tbl");
+    req.table_info_selector = new TTableInfoSelector();
+    req.table_info_selector.want_stats_for_column_names = ImmutableList.of(
+        "date_col", "date_part");
+    TGetPartialCatalogObjectResponse resp = sendRequest(req);
+    List<ColumnStatisticsObj> stats = resp.table_info.column_stats;
+    // We have 2 columns, but 1 is the clustering column which doesn't have stats.
+    assertEquals(1, stats.size());
+    assertEquals("ColumnStatisticsObj(colName:date_col, colType:DATE, " +
+        "statsData:<ColumnStatisticsData dateStats:DateColumnStatsData(" +
+        "numNulls:2, numDVs:16)>)", stats.get(0).toString());
   }
 
   @Test
@@ -178,5 +238,50 @@ public class PartialCatalogInfoTest {
       assertEquals("Failed to load metadata for table: functional.bad_serde",
           tle.getMessage());
     }
+  }
+
+  @Test
+  public void testConcurrentPartialObjectRequests() throws Exception {
+    // Create a request.
+    TGetPartialCatalogObjectRequest req = new TGetPartialCatalogObjectRequest();
+    req.object_desc = new TCatalogObject();
+    req.object_desc.setType(TCatalogObjectType.TABLE);
+    req.object_desc.table = new TTable("functional", "alltypes");
+    req.table_info_selector = new TTableInfoSelector();
+    req.table_info_selector.want_hms_table = true;
+    req.table_info_selector.want_partition_names = true;
+    req.table_info_selector.want_partition_metadata = true;
+
+    // Run 64 concurrent requests and run a tight loop in the background to make sure the
+    // concurrent request count never exceeds 32 (--catalog_partial_rpc_max_parallel_runs)
+    final AtomicBoolean requestsFinished = new AtomicBoolean(false);
+    final int maxParallelRuns = BackendConfig.INSTANCE
+        .getCatalogMaxParallelPartialFetchRpc();
+
+    // Uses a callable<Void> instead of Runnable because junit does not catch exceptions
+    // from threads other than the main thread. Callable here makes sure the exception
+    // is propagated to the main thread.
+    final Callable<Void> assertReqCount = new Callable<Void>() {
+      @Override
+      public Void call() throws Exception {
+        while (!requestsFinished.get()) {
+          int currentReqCount = catalog_.getConcurrentPartialRpcReqCount();
+          assertTrue("Invalid concurrent request count: " + currentReqCount,
+              currentReqCount <= maxParallelRuns);
+        }
+        return null;
+      }
+    };
+    Future<Void> assertThreadTask;
+    try {
+      // Assert the request count in a tight loop.
+      assertThreadTask = Executors.newSingleThreadExecutor().submit(assertReqCount);
+      sendParallelRequests(req, 64);
+    } finally {
+      requestsFinished.set(true);
+    }
+    // 5 minutes is a reasonable timeout for this test. If timed out, an exception is
+    // thrown.
+    assertThreadTask.get(5, TimeUnit.MINUTES);
   }
 }

@@ -40,6 +40,43 @@ class ObjectPool;
 /// single thread per process that will convert an amount (i.e. bytes) counter to a
 /// corresponding rate based counter.  This thread wakes up at fixed intervals and updates
 /// all of the rate counters.
+///
+/// Runtime profile counters can be of several types. See their definition in
+/// runtime-profile-counters.h for more details.
+///
+/// - Counter: Tracks a single value or bitmap. Also serves as the base class for several
+///   |   other counters.
+///   |
+///   - AveragedCounter: Maintains a set of child counters. Its current value is the
+///   |     average of the current values of its children.
+///   |
+///   - ConcurrentTimerCounter: Wraps a ConcurrentStopWatch to track concurrent running
+///   |     time for multiple threads.
+///   |
+///   - DerivedCounter: Computes its current value by calling a function passed during
+///   |     construction.
+///   |
+///   - HighWaterMarkCounter: Keeps track of the highest value seen so far.
+///   |
+///   - SummaryStatsCounter: Keeps track of minimum, maximum, and average value of all
+///         values seen so far.
+///
+/// - EventSequence: Captures a sequence of events, each added by calling MarkEvent().
+///       Events have a text label and a time, relative to when the sequence was started.
+///
+/// - ThreadCounters: Tracks thread runtime information, such as total time, user time,
+///       sys time.
+///
+/// - TimeSeriesCounter (abstract): Keeps track of a value over time. Has two
+///   |   implementations.
+///   |
+///   - SamplingTimeSeriesCounter: Maintains a fixed array of 64 values and resamples if
+///   |     more value than that are added.
+///   |
+///   - ChunkedTimeSeriesCounter: Maintains an unbounded vector of values. Supports
+///         clearing its values after they have been retrieved, and will track the number
+///         of previously retrieved values.
+///
 /// All methods are thread-safe unless otherwise mentioned.
 class RuntimeProfile { // NOLINT: This struct is not packed, but there are not so many
                        // of them that it makes a performance difference
@@ -93,13 +130,15 @@ class RuntimeProfile { // NOLINT: This struct is not packed, but there are not s
   class AveragedCounter;
   class ConcurrentTimerCounter;
   class DerivedCounter;
-  class EventSequence;
   class HighWaterMarkCounter;
   class SummaryStatsCounter;
+  class EventSequence;
   class ThreadCounters;
   class TimeSeriesCounter;
+  class SamplingTimeSeriesCounter;
+  class ChunkedTimeSeriesCounter;
 
-  typedef boost::function<int64_t ()> DerivedCounterFunction;
+  typedef boost::function<int64_t ()> SampleFunction;
 
   /// Create a runtime profile object with 'name'. The profile, counters and any other
   /// structures owned by the profile are allocated from 'pool'.
@@ -182,7 +221,7 @@ class RuntimeProfile { // NOLINT: This struct is not packed, but there are not s
   /// parent_counter_name.
   /// Returns NULL if the counter already exists.
   DerivedCounter* AddDerivedCounter(const std::string& name, TUnit::type unit,
-      const DerivedCounterFunction& counter_fn,
+      const SampleFunction& counter_fn,
       const std::string& parent_counter_name = "");
 
   /// Add a set of thread counters prefixed with 'prefix'. Returns a ThreadCounters object
@@ -191,7 +230,7 @@ class RuntimeProfile { // NOLINT: This struct is not packed, but there are not s
 
   // Add a derived counter to capture the local time. This function can be called at most
   // once.
-  void AddLocalTimeCounter(const DerivedCounterFunction& counter_fn);
+  void AddLocalTimeCounter(const SampleFunction& counter_fn);
 
   /// Gets the counter object with 'name'.  Returns NULL if there is no counter with
   /// that name.
@@ -248,6 +287,9 @@ class RuntimeProfile { // NOLINT: This struct is not packed, but there are not s
   /// Returns event sequence with the provided name if it exists, otherwise NULL.
   EventSequence* GetEventSequence(const std::string& name) const;
 
+  /// Updates 'value' of info string with 'key'. No-op if the key doesn't exist.
+  void UpdateInfoString(const std::string& key, std::string value);
+
   /// Returns a pointer to the info string value for 'key'.  Returns NULL if
   /// the key does not exist.
   const std::string* GetInfoString(const std::string& key) const;
@@ -262,8 +304,9 @@ class RuntimeProfile { // NOLINT: This struct is not packed, but there are not s
   Counter* total_time_counter() { return counter_map_[TOTAL_TIME_COUNTER_NAME]; }
   Counter* inactive_timer() { return counter_map_[INACTIVE_TIME_COUNTER_NAME]; }
   int64_t local_time() { return local_time_ns_; }
+  int64_t total_time() { return total_time_ns_; }
 
-  /// Prints the counters in a name: value format.
+  /// Prints the contents of the profile in a name: value format.
   /// Does not hold locks when it makes any function calls.
   void PrettyPrint(std::ostream* s, const std::string& prefix="") const;
 
@@ -278,6 +321,11 @@ class RuntimeProfile { // NOLINT: This struct is not packed, but there are not s
   /// should not be in the hot path.
   Status SerializeToArchiveString(std::string* out) const WARN_UNUSED_RESULT;
   Status SerializeToArchiveString(std::stringstream* out) const WARN_UNUSED_RESULT;
+
+  /// Deserializes a string into a TRuntimeProfileTree. 'archive_str' is expected to have
+  /// been serialized by SerializeToArchiveString().
+  static Status DeserializeFromArchiveString(
+      const std::string& archive_str, TRuntimeProfileTree* out);
 
   /// Divides all counters by n
   void Divide(int n);
@@ -297,12 +345,18 @@ class RuntimeProfile { // NOLINT: This struct is not packed, but there are not s
   /// (because it doesn't re-file child profiles)
   void set_name(const std::string& name) { name_ = name; }
 
-  int64_t metadata() const { return metadata_; }
-  void set_metadata(int64_t md) { metadata_ = md; }
+  const TRuntimeProfileNodeMetadata& metadata() const { return metadata_; }
+
+  /// Called if this corresponds to a plan node. Sets metadata so that later code that
+  /// analyzes the profile can identify this as the plan node's profile.
+  void SetPlanNodeId(int node_id);
+
+  /// Called if this corresponds to a data sink. Sets metadata so that later code that
+  /// analyzes the profile can identify this as the data sink's profile.
+  void SetDataSinkId(int sink_id);
 
   /// Derived counter function: return measured throughput as input_value/second.
-  static int64_t UnitsPerSecond(
-      const Counter* total_counter, const Counter* timer);
+  static int64_t UnitsPerSecond(const Counter* total_counter, const Counter* timer);
 
   /// Derived counter function: return aggregated value
   static int64_t CounterSum(const std::vector<Counter*>* counters);
@@ -317,7 +371,7 @@ class RuntimeProfile { // NOLINT: This struct is not packed, but there are not s
 
   /// Same as 'AddRateCounter' above except values are taken by calling fn.
   /// The resulting counter will be of 'unit'.
-  Counter* AddRateCounter(const std::string& name, DerivedCounterFunction fn,
+  Counter* AddRateCounter(const std::string& name, SampleFunction fn,
       TUnit::type unit);
 
   /// Add a sampling counter to the current profile based on src_counter with name.
@@ -330,7 +384,7 @@ class RuntimeProfile { // NOLINT: This struct is not packed, but there are not s
   Counter* AddSamplingCounter(const std::string& name, Counter* src_counter);
 
   /// Same as 'AddSamplingCounter' above except the samples are taken by calling fn.
-  Counter* AddSamplingCounter(const std::string& name, DerivedCounterFunction fn);
+  Counter* AddSamplingCounter(const std::string& name, SampleFunction fn);
 
   /// Create a set of counters, one per bucket, to store the sampled value of src_counter.
   /// The 'src_counter' is sampled periodically to obtain the index of the bucket to
@@ -348,22 +402,41 @@ class RuntimeProfile { // NOLINT: This struct is not packed, but there are not s
   /// PeriodicCounterUpdater::StopBucketingCounters() if 'buckets' stops changing.
   std::vector<Counter*>* AddBucketingCounters(Counter* src_counter, int num_buckets);
 
-  /// Create a time series counter. This begins sampling immediately. This counter
-  /// contains a number of samples that are collected periodically by calling sample_fn().
-  /// StopPeriodicCounters() must be called to stop the periodic updating before this
-  /// profile is destroyed. The periodic updating can be stopped earlier by calling
-  /// PeriodicCounterUpdater::StopTimeSeriesCounter() if the input stops changing.
+  /// Creates a sampling time series counter. This begins sampling immediately. This
+  /// counter contains a number of samples that are collected periodically by calling
+  /// sample_fn(). StopPeriodicCounters() must be called to stop the periodic updating
+  /// before this profile is destroyed. The periodic updating can be stopped earlier by
+  /// calling PeriodicCounterUpdater::StopTimeSeriesCounter() if the input stops changing.
   /// Note: these counters don't get merged (to make average profiles)
-  TimeSeriesCounter* AddTimeSeriesCounter(const std::string& name,
-      TUnit::type unit, DerivedCounterFunction sample_fn);
+  TimeSeriesCounter* AddSamplingTimeSeriesCounter(const std::string& name,
+      TUnit::type unit, SampleFunction sample_fn);
 
   /// Same as above except the samples are collected from 'src_counter'.
-  TimeSeriesCounter* AddTimeSeriesCounter(const std::string& name, Counter* src_counter);
+  TimeSeriesCounter* AddSamplingTimeSeriesCounter(const std::string& name, Counter*
+      src_counter);
+
+  /// Adds a chunked time series counter to the profile. This begins sampling immediately.
+  /// This counter will collect new samples periodically by calling 'sample_fn()'. Samples
+  /// are not re-sampled into larger intervals, instead owners of this profile can call
+  /// ClearChunkedTimeSeriesCounters() to reset the sample buffers of all chunked time
+  /// series counters, e.g. after their current values have been transmitted to a remote
+  /// node for profile aggregation.
+  TimeSeriesCounter* AddChunkedTimeSeriesCounter(
+      const std::string& name, TUnit::type unit, SampleFunction sample_fn);
+
+  /// Clear all chunked time series counters in this profile and all children.
+  void ClearChunkedTimeSeriesCounters();
 
   /// Recursively compute the fraction of the 'total_time' spent in this profile and
   /// its children.
   /// This function updates local_time_percent_ for each profile.
   void ComputeTimeInProfile();
+
+  /// Set ExecSummary
+  void SetTExecSummary(const TExecSummary& summary);
+
+  /// Get a copy of exec_summary tp t_exec_summary
+  void GetExecSummary(TExecSummary* t_exec_summary) const;
 
  private:
   /// Pool for allocated counters. Usually owned by the creator of this
@@ -373,8 +446,8 @@ class RuntimeProfile { // NOLINT: This struct is not packed, but there are not s
   /// Name for this runtime profile.
   std::string name_;
 
-  /// user-supplied, uninterpreted metadata.
-  int64_t metadata_;
+  /// Detailed metadata that identifies the plan node, sink, etc.
+  TRuntimeProfileNodeMetadata metadata_;
 
   /// True if this profile is an average derived from other profiles.
   /// All counters in this profile must be of unit AveragedCounter.
@@ -464,6 +537,17 @@ class RuntimeProfile { // NOLINT: This struct is not packed, but there are not s
   /// ComputeTimeInProfile()
   int64_t local_time_ns_;
 
+  /// Total time spent in this node. Computed in ComputeTimeInProfile() and is
+  /// the maximum of the total time spent in children and the value of
+  /// counter_total_time_.
+  int64_t total_time_ns_;
+
+  /// The Exec Summary
+  TExecSummary t_exec_summary_;
+
+  /// Protects exec_summary.
+  mutable SpinLock t_exec_summary_lock_;
+
   /// Constructor used by Create().
   RuntimeProfile(ObjectPool* pool, const std::string& name, bool is_averaged_profile);
 
@@ -479,8 +563,12 @@ class RuntimeProfile { // NOLINT: This struct is not packed, but there are not s
   /// Implementation of AddInfoString() and AppendInfoString(). If 'append' is false,
   /// implements AddInfoString(), otherwise implements AppendInfoString().
   /// Redaction rules are applied on the info string if 'redact' is true.
+  /// Trailing whitspace is removed.
   void AddInfoStringInternal(
-      const std::string& key, const std::string& value, bool append, bool redact = false);
+      const std::string& key, std::string value, bool append, bool redact = false);
+
+  /// Send exec_summary to thrift
+  void ExecSummaryToThrift(TRuntimeProfileTree* tree) const;
 
   /// Name of the counter maintaining the total time.
   static const std::string TOTAL_TIME_COUNTER_NAME;

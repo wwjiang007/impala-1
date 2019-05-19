@@ -165,7 +165,7 @@ Status FilterContext::CodegenEval(
       llvm::BasicBlock::Create(context, "eval_filter", eval_filter_fn);
 
   llvm::Function* compute_fn;
-  RETURN_IF_ERROR(filter_expr->GetCodegendComputeFn(codegen, &compute_fn));
+  RETURN_IF_ERROR(filter_expr->GetCodegendComputeFn(codegen, false, &compute_fn));
   DCHECK(compute_fn != nullptr);
 
   // The function for checking against the bloom filter for match.
@@ -334,7 +334,7 @@ Status FilterContext::CodegenInsert(LlvmCodeGen* codegen, ScalarExpr* filter_exp
       llvm::BasicBlock::Create(context, "insert_filter", insert_filter_fn);
 
   llvm::Function* compute_fn;
-  RETURN_IF_ERROR(filter_expr->GetCodegendComputeFn(codegen, &compute_fn));
+  RETURN_IF_ERROR(filter_expr->GetCodegendComputeFn(codegen, false, &compute_fn));
   DCHECK(compute_fn != nullptr);
 
   // Load 'expr_eval' from 'this_arg' FilterContext object.
@@ -403,7 +403,7 @@ Status FilterContext::CodegenInsert(LlvmCodeGen* codegen, ScalarExpr* filter_exp
     DCHECK(ctx->filter->is_min_max_filter());
     // The function for inserting into the min-max filter.
     llvm::Function* min_max_insert_fn = codegen->GetFunction(
-        MinMaxFilter::GetInsertIRFunctionType(filter_expr->type().type), false);
+        MinMaxFilter::GetInsertIRFunctionType(filter_expr->type()), false);
     DCHECK(min_max_insert_fn != nullptr);
 
     llvm::Value* insert_filter_args[] = {local_filter_arg, val_ptr_phi};

@@ -17,13 +17,14 @@
 
 package org.apache.impala.catalog;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-import com.google.common.cache.CacheStats;
 import org.apache.hadoop.hive.common.FileUtils;
 import org.apache.hadoop.hive.common.StatsSetupConst;
 import org.apache.hadoop.hive.metastore.api.ColumnStatisticsObj;
@@ -33,12 +34,13 @@ import org.apache.impala.analysis.LiteralExpr;
 import org.apache.impala.analysis.NullLiteral;
 import org.apache.impala.analysis.PartitionKeyValue;
 import org.apache.impala.analysis.ToSqlUtils;
-import org.apache.impala.catalog.local.CatalogdMetaProvider;
 import org.apache.impala.catalog.CatalogObject.ThriftObjectType;
 import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
+import org.apache.impala.catalog.local.CatalogdMetaProvider;
 import org.apache.impala.catalog.local.LocalCatalog;
 import org.apache.impala.catalog.local.MetaProvider;
 import org.apache.impala.service.BackendConfig;
+import org.apache.impala.thrift.TCatalogObject;
 import org.apache.impala.thrift.TColumnDescriptor;
 import org.apache.impala.thrift.TGetCatalogMetricsResult;
 import org.apache.impala.thrift.THdfsPartition;
@@ -48,11 +50,10 @@ import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
+import com.google.common.cache.CacheStats;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
-import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import com.google.common.collect.Sets;
 
 /**
  * Static utility functions shared between FeCatalog implementations.
@@ -131,7 +132,7 @@ public abstract class FeCatalogUtils {
 
   // TODO(todd): move to a default method in FeTable in Java8
   public static List<TColumnDescriptor> getTColumnDescriptors(FeTable table) {
-    List<TColumnDescriptor> colDescs = Lists.<TColumnDescriptor>newArrayList();
+    List<TColumnDescriptor> colDescs = new ArrayList<>();
     for (Column col: table.getColumns()) {
       colDescs.add(new TColumnDescriptor(col.getName(), col.getType().toThrift()));
     }
@@ -222,12 +223,12 @@ public abstract class FeCatalogUtils {
       List<String> hmsPartitionValues) throws CatalogException {
     Preconditions.checkArgument(
         hmsPartitionValues.size() == table.getNumClusteringCols(),
-        "Cannot parse partition values %s for table %s: " +
-        "expected %s values but got %s",
+        "Cannot parse partition values '%s' for table %s: " +
+        "expected %d values but got %d",
         hmsPartitionValues, table.getFullName(),
         table.getNumClusteringCols(), hmsPartitionValues.size());
-    List<LiteralExpr> keyValues = Lists.newArrayList();
-    for (String partitionKey: hmsPartitionValues) {
+    List<LiteralExpr> keyValues = new ArrayList<>();
+    for (String partitionKey : hmsPartitionValues) {
       Type type = table.getColumns().get(keyValues.size()).getType();
       // Deal with Hive's special NULL partition key.
       if (partitionKey.equals(table.getNullPartitionKeyValue())) {
@@ -236,7 +237,9 @@ public abstract class FeCatalogUtils {
         try {
           keyValues.add(LiteralExpr.create(partitionKey, type));
         } catch (Exception ex) {
-          LOG.warn("Failed to create literal expression of type: " + type, ex);
+          LOG.warn(String.format(
+              "Failed to create literal expression: type: %s, value: '%s'",
+              type.toSql(), partitionKey), ex);
           throw new CatalogException("Invalid partition key value of type: " + type,
               ex);
         }
@@ -257,7 +260,7 @@ public abstract class FeCatalogUtils {
    */
   public static String getPartitionName(FeFsPartition partition) {
     FeFsTable table = partition.getTable();
-    List<String> partitionCols = Lists.newArrayList();
+    List<String> partitionCols = new ArrayList<>();
     for (int i = 0; i < table.getNumClusteringCols(); ++i) {
       partitionCols.add(table.getColumns().get(i).getName());
     }
@@ -269,7 +272,7 @@ public abstract class FeCatalogUtils {
   // TODO: this could be a default method in FeFsPartition in Java 8.
   public static List<String> getPartitionValuesAsStrings(
       FeFsPartition partition, boolean mapNullsToHiveKey) {
-    List<String> ret = Lists.newArrayList();
+    List<String> ret = new ArrayList<>();
     for (LiteralExpr partValue: partition.getPartitionValues()) {
       if (mapNullsToHiveKey) {
         ret.add(PartitionKeyValue.getPartitionKeyValueString(
@@ -283,16 +286,16 @@ public abstract class FeCatalogUtils {
 
   // TODO: this could be a default method in FeFsPartition in Java 8.
   public static String getConjunctSqlForPartition(FeFsPartition part) {
-    List<String> partColSql = Lists.newArrayList();
+    List<String> partColSql = new ArrayList<>();
     for (Column partCol: part.getTable().getClusteringColumns()) {
       partColSql.add(ToSqlUtils.getIdentSql(partCol.getName()));
     }
 
-    List<String> conjuncts = Lists.newArrayList();
+    List<String> conjuncts = new ArrayList<>();
     for (int i = 0; i < partColSql.size(); ++i) {
       LiteralExpr partVal = part.getPartitionValues().get(i);
       String partValSql = partVal.toSql();
-      if (partVal instanceof NullLiteral || partValSql.isEmpty()) {
+      if (Expr.IS_NULL_LITERAL.apply(partVal) || partValSql.isEmpty()) {
         conjuncts.add(partColSql.get(i) + " IS NULL");
       } else {
         conjuncts.add(partColSql.get(i) + "=" + partValSql);
@@ -306,7 +309,7 @@ public abstract class FeCatalogUtils {
    */
   public static Set<HdfsFileFormat> getFileFormats(
       Iterable<? extends FeFsPartition> partitions) {
-    Set<HdfsFileFormat> fileFormats = Sets.newHashSet();
+    Set<HdfsFileFormat> fileFormats = new HashSet<>();
     for (FeFsPartition partition : partitions) {
       fileFormats.add(partition.getFileFormat());
     }
@@ -327,6 +330,8 @@ public abstract class FeCatalogUtils {
         sd.getBlockSize());
     thriftHdfsPart.setId(part.getId());
     thriftHdfsPart.setLocation(part.getLocationAsThrift());
+    if (part.getWriteId() >= 0)
+      thriftHdfsPart.setWrite_id(part.getWriteId());
     if (type == ThriftObjectType.FULL) {
       thriftHdfsPart.setStats(new TTableStats(part.getNumRows()));
       thriftHdfsPart.setAccess_level(part.getAccessLevel());
@@ -384,5 +389,19 @@ public abstract class FeCatalogUtils {
     metrics.setCache_miss_rate(stats.missRate());
   }
 
+
+  /**
+   * Returns a debug string for a given list of TCatalogObjects. Includes the unique key
+   * and version number for each object.
+   */
+  public static String debugString(List<TCatalogObject> objects) {
+    if (objects == null || objects.size() == 0) return "[]";
+    List<String> catalogObjs = new ArrayList<>();
+    for (TCatalogObject object: objects) {
+      catalogObjs.add(String.format("%s version: %d",
+          Catalog.toCatalogObjectKey(object), object.catalog_version));
+    }
+    return "[" + Joiner.on(",").join(catalogObjs) + "]";
+  }
 
 }

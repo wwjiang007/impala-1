@@ -37,8 +37,11 @@ import java.util.List;
 import java.util.Map;
 
 import org.apache.impala.analysis.CreateTableStmt;
+import org.apache.impala.analysis.Parser;
+import org.apache.impala.analysis.Parser.ParseException;
 import org.apache.impala.analysis.SqlParser;
 import org.apache.impala.analysis.SqlScanner;
+import org.apache.impala.analysis.StatementBase;
 import org.apache.impala.testutil.ImpalaJdbcClient;
 import org.apache.impala.thrift.TQueryOptions;
 import org.apache.impala.util.Metrics;
@@ -99,10 +102,7 @@ public class JdbcTest {
   protected void addTestTable(String createTableSql) throws Exception {
     // Parse the stmt to extract the table name. We do this first to ensure
     // that we do not execute arbitrary SQL here and pollute the test setup.
-    SqlScanner input = new SqlScanner(new StringReader(createTableSql));
-    SqlParser parser = new SqlParser(input);
-    parser.setQueryOptions(new TQueryOptions());
-    Object result = parser.parse().value;
+    StatementBase result = Parser.parse(createTableSql);
     if (!(result instanceof CreateTableStmt)) {
       throw new Exception("Given stmt is not a CREATE TABLE stmt: " + createTableSql);
     }
@@ -321,6 +321,18 @@ public class JdbcTest {
     assertEquals(13, numCols);
     rs.close();
 
+    // validate date_col
+    rs = con_.getMetaData().getColumns(null, "functional", "date_tbl",
+        "date_col");
+    assertTrue(rs.next());
+    assertEquals("Incorrect type", Types.DATE, rs.getInt("DATA_TYPE"));
+    assertEquals(10, rs.getInt("COLUMN_SIZE"));
+    assertEquals(0, rs.getInt("DECIMAL_DIGITS"));
+    // Use getString() to check the value is null (and not 0).
+    assertEquals(null, rs.getString("NUM_PREC_RADIX"));
+    assertFalse(rs.next());
+    rs.close();
+
     // validate DECIMAL columns
     rs = con_.getMetaData().getColumns(null, "functional", "decimal_tbl", null);
     assertTrue(rs.next());
@@ -461,15 +473,19 @@ public class JdbcTest {
     addTestTable("create table default.jdbc_column_comments_test (" +
          "a int comment 'column comment') comment 'table comment'");
 
-    // If a table is not yet loaded before getTables(), then the 'remarks' field
-    // is left empty. getColumns() loads the table metadata, so later getTables()
-    // calls will return 'remarks' correctly.
     ResultSet rs = con_.getMetaData().getTables(
         null, "default", "jdbc_column_comments_test", null);
     assertTrue(rs.next());
     assertEquals("Incorrect table name", "jdbc_column_comments_test",
         rs.getString("TABLE_NAME"));
-    assertEquals("Incorrect table comment", "", rs.getString("REMARKS"));
+
+    String remarks = rs.getString("REMARKS");
+    // IMPALA-7587: with catalog V2, if a table is not yet loaded before
+    // getTables(), then the 'remarks' field is left empty. getColumns()
+    // loads the table metadata, so later getTables() calls will return
+    // 'remarks' correctly.
+    assertTrue("Incorrect table comment: " + remarks,
+        remarks.equals("") || remarks.equals("table comment"));
 
     rs = con_.getMetaData().getColumns(
         null, "default", "jdbc_column_comments_test", null);
@@ -513,6 +529,29 @@ public class JdbcTest {
     assertEquals(rs.getMetaData().getColumnType(6), Types.DECIMAL);
     assertEquals(rs.getMetaData().getPrecision(6), 9);
     assertEquals(rs.getMetaData().getScale(6), 0);
+
+    rs.close();
+  }
+
+  @Test
+  public void testDateGetColumnTypes() throws SQLException {
+    // Table has 1 int column and 2 date columns.
+    ResultSet rs = con_.createStatement().executeQuery(
+        "select * from functional.date_tbl");
+
+    assertEquals(rs.getMetaData().getColumnType(1), Types.INTEGER);
+    // Get the designated column's specified column size.
+    assertEquals(rs.getMetaData().getPrecision(1), 10);
+    // Gets the designated column's number of digits to right of the decimal point.
+    assertEquals(rs.getMetaData().getScale(1), 0);
+
+    assertEquals(rs.getMetaData().getColumnType(2), Types.DATE);
+    assertEquals(rs.getMetaData().getPrecision(2), 10);
+    assertEquals(rs.getMetaData().getScale(2), 0);
+
+    assertEquals(rs.getMetaData().getColumnType(3), Types.DATE);
+    assertEquals(rs.getMetaData().getPrecision(3), 10);
+    assertEquals(rs.getMetaData().getScale(3), 0);
 
     rs.close();
   }

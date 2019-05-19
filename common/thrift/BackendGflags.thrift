@@ -19,8 +19,8 @@ namespace cpp impala
 namespace java org.apache.impala.thrift
 
 enum TReservedWordsVersion {
-  IMPALA_2_11
-  IMPALA_3_0
+  IMPALA_2_11 = 0
+  IMPALA_3_0 = 1
 }
 
 // Used to pass gflags from backend to frontend, JniCatalog and JniFrontend
@@ -44,7 +44,7 @@ struct TBackendGflags {
 
   9: required string principal
 
-  10: required string authorization_policy_file
+  // REMOVED: 10: required string authorization_policy_file
 
   11: required string server_name
 
@@ -99,4 +99,34 @@ struct TBackendGflags {
   36: required double invalidate_tables_fraction_on_memory_pressure
 
   37: required i32 local_catalog_max_fetch_retries
+
+  38: required i64 kudu_scanner_thread_estimated_bytes_per_column
+
+  39: required i64 kudu_scanner_thread_max_estimated_bytes
+
+  40: required i32 catalog_max_parallel_partial_fetch_rpc
+
+  41: required i64 catalog_partial_fetch_rpc_queue_timeout_s
+
+  42: required i64 exchg_node_buffer_size_bytes
+
+  43: required i32 kudu_mutation_buffer_size
+
+  44: required i32 kudu_error_buffer_size
+
+  45: required i32 hms_event_polling_interval_s
+
+  46: required string impala_build_version
+
+  47: required string authorization_factory_class
+
+  48: required bool unlock_mt_dop
+
+  49: required string ranger_service_type
+
+  50: required string ranger_app_id
+
+  51: required string authorization_provider
+
+  52: required bool recursively_list_partitions
 }

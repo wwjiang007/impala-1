@@ -19,6 +19,7 @@
 #include <boost/functional/hash.hpp>
 
 #include "runtime/collection-value.h"
+#include "runtime/date-value.h"
 #include "runtime/raw-value.inline.h"
 #include "runtime/string-value.inline.h"
 #include "runtime/tuple.h"
@@ -29,6 +30,8 @@
 namespace impala {
 
 const int RawValue::ASCII_PRECISION = 16; // print 16 digits for double/float
+const double RawValue::CANONICAL_DOUBLE_NAN = nan("");
+const float RawValue::CANONICAL_FLOAT_NAN = nanf("");
 
 void RawValue::PrintValueAsBytes(const void* value, const ColumnType& type,
                                  stringstream* stream) {
@@ -48,6 +51,9 @@ void RawValue::PrintValueAsBytes(const void* value, const ColumnType& type,
       break;
     case TYPE_INT:
       stream->write(chars, sizeof(int32_t));
+      break;
+    case TYPE_DATE:
+      stream->write(chars, sizeof(DateValue));
       break;
     case TYPE_BIGINT:
       stream->write(chars, sizeof(int64_t));
@@ -105,6 +111,9 @@ void RawValue::PrintValue(const void* value, const ColumnType& type, int scale,
     case TYPE_CHAR:
       *str = string(reinterpret_cast<const char*>(value), type.len);
       return;
+    case TYPE_FIXED_UDA_INTERMEDIATE:
+      *str = "Intermediate UDA step, no value printed";
+      return;
     default:
       PrintValue(value, type, scale, &out);
   }
@@ -132,6 +141,9 @@ void RawValue::Write(const void* value, void* dst, const ColumnType& type,
       break;
     case TYPE_INT:
       *reinterpret_cast<int32_t*>(dst) = *reinterpret_cast<const int32_t*>(value);
+      break;
+    case TYPE_DATE:
+      *reinterpret_cast<DateValue*>(dst) = *reinterpret_cast<const DateValue*>(value);
       break;
     case TYPE_BIGINT:
       *reinterpret_cast<int64_t*>(dst) = *reinterpret_cast<const int64_t*>(value);
@@ -274,7 +286,11 @@ void RawValue::PrintValue(
         default: DCHECK(false) << type;
       }
       break;
-    default: DCHECK(false);
+    case TYPE_DATE: {
+        *stream << *reinterpret_cast<const DateValue*>(value);
+      }
+      break;
+    default: DCHECK(false) << "Unknown type: " << type;
   }
   stream->precision(old_precision);
   // Undo setting stream to fixed

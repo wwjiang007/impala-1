@@ -17,14 +17,26 @@
 
 package org.apache.impala.analysis;
 
-import java.util.Arrays;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 
+import org.apache.impala.catalog.FeTable;
+import org.apache.impala.common.Id;
+import org.apache.impala.common.IdGenerator;
+import org.apache.impala.thrift.TEdgeType;
+import org.apache.impala.thrift.TLineageGraph;
+import org.apache.impala.thrift.TMultiEdge;
+import org.apache.impala.thrift.TQueryCtx;
+import org.apache.impala.thrift.TUniqueId;
+import org.apache.impala.thrift.TVertex;
+import org.apache.impala.util.TUniqueIdUtil;
 import org.json.simple.JSONArray;
 import org.json.simple.JSONObject;
 import org.json.simple.JSONValue;
@@ -32,22 +44,11 @@ import org.json.simple.parser.JSONParser;
 import org.json.simple.parser.ParseException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.apache.impala.catalog.FeTable;
-import org.apache.impala.common.Id;
-import org.apache.impala.common.IdGenerator;
-import org.apache.impala.thrift.TEdgeType;
-import org.apache.impala.thrift.TQueryCtx;
-import org.apache.impala.thrift.TLineageGraph;
-import org.apache.impala.thrift.TMultiEdge;
-import org.apache.impala.thrift.TUniqueId;
-import org.apache.impala.thrift.TVertex;
-import org.apache.impala.util.TUniqueIdUtil;
+
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableSortedSet;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import com.google.common.hash.Hasher;
 import com.google.common.hash.Hashing;
@@ -82,9 +83,9 @@ final class Vertex implements Comparable<Vertex> {
   /**
    * Encodes this Vertex object into a JSON object represented by a Map.
    */
-  public Map toJson() {
+  public Map<String,Object> toJson() {
     // Use a LinkedHashMap to generate a strict ordering of elements.
-    Map obj = new LinkedHashMap();
+    Map<String,Object> obj = new LinkedHashMap<>();
     obj.put("id", id_.asInt());
     obj.put("vertexType", type_);
     obj.put("vertexId", label_);
@@ -123,6 +124,7 @@ final class Vertex implements Comparable<Vertex> {
     return this.id_.equals(vertex.id_);
   }
 
+  @Override
   public int compareTo(Vertex cmp) { return this.id_.compareTo(cmp.id_); }
 
   @Override
@@ -196,8 +198,8 @@ final class MultiEdge {
    * Encodes this MultiEdge object to a JSON object represented by a Map.
    * Returns a LinkedHashMap to guarantee a consistent ordering of elements.
    */
-  public LinkedHashMap toJson() {
-    LinkedHashMap obj = new LinkedHashMap();
+  public Map<String,Object> toJson() {
+    Map<String,Object> obj = new LinkedHashMap<>();
     // Add sources
     JSONArray sourceIds = new JSONArray();
     for (Vertex vertex: getOrderedSources()) {
@@ -218,11 +220,11 @@ final class MultiEdge {
    * Encodes this MultiEdge object to a thrift object
    */
   public TMultiEdge toThrift() {
-    List<TVertex> sources = Lists.newArrayList();
+    List<TVertex> sources = new ArrayList<>();
     for (Vertex vertex: getOrderedSources()) {
       sources.add(vertex.toThrift());
     }
-    List<TVertex> targets = Lists.newArrayList();
+    List<TVertex> targets = new ArrayList<>();
     for (Vertex vertex: getOrderedTargets()) {
       targets.add(vertex.toThrift());
     }
@@ -236,11 +238,11 @@ final class MultiEdge {
    * Constructs a MultiEdge object from a thrift object.
    */
   public static MultiEdge fromThrift(TMultiEdge obj){
-    Set<Vertex> sources = Sets.newHashSet();
+    Set<Vertex> sources = new HashSet<>();
     for (TVertex vertex: obj.sources) {
       sources.add(Vertex.fromThrift(vertex));
     }
-    Set<Vertex> targets = Sets.newHashSet();
+    Set<Vertex> targets = new HashSet<>();
     for (TVertex vertex: obj.targets) {
       targets.add(Vertex.fromThrift(vertex));
     }
@@ -293,24 +295,24 @@ public class ColumnLineageGraph {
   // Name of the user that issued this query
   private String user_;
 
-  private final List<Expr> resultDependencyPredicates_ = Lists.newArrayList();
+  private final List<Expr> resultDependencyPredicates_ = new ArrayList<>();
 
-  private final List<MultiEdge> edges_ = Lists.newArrayList();
+  private final List<MultiEdge> edges_ = new ArrayList<>();
 
   // Timestamp in seconds since epoch (GMT) this query was submitted for execution.
   private long timestamp_;
 
   // Map of Vertex labels to Vertex objects.
-  private final Map<String, Vertex> vertices_ = Maps.newHashMap();
+  private final Map<String, Vertex> vertices_ = new HashMap<>();
 
   // Map of Vertex ids to Vertex objects. Used primarily during the construction of the
   // ColumnLineageGraph from a serialized JSON object.
-  private final Map<VertexId, Vertex> idToVertexMap_ = Maps.newHashMap();
+  private final Map<VertexId, Vertex> idToVertexMap_ = new HashMap<>();
 
   // For an INSERT or a CTAS, these are the columns of the
   // destination table plus any partitioning columns (when dynamic partitioning is used).
   // For a SELECT stmt, they are the labels of the result exprs.
-  private final List<String> targetColumnLabels_ = Lists.newArrayList();
+  private final List<String> targetColumnLabels_ = new ArrayList<>();
 
   // Repository for tuple and slot descriptors for this query. Use it to construct the
   // column lineage graph.
@@ -347,11 +349,11 @@ public class ColumnLineageGraph {
       MultiEdge.EdgeType type) {
     // createVertex() generates new IDs; we sort the input sets to make the output
     // deterministic and independent of the ordering of the input sets.
-    Set<Vertex> targetVertices = Sets.newHashSet();
+    Set<Vertex> targetVertices = new HashSet<>();
     for (String target: ImmutableSortedSet.copyOf(targets)) {
       targetVertices.add(createVertex(target));
     }
-    Set<Vertex> sourceVertices = Sets.newHashSet();
+    Set<Vertex> sourceVertices = new HashSet<>();
     for (String source: ImmutableSortedSet.copyOf(sources)) {
       sourceVertices.add(createVertex(source));
     }
@@ -408,8 +410,8 @@ public class ColumnLineageGraph {
     Preconditions.checkState(resultExprs.size() == targetColumnLabels_.size());
     for (int i = 0; i < resultExprs.size(); ++i) {
       Expr expr = resultExprs.get(i);
-      Set<String> sourceBaseCols = Sets.newHashSet();
-      List<Expr> dependentExprs = Lists.newArrayList();
+      Set<String> sourceBaseCols = new HashSet<>();
+      List<Expr> dependentExprs = new ArrayList<>();
       getSourceBaseCols(expr, sourceBaseCols, dependentExprs, false);
       Set<String> targets = Sets.newHashSet(targetColumnLabels_.get(i));
       createMultiEdge(targets, sourceBaseCols, MultiEdge.EdgeType.PROJECTION);
@@ -419,7 +421,7 @@ public class ColumnLineageGraph {
         // predicate dependencies. For each direct predicate dependency p, 'expr' is
         // transitively predicate dependent on all exprs that p is projection and
         // predicate dependent on.
-        Set<String> predicateBaseCols = Sets.newHashSet();
+        Set<String> predicateBaseCols = new HashSet<>();
         for (Expr dependentExpr: dependentExprs) {
           getSourceBaseCols(dependentExpr, predicateBaseCols, null, true);
         }
@@ -439,7 +441,7 @@ public class ColumnLineageGraph {
       if (expr.isAuxExpr()) continue;
       resultDependencyPredicates_.add(expr);
     }
-    Set<String> predicateBaseCols = Sets.newHashSet();
+    Set<String> predicateBaseCols = new HashSet<>();
     for (Expr expr: resultDependencyPredicates_) {
       getSourceBaseCols(expr, predicateBaseCols, null, true);
     }
@@ -464,7 +466,7 @@ public class ColumnLineageGraph {
     List<Expr> predicateDepExprs = getPredicateDeps(expr);
     if (directPredDeps != null) directPredDeps.addAll(predicateDepExprs);
     if (traversePredDeps) exprsToTraverse.addAll(predicateDepExprs);
-    List<SlotId> slotIds = Lists.newArrayList();
+    List<SlotId> slotIds = new ArrayList<>();
     for (Expr e: exprsToTraverse) {
       e.getIds(null, slotIds);
     }
@@ -492,7 +494,7 @@ public class ColumnLineageGraph {
    */
   private List<Expr> getProjectionDeps(Expr e) {
     Preconditions.checkNotNull(e);
-    List<Expr> outputExprs = Lists.newArrayList();
+    List<Expr> outputExprs = new ArrayList<>();
     if (e instanceof AnalyticExpr) {
       AnalyticExpr analytic = (AnalyticExpr) e;
       outputExprs.addAll(analytic.getChildren().subList(0,
@@ -509,7 +511,7 @@ public class ColumnLineageGraph {
    */
   private List<Expr> getPredicateDeps(Expr e) {
     Preconditions.checkNotNull(e);
-    List<Expr> outputExprs = Lists.newArrayList();
+    List<Expr> outputExprs = new ArrayList<>();
     if (e instanceof AnalyticExpr) {
       AnalyticExpr analyticExpr = (AnalyticExpr) e;
       outputExprs.addAll(analyticExpr.getPartitionExprs());
@@ -529,7 +531,7 @@ public class ColumnLineageGraph {
    */
   public String toJson() {
     if (Strings.isNullOrEmpty(queryStr_)) return "";
-    Map obj = new LinkedHashMap();
+    Map<String, Object> obj = new LinkedHashMap<>();
     obj.put("queryText", queryStr_);
     obj.put("queryId", TUniqueIdUtil.PrintId(queryId_));
     obj.put("hash", getQueryHash(queryStr_));
@@ -563,14 +565,14 @@ public class ColumnLineageGraph {
     graph.setUser(user_);
     graph.setStarted(timestamp_);
     // Add edges
-    List<TMultiEdge> edges = Lists.newArrayList();
+    List<TMultiEdge> edges = new ArrayList<>();
     for (MultiEdge edge: edges_) {
       edges.add(edge.toThrift());
     }
     graph.setEdges(edges);
     // Add vertices
     TreeSet<Vertex> sortedVertices = Sets.newTreeSet(vertices_.values());
-    List<TVertex> vertices = Lists.newArrayList();
+    List<TVertex> vertices = new ArrayList<>();
     for (Vertex vertex: sortedVertices) {
       vertices.add(vertex.toThrift());
     }
@@ -624,7 +626,7 @@ public class ColumnLineageGraph {
     long timestamp = (Long) jsonObj.get("timestamp");
     ColumnLineageGraph graph = new ColumnLineageGraph(stmt, queryId, user, timestamp);
     JSONArray serializedVertices = (JSONArray) jsonObj.get("vertices");
-    Set<Vertex> vertices = Sets.newHashSet();
+    Set<Vertex> vertices = new HashSet<>();
     for (int i = 0; i < serializedVertices.size(); ++i) {
       Vertex v = Vertex.fromJsonObj((JSONObject) serializedVertices.get(i));
       vertices.add(v);
@@ -651,7 +653,7 @@ public class ColumnLineageGraph {
   }
 
   private Set<Vertex> getVerticesFromJSONArray(JSONArray vertexIdArray) {
-    Set<Vertex> vertices = Sets.newHashSet();
+    Set<Vertex> vertices = new HashSet<>();
     for (int i = 0; i < vertexIdArray.size(); ++i) {
       int sourceId = ((Long) vertexIdArray.get(i)).intValue();
       Vertex sourceVertex = idToVertexMap_.get(new VertexId(sourceId));

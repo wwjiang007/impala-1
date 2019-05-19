@@ -16,16 +16,19 @@
 // under the License.
 
 package org.apache.impala.analysis;
+
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 
 import org.apache.impala.common.TreeNode;
+import org.apache.impala.planner.PlanNode;
 
 import com.google.common.base.Preconditions;
 import com.google.common.base.Predicates;
 import com.google.common.collect.Lists;
-import com.google.common.collect.Sets;
 
 /**
  * Encapsulates all the information needed to compute ORDER BY
@@ -63,7 +66,7 @@ public class SortInfo {
     sortExprs_ = sortExprs;
     isAscOrder_ = isAscOrder;
     nullsFirstParams_ = nullsFirstParams;
-    materializedExprs_ = Lists.newArrayList();
+    materializedExprs_ = new ArrayList<>();
     outputSmap_ = new ExprSubstitutionMap();
   }
 
@@ -92,7 +95,7 @@ public class SortInfo {
    */
   public List<Boolean> getNullsFirst() {
     Preconditions.checkState(sortExprs_.size() == nullsFirstParams_.size());
-    List<Boolean> nullsFirst = Lists.newArrayList();
+    List<Boolean> nullsFirst = new ArrayList<>();
     for (int i = 0; i < sortExprs_.size(); ++i) {
       nullsFirst.add(OrderByElement.nullsFirst(nullsFirstParams_.get(i),
           isAscOrder_.get(i)));
@@ -110,7 +113,7 @@ public class SortInfo {
     Preconditions.checkState(sortTupleDesc_.isMaterialized());
     analyzer.materializeSlots(sortExprs_);
     List<SlotDescriptor> sortTupleSlotDescs = sortTupleDesc_.getSlots();
-    List<Expr> materializedExprs = Lists.newArrayList();
+    List<Expr> materializedExprs = new ArrayList<>();
     for (int i = 0; i < sortTupleSlotDescs.size(); ++i) {
       if (sortTupleSlotDescs.get(i).isMaterialized()) {
         materializedExprs.add(materializedExprs_.get(i));
@@ -186,7 +189,7 @@ public class SortInfo {
 
     // Case 2: Materialize required input slots. Using a LinkedHashSet prevents the
     // slots getting reordered unnecessarily.
-    Set<SlotRef> inputSlotRefs = Sets.newLinkedHashSet();
+    Set<SlotRef> inputSlotRefs = new LinkedHashSet<>();
     IsInputSlotRefPred pred = new IsInputSlotRefPred(sortTupleDesc_.getId());
     TreeNode.collect(Expr.substituteList(resultExprs, outputSmap_, analyzer, false),
         pred, inputSlotRefs);
@@ -195,7 +198,7 @@ public class SortInfo {
     addMaterializedExprs(inputSlotRefs, analyzer);
 
     // Case 3: Materialize TupleIsNullPredicates.
-    List<Expr> tupleIsNullPreds = Lists.newArrayList();
+    List<Expr> tupleIsNullPreds = new ArrayList<>();
     TreeNode.collect(resultExprs, Predicates.instanceOf(TupleIsNullPredicate.class),
         tupleIsNullPreds);
     Expr.removeDuplicates(tupleIsNullPreds);
@@ -233,6 +236,18 @@ public class SortInfo {
   }
 
   /**
+   * Estimates the size of the data materialized in memory by the TopN operator. The
+   * method uses the formula <code>estimatedSize = estimated # of rows in memory *
+   * average tuple serialized size</code>. 'cardinality' is the cardinality of the TopN
+   * operator and 'offset' is the value in the 'OFFSET [x]' clause.
+   */
+  public long estimateTopNMaterializedSize(long cardinality, long offset) {
+    getSortTupleDescriptor().computeMemLayout();
+    return (long) Math.ceil(getSortTupleDescriptor().getAvgSerializedSize()
+        * (PlanNode.checkedAdd(cardinality, offset)));
+  }
+
+  /**
    * Returns the subset of 'sortExprs_' that should be materialized. A sort expr is
    * is materialized if it:
    * - contains a non-deterministic expr
@@ -241,7 +256,7 @@ public class SortInfo {
    * - does not have a cost set
    */
   private List<Expr> getMaterializedSortExprs() {
-    List<Expr> result = Lists.newArrayList();
+    List<Expr> result = new ArrayList<>();
     for (Expr sortExpr : sortExprs_) {
       if (!sortExpr.hasCost()
           || sortExpr.getCost() > SORT_MATERIALIZATION_COST_THRESHOLD

@@ -46,6 +46,12 @@ class ImpaladMetricKeys {
   /// Number of fragments currently running on this server.
   static const char* IMPALA_SERVER_NUM_FRAGMENTS_IN_FLIGHT;
 
+  /// Number of queries that started executing on this backend.
+  static const char* BACKEND_NUM_QUERIES_EXECUTED;
+
+  /// Number of queries currently executing on this backend.
+  static const char* BACKEND_NUM_QUERIES_EXECUTING;
+
   /// Number of open HiveServer2 sessions
   static const char* IMPALA_SERVER_NUM_OPEN_HS2_SESSIONS;
 
@@ -57,12 +63,6 @@ class ImpaladMetricKeys {
 
   /// Number of scan ranges with missing volume id metadata
   static const char* NUM_SCAN_RANGES_MISSING_VOLUME_ID;
-
-  /// Number of bytes currently in use across all mem pools
-  static const char* MEM_POOL_TOTAL_BYTES;
-
-  /// Number of bytes currently in use across all hash tables
-  static const char* HASH_TABLE_TOTAL_BYTES;
 
   /// Number of files currently opened by the io mgr
   static const char* IO_MGR_NUM_OPEN_FILES;
@@ -78,6 +78,19 @@ class ImpaladMetricKeys {
 
   /// Total number of cached bytes read by the io mgr
   static const char* IO_MGR_CACHED_BYTES_READ;
+
+  /// Total number of bytes read from the remote data cache.
+  static const char* IO_MGR_REMOTE_DATA_CACHE_HIT_BYTES;
+
+  /// Total number of bytes missing from the remote data cache.
+  static const char* IO_MGR_REMOTE_DATA_CACHE_MISS_BYTES;
+
+  /// Current byte size of the remote data cache.
+  static const char* IO_MGR_REMOTE_DATA_CACHE_TOTAL_BYTES;
+
+  /// Total number of bytes not inserted into the remote data cache due to
+  /// concurrency limit.
+  static const char* IO_MGR_REMOTE_DATA_CACHE_DROPPED_BYTES;
 
   /// Total number of bytes written to disk by the io mgr (for spilling)
   static const char* IO_MGR_BYTES_WRITTEN;
@@ -204,7 +217,12 @@ class ImpaladMetricKeys {
 class ImpaladMetrics {
  public:
   // Counters
-  static IntGauge* HASH_TABLE_TOTAL_BYTES;
+  static IntCounter* BACKEND_NUM_QUERIES_EXECUTED;
+  /// BACKEND_NUM_QUERIES_EXECUTING is used to determine when the backend has quiesced
+  /// and can be safely shut down without causing query failures. See IMPALA-7931 for
+  /// an example of a race that can occur if this is decremented before a query is
+  /// truly finished.
+  static IntGauge* BACKEND_NUM_QUERIES_EXECUTING;
   static IntCounter* IMPALA_SERVER_NUM_FRAGMENTS;
   static IntGauge* IMPALA_SERVER_NUM_FRAGMENTS_IN_FLIGHT;
   static IntCounter* IMPALA_SERVER_NUM_QUERIES;
@@ -216,6 +234,9 @@ class ImpaladMetrics {
   static IntCounter* IO_MGR_BYTES_READ;
   static IntCounter* IO_MGR_LOCAL_BYTES_READ;
   static IntCounter* IO_MGR_CACHED_BYTES_READ;
+  static IntCounter* IO_MGR_REMOTE_DATA_CACHE_HIT_BYTES;
+  static IntCounter* IO_MGR_REMOTE_DATA_CACHE_MISS_BYTES;
+  static IntCounter* IO_MGR_REMOTE_DATA_CACHE_DROPPED_BYTES;
   static IntCounter* IO_MGR_SHORT_CIRCUIT_BYTES_READ;
   static IntCounter* IO_MGR_BYTES_WRITTEN;
   static IntCounter* IO_MGR_CACHED_FILE_HANDLES_REOPENED;
@@ -248,8 +269,7 @@ class ImpaladMetrics {
   static IntGauge* IO_MGR_NUM_FILE_HANDLES_OUTSTANDING;
   static IntGauge* IO_MGR_CACHED_FILE_HANDLES_HIT_COUNT;
   static IntGauge* IO_MGR_CACHED_FILE_HANDLES_MISS_COUNT;
-  static IntGauge* IO_MGR_TOTAL_BYTES;
-  static IntGauge* MEM_POOL_TOTAL_BYTES;
+  static IntGauge* IO_MGR_REMOTE_DATA_CACHE_TOTAL_BYTES;
   static IntGauge* NUM_FILES_OPEN_FOR_INSERT;
   static IntGauge* NUM_QUERIES_REGISTERED;
   static IntGauge* RESULTSET_CACHE_TOTAL_NUM_ROWS;

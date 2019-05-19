@@ -16,14 +16,9 @@
 # under the License.
 #
 # Client tests for SQL statement authorization
-# In these tests we run all the tests twice. Once with just using cache, hence the
-# long sentry poll, and once by ensuring refreshes happen from Sentry.
 
 import grp
 import pytest
-import os
-import sys
-import subprocess
 from getpass import getuser
 from os import getenv
 from time import sleep
@@ -33,19 +28,12 @@ from tests.common.sentry_cache_test_suite import SentryCacheTestSuite, TestObjec
 from tests.util.calculation_util import get_random_id
 from tests.verifiers.metric_verifier import MetricVerifier
 
-SENTRY_CONFIG_FILE = getenv('IMPALA_HOME') + \
-    '/fe/src/test/resources/sentry-site.xml'
+SENTRY_CONFIG_DIR = "%s/%s" % (getenv("IMPALA_HOME"), "fe/src/test/resources")
+SENTRY_CONFIG_FILE = "%s/sentry-site.xml" % SENTRY_CONFIG_DIR
+SENTRY_CONFIG_FILE_OO = "%s/sentry-site_oo.xml" % SENTRY_CONFIG_DIR
 
-# The polling frequency used by catalogd to refresh Sentry privileges.
-# The long polling is so we can check updates just for the cache.
-# The other polling is so we can get the updates without having to wait.
-SENTRY_POLLING_FREQUENCY_S = 1
-SENTRY_LONG_POLLING_FREQUENCY_S = 120
-# The timeout, in seconds, when waiting for a refresh of Sentry privileges.
-# This is also used as a delay before executing a statement. The difference between
-# the two usages is one is used to check results and once successful can return before
-# the time is up.  The other is to enforce a delay with no short circuit.
-SENTRY_REFRESH_TIMEOUT_S = SENTRY_POLLING_FREQUENCY_S * 3
+# Sentry long polling frequency to make Sentry refresh not run.
+SENTRY_LONG_POLLING_FREQUENCY_S = 3600
 
 
 class TestGrantRevoke(SentryCacheTestSuite):
@@ -118,155 +106,111 @@ class TestGrantRevoke(SentryCacheTestSuite):
   @pytest.mark.execute_serially
   @SentryCacheTestSuite.with_args(
       impalad_args="--server_name=server1",
-      catalogd_args="--sentry_config=" + SENTRY_CONFIG_FILE +
-      " --sentry_catalog_polling_frequency_s=" + str(SENTRY_POLLING_FREQUENCY_S),
+      catalogd_args="--sentry_config={0} --sentry_catalog_polling_frequency_s={1}"
+                    .format(SENTRY_CONFIG_FILE, SENTRY_LONG_POLLING_FREQUENCY_S),
       sentry_config=SENTRY_CONFIG_FILE)
-  def test_grant_revoke_with_sentry(self, vector):
-    self.__execute_with_grant_option_tests(TestObject(TestObject.SERVER), "all",
-        sentry_refresh_timeout_s=SENTRY_REFRESH_TIMEOUT_S)
-    self.__execute_with_grant_option_tests(TestObject(TestObject.DATABASE,
-        "grant_rev_db"), "all", sentry_refresh_timeout_s=SENTRY_REFRESH_TIMEOUT_S)
-    self.__execute_with_grant_option_tests(TestObject(TestObject.TABLE,
-        "grant_rev_db.tbl1"), "all", sentry_refresh_timeout_s=SENTRY_REFRESH_TIMEOUT_S)
-    self.__execute_with_grant_option_tests(TestObject(TestObject.VIEW,
-        "grant_rev_db.tbl1"), "all", sentry_refresh_timeout_s=SENTRY_REFRESH_TIMEOUT_S)
-    self.__execute_with_grant_option_tests(TestObject(TestObject.SERVER), "select",
-        sentry_refresh_timeout_s=SENTRY_REFRESH_TIMEOUT_S)
-    self.__execute_with_grant_option_tests(TestObject(TestObject.DATABASE,
-        "grant_rev_db"), "select", sentry_refresh_timeout_s=SENTRY_REFRESH_TIMEOUT_S)
-    self.__execute_with_grant_option_tests(TestObject(TestObject.TABLE,
-        "grant_rev_db.tbl1"), "select", sentry_refresh_timeout_s=SENTRY_REFRESH_TIMEOUT_S)
-    self.__execute_with_grant_option_tests(TestObject(TestObject.VIEW,
-        "grant_rev_db.tbl1"), "select", sentry_refresh_timeout_s=SENTRY_REFRESH_TIMEOUT_S)
+  def test_grant_revoke_with_catalog_v1(self):
+    """Tests grant and revoke using catalog v1."""
+    self._test_grant_revoke()
 
   @pytest.mark.execute_serially
   @SentryCacheTestSuite.with_args(
-      impalad_args="--server_name=server1",
-      catalogd_args="--sentry_config=" + SENTRY_CONFIG_FILE +
-      " --sentry_catalog_polling_frequency_s=" + str(SENTRY_LONG_POLLING_FREQUENCY_S),
-      sentry_config=SENTRY_CONFIG_FILE)
-  def test_grant_revoke_with_sentry_long_poll(self, vector):
-    self.__execute_with_grant_option_tests(TestObject(TestObject.SERVER), "all")
-    self.__execute_with_grant_option_tests(TestObject(TestObject.DATABASE,
-        "grant_rev_db"), "all")
-    self.__execute_with_grant_option_tests(TestObject(TestObject.TABLE,
-        "grant_rev_db.tbl1"), "all")
-    self.__execute_with_grant_option_tests(TestObject(TestObject.VIEW,
-        "grant_rev_db.tbl1"), "all")
-    self.__execute_with_grant_option_tests(TestObject(TestObject.SERVER), "select")
-    self.__execute_with_grant_option_tests(TestObject(TestObject.DATABASE,
-        "grant_rev_db"), "select")
-    self.__execute_with_grant_option_tests(TestObject(TestObject.TABLE,
-        "grant_rev_db.tbl1"), "select")
-    self.__execute_with_grant_option_tests(TestObject(TestObject.VIEW,
-        "grant_rev_db.tbl1"), "select")
-
-  @pytest.mark.execute_serially
-  @SentryCacheTestSuite.with_args(
-    impalad_args="--server_name=server1",
-    catalogd_args="--sentry_config=%s " % SENTRY_CONFIG_FILE +
-                  "--sentry_catalog_polling_frequency_s=%d" % SENTRY_POLLING_FREQUENCY_S,
+    impalad_args="--server_name=server1 --use_local_catalog=true",
+    catalogd_args="--sentry_config={0} --sentry_catalog_polling_frequency_s={1} "
+                  "--use_local_catalog=true --catalog_topic_mode=minimal"
+                  .format(SENTRY_CONFIG_FILE, SENTRY_LONG_POLLING_FREQUENCY_S),
     sentry_config=SENTRY_CONFIG_FILE)
-  def test_grant_revoke_with_sentry_refresh(self):
-    group_name = grp.getgrnam(getuser()).gr_name
-    role_name = "grant_revoke_test_sentry_refresh"
+  def test_grant_revoke_with_local_catalog(self):
+    """Tests grant and revoke using local catalog mode."""
+    self._test_grant_revoke()
+
+  def _test_grant_revoke(self):
+    """Tests grant and revoke for all objects. In these tests, we run tests twice. One
+    with just using cache, hence the long sentry poll, and another one by ensuring
+    refreshes happen from Sentry."""
+    for refresh in [True, False]:
+      for priv in ["all", "select"]:
+        self._execute_with_grant_option_tests(
+          TestObject(TestObject.SERVER), priv, refresh)
+        self._execute_with_grant_option_tests(TestObject(
+          TestObject.DATABASE, "grant_rev_db"), priv, refresh)
+        self._execute_with_grant_option_tests(TestObject(
+          TestObject.TABLE, "grant_rev_db.tbl1"), priv, refresh)
+        self._execute_with_grant_option_tests(
+          TestObject(TestObject.VIEW, "grant_rev_db.tbl1"), priv, refresh)
+
+  def _execute_with_grant_option_tests(self, test_obj, privilege, refresh_authorization):
+    """
+    Executes grant/revoke tests with grant option.
+    """
+    def setup():
+      group_name = grp.getgrnam(getuser()).gr_name
+      try:
+        self.client.execute("create role grant_revoke_test_admin")
+      except Exception:
+        # Ignore this as it was already created on the last run.
+        pass
+      self.client.execute("grant all on server to grant_revoke_test_admin")
+      self.client.execute("grant role grant_revoke_test_admin to group `%s`" % group_name)
+      self.client.execute("create role grant_revoke_test_role")
+
+    def cleanup():
+      # Reset the grant value
+      test_obj.grant = False
+      # Remove the role
+      self.client.execute("drop role grant_revoke_test_role")
+
     try:
-      self.client.execute("create role %s" % role_name)
-      self.client.execute("grant role %s to group `%s`" % (role_name, group_name))
-      # Add select and insert into the catalog.
-      self.client.execute("grant select on table functional.alltypes to %s" % role_name)
-      self.client.execute("grant insert on table functional.alltypes to %s" % role_name)
-      # Grant alter privilege and revoke insert privilege using Sentry CLI.
-      subprocess.check_call(
-        ["/bin/bash", "-c", "%s/bin/sentryShell "
-         "--conf %s/sentry-site.xml -gpr "
-         "-p 'server=server1->db=functional->table=alltypes->action=alter' "
-         "-r %s" % (os.getenv("SENTRY_HOME"), os.getenv("SENTRY_CONF_DIR"), role_name)],
-        stdout=sys.stdout, stderr=sys.stderr)
-      subprocess.check_call(
-          ["/bin/bash", "-c", "%s/bin/sentryShell "
-           "--conf %s/sentry-site.xml -rpr "
-           "-p 'server=server1->db=functional->table=alltypes->action=insert' "
-           "-r %s" % (os.getenv("SENTRY_HOME"), os.getenv("SENTRY_CONF_DIR"), role_name)],
-          stdout=sys.stdout, stderr=sys.stderr)
-      # Wait for the catalog update with Sentry refresh.
-      sleep(SENTRY_POLLING_FREQUENCY_S + 3)
-      # Ensure alter privilege was granted and insert privilege was revoked.
-      result = self.execute_query_expect_success(self.client, "show grant role %s" %
-                                                 role_name)
-      assert len(result.data) == 2
-      assert any('select' in x for x in result.data)
-      assert any('alter' in x for x in result.data)
+      setup()
+      if test_obj.obj_type != TestObject.SERVER:
+        self.user_query(self.client, "create %s if not exists %s %s %s" %
+                        (test_obj.obj_type, test_obj.obj_name, test_obj.table_def,
+                         test_obj.view_select), user="root")
+
+      # Grant a basic privilege
+      self.user_query(self.client, "grant %s on %s %s to role grant_revoke_test_role" %
+                      (privilege, test_obj.grant_name, test_obj.obj_name), user="root")
+
+      # Ensure role has privilege.
+      self.validate_privileges(self.client, "show grant role grant_revoke_test_role",
+                               test_obj, refresh_authorization=refresh_authorization)
+
+      # Try with grant option on existing privilege.
+      test_obj.grant = True
+      self.user_query(self.client,
+                      "grant %s on %s %s to role grant_revoke_test_role with grant option"
+                      % (privilege, test_obj.grant_name, test_obj.obj_name), user="root")
+      # Ensure role has updated privilege.
+      self.validate_privileges(self.client, "show grant role grant_revoke_test_role",
+                               test_obj, refresh_authorization=refresh_authorization)
+
+      # Revoke the grant option
+      self.user_query(self.client, "revoke grant option for %s on %s %s from role "
+                                   "grant_revoke_test_role" % (privilege,
+                                                               test_obj.grant_name,
+                                                               test_obj.obj_name))
+      # Ensure role has updated privilege.
+      test_obj.grant = False
+      self.validate_privileges(self.client, "show grant role grant_revoke_test_role",
+                               test_obj, refresh_authorization=refresh_authorization)
+
+      # Add the grant option back, then add a regular privilege
+      self.user_query(self.client,
+                      "grant %s on %s %s to role grant_revoke_test_role with grant option"
+                      % (privilege, test_obj.grant_name, test_obj.obj_name), user="root")
+      self.user_query(self.client, "grant %s on %s %s to role grant_revoke_test_role" %
+                      (privilege, test_obj.grant_name, test_obj.obj_name), user="root")
+      test_obj.grant = True
+      self.validate_privileges(self.client, "show grant role grant_revoke_test_role",
+                               test_obj, refresh_authorization=refresh_authorization)
+
+      # Revoke the privilege
+      self.user_query(self.client, "revoke %s on %s %s from role grant_revoke_test_role" %
+                      (privilege, test_obj.grant_name, test_obj.obj_name))
+      result = self.user_query(self.client, "show grant role grant_revoke_test_role")
+      assert len(result.data) == 0
     finally:
-      self.client.execute("drop role %s" % role_name)
-
-  def __execute_with_grant_option_tests(self, test_obj, privilege,
-      sentry_refresh_timeout_s=0):
-    """
-    Executes grant/revoke tests with grant option
-    """
-    # Do some initial setup only for this test.
-    group_name = grp.getgrnam(getuser()).gr_name
-    try:
-      self.client.execute("create role grant_revoke_test_admin")
-    except Exception:
-      # Ignore this as it was already created on the last run.
-      pass
-    self.client.execute("grant all on server to grant_revoke_test_admin")
-    self.client.execute("grant role grant_revoke_test_admin to group `%s`" % group_name)
-    self.client.execute("create role grant_revoke_test_role")
-    if test_obj.obj_type != TestObject.SERVER:
-      self.user_query(self.client, "create %s if not exists %s %s %s"
-          % (test_obj.obj_type, test_obj.obj_name, test_obj.table_def,
-          test_obj.view_select), user="root")
-
-    # Grant a basic privilege
-    self.user_query(self.client, "grant %s on %s %s to role grant_revoke_test_role"
-        % (privilege, test_obj.grant_name, test_obj.obj_name), user="root")
-
-    # Ensure role has privilege.
-    self.validate_privileges(self.client, "show grant role grant_revoke_test_role",
-        test_obj, timeout_sec=sentry_refresh_timeout_s)
-
-    # Try with grant option on existing privilege.
-    test_obj.grant = True
-    self.user_query(self.client, "grant %s on %s %s " % (privilege, test_obj.grant_name,
-        test_obj.obj_name) + " to role grant_revoke_test_role with grant option",
-        user="root")
-    # Ensure role has updated privilege.
-    self.validate_privileges(self.client, "show grant role grant_revoke_test_role",
-        test_obj, timeout_sec=sentry_refresh_timeout_s)
-
-    # Revoke the grant option
-    self.user_query(self.client,
-        "revoke grant option for %s on %s %s from role grant_revoke_test_role"
-        % (privilege, test_obj.grant_name, test_obj.obj_name))
-    # Ensure role has updated privilege.
-    test_obj.grant = False
-    self.validate_privileges(self.client, "show grant role grant_revoke_test_role",
-        test_obj, delay_s=sentry_refresh_timeout_s)
-
-    # Add the grant option back, then add a regular privilege
-    self.user_query(self.client, "grant %s on %s %s to role grant_revoke_test_role"
-        % (privilege, test_obj.grant_name, test_obj.obj_name) + " with grant option",
-        user="root")
-    self.user_query(self.client, "grant %s on %s %s to role grant_revoke_test_role"
-        % (privilege, test_obj.grant_name, test_obj.obj_name), user="root")
-    test_obj.grant = True
-    self.validate_privileges(self.client, "show grant role grant_revoke_test_role",
-        test_obj, timeout_sec=sentry_refresh_timeout_s)
-
-    # Revoke the privilege
-    self.user_query(self.client, "revoke %s on %s %s from role grant_revoke_test_role"
-        % (privilege, test_obj.grant_name, test_obj.obj_name))
-    result = self.user_query(self.client, "show grant role grant_revoke_test_role",
-        delay_s=sentry_refresh_timeout_s)
-    assert len(result.data) == 0
-
-    # Reset the grant value
-    test_obj.grant = False
-    # Remove the role
-    self.client.execute("drop role grant_revoke_test_role")
+      cleanup()
 
   @pytest.mark.execute_serially
   @SentryCacheTestSuite.with_args(
@@ -369,3 +313,113 @@ class TestGrantRevoke(SentryCacheTestSuite):
       assert privileges_before.data == privileges_after.data
     finally:
       self.client.execute("drop role {0}".format(role_name))
+
+  @pytest.mark.execute_serially
+  @SentryCacheTestSuite.with_args(
+      impalad_args="--server_name=server1",
+      catalogd_args="--sentry_config={0}".format(SENTRY_CONFIG_FILE),
+      sentry_config=SENTRY_CONFIG_FILE)
+  def test_role_name_case_insensitive_invalidate_metadata(self, unique_role):
+    """IMPALA-7729: Tests running invalidate metadata with role names that have different
+    case sensitivity."""
+    for role_name in [unique_role.lower(), unique_role.upper(), unique_role.capitalize()]:
+      try:
+        self.client.execute("create role {0}".format(role_name))
+        self.client.execute("grant all on server to {0}".format(role_name))
+        self.client.execute("grant role {0} to group `{1}`".format(
+          role_name, grp.getgrnam(getuser()).gr_name))
+
+        # Verify that running invalidate metadata won't hang due to case sensitivity
+        # in the role names.
+        handle = self.client.execute_async("invalidate metadata")
+        assert self.client.wait_for_finished_timeout(handle, timeout=60)
+      finally:
+        self.client.execute("drop role {0}".format(role_name))
+
+  @pytest.mark.execute_serially
+  @SentryCacheTestSuite.with_args(
+      impalad_args="--server_name=server1 --sentry_config={0} "
+                   "--authorization_policy_provider_class="
+                   "org.apache.impala.testutil.TestSentryResourceAuthorizationProvider"
+                   .format(SENTRY_CONFIG_FILE_OO),
+      catalogd_args="--sentry_config={0} "
+                    "--authorization_policy_provider_class="
+                    "org.apache.impala.testutil.TestSentryResourceAuthorizationProvider"
+                    .format(SENTRY_CONFIG_FILE_OO),
+      sentry_config=SENTRY_CONFIG_FILE_OO)
+  def test_same_name_for_role_and_user_invalidate_metadata(self, unique_name):
+    """IMPALA-7729: Tests running invalidate metadata with for the same name for both
+    user and role should not cause Impala query to hang."""
+    db_prefix = unique_name
+    role_name = "foobar"
+    # Use two different clients so that the sessions will use two different user names.
+    foobar_impalad_client = self.create_impala_client()
+    FOOBAR_impalad_client = self.create_impala_client()
+    try:
+      # This will create "foobar" role catalog object.
+      self.client.execute("create role {0}".format(role_name))
+      self.client.execute("grant all on server to {0}".format(role_name))
+      self.client.execute("grant role {0} to group `{1}`".format(
+          role_name, grp.getgrnam(getuser()).gr_name))
+
+      # User names are case sensitive, so "foobar" and "FOOBAR" users should be treated
+      # as two different catalog objects.
+
+      # This will create "foobar" user catalog object.
+      self.user_query(foobar_impalad_client, "create database {0}_db1"
+                      .format(db_prefix, user="foobar"))
+      # This will create "FOOBAR" user catalog object.
+      self.user_query(FOOBAR_impalad_client, "create database {0}_db2"
+                      .format(db_prefix, user="FOOBAR"))
+
+      # Verify that running invalidate metadata won't hang due to having the same name
+      # in both user and role.
+      handle = self.client.execute_async("invalidate metadata")
+      assert self.client.wait_for_finished_timeout(handle, timeout=60)
+    finally:
+      self.client.execute("drop database {0}_db1".format(db_prefix))
+      self.client.execute("drop database {0}_db2".format(db_prefix))
+      self.client.execute("drop role {0}".format(role_name))
+
+  @pytest.mark.execute_serially
+  @SentryCacheTestSuite.with_args(
+      impalad_args="--server_name=server1",
+      catalogd_args="--sentry_config={0}".format(SENTRY_CONFIG_FILE),
+      sentry_config=SENTRY_CONFIG_FILE)
+  def test_uri_privilege_case_sensitive(self, unique_role):
+    """Tests that revoking on a granted URI with a different case should not be
+       allowed."""
+    try:
+      self.client.execute("create role {0}".format(unique_role))
+      self.client.execute("grant role {0} to group `{1}`"
+                          .format(unique_role, grp.getgrnam(getuser()).gr_name))
+      self.client.execute("grant refresh on server to {0}".format(unique_role))
+      self.client.execute("grant all on uri '/test-warehouse/FOO' to {0}"
+                          .format(unique_role))
+      self.client.execute("grant all on uri '/test-warehouse/foo' to {0}"
+                          .format(unique_role))
+      result = self.client.execute("show grant role {0}".format(unique_role))
+
+      # Both URIs should exist.
+      assert any("/test-warehouse/FOO" in x for x in result.data)
+      assert any("/test-warehouse/foo" in x for x in result.data)
+
+      self.client.execute("refresh authorization")
+      # After refresh authorization, we should expect both URIs to still exist.
+      assert any("/test-warehouse/FOO" in x for x in result.data)
+      assert any("/test-warehouse/foo" in x for x in result.data)
+
+      self.client.execute("revoke all on uri '/test-warehouse/foo' from {0}"
+                          .format(unique_role))
+
+      result = self.client.execute("show grant role {0}".format(unique_role))
+      # Only one URI should exist.
+      assert any("/test-warehouse/FOO" in x for x in result.data)
+      assert not any("/test-warehouse/foo" in x for x in result.data)
+
+      self.client.execute("refresh authorization")
+      # After refresh authorization, the one URI should still exist.
+      assert any("/test-warehouse/FOO" in x for x in result.data)
+      assert not any("/test-warehouse/foo" in x for x in result.data)
+    finally:
+      self.client.execute("drop role {0}".format(unique_role))

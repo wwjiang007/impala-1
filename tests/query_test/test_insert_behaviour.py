@@ -23,7 +23,8 @@ import re
 
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.parametrize import UniqueDatabase
-from tests.common.skip import SkipIfS3, SkipIfADLS, SkipIfIsilon, SkipIfLocal
+from tests.common.skip import (SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfIsilon,
+    SkipIfLocal, SkipIfDockerizedCluster, SkipIfCatalogV2)
 from tests.util.filesystem_utils import WAREHOUSE, get_fs_path, IS_S3
 
 @SkipIfLocal.hdfs_client
@@ -132,6 +133,7 @@ class TestInsertBehaviour(ImpalaTestSuite):
     assert len(self.filesystem_client.ls(part_dir)) == 1
 
   @SkipIfS3.hdfs_acls
+  @SkipIfABFS.hdfs_acls
   @SkipIfADLS.hdfs_acls
   @SkipIfIsilon.hdfs_acls
   @pytest.mark.xfail(run=False, reason="Fails intermittently on test clusters")
@@ -193,8 +195,10 @@ class TestInsertBehaviour(ImpalaTestSuite):
     check_has_acls("p1=1/p2=2/p3=30", "default:group:new_leaf_group:-w-")
 
   @SkipIfS3.hdfs_acls
+  @SkipIfABFS.hdfs_acls
   @SkipIfADLS.hdfs_acls
   @SkipIfIsilon.hdfs_acls
+  @SkipIfCatalogV2.impala_7539()
   def test_insert_file_permissions(self, unique_database):
     """Test that INSERT correctly respects file permission (minimum ACLs)"""
     table = "`{0}`.`insert_acl_permissions`".format(unique_database)
@@ -244,8 +248,10 @@ class TestInsertBehaviour(ImpalaTestSuite):
     self.execute_query_expect_success(self.client, insert_query)
 
   @SkipIfS3.hdfs_acls
+  @SkipIfABFS.hdfs_acls
   @SkipIfADLS.hdfs_acls
   @SkipIfIsilon.hdfs_acls
+  @SkipIfCatalogV2.impala_7539()
   def test_mixed_partition_permissions(self, unique_database):
     """
     Test that INSERT and LOAD DATA into explicit partitions is allowed even
@@ -324,8 +330,10 @@ class TestInsertBehaviour(ImpalaTestSuite):
     load_data(self.execute_query_expect_success, "added_part")
 
   @SkipIfS3.hdfs_acls
+  @SkipIfABFS.hdfs_acls
   @SkipIfADLS.hdfs_acls
   @SkipIfIsilon.hdfs_acls
+  @SkipIfCatalogV2.impala_7539()
   def test_readonly_table_dir(self, unique_database):
     """
     Test that, if a partitioned table has a read-only base directory,
@@ -355,8 +363,11 @@ class TestInsertBehaviour(ImpalaTestSuite):
     assert re.search(r'Impala does not have WRITE access.*' + table_path, str(err))
 
   @SkipIfS3.hdfs_acls
+  @SkipIfABFS.hdfs_acls
   @SkipIfADLS.hdfs_acls
   @SkipIfIsilon.hdfs_acls
+  @SkipIfDockerizedCluster.insert_acls
+  @SkipIfCatalogV2.impala_7539()
   def test_insert_acl_permissions(self, unique_database):
     """Test that INSERT correctly respects ACLs"""
     table = "`{0}`.`insert_acl_permissions`".format(unique_database)
@@ -433,8 +444,10 @@ class TestInsertBehaviour(ImpalaTestSuite):
     self.execute_query_expect_success(self.client, insert_query)
 
   @SkipIfS3.hdfs_acls
+  @SkipIfABFS.hdfs_acls
   @SkipIfADLS.hdfs_acls
   @SkipIfIsilon.hdfs_acls
+  @SkipIfCatalogV2.impala_7539()
   def test_load_permissions(self, unique_database):
     # We rely on test_insert_acl_permissions() to exhaustively check that ACL semantics
     # are correct. Here we just validate that LOADs can't be done when we cannot read from
@@ -557,8 +570,11 @@ class TestInsertBehaviour(ImpalaTestSuite):
     self.execute_query_expect_failure(self.client, insert_query)
 
   @SkipIfS3.hdfs_acls
+  @SkipIfABFS.hdfs_acls
   @SkipIfADLS.hdfs_acls
   @SkipIfIsilon.hdfs_acls
+  @SkipIfDockerizedCluster.insert_acls
+  @SkipIfCatalogV2.impala_7539()
   def test_multiple_group_acls(self, unique_database):
     """Test that INSERT correctly respects multiple group ACLs"""
     table = "`{0}`.`insert_group_acl_permissions`".format(unique_database)

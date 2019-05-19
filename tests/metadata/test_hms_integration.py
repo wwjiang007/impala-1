@@ -29,14 +29,16 @@ import random
 import string
 from subprocess import call
 
+from tests.common.environ import IMPALA_TEST_CLUSTER_PROPERTIES
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfS3, SkipIfADLS, SkipIfIsilon, SkipIfLocal
+from tests.common.skip import SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfIsilon, SkipIfLocal
 from tests.common.test_dimensions import (
     create_single_exec_option_dimension,
     create_uncompressed_text_dimension)
 from tests.util.hive_utils import HiveDbWrapper, HiveTableWrapper
 
 @SkipIfS3.hive
+@SkipIfABFS.hive
 @SkipIfADLS.hive
 @SkipIfIsilon.hive
 @SkipIfLocal.hive
@@ -61,7 +63,12 @@ class TestHmsIntegrationSanity(ImpalaTestSuite):
     self.run_stmt_in_hive("drop database if exists hms_sanity_db cascade")
     self.run_stmt_in_hive("create database hms_sanity_db")
     # Make sure Impala's metadata is in sync.
-    self.client.execute("invalidate metadata")
+    if IMPALA_TEST_CLUSTER_PROPERTIES.is_catalog_v2_cluster():
+      # Using local catalog + HMS event processor - wait until the database shows up.
+      self.wait_for_db_to_appear("hms_sanity_db", timeout_s=30)
+    else:
+      # Using traditional catalog - need to invalidate to pick up hive-created db.
+      self.client.execute("invalidate metadata")
     # Creating a database with the same name using 'IF NOT EXISTS' in Impala should
     # not fail
     self.client.execute("create database if not exists hms_sanity_db")
@@ -77,13 +84,18 @@ class TestHmsIntegrationSanity(ImpalaTestSuite):
     # Creating a table with the same name using 'IF NOT EXISTS' in Impala should
     # not fail
     self.client.execute("create table if not exists hms_sanity_db.test_tbl (a int)")
-    # The table should not appear in the catalog unless invalidate metadata is
-    # executed
-    assert 'test_tbl' not in self.client.execute("show tables in hms_sanity_db").data
+    # The table should not appear in the catalog for catalog_v1 unless invalidate
+    # metadata is executed.
+    if IMPALA_TEST_CLUSTER_PROPERTIES.is_catalog_v2_cluster():
+      self.wait_for_table_to_appear("hms_sanity_db", "test_tbl", 10)
+      assert 'test_tbl' in self.client.execute("show tables in hms_sanity_db").data
+    else:
+      assert 'test_tbl' not in self.client.execute("show tables in hms_sanity_db").data
     self.client.execute("invalidate metadata hms_sanity_db.test_tbl")
     assert 'test_tbl' in self.client.execute("show tables in hms_sanity_db").data
 
 @SkipIfS3.hive
+@SkipIfABFS.hive
 @SkipIfADLS.hive
 @SkipIfIsilon.hive
 @SkipIfLocal.hive

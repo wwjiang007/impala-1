@@ -25,8 +25,6 @@ import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TExprNode;
 import org.apache.impala.thrift.TExprNodeType;
 import org.apache.impala.thrift.TKuduPartitionExpr;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Preconditions;
 
@@ -36,8 +34,6 @@ import com.google.common.base.Preconditions;
  * this Expr produce the values for the partition columns.
  */
 public class KuduPartitionExpr extends Expr {
-  private final static Logger LOG = LoggerFactory.getLogger(KuduPartitionExpr.class);
-
   // The table to use the partitioning scheme from.
   private final int targetTableId_;
   private final FeKuduTable targetTable_;
@@ -79,11 +75,11 @@ public class KuduPartitionExpr extends Expr {
   protected float computeEvalCost() { return UNKNOWN_COST; }
 
   @Override
-  protected String toSqlImpl() {
+  protected String toSqlImpl(ToSqlOptions options) {
     StringBuilder sb = new StringBuilder("KuduPartition(");
     for (int i = 0; i < children_.size(); ++i) {
       if (i != 0) sb.append(", ");
-      sb.append(children_.get(i).toSql());
+      sb.append(children_.get(i).toSql(options));
     }
     sb.append(")");
     return sb.toString();

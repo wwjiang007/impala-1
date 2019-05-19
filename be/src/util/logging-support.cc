@@ -100,17 +100,17 @@ void AddDocumentMember(const string& message, const char* member,
 
 template<class F>
 Webserver::UrlCallback MakeCallback(const F& fnc, bool display_log4j_handlers) {
-  return [fnc, display_log4j_handlers](const auto& args, auto* doc) {
+  return [fnc, display_log4j_handlers](const auto& req, auto* doc) {
     // Display log4j log level handlers only when display_log4j_handlers is true.
     if (display_log4j_handlers) AddDocumentMember("true", "include_log4j_handlers", doc);
-    (*fnc)(args, doc);
+    (*fnc)(req, doc);
   };
 }
 
 void InitDynamicLoggingSupport() {
-  JNIEnv* env = getJNIEnv();
-  log4j_logger_class_ = env->FindClass("org/apache/impala/util/GlogAppender");
-  EXIT_IF_EXC(env);
+  JNIEnv* env = JniUtil::GetJNIEnv();
+  ABORT_IF_ERROR(JniUtil::GetGlobalClassRef(env, "org/apache/impala/util/GlogAppender",
+        &log4j_logger_class_));
   JniMethodDescriptor get_log_level_method_desc =
       {"getLogLevel", "([B)Ljava/lang/String;", &get_log_level_method};
   JniMethodDescriptor set_log_level_method_desc =
@@ -144,7 +144,8 @@ Status ResetJavaLogLevels() {
 }
 
 // Callback handler for /get_java_loglevel.
-void GetJavaLogLevelCallback(const Webserver::ArgumentMap& args, Document* document) {
+void GetJavaLogLevelCallback(const Webserver::WebRequest& req, Document* document) {
+  const auto& args = req.parsed_args;
   Webserver::ArgumentMap::const_iterator log_getclass = args.find("class");
   if (log_getclass == args.end() || log_getclass->second.empty()) {
     AddDocumentMember("Invalid input class name", "error", document);
@@ -166,7 +167,8 @@ void GetJavaLogLevelCallback(const Webserver::ArgumentMap& args, Document* docum
 }
 
 // Callback handler for /set_java_loglevel.
-void SetJavaLogLevelCallback(const Webserver::ArgumentMap& args, Document* document) {
+void SetJavaLogLevelCallback(const Webserver::WebRequest& req, Document* document) {
+  const auto& args = req.parsed_args;
   Webserver::ArgumentMap::const_iterator classname = args.find("class");
   Webserver::ArgumentMap::const_iterator level = args.find("level");
   if (classname == args.end() || classname->second.empty() ||
@@ -194,7 +196,7 @@ void SetJavaLogLevelCallback(const Webserver::ArgumentMap& args, Document* docum
 }
 
 // Callback handler for /reset_java_loglevel.
-void ResetJavaLogLevelCallback(const Webserver::ArgumentMap& args, Document* document) {
+void ResetJavaLogLevelCallback(const Webserver::WebRequest& req, Document* document) {
   Status status = ResetJavaLogLevels();
   if (!status.ok()) {
     AddDocumentMember(status.GetDetail(), "error", document);
@@ -204,7 +206,8 @@ void ResetJavaLogLevelCallback(const Webserver::ArgumentMap& args, Document* doc
 }
 
 // Callback handler for /set_glog_level
-void SetGlogLevelCallback(const Webserver::ArgumentMap& args, Document* document) {
+void SetGlogLevelCallback(const Webserver::WebRequest& req, Document* document) {
+  const auto& args = req.parsed_args;
   Webserver::ArgumentMap::const_iterator glog_level = args.find("glog");
   if (glog_level == args.end() || glog_level->second.empty()) {
     AddDocumentMember("Bad glog level input. Valid inputs are integers in the "
@@ -222,7 +225,7 @@ void SetGlogLevelCallback(const Webserver::ArgumentMap& args, Document* document
 }
 
 // Callback handler for /reset_glog_level
-void ResetGlogLevelCallback(const Webserver::ArgumentMap& args, Document* document) {
+void ResetGlogLevelCallback(const Webserver::WebRequest& req, Document* document) {
   string new_log_level = google::SetCommandLineOption("v",
       to_string(FLAGS_v_original_value).data());
   AddDocumentMember(new_log_level, "reset_glog_level_result", document);
@@ -233,14 +236,14 @@ void ResetGlogLevelCallback(const Webserver::ArgumentMap& args, Document* docume
 namespace impala {
 
 void InitJvmLoggingSupport() {
-  JNIEnv* env = getJNIEnv();
+  JNIEnv* env = JniUtil::GetJNIEnv();
   JNINativeMethod nm;
   jclass native_backend_cl = env->FindClass("org/apache/impala/util/NativeLogger");
   nm.name = const_cast<char*>("Log");
   nm.signature = const_cast<char*>("(ILjava/lang/String;Ljava/lang/String;I)V");
   nm.fnPtr = reinterpret_cast<void*>(::Java_org_apache_impala_util_NativeLogger_Log);
   env->RegisterNatives(native_backend_cl, &nm, 1);
-  EXIT_IF_EXC(env);
+  ABORT_IF_EXC(env);
   InitDynamicLoggingSupport();
 }
 
@@ -304,8 +307,8 @@ void LoggingSupport::DeleteOldLogs(const string& path_pattern, int max_log_files
 
 void RegisterLogLevelCallbacks(Webserver* webserver, bool register_log4j_handlers) {
   webserver->RegisterUrlCallback("/log_level", "log_level.tmpl",
-      MakeCallback([](const Webserver::ArgumentMap& args, Document* document){},
-      register_log4j_handlers));
+      MakeCallback([](const Webserver::WebRequest& req, Document* document){},
+      register_log4j_handlers), true);
   webserver->RegisterUrlCallback("/set_glog_level", "log_level.tmpl",
       MakeCallback(&SetGlogLevelCallback, register_log4j_handlers), false);
   webserver->RegisterUrlCallback("/reset_glog_level", "log_level.tmpl",

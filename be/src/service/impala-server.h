@@ -32,6 +32,7 @@
 #include "gen-cpp/ImpalaHiveServer2Service.h"
 #include "gen-cpp/ImpalaInternalService.h"
 #include "gen-cpp/Frontend_types.h"
+#include "kudu/util/random.h"
 #include "rpc/thrift-server.h"
 #include "common/status.h"
 #include "service/query-options.h"
@@ -47,6 +48,7 @@
 #include "statestore/statestore-subscriber.h"
 
 namespace impala {
+using kudu::ThreadSafeRandom;
 
 class ExecEnv;
 class DataSink;
@@ -85,6 +87,7 @@ class QuerySchedule;
 ///
 /// Main thread (caller code), after instantiating the server, must call Start().
 /// Start() does the following:
+///    - Registers the ImpalaServer instance with the ExecEnv
 ///    - Start internal services
 ///    - Wait (indefinitely) for local catalog to be initialized from statestore
 ///      (if coordinator)
@@ -120,8 +123,10 @@ class QuerySchedule;
 ///     -> Queuing delay in the admission controller (which may be unbounded).
 /// 3. The startup grace period elapses.
 /// 4. The background shutdown thread periodically checks to see if the Impala daemon is
-///    quiesced (i.e. no client requests are registered and no fragment instances are
-///    executing). If it is quiesced then it cleanly shuts down by exiting the process.
+///    quiesced (i.e. no client requests are registered and no queries are executing on
+///    the backend). If it is quiesced then it cleanly shuts down by exiting the process.
+///    The statestore will detect that the process is not responding to heartbeats and
+///    remove any entries.
 /// 5. The shutdown deadline elapses. The Impala daemon exits regardless of whether
 ///    it was successfully quiesced or not.
 ///
@@ -151,6 +156,7 @@ class QuerySchedule;
 /// * uuid_lock_
 /// * catalog_version_lock_
 /// * connection_to_sessions_map_lock_
+/// * known_backends_lock_
 ///
 /// TODO: The same doesn't apply to the execution state of an individual plan
 /// fragment: the originating coordinator might die, but we can get notified of
@@ -296,8 +302,6 @@ class ImpalaServer : public ImpalaServiceIf,
       const apache::hive::service::cli::thrift::TRenewDelegationTokenReq& req);
 
   /// ImpalaInternalService rpcs
-  void ReportExecStatus(TReportExecStatusResult& return_val,
-      const TReportExecStatusParams& params);
   void UpdateFilter(TUpdateFilterResult& return_val,
       const TUpdateFilterParams& params);
 
@@ -308,7 +312,8 @@ class ImpalaServer : public ImpalaServiceIf,
   void PrepareQueryContext(TQueryCtx* query_ctx);
 
   /// Static helper for PrepareQueryContext() that is used from expr-benchmark.
-  static void PrepareQueryContext(const TNetworkAddress& backend_addr, TQueryCtx* query_ctx);
+  static void PrepareQueryContext(const TNetworkAddress& backend_addr,
+      const TNetworkAddress& krpc_addr, TQueryCtx* query_ctx);
 
   /// SessionHandlerIf methods
 
@@ -362,7 +367,7 @@ class ImpalaServer : public ImpalaServiceIf,
       const TUniqueId& catalog_service_id);
 
   /// Wait until the minimum catalog object version in the local cache is
-  /// greater than or equal to 'min_catalog_update_version' or until the catalog
+  /// greater than 'min_catalog_update_version' or until the catalog
   /// service id has changed.
   void WaitForMinCatalogUpdate(const int64_t min_catalog_update_version,
       const TUniqueId& catalog_service_id);
@@ -397,14 +402,14 @@ class ImpalaServer : public ImpalaServiceIf,
   int GetHS2Port();
 
   typedef boost::unordered_map<std::string, TBackendDescriptor> BackendDescriptorMap;
-  const BackendDescriptorMap& GetKnownBackends();
+  const BackendDescriptorMap GetKnownBackends();
 
   /// Start the shutdown process. Return an error if it could not be started. Otherwise,
   /// if it was successfully started by this or a previous call, return OK along with
   /// information about the pending shutdown in 'shutdown_status'. 'relative_deadline_s'
   /// is the deadline value in seconds to use, or -1 if we should use the default
   /// deadline. See Shutdown class comment for explanation of the shutdown sequence.
-  Status StartShutdown(int64_t relative_deadline_s, TShutdownStatus* shutdown_status);
+  Status StartShutdown(int64_t relative_deadline_s, ShutdownStatusPB* shutdown_status);
 
   /// Returns true if a shut down is in progress.
   bool IsShuttingDown() const { return shutting_down_.Load() != 0; }
@@ -416,10 +421,10 @@ class ImpalaServer : public ImpalaServiceIf,
 
   /// Return information about the status of a shutdown. Only valid to call if a shutdown
   /// is in progress (i.e. IsShuttingDown() is true).
-  TShutdownStatus GetShutdownStatus() const;
+  ShutdownStatusPB GetShutdownStatus() const;
 
   /// Convert the shutdown status to a human-readable string.
-  static std::string ShutdownStatusToString(const TShutdownStatus& shutdown_status);
+  static std::string ShutdownStatusToString(const ShutdownStatusPB& shutdown_status);
 
   // Mapping between query option names and levels
   QueryOptionLevels query_option_levels_;
@@ -533,6 +538,7 @@ class ImpalaServer : public ImpalaServiceIf,
  private:
   struct ExpirationEvent;
   friend class ChildQuery;
+  friend class ControlService;
   friend class ImpalaHttpHandler;
   friend struct SessionState;
   friend class ImpalaServerTest;
@@ -571,7 +577,7 @@ class ImpalaServer : public ImpalaServiceIf,
       std::shared_ptr<ClientRequestState>* exec_state) WARN_UNUSED_RESULT;
 
   /// Registers the query exec state with client_request_state_map_ using the
-  /// globally unique query_id and add the query id to session state's open query list.
+  /// globally unique query_id.
   /// The caller must have checked out the session state.
   Status RegisterQuery(std::shared_ptr<SessionState> session_state,
       const std::shared_ptr<ClientRequestState>& exec_state) WARN_UNUSED_RESULT;
@@ -617,14 +623,15 @@ class ImpalaServer : public ImpalaServiceIf,
   /// match is found there, the query log is searched. Returns OK if the profile was
   /// found, otherwise a Status object with an error message will be returned. The
   /// output stream will not be modified on error.
-  /// If base64_encoded, outputs the base64 encoded profile output, otherwise the human
-  /// readable string.
+  /// On success, if 'format' is BASE64 or STRING then 'output' will be set, or if
+  /// 'format' is THRIFT then 'thrift_output' will be set.
   /// If the user asking for this profile is the same user that runs the query
   /// and that user has access to the runtime profile, the profile is written to
   /// the output. Otherwise, nothing is written to output and an error code is
   /// returned to indicate an authorization error.
-  Status GetRuntimeProfileStr(const TUniqueId& query_id, const std::string& user,
-      bool base64_encoded, std::stringstream* output) WARN_UNUSED_RESULT;
+  Status GetRuntimeProfileOutput(const TUniqueId& query_id, const std::string& user,
+      TRuntimeProfileFormat::type format, std::stringstream* output,
+      TRuntimeProfileTree* thrift_output) WARN_UNUSED_RESULT;
 
   /// Returns the exec summary for this query if the user asking for the exec
   /// summary is the same user that run the query and that user has access to the full
@@ -632,6 +639,9 @@ class ImpalaServer : public ImpalaServiceIf,
   /// authorization error.
   Status GetExecSummary(const TUniqueId& query_id, const std::string& user,
       TExecSummary* result) WARN_UNUSED_RESULT;
+
+  /// Collect ExecSummary and update it to the profile in request_state
+  void UpdateExecSummary(std::shared_ptr<ClientRequestState> request_state) const;
 
   /// Initialize "default_configs_" to show the default values for ImpalaQueryOptions and
   /// "support_start_over/false" to indicate that Impala does not support start over
@@ -700,9 +710,14 @@ class ImpalaServer : public ImpalaServiceIf,
   Status AuthorizeProxyUser(const std::string& user, const std::string& do_as_user)
       WARN_UNUSED_RESULT;
 
-  // Check if the local backend descriptor is in the list of known backends. If not, add
-  // it to the list of known backends and add it to the 'topic_updates'.
+  /// Check if the local backend descriptor is in the list of known backends. If not, add
+  /// it to the list of known backends and add it to the 'topic_updates'.
+  /// 'known_backends_lock_' must be held by the caller.
   void AddLocalBackendToStatestore(std::vector<TTopicDelta>* topic_updates);
+
+  /// Takes a set of network addresses of active backends and cancels all the queries
+  /// running on failed ones (that is, addresses not in the active set).
+  void CancelQueriesOnFailedBackends(const std::set<TNetworkAddress>& current_membership);
 
   /// Snapshot of a query's state, archived in the query log.
   struct QueryStateRecord {
@@ -883,6 +898,10 @@ class ImpalaServer : public ImpalaServiceIf,
   /// FLAGS_idle_query_timeout seconds.
   [[noreturn]] void ExpireQueries();
 
+  /// Periodically iterates over all queries and cancels any where a backend hasn't sent a
+  /// status report in greater than GetMaxReportRetryMs().
+  [[noreturn]] void UnresponsiveBackendThread();
+
   /// Called from ExpireQueries() to check query resource limits for 'crs'. If the query
   /// exceeded a resource limit, returns a non-OK status with information about what
   /// limit was exceeded. Returns OK if the query will continue running and expiration
@@ -906,6 +925,9 @@ class ImpalaServer : public ImpalaServiceIf,
 
   /// Background thread that does the shutdown.
   [[noreturn]] void ShutdownThread();
+
+  /// Random number generator for use in this class, thread safe.
+  static ThreadSafeRandom rng_;
 
   /// Guards query_log_ and query_log_index_
   boost::mutex query_log_lock_;
@@ -959,6 +981,9 @@ class ImpalaServer : public ImpalaServiceIf,
   /// session_timeout_thread_ relies on the following conditional variable to wake up
   /// when there are sessions that have a timeout.
   ConditionVariable session_timeout_cv_;
+
+  /// Thread that runs UnresponsiveBackendThread().
+  std::unique_ptr<Thread> unresponsive_backend_thread_;
 
   /// maps from query id to exec state; ClientRequestState is owned by us and referenced
   /// as a shared_ptr to allow asynchronous deletion
@@ -1065,6 +1090,9 @@ class ImpalaServer : public ImpalaServiceIf,
   /// component (the scheduler?) that tracks this information and calls other interested
   /// components.
   BackendDescriptorMap known_backends_;
+
+  /// Lock to protect 'known_backends_'. Not held in conjunction with other locks.
+  boost::mutex known_backends_lock_;
 
   /// Generate unique session id for HiveServer2 session
   boost::uuids::random_generator uuid_generator_;

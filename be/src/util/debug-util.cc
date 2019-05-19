@@ -85,10 +85,12 @@ PRINT_THRIFT_ENUM_IMPL(TRuntimeFilterMode)
 PRINT_THRIFT_ENUM_IMPL(TSessionType)
 PRINT_THRIFT_ENUM_IMPL(TStmtType)
 PRINT_THRIFT_ENUM_IMPL(TUnit)
+PRINT_THRIFT_ENUM_IMPL(TParquetTimestampType)
 
 string PrintId(const TUniqueId& id, const string& separator) {
   stringstream out;
-  out << hex << id.hi << separator << id.lo;
+  // Outputting the separator string resets the stream width.
+  out << hex << setfill('0') << setw(16) << id.hi << separator << setw(16) << id.lo;
   return out.str();
 }
 
@@ -326,10 +328,8 @@ static bool ParseProbability(const string& prob_str, bool* should_execute) {
   return true;
 }
 
-Status DebugActionImpl(
-    const TQueryOptions& query_options, const char* label) {
-  const DebugActionTokens& action_list = TokenizeDebugActions(
-      query_options.debug_action);
+Status DebugActionImpl(const string& debug_action, const char* label) {
+  const DebugActionTokens& action_list = TokenizeDebugActions(debug_action);
   static const char ERROR_MSG[] = "Invalid debug_action $0:$1 ($2)";
   for (const vector<string>& components : action_list) {
     // size() != 2 check filters out ExecNode debug actions.

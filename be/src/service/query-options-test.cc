@@ -144,6 +144,7 @@ TEST(QueryOptions, SetByteOptions) {
       {MAKE_OPTIONDEF(compute_stats_min_sample_size), {-1, I64_MAX}},
       {MAKE_OPTIONDEF(max_mem_estimate_for_admission), {-1, I64_MAX}},
       {MAKE_OPTIONDEF(scan_bytes_limit), {-1, I64_MAX}},
+      {MAKE_OPTIONDEF(topn_bytes_limit), {-1, I64_MAX}},
   };
   vector<pair<OptionDef<int32_t>, Range<int32_t>>> case_set_i32{
       {MAKE_OPTIONDEF(runtime_filter_min_size),
@@ -209,7 +210,14 @@ TEST(QueryOptions, SetEnumOptions) {
   TestEnumCase(options, CASE(parquet_array_resolution, TParquetArrayResolution,
       (THREE_LEVEL, TWO_LEVEL, TWO_LEVEL_THEN_THREE_LEVEL)), true);
   TestEnumCase(options, CASE(compression_codec, THdfsCompression,
-      (NONE, GZIP, BZIP2, DEFAULT, SNAPPY, SNAPPY_BLOCKED)), false);
+      (NONE, DEFAULT, GZIP, DEFLATE, BZIP2, SNAPPY, SNAPPY_BLOCKED, LZO, LZ4, ZLIB,
+          ZSTD)), true);
+  TestEnumCase(options, CASE(default_file_format, THdfsFileFormat,
+      (TEXT, RC_FILE, SEQUENCE_FILE, AVRO, PARQUET, KUDU, ORC)), true);
+  TestEnumCase(options, CASE(runtime_filter_mode, TRuntimeFilterMode,
+      (OFF, LOCAL, GLOBAL)), true);
+  TestEnumCase(options, CASE(kudu_read_mode, TKuduReadMode,
+      (DEFAULT, READ_LATEST, READ_AT_SNAPSHOT)), true);
 #undef CASE
 #undef ENTRIES
 #undef ENTRY
@@ -250,7 +258,8 @@ TEST(QueryOptions, SetBigIntOptions) {
   TQueryOptions options;
   // List of pairs of Key and its valid range
   pair<OptionDef<int64_t>, Range<int64_t>> case_set[] {
-      {MAKE_OPTIONDEF(cpu_limit_s),  {0, I64_MAX}},
+      {MAKE_OPTIONDEF(cpu_limit_s), {0, I64_MAX}},
+      {MAKE_OPTIONDEF(num_rows_produced_limit), {0, I64_MAX}},
   };
   for (const auto& test_case : case_set) {
     const OptionDef<int64_t>& option_def = test_case.first;

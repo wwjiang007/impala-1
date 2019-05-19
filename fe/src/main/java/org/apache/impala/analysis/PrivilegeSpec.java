@@ -17,13 +17,15 @@
 
 package org.apache.impala.analysis;
 
+import static org.apache.impala.analysis.ToSqlOptions.DEFAULT;
+
+import java.util.ArrayList;
 import java.util.List;
 
 import org.apache.impala.authorization.Privilege;
 import org.apache.impala.catalog.FeDataSourceTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.FeView;
-import org.apache.impala.catalog.PrincipalPrivilege;
 import org.apache.impala.catalog.TableLoadingException;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TPrivilege;
@@ -33,14 +35,13 @@ import org.apache.impala.thrift.TPrivilegeScope;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
-import com.google.common.collect.Lists;
 
 /**
  * Represents a privilege spec from a GRANT/REVOKE statement.
  * A privilege spec may correspond to one or more privileges. Currently, a privilege spec
  * can represent multiple privileges only at the COLUMN scope.
  */
-public class PrivilegeSpec implements ParseNode {
+public class PrivilegeSpec extends StmtNode {
   private final TPrivilegeScope scope_;
   private final TPrivilegeLevel privilegeLevel_;
   private final TableName tableName_;
@@ -105,7 +106,7 @@ public class PrivilegeSpec implements ParseNode {
   }
 
   public List<TPrivilege> toThrift() {
-    List<TPrivilege> privileges = Lists.newArrayList();
+    List<TPrivilege> privileges = new ArrayList<>();
     if (scope_ == TPrivilegeScope.COLUMN) {
       // Create a TPrivilege for every referenced column
       for (String column: columnNames_) {
@@ -149,10 +150,17 @@ public class PrivilegeSpec implements ParseNode {
   }
 
   @Override
-  public String toSql() {
+  public final String toSql() {
+    return toSql(DEFAULT);
+  }
+
+  @Override
+  public String toSql(ToSqlOptions options) {
     StringBuilder sb = new StringBuilder(privilegeLevel_.toString());
-    sb.append(" ON ");
-    sb.append(scope_.toString());
+    if (scope_ != TPrivilegeScope.COLUMN) {
+      sb.append(" ON ");
+      sb.append(scope_.toString());
+    }
     if (scope_ == TPrivilegeScope.SERVER && serverName_ != null) {
       sb.append(" " + serverName_);
     } else if (scope_ == TPrivilegeScope.DATABASE) {
@@ -160,10 +168,10 @@ public class PrivilegeSpec implements ParseNode {
     } else if (scope_ == TPrivilegeScope.TABLE) {
       sb.append(" " + tableName_.toString());
     } else if (scope_ == TPrivilegeScope.COLUMN) {
-      sb.append("(");
+      sb.append(" (");
       sb.append(Joiner.on(",").join(columnNames_));
       sb.append(")");
-      sb.append(" " + tableName_.toString());
+      sb.append(" ON TABLE " + tableName_.toString());
     } else if (scope_ == TPrivilegeScope.URI) {
       sb.append(" '" + uri_.getLocation() + "'");
     }
@@ -237,10 +245,6 @@ public class PrivilegeSpec implements ParseNode {
           "in a column privilege spec.");
     }
     FeTable table = analyzeTargetTable(analyzer);
-    if (table instanceof FeView) {
-      throw new AnalysisException("Column-level privileges on views are not " +
-          "supported.");
-    }
     if (table instanceof FeDataSourceTable) {
       throw new AnalysisException("Column-level privileges on external data " +
           "source tables are not supported.");
@@ -287,4 +291,14 @@ public class PrivilegeSpec implements ParseNode {
     Preconditions.checkNotNull(table);
     return table;
   }
+
+  public TPrivilegeScope getScope() { return scope_; }
+
+  public TableName getTableName() { return tableName_; }
+
+  public HdfsUri getUri() { return uri_; }
+
+  public String getDbName() { return dbName_; }
+
+  public String getServerName() { return serverName_; }
 }

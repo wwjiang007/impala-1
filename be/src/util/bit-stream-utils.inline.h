@@ -21,7 +21,7 @@
 #include "util/bit-stream-utils.h"
 
 #include "common/compiler-util.h"
-#include "util/bit-packing.inline.h"
+#include "util/bit-packing.h"
 
 namespace impala {
 
@@ -102,9 +102,21 @@ inline int BatchedBitReader::UnpackBatch(int bit_width, int num_values, T* v) {
   return static_cast<int>(num_read);
 }
 
-template<typename T>
+inline bool BatchedBitReader::SkipBatch(int bit_width, int num_values_to_skip) {
+  DCHECK(buffer_pos_ != nullptr);
+  DCHECK_GT(bit_width, 0);
+  DCHECK_LE(bit_width, MAX_BITWIDTH);
+  DCHECK_GT(num_values_to_skip, 0);
+
+  int skip_bytes = BitUtil::RoundUpNumBytes(bit_width * num_values_to_skip);
+  if (skip_bytes > buffer_end_ - buffer_pos_) return false;
+  buffer_pos_ += skip_bytes;
+  return true;
+}
+
+template <typename T>
 inline int BatchedBitReader::UnpackAndDecodeBatch(
-      int bit_width, T* dict, int64_t dict_len, int num_values, T* v){
+    int bit_width, T* dict, int64_t dict_len, int num_values, T* v, int64_t stride) {
   DCHECK(buffer_pos_ != nullptr);
   DCHECK_GE(bit_width, 0);
   DCHECK_LE(bit_width, MAX_BITWIDTH);
@@ -114,7 +126,7 @@ inline int BatchedBitReader::UnpackAndDecodeBatch(
   int64_t num_read;
   bool decode_error = false;
   std::tie(new_buffer_pos, num_read) = BitPacking::UnpackAndDecodeValues(bit_width,
-      buffer_pos_, bytes_left(), dict, dict_len, num_values, v, &decode_error);
+      buffer_pos_, bytes_left(), dict, dict_len, num_values, v, stride, &decode_error);
   if (UNLIKELY(decode_error)) return -1;
   buffer_pos_ = new_buffer_pos;
   DCHECK_LE(buffer_pos_, buffer_end_);
@@ -141,7 +153,10 @@ inline bool BatchedBitReader::GetUleb128Int(uint32_t* v) {
   do {
     if (UNLIKELY(shift >= MAX_VLQ_BYTE_LEN * 7)) return false;
     if (!GetBytes(1, &byte)) return false;
-    *v |= (byte & 0x7F) << shift;
+    // The constant below must be explicitly unsigned to ensure that the result of the
+    // bitwise-and is unsigned, so that the left shift is always defined behavior under
+    // the C++ standard.
+    *v |= (byte & 0x7Fu) << shift;
     shift += 7;
   } while ((byte & 0x80) != 0);
   return true;

@@ -17,9 +17,10 @@
 
 package org.apache.impala.analysis;
 
+import java.util.ArrayList;
 import java.util.List;
 
-import org.apache.impala.authorization.PrivilegeRequestBuilder;
+import org.apache.impala.authorization.AuthorizationConfig;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.common.Pair;
@@ -30,7 +31,6 @@ import org.apache.impala.thrift.TShutdownParams;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
 
 /**
  * Represents an administrative function call, e.g. ": shutdown('hostname:123')".
@@ -60,11 +60,11 @@ public class AdminFnStmt extends StatementBase {
   }
 
   @Override
-  public String toSql() {
+  public String toSql(ToSqlOptions options) {
     StringBuilder sb = new StringBuilder();
     sb.append(":").append(fnName_).append("(");
-    List<String> paramsSql = Lists.newArrayList();
-    for (Expr param: params_) paramsSql.add(param.toSql());
+    List<String> paramsSql = new ArrayList<>();
+    for (Expr param : params_) paramsSql.add(param.toSql(options));
     sb.append(Joiner.on(", ").join(paramsSql));
     sb.append(")");
     return sb.toString();
@@ -96,12 +96,12 @@ public class AdminFnStmt extends StatementBase {
    * shutdown('host:port'), shutdown(deadline), shutdown('host:port', deadline).
    */
   private void analyzeShutdown(Analyzer analyzer) throws AnalysisException {
-    if (analyzer.getAuthzConfig().isEnabled()) {
+    AuthorizationConfig authzConfig = analyzer.getAuthzConfig();
+    if (authzConfig.isEnabled()) {
       // Only admins (i.e. user with ALL privilege on server) can execute admin functions.
-      String authzServer = analyzer.getAuthzConfig().getServerName();
+      String authzServer = authzConfig.getServerName();
       Preconditions.checkNotNull(authzServer);
-      analyzer.registerPrivReq(
-          new PrivilegeRequestBuilder().onServer(authzServer).all().toRequest());
+      analyzer.registerPrivReq(builder -> builder.onServer(authzServer).all().build());
     }
 
     // TODO: this parsing and type checking logic is specific to the command, similar to
@@ -117,7 +117,7 @@ public class AdminFnStmt extends StatementBase {
         throw new AnalysisException(
             "Invalid backend, must be a string literal: " + backendExpr.toSql());
       }
-      backend_ = parseBackendAddress(((StringLiteral) backendExpr).getValue());
+      backend_ = parseBackendAddress(((StringLiteral) backendExpr).getUnescapedValue());
     }
     if (deadlineExpr != null) {
       deadlineSecs_ = deadlineExpr.evalToNonNegativeInteger(analyzer, "deadline");

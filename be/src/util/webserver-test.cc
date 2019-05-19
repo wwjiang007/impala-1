@@ -105,8 +105,9 @@ TEST(Webserver, SmokeTest) {
   ASSERT_OK(HttpGet("localhost", FLAGS_webserver_port, "/", &contents));
 }
 
-void AssertArgsCallback(bool* success, const Webserver::ArgumentMap& args,
+void AssertArgsCallback(bool* success, const Webserver::WebRequest& req,
     Document* document) {
+  const auto& args = req.parsed_args;
   *success = args.find(TEST_ARG) != args.end();
 }
 
@@ -116,7 +117,7 @@ TEST(Webserver, ArgsTest) {
   const string ARGS_TEST_PATH = "/args-test";
   bool success = false;
   Webserver::UrlCallback callback = bind<void>(AssertArgsCallback, &success , _1, _2);
-  webserver.RegisterUrlCallback(ARGS_TEST_PATH, "json-test.tmpl", callback);
+  webserver.RegisterUrlCallback(ARGS_TEST_PATH, "json-test.tmpl", callback, true);
 
   ASSERT_OK(webserver.Start());
   stringstream contents;
@@ -128,7 +129,7 @@ TEST(Webserver, ArgsTest) {
   ASSERT_TRUE(success) << "Did not find " << TEST_ARG;
 }
 
-void JsonCallback(bool always_text, const Webserver::ArgumentMap& args,
+void JsonCallback(bool always_text, const Webserver::WebRequest& req,
     Document* document) {
   document->AddMember(rapidjson::StringRef(SALUTATION_KEY.c_str()),
       StringRef(SALUTATION_VALUE.c_str()), document->GetAllocator());
@@ -147,11 +148,11 @@ TEST(Webserver, JsonTest) {
   const string RAW_TEXT_PATH = "/text";
   const string NO_TEMPLATE_PATH = "/no-template";
   Webserver::UrlCallback callback = bind<void>(JsonCallback, false, _1, _2);
-  webserver.RegisterUrlCallback(JSON_TEST_PATH, "json-test.tmpl", callback);
-  webserver.RegisterUrlCallback(NO_TEMPLATE_PATH, "doesnt-exist.tmpl", callback);
+  webserver.RegisterUrlCallback(JSON_TEST_PATH, "json-test.tmpl", callback, true);
+  webserver.RegisterUrlCallback(NO_TEMPLATE_PATH, "doesnt-exist.tmpl", callback, true);
 
   Webserver::UrlCallback text_callback = bind<void>(JsonCallback, true, _1, _2);
-  webserver.RegisterUrlCallback(RAW_TEXT_PATH, "json-test.tmpl", text_callback);
+  webserver.RegisterUrlCallback(RAW_TEXT_PATH, "json-test.tmpl", text_callback, true);
   ASSERT_OK(webserver.Start());
 
   stringstream contents;
@@ -187,7 +188,7 @@ TEST(Webserver, EscapingTest) {
 
   const string JSON_TEST_PATH = "/json-test";
   Webserver::UrlCallback callback = bind<void>(JsonCallback, false, _1, _2);
-  webserver.RegisterUrlCallback(JSON_TEST_PATH, "json-test.tmpl", callback);
+  webserver.RegisterUrlCallback(JSON_TEST_PATH, "json-test.tmpl", callback, true);
   ASSERT_OK(webserver.Start());
   stringstream contents;
   ASSERT_OK(HttpGet("localhost", FLAGS_webserver_port, JSON_TEST_PATH, &contents));
@@ -353,7 +354,7 @@ TEST(Webserver, DirectoryListingDisabledTest) {
   ASSERT_TRUE(contents.str().find("Directory listing denied") != string::npos);
 }
 
-void FrameCallback(const Webserver::ArgumentMap& args, Document* document) {
+void FrameCallback(const Webserver::WebRequest& req, Document* document) {
   const string contents = "<frameset cols='50%,50%'><frame src='/metrics'></frameset>";
   Value value(contents.c_str(), document->GetAllocator());
   document->AddMember("contents", value, document->GetAllocator());
@@ -363,7 +364,7 @@ TEST(Webserver, NoFrameEmbeddingTest) {
   const string FRAME_TEST_PATH = "/frames_test";
   Webserver webserver(FLAGS_webserver_port);
   Webserver::UrlCallback callback = bind<void>(FrameCallback, _1, _2);
-  webserver.RegisterUrlCallback(FRAME_TEST_PATH, "raw_text.tmpl", callback);
+  webserver.RegisterUrlCallback(FRAME_TEST_PATH, "raw_text.tmpl", callback, true);
   ASSERT_OK(webserver.Start());
   stringstream contents;
   ASSERT_OK(HttpGet("localhost", FLAGS_webserver_port,
@@ -378,7 +379,7 @@ TEST(Webserver, FrameAllowEmbeddingTest) {
       ScopedFlagSetter<string>::Make(&FLAGS_webserver_x_frame_options, "ALLOWALL");
   Webserver webserver(FLAGS_webserver_port);
   Webserver::UrlCallback callback = bind<void>(FrameCallback, _1, _2);
-  webserver.RegisterUrlCallback(FRAME_TEST_PATH, "raw_text.tmpl", callback);
+  webserver.RegisterUrlCallback(FRAME_TEST_PATH, "raw_text.tmpl", callback, true);
   ASSERT_OK(webserver.Start());
   stringstream contents;
   ASSERT_OK(HttpGet("localhost", FLAGS_webserver_port,
@@ -390,7 +391,7 @@ TEST(Webserver, FrameAllowEmbeddingTest) {
 
 const string STRING_WITH_NULL = "123456789\0ABCDE";
 
-void NullCharCallback(const Webserver::ArgumentMap& args, stringstream* out) {
+void NullCharCallback(const Webserver::WebRequest& req, stringstream* out) {
   (*out) << STRING_WITH_NULL;
 }
 

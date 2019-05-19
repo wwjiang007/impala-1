@@ -37,9 +37,10 @@ import time
 from datetime import datetime
 from pytz import utc
 
+from tests.common.environ import IMPALA_TEST_CLUSTER_PROPERTIES
 from tests.common.kudu_test_suite import KuduTestSuite
 from tests.common.impala_cluster import ImpalaCluster
-from tests.common.skip import SkipIfNotHdfsMinicluster
+from tests.common.skip import SkipIfNotHdfsMinicluster, SkipIfKudu, SkipIfCatalogV2
 from tests.common.test_dimensions import add_exec_option_dimension
 from tests.verifiers.metric_verifier import MetricVerifier
 
@@ -59,6 +60,7 @@ class TestKuduOperations(KuduTestSuite):
     # these tests.
     add_exec_option_dimension(cls, "kudu_read_mode", "READ_AT_SNAPSHOT")
 
+  @SkipIfKudu.no_hybrid_clock
   def test_out_of_range_timestamps(self, vector, cursor, kudu_client, unique_database):
     """Test timestamp values that are outside of Impala's supported date range."""
     cursor.execute("""CREATE TABLE %s.times (a INT PRIMARY KEY, ts TIMESTAMP)
@@ -86,40 +88,51 @@ class TestKuduOperations(KuduTestSuite):
     self.run_test_case('QueryTest/kudu-overflow-ts-abort-on-error', vector,
         use_db=unique_database)
 
+  @SkipIfKudu.no_hybrid_clock
   def test_kudu_scan_node(self, vector, unique_database):
     self.run_test_case('QueryTest/kudu-scan-node', vector, use_db=unique_database)
 
+  @SkipIfKudu.no_hybrid_clock
   def test_kudu_insert(self, vector, unique_database):
     self.run_test_case('QueryTest/kudu_insert', vector, use_db=unique_database)
 
   @SkipIfNotHdfsMinicluster.tuned_for_minicluster
+  @SkipIfKudu.no_hybrid_clock
   def test_kudu_insert_mem_limit(self, vector, unique_database):
     self.run_test_case('QueryTest/kudu_insert_mem_limit', vector, use_db=unique_database)
 
+  @SkipIfKudu.no_hybrid_clock
   def test_kudu_update(self, vector, unique_database):
     self.run_test_case('QueryTest/kudu_update', vector, use_db=unique_database)
 
+  @SkipIfKudu.no_hybrid_clock
   def test_kudu_upsert(self, vector, unique_database):
     self.run_test_case('QueryTest/kudu_upsert', vector, use_db=unique_database)
 
+  @SkipIfKudu.no_hybrid_clock
   def test_kudu_delete(self, vector, unique_database):
     self.run_test_case('QueryTest/kudu_delete', vector, use_db=unique_database)
 
+  @SkipIfKudu.no_hybrid_clock
   def test_kudu_partition_ddl(self, vector, unique_database):
     self.run_test_case('QueryTest/kudu_partition_ddl', vector, use_db=unique_database)
 
   @pytest.mark.skipif(pytest.config.option.testing_remote_cluster,
                       reason="Test references hardcoded hostnames: IMPALA-4873")
   @pytest.mark.execute_serially
+  @SkipIfKudu.no_hybrid_clock
   def test_kudu_alter_table(self, vector, unique_database):
     self.run_test_case('QueryTest/kudu_alter', vector, use_db=unique_database)
 
+  @SkipIfKudu.no_hybrid_clock
   def test_kudu_stats(self, vector, unique_database):
     self.run_test_case('QueryTest/kudu_stats', vector, use_db=unique_database)
 
+  @SkipIfKudu.no_hybrid_clock
   def test_kudu_describe(self, vector, unique_database):
     self.run_test_case('QueryTest/kudu_describe', vector, use_db=unique_database)
 
+  @SkipIfKudu.no_hybrid_clock
   def test_kudu_limit(self, vector, unique_database):
     self.run_test_case('QueryTest/kudu_limit', vector, use_db=unique_database)
 
@@ -173,11 +186,14 @@ class TestKuduOperations(KuduTestSuite):
       session.apply(op)
     session.flush()
 
-    # Scanning should result in an error
+    # Scanning should result in an error with Catalog V1, since the metadata is cached.
     try:
       cursor.execute("SELECT * FROM %s.foo" % (unique_database))
-      assert False
+      assert IMPALA_TEST_CLUSTER_PROPERTIES.is_catalog_v2_cluster(),\
+          "Should fail with Catalog V1, which caches metadata"
     except Exception as e:
+      assert not IMPALA_TEST_CLUSTER_PROPERTIES.is_catalog_v2_cluster(),\
+          "Should succeed with Catalog V2, which does not cache metadata"
       expected_error = "Column 's' is type INT but Impala expected STRING. The table "\
           "metadata in Impala may be outdated and need to be refreshed."
       assert expected_error in str(e)
@@ -217,8 +233,11 @@ class TestKuduOperations(KuduTestSuite):
     # Scanning should result in an error
     try:
       cursor.execute("SELECT * FROM %s.foo" % (unique_database))
-      assert False
+      assert IMPALA_TEST_CLUSTER_PROPERTIES.is_catalog_v2_cluster(),\
+          "Should fail with Catalog V1, which caches metadata"
     except Exception as e:
+      assert not IMPALA_TEST_CLUSTER_PROPERTIES.is_catalog_v2_cluster(),\
+          "Should succeed with Catalog V2, which does not cache metadata"
       expected_error = "Column 's' is nullable but Impala expected it to be "\
           "not nullable. The table metadata in Impala may be outdated and need to be "\
           "refreshed."
@@ -259,8 +278,11 @@ class TestKuduOperations(KuduTestSuite):
     # Scanning should result in an error
     try:
       cursor.execute("SELECT * FROM %s.foo" % (unique_database))
-      assert False
+      assert IMPALA_TEST_CLUSTER_PROPERTIES.is_catalog_v2_cluster(),\
+          "Should fail with Catalog V1, which caches metadata"
     except Exception as e:
+      assert not IMPALA_TEST_CLUSTER_PROPERTIES.is_catalog_v2_cluster(),\
+          "Should succeed with Catalog V2, which does not cache metadata"
       expected_error = "Column 's' is not nullable but Impala expected it to be "\
           "nullable. The table metadata in Impala may be outdated and need to be "\
           "refreshed."
@@ -293,18 +315,23 @@ class TestKuduOperations(KuduTestSuite):
     session.apply(op)
     session.flush()
 
-    # Only the first col is visible to Impala. Impala will not know about the missing
-    # column, so '*' is expanded to known columns. This doesn't have a separate check
-    # because the query can proceed and checking would need to fetch metadata from the
-    # Kudu master, which is what REFRESH is for.
     cursor.execute("SELECT * FROM %s.foo" % (unique_database))
-    assert cursor.fetchall() == [(0, )]
+    if IMPALA_TEST_CLUSTER_PROPERTIES.is_catalog_v2_cluster():
+      # Changes in Kudu should be immediately visible to Impala with Catalog V2.
+      assert cursor.fetchall() == [(0, 0)]
+    else:
+      # Only the first col is visible to Impala. Impala will not know about the missing
+      # column, so '*' is expanded to known columns. This doesn't have a separate check
+      # because the query can proceed and checking would need to fetch metadata from the
+      # Kudu master, which is what REFRESH is for.
+      assert cursor.fetchall() == [(0, )]
 
     # After a REFRESH both cols should be visible
     cursor.execute("REFRESH %s.foo" % (unique_database))
     cursor.execute("SELECT * FROM %s.foo" % (unique_database))
     assert cursor.fetchall() == [(0, 0)]
 
+  @SkipIfKudu.no_hybrid_clock
   def test_kudu_col_removed(self, cursor, kudu_client, unique_database):
     """Test removing a Kudu column outside of Impala."""
     cursor.execute("set kudu_read_mode=READ_AT_SNAPSHOT")
@@ -365,7 +392,7 @@ class TestKuduOperations(KuduTestSuite):
       if kudu_client.table_exists(name):
         kudu_client.delete_table(name)
 
-
+  @SkipIfKudu.no_hybrid_clock
   def test_column_storage_attributes(self, cursor, unique_database):
     """Tests that for every valid combination of column type, encoding, and compression,
        we can insert a value and scan it back from Kudu."""
@@ -437,13 +464,18 @@ class TestKuduOperations(KuduTestSuite):
     for error in insert_thread.errors:
       msg = str(error)
       # The first two are AnalysisExceptions, the next two come from KuduTableSink::Open()
-      # if the schema has changed since analysis, the last comes from the Kudu server if
+      # if the schema has changed since analysis, the rest come from the Kudu server if
       # the schema changes between KuduTableSink::Open() and when the write ops are sent.
-      assert "has fewer columns (1) than the SELECT / VALUES clause returns (2)" in msg \
-        or "(type: TINYINT) is not compatible with column 'col1' (type: STRING)" in msg \
-        or "has fewer columns than expected." in msg \
-        or "Column col1 has unexpected type." in msg \
-        or "Client provided column col1[int64 NULLABLE] not present in tablet" in msg
+      possible_errors = [
+        "has fewer columns (1) than the SELECT / VALUES clause returns (2)",
+        "(type: TINYINT) is not compatible with column 'col1' (type: STRING)",
+        "has fewer columns than expected.",
+        "Column col1 has unexpected type.",
+        "Client provided column col1[int64 NULLABLE] not present in tablet",
+        "Client provided column col1 INT64 NULLABLE not present in tablet",
+        "The column 'col1' must have type string NULLABLE found int64 NULLABLE"
+      ]
+      assert any(err in msg for err in possible_errors)
 
   def _retry_query(self, cursor, query, expected):
     retries = 0
@@ -637,6 +669,7 @@ class TestCreateExternalTable(KuduTestSuite):
       except Exception as e:
         assert "Table does not exist in Kudu: '%s'" % table_name in str(e)
 
+  @SkipIfKudu.no_hybrid_clock
   def test_table_without_partitioning(self, cursor, kudu_client, unique_database):
     """Test a Kudu table created without partitioning (i.e. equivalent to a single
        unbounded partition). It is not possible to create such a table in Impala, but
@@ -671,6 +704,7 @@ class TestCreateExternalTable(KuduTestSuite):
       if kudu_client.table_exists(name):
         kudu_client.delete_table(name)
 
+  @SkipIfKudu.no_hybrid_clock
   def test_column_name_case(self, cursor, kudu_client, unique_database):
     """IMPALA-5286: Tests that an external Kudu table that was created with a column name
        containing upper case letters is handled correctly."""
@@ -756,6 +790,7 @@ class TestCreateExternalTable(KuduTestSuite):
         kudu_client.delete_table(table_name)
 
 class TestShowCreateTable(KuduTestSuite):
+  column_properties = "ENCODING AUTO_ENCODING COMPRESSION DEFAULT_COMPRESSION"
 
   def assert_show_create_equals(self, cursor, create_sql, show_create_sql):
     """Executes 'create_sql' to create a table, then runs "SHOW CREATE TABLE" and checks
@@ -770,7 +805,6 @@ class TestShowCreateTable(KuduTestSuite):
         textwrap.dedent(show_create_sql.format(**format_args)).strip()
 
   def test_primary_key_and_distribution(self, cursor):
-    # TODO: Add test cases with column comments once KUDU-1711 is fixed.
     # TODO: Add case with BLOCK_SIZE
     self.assert_show_create_equals(cursor,
         """
@@ -857,7 +891,18 @@ class TestShowCreateTable(KuduTestSuite):
         STORED AS KUDU
         TBLPROPERTIES ('kudu.master_addresses'='{kudu_addr}')""".format(
             db=cursor.conn.db_name, kudu_addr=KUDU_MASTER_HOSTS))
-
+    self.assert_show_create_equals(cursor,
+        """
+        CREATE TABLE {table} (c INT COMMENT 'Ab 1@' PRIMARY KEY) STORED AS KUDU""",
+        """
+        CREATE TABLE {db}.{{table}} (
+          c INT NOT NULL {p} COMMENT 'Ab 1@',
+          PRIMARY KEY (c)
+        )
+        STORED AS KUDU
+        TBLPROPERTIES ('kudu.master_addresses'='{kudu_addr}')""".format(
+            db=cursor.conn.db_name, p=self.column_properties,
+            kudu_addr=KUDU_MASTER_HOSTS))
 
   def test_timestamp_default_value(self, cursor):
     create_sql_fmt = """
@@ -1031,6 +1076,7 @@ class TestImpalaKuduIntegration(KuduTestSuite):
              ("c", "string", "", "false", "true", "", "AUTO_ENCODING",
               "DEFAULT_COMPRESSION", "0")]
 
+  @SkipIfCatalogV2.impala_8459()
   def test_delete_external_kudu_table(self, cursor, kudu_client):
     """Check that Impala can recover from the case where the underlying Kudu table of
         an external table is dropped using the Kudu client.
@@ -1057,6 +1103,7 @@ class TestImpalaKuduIntegration(KuduTestSuite):
       cursor.execute("SHOW TABLES")
       assert (impala_table_name,) not in cursor.fetchall()
 
+  @SkipIfCatalogV2.impala_8459()
   def test_delete_managed_kudu_table(self, cursor, kudu_client, unique_database):
     """Check that dropping a managed Kudu table works even if the underlying Kudu table
         has been dropped externally."""
@@ -1104,6 +1151,7 @@ class TestKuduMemLimits(KuduTestSuite):
     # additional minute. This ensures that the num fragments 'in flight' reaches 0 in
     # less time than IMPALA-4654 was reproducing (~60sec) but yet still enough time that
     # this test won't be flaky.
-    verifiers = [ MetricVerifier(i.service) for i in ImpalaCluster().impalads ]
+    verifiers = [MetricVerifier(i.service)
+                 for i in ImpalaCluster.get_e2e_test_cluster().impalads]
     for v in verifiers:
       v.wait_for_metric("impala-server.num-fragments-in-flight", 0, timeout=30)

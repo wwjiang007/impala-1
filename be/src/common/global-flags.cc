@@ -53,13 +53,18 @@ DEFINE_string(krb5_conf, "", "Absolute path to Kerberos krb5.conf if in a non-st
     "location. Does not normally need to be set.");
 DEFINE_string(krb5_debug_file, "", "Turn on Kerberos debugging and output to this file");
 
-static const string mem_limit_help_msg = "Limit on process memory consumption, "
-    "excluding the JVM's memory consumption. "
+static const string mem_limit_help_msg = "Limit on process memory consumption. "
+    "Includes the JVM's memory consumption only if --mem_limit_includes_jvm is true. "
     + Substitute(MEM_UNITS_HELP_MSG, "the physical memory");
 DEFINE_string(mem_limit, "80%",  mem_limit_help_msg.c_str());
 
+DEFINE_bool(mem_limit_includes_jvm, false,
+    "If true, --mem_limit will include the JVM's max heap size and committed memory in "
+    "the process memory limit.");
+
 static const string buffer_pool_limit_help_msg = "(Advanced) Limit on buffer pool size. "
-     + Substitute(MEM_UNITS_HELP_MSG, "the process memory limit") + " "
+     + Substitute(MEM_UNITS_HELP_MSG, "the process memory limit (minus the JVM heap if "
+       "--mem_limit_includes_jvm is true)") + " "
     "The default value and behaviour of this flag may change between releases.";
 DEFINE_string(buffer_pool_limit, "85%", buffer_pool_limit_help_msg.c_str());
 
@@ -131,11 +136,6 @@ DEFINE_int32(stress_datastream_recvr_delay_ms, 0, "A stress option that causes d
     "stream receiver registration to be delayed. Effective in debug builds only.");
 DEFINE_bool(skip_file_runtime_filtering, false, "Skips file-based runtime filtering for"
     "testing purposes. Effective in debug builds only.");
-DEFINE_int32(fault_injection_rpc_delay_ms, 0, "A fault injection option that causes "
-    "rpc server handling to be delayed to trigger an RPC timeout on the caller side. "
-    "Effective in debug builds only.");
-DEFINE_int32(fault_injection_rpc_type, 0, "A fault injection option that specifies "
-    "which rpc call will be injected with the delay. Effective in debug builds only.");
 DEFINE_int32(fault_injection_rpc_exception_type, 0, "A fault injection option that "
     "specifies the exception to be thrown in the caller side of an RPC call. Effective "
     "in debug builds only");
@@ -151,6 +151,10 @@ DEFINE_int32(stress_disk_read_delay_ms, 0, "A stress option that injects extra d
     " in milliseconds when the I/O manager is reading from disk.");
 #endif
 
+DEFINE_string(debug_actions, "", "For testing only. Uses the same format as the debug "
+    "action query options, but allows for injection of debug actions in code paths where "
+    "query options are not available.");
+
 // Used for testing the path where the Kudu client is stubbed.
 DEFINE_bool(disable_kudu, false, "If true, Kudu features will be disabled.");
 
@@ -161,12 +165,18 @@ DEFINE_int32(kudu_operation_timeout_ms, 3 * 60 * 1000, "Timeout (milliseconds) s
     "all Kudu operations. This must be a positive value, and there is no way to disable "
     "timeouts.");
 
+#ifdef SLOW_BUILD
+static const int32 default_kudu_client_rpc_timeout_ms = 60000;
+#else
+static const int32 default_kudu_client_rpc_timeout_ms = 0;
+#endif
+
 // Timeout (ms) for Kudu rpcs set in the BE on the KuduClient.
-DEFINE_int32(kudu_client_rpc_timeout_ms, 0, "(Advanced) Timeout (milliseconds) set for "
-    "individual Kudu client rpcs. An operation may consist of several rpcs, so this is "
-    "expected to be less than kudu_operation_timeout_ms. This must be a positive value "
-    "or it will be ignored and Kudu's default of 10s will be used. There is no way to "
-    "disable timeouts.");
+DEFINE_int32(kudu_client_rpc_timeout_ms, default_kudu_client_rpc_timeout_ms,
+    "(Advanced) Timeout (milliseconds) set for individual Kudu client rpcs. An operation "
+    "may consist of several rpcs, so this is expected to be less than "
+    "kudu_operation_timeout_ms. This must be a positive value or it will be ignored and "
+    "Kudu's default of 10s will be used. There is no way to disable timeouts.");
 
 DEFINE_int64(inc_stats_size_limit_bytes, 200 * (1LL<<20), "Maximum size of "
     "incremental stats the catalog is allowed to serialize per table. "
@@ -210,11 +220,11 @@ DEFINE_bool_hidden(disable_catalog_data_ops_debug_only, false,
 // same way, is error prone. One fix for this flag is to set it only on
 // catalogd, propagate the setting as a property of the Catalog object, and let
 // impalad uses act on this setting.
-DEFINE_bool(pull_incremental_statistics, false,
+DEFINE_bool(pull_incremental_statistics, true,
     "When set, impalad coordinators pull incremental statistics from catalogd on-demand "
     "and catalogd does not broadcast incremental statistics via statestored to "
     "coordinators. If used, the flag must be set on both catalogd and all impalad "
-    "coordinators.");
+    "coordinators. This feature should not be used when --use_local_catalog is true.");
 
 DEFINE_int32(invalidate_tables_timeout_s, 0, "If a table has not been referenced in a "
     "SQL statement for more than the configured amount of time, the catalog server will "
@@ -231,6 +241,20 @@ DEFINE_bool(invalidate_tables_on_memory_pressure, false, "Configure catalogd to 
     "invalidate_table_timeout_s. To enable this feature, a true flag must be applied to "
     "both catalogd and impalad.");
 
+DEFINE_int32(hms_event_polling_interval_s, 0,
+    "Configure catalogd to invalidate cached table metadata based on metastore events. "
+    "These metastore events could be generated by external systems like Apache Hive or "
+    "a different Impala cluster using the same Hive metastore server as this one. "
+    "A non-zero value of this flag sets the polling interval of catalogd in seconds to "
+    "fetch new metastore events. A value of zero disables this feature. When enabled, "
+    "this flag has the same effect as \"INVALIDATE METADATA\" statement on the table "
+    "for certain metastore event types. Additionally, in case of events which detect "
+    "creation or removal of objects from metastore, catalogd adds or removes such "
+    "objects from its cached metadata. This feature is independent of time and memory "
+    "based automatic invalidation of tables. Note that this is still an experimental "
+    "feature and not recommended to be deployed on production systems until it is "
+    "made generally available.");
+
 DEFINE_double_hidden(invalidate_tables_gc_old_gen_full_threshold, 0.6, "The threshold "
     "above which CatalogdTableInvalidator would consider the old generation to be almost "
     "full and trigger an invalidation on recently unused tables");
@@ -238,6 +262,18 @@ DEFINE_double_hidden(invalidate_tables_gc_old_gen_full_threshold, 0.6, "The thre
 DEFINE_double_hidden(invalidate_tables_fraction_on_memory_pressure, 0.1,
     "The fraction of tables to invalidate when CatalogdTableInvalidator considers the "
     "old GC generation to be almost full.");
+
+DEFINE_bool_hidden(enable_parquet_page_index_writing_debug_only, true, "If true, Impala "
+    "will write the Parquet page index. It is not advised to use it in a production "
+    "environment, only for testing and development. This flag is meant to be temporary. "
+    "We plan to remove this flag once Impala is able to read the page index and has "
+    "better test coverage around it.");
+
+DEFINE_bool_hidden(unlock_mt_dop, false,
+    "(Experimental) If true, allow specifying mt_dop for all queries.");
+
+DEFINE_bool_hidden(recursively_list_partitions, true,
+    "If true, recursively list the content of partition directories.");
 
 // ++========================++
 // || Startup flag graveyard ||
@@ -265,8 +301,11 @@ DEFINE_double_hidden(invalidate_tables_fraction_on_memory_pressure, 0.1,
       return true; \
     });
 
+REMOVED_FLAG(authorization_policy_file)
 REMOVED_FLAG(be_service_threads);
 REMOVED_FLAG(cgroup_hierarchy_path);
+REMOVED_FLAG(disable_admission_control);
+REMOVED_FLAG(disable_mem_pools);
 REMOVED_FLAG(enable_accept_queue_server);
 REMOVED_FLAG(enable_partitioned_aggregation);
 REMOVED_FLAG(enable_partitioned_hash_join);
@@ -282,6 +321,7 @@ REMOVED_FLAG(llama_registration_timeout_secs);
 REMOVED_FLAG(llama_registration_wait_secs);
 REMOVED_FLAG(local_nodemanager_url);
 REMOVED_FLAG(max_free_io_buffers);
+REMOVED_FLAG(report_status_retry_interval_ms);
 REMOVED_FLAG(resource_broker_cnxn_attempts);
 REMOVED_FLAG(resource_broker_cnxn_retry_interval_ms);
 REMOVED_FLAG(resource_broker_recv_timeout);
@@ -293,9 +333,9 @@ REMOVED_FLAG(rpc_cnxn_attempts);
 REMOVED_FLAG(rpc_cnxn_retry_interval_ms);
 REMOVED_FLAG(skip_lzo_version_check);
 REMOVED_FLAG(staging_cgroup);
+REMOVED_FLAG(status_report_interval);
+REMOVED_FLAG(status_report_max_retries);
 REMOVED_FLAG(suppress_unknown_disk_id_warnings);
-REMOVED_FLAG(use_statestore);
-REMOVED_FLAG(use_kudu_kinit);
-REMOVED_FLAG(disable_admission_control);
-REMOVED_FLAG(disable_mem_pools);
 REMOVED_FLAG(use_krpc);
+REMOVED_FLAG(use_kudu_kinit);
+REMOVED_FLAG(use_statestore);

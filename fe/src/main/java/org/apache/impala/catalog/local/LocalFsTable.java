@@ -20,6 +20,7 @@ package org.apache.impala.catalog.local;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -27,13 +28,14 @@ import java.util.Set;
 import java.util.TreeMap;
 
 import org.apache.avro.Schema;
+import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.hadoop.hive.metastore.api.Partition;
 import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
 import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.hadoop.hive.serde.serdeConstants;
+import org.apache.impala.analysis.Expr;
 import org.apache.impala.analysis.LiteralExpr;
-import org.apache.impala.analysis.NullLiteral;
 import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.CatalogObject.ThriftObjectType;
 import org.apache.impala.catalog.Column;
@@ -48,6 +50,7 @@ import org.apache.impala.catalog.local.MetaProvider.PartitionMetadata;
 import org.apache.impala.catalog.local.MetaProvider.PartitionRef;
 import org.apache.impala.catalog.local.MetaProvider.TableMetaRef;
 import org.apache.impala.common.AnalysisException;
+import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.thrift.CatalogObjectsConstants;
 import org.apache.impala.thrift.THdfsPartition;
 import org.apache.impala.thrift.THdfsTable;
@@ -65,7 +68,6 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
 
 public class LocalFsTable extends LocalTable implements FeFsTable {
   /**
@@ -81,7 +83,7 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
    *
    * Set by loadPartitionValueMap().
    */
-  private ArrayList<TreeMap<LiteralExpr, HashSet<Long>>> partitionValueMap_;
+  private List<TreeMap<LiteralExpr, Set<Long>>> partitionValueMap_;
 
   /**
    * For each partition column, the set of partition IDs having a NULL value
@@ -89,7 +91,7 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
    *
    * Set by loadPartitionValueMap().
    */
-  private ArrayList<HashSet<Long>> nullPartitionIds_;
+  private List<Set<Long>> nullPartitionIds_;
 
   /**
    * The value that will be stored in a partition name to indicate NULL.
@@ -271,13 +273,23 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
   }
 
   @Override
+  public FileSystemUtil.FsType getFsType() {
+    Preconditions.checkNotNull(getHdfsBaseDir(),
+            "LocalTable base dir is null");
+    Path hdfsBaseDirPath = new Path(getHdfsBaseDir());
+    Preconditions.checkNotNull(hdfsBaseDirPath.toUri().getScheme(),
+        "Cannot get scheme from path " + getHdfsBaseDir());
+    return FileSystemUtil.FsType.getFsType(hdfsBaseDirPath.toUri().getScheme());
+  }
+
+  @Override
   public TTableDescriptor toThriftDescriptor(int tableId,
       Set<Long> referencedPartitions) {
     if (referencedPartitions == null) {
       // null means "all partitions".
       referencedPartitions = getPartitionIds();
     }
-    Map<Long, THdfsPartition> idToPartition = Maps.newHashMap();
+    Map<Long, THdfsPartition> idToPartition = new HashMap<>();
     List<? extends FeFsPartition> partitions = loadPartitions(referencedPartitions);
     for (FeFsPartition partition : partitions) {
       idToPartition.put(partition.getId(),
@@ -360,7 +372,7 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
   }
 
   @Override
-  public TreeMap<LiteralExpr, HashSet<Long>> getPartitionValueMap(int col) {
+  public TreeMap<LiteralExpr, Set<Long>> getPartitionValueMap(int col) {
     loadPartitionValueMap();
     return partitionValueMap_.get(col);
   }
@@ -383,7 +395,7 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
     // Possible in the case that all partitions were pruned.
     if (ids.isEmpty()) return Collections.emptyList();
 
-    List<PartitionRef> refs = Lists.newArrayList();
+    List<PartitionRef> refs = new ArrayList<>();
     for (Long id : ids) {
       LocalPartitionSpec spec = partitionSpecs_.get(id);
       Preconditions.checkArgument(spec != null, "Invalid partition ID for table %s: %s",
@@ -430,24 +442,24 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
     if (partitionValueMap_ != null) return;
 
     loadPartitionSpecs();
-    ArrayList<TreeMap<LiteralExpr, HashSet<Long>>> valMapByCol =
+    List<TreeMap<LiteralExpr, Set<Long>>> valMapByCol =
         new ArrayList<>();
-    ArrayList<HashSet<Long>> nullParts = new ArrayList<>();
+    List<Set<Long>> nullParts = new ArrayList<>();
 
     for (int i = 0; i < getNumClusteringCols(); i++) {
-      valMapByCol.add(new TreeMap<LiteralExpr, HashSet<Long>>());
-      nullParts.add(new HashSet<Long>());
+      valMapByCol.add(new TreeMap<>());
+      nullParts.add(new HashSet<>());
     }
     for (LocalPartitionSpec partition : partitionSpecs_.values()) {
       List<LiteralExpr> vals = partition.getPartitionValues();
       for (int i = 0; i < getNumClusteringCols(); i++) {
         LiteralExpr val = vals.get(i);
-        if (val instanceof NullLiteral) {
+        if (Expr.IS_NULL_LITERAL.apply(val)) {
           nullParts.get(i).add(partition.getId());
           continue;
         }
 
-        HashSet<Long> ids = valMapByCol.get(i).get(val);
+        Set<Long> ids = valMapByCol.get(i).get(val);
         if (ids == null) {
           ids = new HashSet<>();
           valMapByCol.get(i).put(val,  ids);
@@ -505,12 +517,6 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
       // However, it maintains the existing behavior from HdfsTable.
       stats.setNumNulls(nullParts);
     }
-  }
-
-  @Override
-  public int parseSkipHeaderLineCount(StringBuilder error) {
-    // TODO Auto-generated method stub
-    return 0;
   }
 
   @Override

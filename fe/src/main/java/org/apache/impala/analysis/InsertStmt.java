@@ -24,7 +24,6 @@ import java.util.List;
 import java.util.Set;
 
 import org.apache.impala.authorization.Privilege;
-import org.apache.impala.authorization.PrivilegeRequestBuilder;
 import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.FeFsTable;
 import org.apache.impala.catalog.FeHBaseTable;
@@ -43,8 +42,6 @@ import org.apache.impala.rewrite.ExprRewriter;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Iterables;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Sets;
 
 /**
  * Representation of a single insert or upsert statement, including the select statement
@@ -71,7 +68,7 @@ public class InsertStmt extends StatementBase {
   private final List<PartitionKeyValue> partitionKeyValues_;
 
   // User-supplied hints to control hash partitioning before the table sink in the plan.
-  private List<PlanHint> planHints_ = Lists.newArrayList();
+  private List<PlanHint> planHints_ = new ArrayList<>();
 
   // The location of given hints.
   private HintLocation hintLoc_;
@@ -120,14 +117,14 @@ public class InsertStmt extends StatementBase {
 
   // Set in analyze(). Exprs correspond to the partitionKeyValues, if specified, or to
   // the partition columns for Kudu tables.
-  private List<Expr> partitionKeyExprs_ = Lists.newArrayList();
+  private List<Expr> partitionKeyExprs_ = new ArrayList<>();
 
   // Set in analyze(). Maps exprs in partitionKeyExprs_ to their column's position in the
   // table, eg. partitionKeyExprs_[i] corresponds to table_.columns(partitionKeyIdx_[i]).
   // For Kudu tables, the primary keys are a leading subset of the cols, and the partition
   // cols can be any subset of the primary keys, meaning that this list will be in
   // ascending order from '0' to '# primary key cols - 1' but may leave out some numbers.
-  private final List<Integer> partitionColPos_ = Lists.newArrayList();
+  private final List<Integer> partitionColPos_ = new ArrayList<>();
 
   // Indicates whether this insert stmt has a shuffle or noshuffle plan hint.
   // Both flags may be false. Only one of them may be true, not both.
@@ -150,12 +147,12 @@ public class InsertStmt extends StatementBase {
   // will be sorted by these exprs. If the list is empty, no additional sorting by
   // non-partitioning columns will be performed. The column list must not contain
   // partition columns and must be empty for non-Hdfs tables.
-  private List<Expr> sortExprs_ = Lists.newArrayList();
+  private List<Expr> sortExprs_ = new ArrayList<>();
 
   // Stores the indices into the list of non-clustering columns of the target table that
   // are mentioned in the 'sort.columns' table property. This is
   // sent to the backend to populate the RowGroup::sorting_columns list in parquet files.
-  private List<Integer> sortColumns_ = Lists.newArrayList();
+  private List<Integer> sortColumns_ = new ArrayList<>();
 
   // Output expressions that produce the final results to write to the target table. May
   // include casts. Set in prepareExpressions().
@@ -167,16 +164,16 @@ public class InsertStmt extends StatementBase {
   // For Kudu tables (INSERT and UPSERT operations), it will contain one Expr per column
   // mentioned in the query and mentionedColumns_ is used to map between the Exprs
   // and columns in the target table.
-  private ArrayList<Expr> resultExprs_ = Lists.newArrayList();
+  private List<Expr> resultExprs_ = new ArrayList<>();
 
   // Position mapping of exprs in resultExprs_ to columns in the target table -
   // resultExprs_[i] produces the mentionedColumns_[i] column of the target table.
   // Only used for Kudu tables, set in prepareExpressions().
-  private final List<Integer> mentionedColumns_ = Lists.newArrayList();
+  private final List<Integer> mentionedColumns_ = new ArrayList<>();
 
   // Set in analyze(). Exprs corresponding to key columns of Kudu tables. Empty for
   // non-Kudu tables.
-  private ArrayList<Expr> primaryKeyExprs_ = Lists.newArrayList();
+  private List<Expr> primaryKeyExprs_ = new ArrayList<>();
 
   // END: Members that need to be reset()
   /////////////////////////////////////////
@@ -209,7 +206,7 @@ public class InsertStmt extends StatementBase {
     originalTableName_ = targetTableName_;
     overwrite_ = overwrite;
     partitionKeyValues_ = partitionKeyValues;
-    planHints_ = (planHints != null) ? planHints : new ArrayList<PlanHint>();
+    planHints_ = (planHints != null) ? planHints : new ArrayList<>();
     hintLoc_ = (hintLoc != null) ? hintLoc : HintLocation.End;
     queryStmt_ = queryStmt;
     needsGeneratedQueryStatement_ = (queryStmt == null);
@@ -276,7 +273,7 @@ public class InsertStmt extends StatementBase {
       // substitution with TupleIsNullPredicate() wrapping happens in planning.
       selectListExprs = Expr.cloneList(queryStmt_.getResultExprs());
     } else {
-      selectListExprs = Lists.newArrayList();
+      selectListExprs = new ArrayList<>();
     }
 
     // Set target table and perform table-type specific analysis and auth checking.
@@ -312,8 +309,8 @@ public class InsertStmt extends StatementBase {
     // order.
     List<String> analysisColumnPermutation = columnPermutation_;
     if (analysisColumnPermutation == null) {
-      analysisColumnPermutation = Lists.newArrayList();
-      ArrayList<Column> tableColumns = table_.getColumns();
+      analysisColumnPermutation = new ArrayList<>();
+      List<Column> tableColumns = table_.getColumns();
       for (int i = numClusteringCols; i < tableColumns.size(); ++i) {
         analysisColumnPermutation.add(tableColumns.get(i).getName());
       }
@@ -322,11 +319,11 @@ public class InsertStmt extends StatementBase {
     // selectExprTargetColumns maps from select expression index to a column in the target
     // table. It will eventually include all mentioned columns that aren't static-valued
     // partition columns.
-    ArrayList<Column> selectExprTargetColumns = Lists.newArrayList();
+    List<Column> selectExprTargetColumns = new ArrayList<>();
 
     // Tracks the name of all columns encountered in either the permutation clause or the
     // partition clause to detect duplicates.
-    Set<String> mentionedColumnNames = Sets.newHashSet();
+    Set<String> mentionedColumnNames = new HashSet<>();
     for (String columnName: analysisColumnPermutation) {
       Column column = table_.getColumn(columnName);
       if (column == null) {
@@ -422,9 +419,10 @@ public class InsertStmt extends StatementBase {
       table_ = analyzer.getTable(targetTableName_, privilegeRequired);
     } else {
       targetTableName_ = new TableName(table_.getDb().getName(), table_.getName());
-      PrivilegeRequestBuilder pb = new PrivilegeRequestBuilder();
-      analyzer.registerPrivReq(pb.onTable(table_.getDb().getName(), table_.getName())
-          .allOf(privilegeRequired).toRequest());
+      analyzer.registerPrivReq(builder ->
+          builder.onTable(table_.getDb().getName(), table_.getName())
+              .allOf(privilegeRequired)
+              .build());
     }
 
     // We do not support (in|up)serting into views.
@@ -546,7 +544,7 @@ public class InsertStmt extends StatementBase {
    * partition exprs collectively cover exactly all required columns in the target table,
    * depending on the table type.
    */
-  private void checkColumnCoverage(ArrayList<Column> selectExprTargetColumns,
+  private void checkColumnCoverage(List<Column> selectExprTargetColumns,
       Set<String> mentionedColumnNames, int numSelectListExprs,
       int numStaticPartitionExprs) throws AnalysisException {
     // Check that all required cols are mentioned by the permutation and partition clauses
@@ -599,7 +597,7 @@ public class InsertStmt extends StatementBase {
       throws AnalysisException {
     Preconditions.checkState(table_ instanceof FeKuduTable);
     List<String> keyColumns = ((FeKuduTable) table_).getPrimaryKeyColumnNames();
-    List<String> missingKeyColumnNames = Lists.newArrayList();
+    List<String> missingKeyColumnNames = new ArrayList<>();
     for (Column column : table_.getColumns()) {
       if (!mentionedColumnNames.contains(column.getName())
           && keyColumns.contains(column.getName())) {
@@ -637,7 +635,7 @@ public class InsertStmt extends StatementBase {
   private void checkRequiredPartitionedColumns(Set<String> mentionedColumnNames)
       throws AnalysisException {
     int numClusteringCols = table_.getNumClusteringCols();
-    List<String> missingPartitionColumnNames = Lists.newArrayList();
+    List<String> missingPartitionColumnNames = new ArrayList<>();
     for (Column column : table_.getColumns()) {
       if (!mentionedColumnNames.contains(column.getName())
           && column.getPosition() < numClusteringCols) {
@@ -675,8 +673,8 @@ public class InsertStmt extends StatementBase {
       List<Expr> selectListExprs, FeTable tbl, Analyzer analyzer)
       throws AnalysisException {
     // Temporary lists of partition key exprs and names in an arbitrary order.
-    List<Expr> tmpPartitionKeyExprs = new ArrayList<Expr>();
-    List<String> tmpPartitionKeyNames = new ArrayList<String>();
+    List<Expr> tmpPartitionKeyExprs = new ArrayList<>();
+    List<String> tmpPartitionKeyNames = new ArrayList<>();
 
     int numClusteringCols = (tbl instanceof FeHBaseTable) ? 0
         : tbl.getNumClusteringCols();
@@ -686,12 +684,23 @@ public class InsertStmt extends StatementBase {
       kuduPartitionColumnNames = getKuduPartitionColumnNames((FeKuduTable) table_);
     }
 
+    UnionStmt unionStmt =
+        (queryStmt_ instanceof UnionStmt) ? (UnionStmt) queryStmt_ : null;
+    List<Expr> widestTypeExprList = null;
+    if (unionStmt != null && unionStmt.getWidestExprs() != null
+        && unionStmt.getWidestExprs().size() > 0) {
+      widestTypeExprList = unionStmt.getWidestExprs();
+    }
+
     // Check dynamic partition columns for type compatibility.
     for (int i = 0; i < selectListExprs.size(); ++i) {
       Column targetColumn = selectExprTargetColumns.get(i);
-      Expr compatibleExpr = checkTypeCompatibility(
-          targetTableName_.toString(), targetColumn, selectListExprs.get(i),
-          analyzer.getQueryOptions().isDecimal_v2());
+      // widestTypeExpr is widest type expression for column i
+      Expr widestTypeExpr =
+          (widestTypeExprList != null) ? widestTypeExprList.get(i) : null;
+      Expr compatibleExpr = checkTypeCompatibility(targetTableName_.toString(),
+          targetColumn, selectListExprs.get(i), analyzer.getQueryOptions().isDecimal_v2(),
+          widestTypeExpr);
       if (targetColumn.getPosition() < numClusteringCols) {
         // This is a dynamic clustering column
         tmpPartitionKeyExprs.add(compatibleExpr);
@@ -712,9 +721,8 @@ public class InsertStmt extends StatementBase {
         if (pkv.isStatic()) {
           // tableColumns is guaranteed to exist after the earlier analysis checks
           Column tableColumn = table_.getColumn(pkv.getColName());
-          Expr compatibleExpr = checkTypeCompatibility(
-              targetTableName_.toString(), tableColumn,
-              pkv.getLiteralValue(), analyzer.isDecimalV2());
+          Expr compatibleExpr = checkTypeCompatibility(targetTableName_.toString(),
+              tableColumn, pkv.getLiteralValue(), analyzer.isDecimalV2(), null);
           tmpPartitionKeyExprs.add(compatibleExpr);
           tmpPartitionKeyNames.add(pkv.getColName());
         }
@@ -793,7 +801,7 @@ public class InsertStmt extends StatementBase {
     // TODO: Check that HBase row-key columns are not NULL? See IMPALA-406
     if (needsGeneratedQueryStatement_) {
       // Build a query statement that returns NULL for every column
-      List<SelectListItem> selectListItems = Lists.newArrayList();
+      List<SelectListItem> selectListItems = new ArrayList<>();
       for(Expr e: resultExprs_) {
         selectListItems.add(new SelectListItem(e, null));
       }
@@ -804,7 +812,7 @@ public class InsertStmt extends StatementBase {
   }
 
   private static Set<String> getKuduPartitionColumnNames(FeKuduTable table) {
-    Set<String> ret = new HashSet<String>();
+    Set<String> ret = new HashSet<>();
     for (KuduPartitionParam partitionParam : table.getPartitionBy()) {
       ret.addAll(partitionParam.getColumnNames());
     }
@@ -859,7 +867,7 @@ public class InsertStmt extends StatementBase {
   }
 
   @Override
-  public ArrayList<Expr> getResultExprs() { return resultExprs_; }
+  public List<Expr> getResultExprs() { return resultExprs_; }
 
   @Override
   public void rewriteExprs(ExprRewriter rewriter) throws AnalysisException {
@@ -885,7 +893,7 @@ public class InsertStmt extends StatementBase {
   public boolean hasNoShuffleHint() { return hasNoShuffleHint_; }
   public boolean hasClusteredHint() { return hasClusteredHint_; }
   public boolean hasNoClusteredHint() { return hasNoClusteredHint_; }
-  public ArrayList<Expr> getPrimaryKeyExprs() { return primaryKeyExprs_; }
+  public List<Expr> getPrimaryKeyExprs() { return primaryKeyExprs_; }
   public List<Expr> getSortExprs() { return sortExprs_; }
 
   // Clustering is enabled by default. If the table has a 'sort.columns' property and the
@@ -896,7 +904,7 @@ public class InsertStmt extends StatementBase {
   }
 
   public List<String> getMentionedColumns() {
-    List<String> result = Lists.newArrayList();
+    List<String> result = new ArrayList<>();
     List<Column> columns = table_.getColumns();
     for (Integer i: mentionedColumns_) result.add(columns.get(i).getName());
     return result;
@@ -923,14 +931,14 @@ public class InsertStmt extends StatementBase {
   }
 
   @Override
-  public String toSql(boolean rewritten) {
+  public String toSql(ToSqlOptions options) {
     StringBuilder strBuilder = new StringBuilder();
 
-    if (withClause_ != null) strBuilder.append(withClause_.toSql(rewritten) + " ");
+    if (withClause_ != null) strBuilder.append(withClause_.toSql(options) + " ");
 
     strBuilder.append(getOpName());
     if (!planHints_.isEmpty() && hintLoc_ == HintLocation.Start) {
-      strBuilder.append(" " + ToSqlUtils.getPlanHintsSql(getPlanHints()));
+      strBuilder.append(" " + ToSqlUtils.getPlanHintsSql(options, getPlanHints()));
     }
     if (overwrite_) {
       strBuilder.append(" OVERWRITE");
@@ -940,22 +948,27 @@ public class InsertStmt extends StatementBase {
     strBuilder.append(" TABLE " + originalTableName_);
     if (columnPermutation_ != null) {
       strBuilder.append("(");
-      strBuilder.append(Joiner.on(", ").join(columnPermutation_));
+      String sep = "";
+      for (String col : columnPermutation_) {
+        strBuilder.append(sep);
+        strBuilder.append(ToSqlUtils.getIdentSql(col));
+        sep = ", ";
+      }
       strBuilder.append(")");
     }
     if (partitionKeyValues_ != null) {
-      List<String> values = Lists.newArrayList();
+      List<String> values = new ArrayList<>();
       for (PartitionKeyValue pkv: partitionKeyValues_) {
-        values.add(pkv.getColName() +
-            (pkv.getValue() != null ? ("=" + pkv.getValue().toSql()) : ""));
+        values.add(ToSqlUtils.getIdentSql(pkv.getColName())
+            + (pkv.getValue() != null ? ("=" + pkv.getValue().toSql(options)) : ""));
       }
       strBuilder.append(" PARTITION (" + Joiner.on(", ").join(values) + ")");
     }
     if (!planHints_.isEmpty() && hintLoc_ == HintLocation.End) {
-      strBuilder.append(" " + ToSqlUtils.getPlanHintsSql(getPlanHints()));
+      strBuilder.append(" " + ToSqlUtils.getPlanHintsSql(options, getPlanHints()));
     }
     if (!needsGeneratedQueryStatement_) {
-      strBuilder.append(" " + queryStmt_.toSql(rewritten));
+      strBuilder.append(" " + queryStmt_.toSql(options));
     }
     return strBuilder.toString();
   }

@@ -39,7 +39,8 @@ from StatestoreService.StatestoreSubscriber import TTopicRegistration
 from ErrorCodes.ttypes import TErrorCode
 from Status.ttypes import TStatus
 
-from tests.common.environ import specific_build_type_timeout
+from tests.common.environ import build_flavor_timeout
+from tests.common.skip import SkipIfDockerizedCluster
 
 LOG = logging.getLogger('test_statestore')
 
@@ -69,10 +70,10 @@ DEFAULT_UPDATE_STATE_RESPONSE = TUpdateStateResponse(status=STATUS_OK, topic_upd
                                                      skipped=False)
 
 # IMPALA-3501: the timeout needs to be higher in code coverage builds
-WAIT_FOR_FAILURE_TIMEOUT = specific_build_type_timeout(40, code_coverage_build_timeout=60)
-WAIT_FOR_HEARTBEAT_TIMEOUT = specific_build_type_timeout(
+WAIT_FOR_FAILURE_TIMEOUT = build_flavor_timeout(40, code_coverage_build_timeout=60)
+WAIT_FOR_HEARTBEAT_TIMEOUT = build_flavor_timeout(
     40, code_coverage_build_timeout=60)
-WAIT_FOR_UPDATE_TIMEOUT = specific_build_type_timeout(40, code_coverage_build_timeout=60)
+WAIT_FOR_UPDATE_TIMEOUT = build_flavor_timeout(40, code_coverage_build_timeout=60)
 
 class WildcardServerSocket(TSocket.TSocketBase, TTransport.TServerTransportBase):
   """Specialised server socket that binds to a random port at construction"""
@@ -158,7 +159,6 @@ class KillableThreadedServer(TServer):
 
     itrans.close()
     otrans.close()
-
 
 class StatestoreSubscriber(object):
   """A bare-bones subscriber skeleton. Tests should create a new StatestoreSubscriber(),
@@ -341,6 +341,8 @@ class StatestoreSubscriber(object):
             self.subscriber_id, timeout))
       time.sleep(0.2)
 
+
+@SkipIfDockerizedCluster.statestore_not_exposed
 class TestStatestore():
   def make_topic_update(self, topic_name, key_template="foo", value_template="bar",
                         num_updates=1, clear_topic_entries=False):
@@ -532,24 +534,56 @@ class TestStatestore():
            .wait_for_failure(timeout=60)
        )
 
+  def test_intermittent_hung_heartbeats(self):
+    """Heartbeats that occasionally time out should not cause a failure to be detected."""
+    heartbeat_count = [0]  # Use array to allow mutating from inside callback.
+
+    def heartbeat_cb(sub, args):
+      heartbeat_count[0] += 1
+      # Delay every second heartbeat.
+      if (heartbeat_count[0] % 2 == 1):
+        time.sleep(4)
+      return Subscriber.THeartbeatResponse()
+
+    with StatestoreSubscriber(heartbeat_cb=heartbeat_cb) as sub:
+      topic_name = "test_intermittent_hung_heartbeats"
+      reg = TTopicRegistration(topic_name=topic_name, is_transient=True)
+      (
+        sub.start()
+           .register(topics=[reg])
+           .wait_for_update(topic_name, 30)
+           .kill()
+           .wait_for_failure()
+       )
+
   def test_slow_subscriber(self):
-    """Test for IMPALA-6644: This test kills a healthy subscriber and sleeps for a random
-    interval between 1 and 9 seconds, this lets the heartbeats fail without removing the
-    subscriber from the set of active subscribers. It then checks the subscribers page
-    of the statestore to ensure that the 'time_since_heartbeat' field is updated with an
-    acceptable value. Since the statestore heartbeats at 1 second intervals, an acceptable
-    value would be between ((sleep_time-1.0), (sleep_time+1.0))."""
+    """Test for IMPALA-6644: This test kills a healthy subscriber and sleeps for multiple
+    intervals of about 1 second each, this lets the heartbeats to the subscriber fail.
+    It polls the subscribers page of the statestore to ensure that the
+    'secs_since_heartbeat' field is updated with an acceptable value. This test only
+    checks for a strictly increasing value since the actual value of time might depend
+    on the system load. It stops polling the page once the subscriber is removed from
+    the set of active subscribers. It also checks that a valid heartbeat record of the
+    subscriber is found at least once."""
     sub = StatestoreSubscriber()
     sub.start().register().wait_for_heartbeat(1)
     sub.kill()
-    sleep_time = randint(1, 9)
-    time.sleep(sleep_time)
-    subscribers = get_statestore_subscribers()["subscribers"]
-    for s in subscribers:
-      if str(s["id"]) == sub.subscriber_id:
-        secs_since_heartbeat = float(s["secs_since_heartbeat"])
-        assert (secs_since_heartbeat > float(sleep_time - 1.0))
-        assert (secs_since_heartbeat < float(sleep_time + 1.0))
+    # secs_since_heartbeat is initially unknown.
+    secs_since_heartbeat = -1
+    valid_heartbeat_record = False
+    while secs_since_heartbeat != 0:
+      sleep_start_time = time.time()
+      while time.time() - sleep_start_time < 1:
+        time.sleep(0.1)
+      prev_secs_since_heartbeat = secs_since_heartbeat
+      secs_since_heartbeat = 0
+      subscribers = get_statestore_subscribers()["subscribers"]
+      for s in subscribers:
+        if str(s["id"]) == sub.subscriber_id:
+          secs_since_heartbeat = float(s["secs_since_heartbeat"])
+          assert (secs_since_heartbeat > prev_secs_since_heartbeat)
+          valid_heartbeat_record = True
+    assert valid_heartbeat_record
 
   def test_topic_persistence(self):
     """Test that persistent topic entries survive subscriber failure, but transent topic

@@ -85,9 +85,10 @@ class Scheduler {
   /// on failure. 'backend_address' is the address of thrift based ImpalaInternalService
   /// of this backend. If FLAGS_use_krpc is true, 'krpc_address' contains IP-address:port
   /// on which KRPC based ImpalaInternalService is exported. 'ip' is the resolved
-  /// IP address of this backend.
-  Status Init(const TNetworkAddress& backend_address,
-      const TNetworkAddress& krpc_address, const IpAddr& ip);
+  /// IP address of this backend. 'admit_mem_limit' is the ExecEnv::admit_mem_limit()
+  /// value or a dummy value provided by scheduler tests.
+  Status Init(const TNetworkAddress& backend_address, const TNetworkAddress& krpc_address,
+      const IpAddr& ip, int64_t admit_mem_limit);
 
   /// Test helper that updates the local backend address to reflect whatever
   /// ephemeral port was assigned during server startup. Should only be called
@@ -98,6 +99,12 @@ class Scheduler {
   /// Populates given query schedule and assigns fragments to hosts based on scan
   /// ranges in the query exec request.
   Status Schedule(QuerySchedule* schedule);
+
+  /// Build a backend descriptor for this Impala daemon. Fills out all metadata using
+  /// the provided arguments, except does not set 'is_quiescing'.
+  static TBackendDescriptor BuildLocalBackendDescriptor(Webserver* webserver,
+      const TNetworkAddress& backend_address, const TNetworkAddress& krpc_address,
+      const IpAddr& ip, int64_t admit_mem_limit);
 
  private:
   /// Map from a host's IP address to the next executor to be round-robin scheduled for
@@ -183,8 +190,18 @@ class Scheduler {
     /// 'break_ties_by_rank' is true, then the executor rank is used to break ties.
     /// Otherwise the first executor according to their order in 'data_locations' is
     /// selected.
-    const IpAddr* SelectLocalExecutor(
+    const IpAddr* SelectExecutorFromCandidates(
         const std::vector<IpAddr>& data_locations, bool break_ties_by_rank);
+
+    /// Populate 'remote_executor_candidates' with 'num_candidates' distinct
+    /// executors. The algorithm for picking remote executor candidates is to hash
+    /// the file name / offset from 'hdfs_file_split' multiple times and look up the
+    /// closest executors stored in the BackendConfig's HashRing. Given the same file
+    /// name / offset and same set of executors, this function is deterministic. The hash
+    /// ring also limits the disruption when executors are added or removed. Note that
+    /// 'num_candidates' cannot be 0 and must be less than the total number of executors.
+    void GetRemoteExecutorCandidates(const THdfsFileSplit* hdfs_file_split,
+        int num_remote_replicas, vector<IpAddr>* remote_executor_candidates);
 
     /// Select an executor for a remote read. If there are unused executor hosts, then
     /// those will be preferred. Otherwise the one with the lowest number of assigned
@@ -430,8 +447,9 @@ class Scheduler {
   /// Recursively create FInstanceExecParams and set per_node_scan_ranges for
   /// fragment_params and its input fragments via a depth-first traversal.
   /// All fragments are part of plan_exec_info.
-  void ComputeFragmentExecParams(const TPlanExecInfo& plan_exec_info,
-      FragmentExecParams* fragment_params, QuerySchedule* schedule);
+  void ComputeFragmentExecParams(const BackendConfig& executor_config,
+      const TPlanExecInfo& plan_exec_info, FragmentExecParams* fragment_params,
+      QuerySchedule* schedule);
 
   /// Create instances of the fragment corresponding to fragment_params, which contains
   /// a Union node.
@@ -442,7 +460,8 @@ class Scheduler {
   /// a UnionNode with partitioned joins or grouping aggregates as children runs on
   /// at least as many hosts as the input to those children).
   /// TODO: is this really necessary? If not, revise.
-  void CreateUnionInstances(FragmentExecParams* fragment_params, QuerySchedule* schedule);
+  void CreateUnionInstances(const BackendConfig& executor_config,
+      FragmentExecParams* fragment_params, QuerySchedule* schedule);
 
   /// Create instances of the fragment corresponding to fragment_params to run on the
   /// selected replica hosts of the scan ranges of the node with id scan_id.
@@ -451,8 +470,8 @@ class Scheduler {
   /// number of bytes per instances and then in a single pass assigning scan ranges to
   /// each instance to roughly meet that average.
   /// For all other storage mgrs, it load-balances the number of splits per instance.
-  void CreateScanInstances(
-      PlanNodeId scan_id, FragmentExecParams* fragment_params, QuerySchedule* schedule);
+  void CreateScanInstances(const BackendConfig& executor_config, PlanNodeId scan_id,
+      FragmentExecParams* fragment_params, QuerySchedule* schedule);
 
   /// For each instance of fragment_params's input fragment, create a collocated
   /// instance for fragment_params's fragment.

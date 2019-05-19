@@ -21,12 +21,12 @@ import java.io.IOException;
 import java.lang.reflect.Method;
 import java.net.URL;
 import java.net.URLClassLoader;
+import java.util.Base64;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
-import org.apache.commons.codec.binary.Base64;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hive.metastore.api.FunctionType;
 import org.apache.hadoop.hive.metastore.api.ResourceType;
@@ -95,34 +95,34 @@ public abstract class FunctionUtils {
         throw new ImpalaRuntimeException(errorMsg);
       }
       URL[] classLoaderUrls = new URL[] {new URL(localJarPath.toString())};
-      URLClassLoader urlClassLoader = new URLClassLoader(classLoaderUrls);
-      // TODO(todd): above class loader is leaked without closing.
-      udfClass = urlClassLoader.loadClass(function.getClassName());
-      // Check if the class is of UDF type. Currently we don't support other functions
-      // TODO: Remove this once we support Java UDAF/UDTF
-      if (org.apache.hadoop.hive.ql.exec.FunctionUtils.getUDFClassType(udfClass) !=
-          org.apache.hadoop.hive.ql.exec.FunctionUtils.UDFClassType.UDF) {
-        LOG.warn("Ignoring load of incompatible Java function: " +
-            function.getFunctionName() + " as " +
-            org.apache.hadoop.hive.ql.exec.FunctionUtils.getUDFClassType(udfClass)
-            + " is not a supported type. Only UDFs are supported");
-        return result;
-      }
-      // Load each method in the UDF class and create the corresponding Impala Function
-      // object.
-      for (Method m: udfClass.getMethods()) {
-        if (!m.getName().equals(UdfExecutor.UDF_FUNCTION_NAME)) continue;
-        Function fn = ScalarFunction.fromHiveFunction(db,
-            function.getFunctionName(), function.getClassName(),
-            m.getParameterTypes(), m.getReturnType(), jarUri);
-        if (fn == null) {
-          LOG.warn("Ignoring incompatible method: " + m.toString() + " during load of " +
-             "Hive UDF:" + function.getFunctionName() + " from " + udfClass);
-          continue;
-        }
-        if (!addedSignatures.contains(fn.signatureString())) {
-          result.add(fn);
-          addedSignatures.add(fn.signatureString());
+      try (URLClassLoader urlClassLoader = new URLClassLoader(classLoaderUrls)) {
+        udfClass = urlClassLoader.loadClass(function.getClassName());
+        // Check if the class is of UDF type. Currently we don't support other functions
+        // TODO: Remove this once we support Java UDAF/UDTF
+        if (org.apache.hadoop.hive.ql.exec.FunctionUtils.getUDFClassType(udfClass) !=
+            org.apache.hadoop.hive.ql.exec.FunctionUtils.UDFClassType.UDF) {
+          LOG.warn("Ignoring load of incompatible Java function: " +
+              function.getFunctionName() + " as " +
+              org.apache.hadoop.hive.ql.exec.FunctionUtils.getUDFClassType(udfClass)
+              + " is not a supported type. Only UDFs are supported");
+          return result;
+            }
+        // Load each method in the UDF class and create the corresponding Impala Function
+        // object.
+        for (Method m: udfClass.getMethods()) {
+          if (!m.getName().equals(UdfExecutor.UDF_FUNCTION_NAME)) continue;
+          Function fn = ScalarFunction.fromHiveFunction(db,
+              function.getFunctionName(), function.getClassName(),
+              m.getParameterTypes(), m.getReturnType(), jarUri);
+          if (fn == null) {
+            LOG.warn("Ignoring incompatible method: " + m.toString() + " during load of "
+                + "Hive UDF:" + function.getFunctionName() + " from " + udfClass);
+            continue;
+          }
+          if (!addedSignatures.contains(fn.signatureString())) {
+            result.add(fn);
+            addedSignatures.add(fn.signatureString());
+          }
         }
       }
     } catch (ClassNotFoundException c) {
@@ -154,7 +154,7 @@ public abstract class FunctionUtils {
       try {
         TFunction fn = new TFunction();
         JniUtil.deserializeThrift(protocolFactory, fn,
-            Base64.decodeBase64(entry.getValue()));
+            Base64.getDecoder().decode(entry.getValue()));
         results.add(Function.fromThrift(fn));
       } catch (ImpalaException e) {
         LOG.error("Encountered an error during function load: key=" +
@@ -214,28 +214,33 @@ public abstract class FunctionUtils {
     Preconditions.checkNotNull(mode);
 
     // First check for identical
-    for (Function f: fns) {
-      if (f.compare(desc, Function.CompareMode.IS_IDENTICAL)) return f;
-    }
-    if (mode == Function.CompareMode.IS_IDENTICAL) return null;
+    Function f = getBestFitFunction(fns, desc, Function.CompareMode.IS_IDENTICAL);
+    if (f != null || mode == Function.CompareMode.IS_IDENTICAL) return f;
 
     // Next check for indistinguishable
-    for (Function f: fns) {
-      if (f.compare(desc, Function.CompareMode.IS_INDISTINGUISHABLE)) return f;
-    }
-    if (mode == Function.CompareMode.IS_INDISTINGUISHABLE) return null;
+    f = getBestFitFunction(fns, desc, Function.CompareMode.IS_INDISTINGUISHABLE);
+    if (f != null || mode == Function.CompareMode.IS_INDISTINGUISHABLE) return f;
 
     // Next check for strict supertypes
-    for (Function f: fns) {
-      if (f.compare(desc, Function.CompareMode.IS_SUPERTYPE_OF)) return f;
-    }
-    if (mode == Function.CompareMode.IS_SUPERTYPE_OF) return null;
+    f = getBestFitFunction(fns, desc, Function.CompareMode.IS_SUPERTYPE_OF);
+    if (f != null || mode == Function.CompareMode.IS_SUPERTYPE_OF) return f;
 
     // Finally check for non-strict supertypes
+    return getBestFitFunction(fns, desc, Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
+  }
+
+  private static Function getBestFitFunction(Iterable<Function> fns, Function desc,
+      CompareMode mode) {
+    int maxScore = -1;
+    Function maxFunc = null;
     for (Function f: fns) {
-      if (f.compare(desc, Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF)) return f;
+      int score = f.calcMatchScore(desc, mode);
+      if (score >= 0 && score > maxScore) {
+        maxScore = score;
+        maxFunc = f;
+      }
     }
-    return null;
+    return maxFunc;
   }
 
   public static List<Function> getVisibleFunctionsInCategory(

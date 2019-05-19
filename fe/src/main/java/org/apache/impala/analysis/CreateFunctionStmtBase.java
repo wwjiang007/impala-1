@@ -17,15 +17,11 @@
 
 package org.apache.impala.analysis;
 
-import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import org.apache.hadoop.fs.permission.FsAction;
-import org.apache.impala.authorization.AuthorizeableFn;
 import org.apache.impala.authorization.Privilege;
-import org.apache.impala.authorization.PrivilegeRequest;
-import org.apache.impala.catalog.ImpaladCatalog;
 import org.apache.impala.catalog.FeDb;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.Type;
@@ -58,7 +54,7 @@ public abstract class CreateFunctionStmtBase extends StatementBase {
   protected final FunctionArgs args_;
   protected final TypeDef retTypeDef_;
   protected final HdfsUri location_;
-  protected final HashMap<CreateFunctionStmtBase.OptArg, String> optArgs_;
+  protected final Map<CreateFunctionStmtBase.OptArg, String> optArgs_;
   protected final boolean ifNotExists_;
 
   // Result of analysis.
@@ -72,7 +68,7 @@ public abstract class CreateFunctionStmtBase extends StatementBase {
 
   protected CreateFunctionStmtBase(FunctionName fnName, FunctionArgs args,
       TypeDef retTypeDef, HdfsUri location, boolean ifNotExists,
-      HashMap<CreateFunctionStmtBase.OptArg, String> optArgs) {
+      Map<CreateFunctionStmtBase.OptArg, String> optArgs) {
     // The return and arg types must either be both null or non-null.
     Preconditions.checkState(!(args == null ^ retTypeDef == null));
     fnName_ = fnName;
@@ -146,8 +142,10 @@ public abstract class CreateFunctionStmtBase extends StatementBase {
       fn_ = createFunction(fnName_, null, null, false);
     }
 
-    analyzer.registerPrivReq(new PrivilegeRequest(
-        new AuthorizeableFn(fn_.dbName(), fn_.signatureString()), Privilege.CREATE));
+    analyzer.registerPrivReq(builder ->
+        builder.onFunction(fn_.dbName(), fn_.signatureString())
+            .allOf(Privilege.CREATE)
+            .build());
 
     db_ = analyzer.getDb(fn_.dbName(), true);
     Function existingFn = db_.getFunction(fn_, Function.CompareMode.IS_INDISTINGUISHABLE);
@@ -192,5 +190,5 @@ public abstract class CreateFunctionStmtBase extends StatementBase {
    * Creates a concrete function.
    */
   protected abstract Function createFunction(FunctionName fnName,
-      ArrayList<Type> argTypes, Type retType, boolean hasVarArgs);
+      List<Type> argTypes, Type retType, boolean hasVarArgs);
 }

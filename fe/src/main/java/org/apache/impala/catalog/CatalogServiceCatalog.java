@@ -21,6 +21,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -29,19 +30,29 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
-import com.google.common.annotations.VisibleForTesting;
+import org.apache.hadoop.fs.Hdfs;
 import org.apache.hadoop.fs.RemoteIterator;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
 import org.apache.hadoop.hdfs.protocol.CachePoolEntry;
 import org.apache.hadoop.hdfs.protocol.CachePoolInfo;
+import org.apache.hadoop.hive.metastore.api.CurrentNotificationEventId;
+import org.apache.hadoop.hive.metastore.api.Database;
 import org.apache.hadoop.hive.metastore.api.NoSuchObjectException;
+import org.apache.hadoop.hive.metastore.api.Partition;
 import org.apache.hadoop.hive.metastore.api.UnknownDBException;
-import org.apache.impala.authorization.SentryConfig;
+import org.apache.impala.analysis.TableName;
+import org.apache.impala.authorization.AuthorizationDelta;
+import org.apache.impala.authorization.AuthorizationManager;
+import org.apache.impala.authorization.AuthorizationPolicy;
 import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
+import org.apache.impala.catalog.events.ExternalEventsProcessor;
+import org.apache.impala.catalog.events.MetastoreEventsProcessor;
+import org.apache.impala.catalog.events.NoOpEventProcessor;
 import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.Pair;
@@ -57,12 +68,14 @@ import org.apache.impala.thrift.TCatalogObject;
 import org.apache.impala.thrift.TCatalogObjectType;
 import org.apache.impala.thrift.TCatalogUpdateResult;
 import org.apache.impala.thrift.TDatabase;
+import org.apache.impala.thrift.TEventProcessorMetrics;
+import org.apache.impala.thrift.TEventProcessorMetricsSummaryResponse;
 import org.apache.impala.thrift.TFunction;
 import org.apache.impala.thrift.TGetCatalogUsageResponse;
 import org.apache.impala.thrift.TGetPartialCatalogObjectRequest;
 import org.apache.impala.thrift.TGetPartialCatalogObjectResponse;
-import org.apache.impala.thrift.TPartialCatalogInfo;
 import org.apache.impala.thrift.TGetPartitionStatsRequest;
+import org.apache.impala.thrift.TPartialCatalogInfo;
 import org.apache.impala.thrift.TPartitionKeyValue;
 import org.apache.impala.thrift.TPartitionStats;
 import org.apache.impala.thrift.TPrincipalType;
@@ -72,20 +85,22 @@ import org.apache.impala.thrift.TTableName;
 import org.apache.impala.thrift.TTableUsage;
 import org.apache.impala.thrift.TTableUsageMetrics;
 import org.apache.impala.thrift.TUniqueId;
-import org.apache.impala.util.FunctionUtils;
 import org.apache.impala.thrift.TUpdateTableUsageRequest;
+import org.apache.impala.util.FunctionUtils;
 import org.apache.impala.util.PatternMatcher;
-import org.apache.impala.util.SentryProxy;
-import org.apache.log4j.Logger;
+import org.apache.impala.util.TUniqueIdUtil;
+import org.apache.impala.util.ThreadNameAnnotator;
 import org.apache.thrift.TException;
 import org.apache.thrift.TSerializer;
 import org.apache.thrift.protocol.TBinaryProtocol;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import com.codahale.metrics.Timer;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 
 
@@ -167,10 +182,16 @@ import com.google.common.collect.Sets;
  * loading thread pool.
  */
 public class CatalogServiceCatalog extends Catalog {
-  public static final Logger LOG = Logger.getLogger(CatalogServiceCatalog.class);
+  public static final Logger LOG = LoggerFactory.getLogger(CatalogServiceCatalog.class);
 
   private static final int INITIAL_META_STORE_CLIENT_POOL_SIZE = 10;
   private static final int MAX_NUM_SKIPPED_TOPIC_UPDATES = 2;
+  // Timeout for acquiring a table lock
+  // TODO: Make this configurable
+  private static final long TBL_LOCK_TIMEOUT_MS = 7200000;
+  // Time to sleep before retrying to acquire a table lock
+  private static final int TBL_LOCK_RETRY_MS = 10;
+
   private final TUniqueId catalogServiceId_;
 
   // Fair lock used to synchronize reads/writes of catalogVersion_. Because this lock
@@ -204,10 +225,6 @@ public class CatalogServiceCatalog extends Catalog {
   private final ScheduledExecutorService cachePoolReader_ =
       Executors.newScheduledThreadPool(1);
 
-  // Proxy to access the Sentry Service and also periodically refreshes the
-  // policy metadata. Null if Sentry Service is not enabled.
-  private final SentryProxy sentryProxy_;
-
   // Log of deleted catalog objects.
   private final CatalogDeltaLog deleteLog_;
 
@@ -225,6 +242,9 @@ public class CatalogServiceCatalog extends Catalog {
 
   private CatalogdTableInvalidator catalogdTableInvalidator_;
 
+  // Manages the event processing from metastore for issuing invalidates on tables
+  private ExternalEventsProcessor metastoreEventProcessor_;
+
   /**
    * See the gflag definition in be/.../catalog-server.cc for details on these modes.
    */
@@ -235,17 +255,32 @@ public class CatalogServiceCatalog extends Catalog {
   };
   final TopicMode topicMode_;
 
+  private final long PARTIAL_FETCH_RPC_QUEUE_TIMEOUT_S = BackendConfig.INSTANCE
+      .getCatalogPartialFetchRpcQueueTimeoutS();
+
+  private final int MAX_PARALLEL_PARTIAL_FETCH_RPC_COUNT = BackendConfig.INSTANCE
+      .getCatalogMaxParallelPartialFetchRpc();
+
+  // Controls concurrent access to doGetPartialCatalogObject() call. Limits the number
+  // of parallel requests to --catalog_max_parallel_partial_fetch_rpc.
+  private final Semaphore partialObjectFetchAccess_ =
+      new Semaphore(MAX_PARALLEL_PARTIAL_FETCH_RPC_COUNT, /*fair =*/ true);
+
+  private AuthorizationManager authzManager_;
+
   /**
-   * Initialize the CatalogServiceCatalog. If 'loadInBackground' is true, table metadata
-   * will be loaded in the background. 'initialHmsCnxnTimeoutSec' specifies the time (in
-   * seconds) CatalogServiceCatalog will wait to establish an initial connection to the
-   * HMS before giving up. Using this setting allows catalogd and HMS to be started
-   * simultaneously.
+   * Initialize the CatalogServiceCatalog using a given MetastoreClientPool impl.
+   *
+   * @param loadInBackground    If true, table metadata will be loaded in the background.
+   * @param numLoadingThreads   Number of threads used to load table metadata.
+   * @param metaStoreClientPool A pool of HMS clients backing this Catalog.
+   * @throws ImpalaException
    */
   public CatalogServiceCatalog(boolean loadInBackground, int numLoadingThreads,
-      int initialHmsCnxnTimeoutSec, SentryConfig sentryConfig, TUniqueId catalogServiceId,
-      String kerberosPrincipal, String localLibraryPath) throws ImpalaException {
-    super(INITIAL_META_STORE_CLIENT_POOL_SIZE, initialHmsCnxnTimeoutSec);
+      TUniqueId catalogServiceId, String localLibraryPath,
+      MetaStoreClientPool metaStoreClientPool)
+      throws ImpalaException {
+    super(metaStoreClientPool);
     catalogServiceId_ = catalogServiceId;
     tableLoadingMgr_ = new TableLoadingMgr(this, numLoadingThreads);
     loadInBackground_ = loadInBackground;
@@ -259,24 +294,72 @@ public class CatalogServiceCatalog extends Catalog {
     } catch (IOException e) {
       LOG.error("Couldn't identify the default FS. Cache Pool reader will be disabled.");
     }
-    if (sentryConfig != null) {
-      sentryProxy_ = new SentryProxy(sentryConfig, this, kerberosPrincipal);
-    } else {
-      sentryProxy_ = null;
-    }
     localLibraryPath_ = localLibraryPath;
     deleteLog_ = new CatalogDeltaLog();
     topicMode_ = TopicMode.valueOf(
         BackendConfig.INSTANCE.getBackendCfg().catalog_topic_mode.toUpperCase());
     catalogdTableInvalidator_ = CatalogdTableInvalidator.create(this,
         BackendConfig.INSTANCE);
+    metastoreEventProcessor_ = getEventsProcessor();
+    Preconditions.checkState(PARTIAL_FETCH_RPC_QUEUE_TIMEOUT_S > 0);
+    // start polling for metastore events
+    metastoreEventProcessor_.start();
   }
 
-  // Timeout for acquiring a table lock
-  // TODO: Make this configurable
-  private static final long TBL_LOCK_TIMEOUT_MS = 7200000;
-  // Time to sleep before retrying to acquire a table lock
-  private static final int TBL_LOCK_RETRY_MS = 10;
+  /**
+   * Initializes the Catalog using the default MetastoreClientPool impl.
+   * @param initialHmsCnxnTimeoutSec Time (in seconds) CatalogServiceCatalog will wait
+   * to establish an initial connection to the HMS before giving up.
+   */
+  public CatalogServiceCatalog(boolean loadInBackground, int numLoadingThreads,
+      int initialHmsCnxnTimeoutSec, TUniqueId catalogServiceId, String localLibraryPath)
+      throws ImpalaException {
+    this(loadInBackground, numLoadingThreads, catalogServiceId, localLibraryPath,
+        new MetaStoreClientPool(INITIAL_META_STORE_CLIENT_POOL_SIZE,
+            initialHmsCnxnTimeoutSec));
+  }
+
+  public void setAuthzManager(AuthorizationManager authzManager) {
+    authzManager_ = Preconditions.checkNotNull(authzManager);
+  }
+
+  /**
+   * Returns a Metastore event processor object if
+   * <code>BackendConfig#getHMSPollingIntervalInSeconds</code> returns a non-zero
+   *.value of polling interval. Otherwise, returns a no-op events processor. It is
+   * important to fetch the current notification event id at the Catalog service
+   * initialization time so that event processor starts to sync at the event id
+   * corresponding to the catalog start time.
+   */
+  private ExternalEventsProcessor getEventsProcessor() throws ImpalaException {
+    long eventPollingInterval = BackendConfig.INSTANCE.getHMSPollingIntervalInSeconds();
+    if (eventPollingInterval <= 0) {
+      LOG.info(String
+          .format("Metastore event processing is disabled. Event polling interval is %d",
+              eventPollingInterval));
+      return NoOpEventProcessor.getInstance();
+    }
+    try (MetaStoreClient metaStoreClient = getMetaStoreClient()) {
+      CurrentNotificationEventId currentNotificationId =
+          metaStoreClient.getHiveClient().getCurrentNotificationEventId();
+      return MetastoreEventsProcessor.getInstance(
+          this, currentNotificationId.getEventId(), eventPollingInterval);
+    } catch (TException e) {
+      LOG.error("Unable to fetch the current notification event id from metastore."
+          + "Metastore event processing will be disabled.", e);
+      throw new CatalogException(
+          "Fatal error while initializing metastore event processor", e);
+    }
+  }
+
+  @VisibleForTesting
+  public ExternalEventsProcessor getMetastoreEventProcessor() {
+    return metastoreEventProcessor_;
+  }
+
+  public boolean isExternalEventProcessingEnabled() {
+    return !(metastoreEventProcessor_ instanceof NoOpEventProcessor);
+  }
 
   /**
    * Tries to acquire versionLock_ and the lock of 'tbl' in that order. Returns true if it
@@ -284,28 +367,31 @@ public class CatalogServiceCatalog extends Catalog {
    * when the function returns. Returns false otherwise and no lock is held in this case.
    */
   public boolean tryLockTable(Table tbl) {
-    long begin = System.currentTimeMillis();
-    long end;
-    do {
-      versionLock_.writeLock().lock();
-      if (tbl.getLock().tryLock()) {
-        if (LOG.isTraceEnabled()) {
-          end = System.currentTimeMillis();
-          LOG.trace(String.format("Lock for table %s was acquired in %d msec",
-              tbl.getFullName(), end - begin));
+    try (ThreadNameAnnotator tna = new ThreadNameAnnotator(
+        "Attempting to lock table " + tbl.getFullName())) {
+      long begin = System.currentTimeMillis();
+      long end;
+      do {
+        versionLock_.writeLock().lock();
+        if (tbl.getLock().tryLock()) {
+          if (LOG.isTraceEnabled()) {
+            end = System.currentTimeMillis();
+            LOG.trace(String.format("Lock for table %s was acquired in %d msec",
+                tbl.getFullName(), end - begin));
+          }
+          return true;
         }
-        return true;
-      }
-      versionLock_.writeLock().unlock();
-      try {
-        // Sleep to avoid spinning and allow other operations to make progress.
-        Thread.sleep(TBL_LOCK_RETRY_MS);
-      } catch (InterruptedException e) {
-        // ignore
-      }
-      end = System.currentTimeMillis();
-    } while (end - begin < TBL_LOCK_TIMEOUT_MS);
-    return false;
+        versionLock_.writeLock().unlock();
+        try {
+          // Sleep to avoid spinning and allow other operations to make progress.
+          Thread.sleep(TBL_LOCK_RETRY_MS);
+        } catch (InterruptedException e) {
+          // ignore
+        }
+        end = System.currentTimeMillis();
+      } while (end - begin < TBL_LOCK_TIMEOUT_MS);
+      return false;
+    }
   }
 
   /**
@@ -326,12 +412,13 @@ public class CatalogServiceCatalog extends Catalog {
       incrementVersions_ = incrementVersions;
     }
 
+    @Override
     public void run() {
       if (LOG.isTraceEnabled()) LOG.trace("Reloading cache pool names from HDFS");
 
       // Map of cache pool name to CachePoolInfo. Stored in a map to allow Set operations
       // to be performed on the keys.
-      Map<String, CachePoolInfo> currentCachePools = Maps.newHashMap();
+      Map<String, CachePoolInfo> currentCachePools = new HashMap<>();
       try {
         DistributedFileSystem dfs = FileSystemUtil.getDistributedFileSystem();
         RemoteIterator<CachePoolEntry> itr = dfs.listCachePools();
@@ -385,6 +472,10 @@ public class CatalogServiceCatalog extends Catalog {
         versionLock_.writeLock().unlock();
       }
     }
+  }
+
+  public int getPartialFetchRpcQueueLength() {
+    return partialObjectFetchAccess_.getQueueLength();
   }
 
   /**
@@ -445,7 +536,7 @@ public class CatalogServiceCatalog extends Catalog {
     // Table must be loaded.
     Preconditions.checkState(table.isLoaded());
 
-    Map<String, ByteBuffer> stats = Maps.newHashMap();
+    Map<String, ByteBuffer> stats = new HashMap<>();
     HdfsTable hdfsTable = (HdfsTable) table;
     hdfsTable.getLock().lock();
     try {
@@ -547,6 +638,7 @@ public class CatalogServiceCatalog extends Catalog {
         return obj;
       case PRIVILEGE:
       case PRINCIPAL:
+      case AUTHZ_CACHE_INVALIDATION:
         // The caching of this data on the impalad side is somewhat complex
         // and this code is also under some churn at the moment. So, we'll just publish
         // the full information rather than doing fetch-on-demand.
@@ -596,6 +688,9 @@ public class CatalogServiceCatalog extends Catalog {
     for (User user: getAllUsers()) {
       addPrincipalToCatalogDelta(user, ctx);
     }
+    for (AuthzCacheInvalidation authzCacheInvalidation: getAllAuthzCacheInvalidation()) {
+      addAuthzCacheInvalidationToCatalogDelta(authzCacheInvalidation, ctx);
+    }
     // Identify the catalog objects that were removed from the catalog for which their
     // versions are in range ('ctx.fromVersion', 'ctx.toVersion']. We need to make sure
     // that we don't include "deleted" objects that were re-added to the catalog.
@@ -626,6 +721,109 @@ public class CatalogServiceCatalog extends Catalog {
     return ctx.toVersion;
   }
 
+  /**
+   * Gets the list of versions for in-flight events for the given table. Applicable
+   * only when external event processing is enabled.
+   * @param dbName database name
+   * @param tblName table name
+   * @return List of previous version numbers for in-flight events on this table.
+   * If table is not laoded returns a empty list. If event processing is disabled,
+   * returns a empty list
+   */
+  public List<Long> getInFlightVersionsForEvents(String dbName, String tblName)
+      throws DatabaseNotFoundException, TableNotFoundException {
+    Preconditions.checkState(isExternalEventProcessingEnabled(),
+        "Event processing should be enabled before calling this method");
+    List<Long> result = Collections.EMPTY_LIST;
+    versionLock_.readLock().lock();
+    try {
+      Db db = getDb(dbName);
+      if (db == null) {
+        throw new DatabaseNotFoundException(
+            String.format("Database %s not found", dbName));
+      }
+      if (tblName == null) {
+        return db.getVersionsForInflightEvents();
+      }
+      Table tbl = getTable(dbName, tblName);
+      if (tbl == null) {
+        throw new TableNotFoundException(
+            String.format("Table %s not found", new TableName(dbName, tblName)));
+      }
+      if (tbl instanceof IncompleteTable) return result;
+      return tbl.getVersionsForInflightEvents();
+    } finally {
+      versionLock_.readLock().unlock();
+    }
+  }
+
+  /**
+   * Removes a given version number from the catalog database/table's list of versions
+   * for in-flight events.
+   * If tblName is null, removes version number from database.
+   * If tblName not null and table is not incomplete, removes version number from table
+   * Applicable only when external event processing is enabled.
+   * @param dbName database name
+   * @param tblName table name
+   */
+  public void removeFromInFlightVersionsForEvents(String dbName, String tblName,
+      long versionNumber) throws DatabaseNotFoundException, TableNotFoundException {
+    Preconditions.checkState(isExternalEventProcessingEnabled(),
+        "Event processing should be enabled when calling this method");
+    versionLock_.writeLock().lock();
+    try {
+      Db db = getDb(dbName);
+      if (db == null) return;
+      if (tblName == null) {
+        db.removeFromVersionsForInflightEvents(versionNumber);
+        return;
+      }
+      Table tbl = getTable(dbName, tblName);
+      if (tbl == null) {
+        throw new TableNotFoundException(
+            String.format("Table %s not found", new TableName(dbName, tblName)));
+      }
+      if (tbl instanceof IncompleteTable) return;
+      tbl.removeFromVersionsForInflightEvents(versionNumber);
+    } finally {
+      versionLock_.writeLock().unlock();
+    }
+  }
+
+  /**
+   * Adds a given version number from the catalog table's list of versions for in-flight
+   * events. Applicable only when external event processing is enabled.
+   *
+   * @param tbl Catalog table
+   * @param versionNumber version number to be added
+   */
+  public void addVersionsForInflightEvents(Table tbl, long versionNumber) {
+    if (!isExternalEventProcessingEnabled()) return;
+    versionLock_.writeLock().lock();
+    try {
+      if (tbl instanceof IncompleteTable) return;
+      tbl.addToVersionsForInflightEvents(versionNumber);
+    } finally {
+      versionLock_.writeLock().unlock();
+    }
+  }
+
+  /**
+   * Adds a given version number from the catalog database's list of versions for
+   * in-flight events. Applicable only when external event processing is enabled.
+   *
+   * @param db Catalog database
+   * @param versionNumber version number to be added
+   */
+  public void addVersionsForInflightEvents(Db db, long versionNumber) {
+    if (!isExternalEventProcessingEnabled()) return;
+    versionLock_.writeLock().lock();
+    try {
+      db.addToVersionsForInflightEvents(versionNumber);
+    } finally {
+      versionLock_.writeLock().unlock();
+    }
+  }
 
   /**
    * Get a snapshot view of all the catalog objects that were deleted between versions
@@ -701,6 +899,18 @@ public class CatalogServiceCatalog extends Catalog {
   }
 
   /**
+   * Get a snapshot view of all authz cache invalidation markers in the catalog.
+   */
+  private List<AuthzCacheInvalidation> getAllAuthzCacheInvalidation() {
+    versionLock_.readLock().lock();
+    try {
+      return ImmutableList.copyOf(authzCacheInvalidation_);
+    } finally {
+      versionLock_.readLock().unlock();
+    }
+  }
+
+  /**
    * Adds a database in the topic update if its version is in the range
    * ('ctx.fromVersion', 'ctx.toVersion']. It iterates through all the tables and
    * functions of this database to determine if they can be included in the topic update.
@@ -749,6 +959,82 @@ public class CatalogServiceCatalog extends Catalog {
   }
 
   /**
+   * Given a database name and a property key returns the value of the key from the
+   * parameters map of the HMS db object
+   * @param dbName name of the database
+   * @param propertyKey property key
+   * @return value of key from the db parameter. returns null if Db is not found or key
+   * does not exist in the parameters
+   */
+  public String getDbProperty(String dbName, String propertyKey) {
+    Preconditions.checkNotNull(dbName);
+    Preconditions.checkNotNull(propertyKey);
+    versionLock_.readLock().lock();
+    try {
+      Db db = getDb(dbName);
+      if (db == null) return null;
+      if (!db.getMetaStoreDb().isSetParameters()) return null;
+      return db.getMetaStoreDb().getParameters().get(propertyKey);
+    } finally {
+      versionLock_.readLock().unlock();
+    }
+  }
+
+  /**
+   * Given a dbname, table name and a key returns the value of the key from the cached
+   * Table object's parameters
+   * @return Value of the parameter which maps to property key, null if the table
+   * doesn't exist, if it is a incomplete table or if the parameter is not found
+   */
+  public List<String> getTableProperties(
+      String dbName, String tblName, List<String> propertyKeys) {
+    Preconditions.checkNotNull(dbName);
+    Preconditions.checkNotNull(tblName);
+    Preconditions.checkNotNull(propertyKeys);
+    versionLock_.readLock().lock();
+    try {
+      Db db = getDb(dbName);
+      if (db == null) return null;
+      Table tbl = db.getTable(tblName);
+      if (tbl == null || tbl instanceof IncompleteTable) return null;
+      if (!tbl.getMetaStoreTable().isSetParameters()) return null;
+      List<String> propertyValues = new ArrayList<>(propertyKeys.size());
+      for (String propertyKey : propertyKeys) {
+        propertyValues.add(tbl.getMetaStoreTable().getParameters().get(propertyKey));
+      }
+      return propertyValues;
+    } finally {
+      versionLock_.readLock().unlock();
+    }
+  }
+
+  /**
+   * Updates the Db with the given metastore database object. Useful to doing in-place
+   * updates to the HMS db like in case of changing owner, adding comment or setting
+   * certain properties
+   * @param msDb The HMS database object to be used to update
+   * @return The updated Db object
+   * @throws DatabaseNotFoundException if Db with the name provided by given Database
+   * is not found in Catalog
+   */
+  public Db updateDb(Database msDb) throws DatabaseNotFoundException {
+    Preconditions.checkNotNull(msDb);
+    Preconditions.checkNotNull(msDb.getName());
+    versionLock_.writeLock().lock();
+    try {
+      Db db = getDb(msDb.getName());
+      if (db == null) {
+        throw new DatabaseNotFoundException("Database " + msDb.getName() + " not found");
+      }
+      db.setMetastoreDb(msDb.getName(), msDb);
+      db.setCatalogVersion(incrementAndGetCatalogVersion());
+      return db;
+    } finally {
+      versionLock_.writeLock().unlock();
+    }
+  }
+
+  /**
    * Adds a table in the topic update if its version is in the range
    * ('ctx.fromVersion', 'ctx.toVersion']. If the table's version is larger than
    * 'ctx.toVersion' and the table has skipped a topic update
@@ -791,13 +1077,14 @@ public class CatalogServiceCatalog extends Catalog {
     try {
       long tblVersion = tbl.getCatalogVersion();
       if (tblVersion <= ctx.fromVersion) return;
+      String tableUniqueName = tbl.getUniqueName();
       TopicUpdateLog.Entry topicUpdateEntry =
-          topicUpdateLog_.getOrCreateLogEntry(tbl.getUniqueName());
+          topicUpdateLog_.getOrCreateLogEntry(tableUniqueName);
       if (tblVersion > ctx.toVersion &&
           topicUpdateEntry.getNumSkippedTopicUpdates() < MAX_NUM_SKIPPED_TOPIC_UPDATES) {
         LOG.info("Table " + tbl.getFullName() + " is skipping topic update " +
             ctx.toVersion);
-        topicUpdateLog_.add(tbl.getUniqueName(),
+        topicUpdateLog_.add(tableUniqueName,
             new TopicUpdateLog.Entry(
                 topicUpdateEntry.getNumSkippedTopicUpdates() + 1,
                 topicUpdateEntry.getLastSentVersion(),
@@ -910,6 +1197,22 @@ public class CatalogServiceCatalog extends Catalog {
   }
 
   /**
+   * Adds an authz cache invalidation to the topic update if its version is in the range
+   * ('ctx.fromVersion', 'ctx.toVersion'].
+   */
+  private void addAuthzCacheInvalidationToCatalogDelta(
+      AuthzCacheInvalidation authzCacheInvalidation, GetCatalogDeltaContext ctx)
+      throws TException  {
+    long authzCacheInvalidationVersion = authzCacheInvalidation.getCatalogVersion();
+    if (authzCacheInvalidationVersion <= ctx.fromVersion ||
+        authzCacheInvalidationVersion > ctx.toVersion) return;
+    TCatalogObject catalogObj = new TCatalogObject(
+        TCatalogObjectType.AUTHZ_CACHE_INVALIDATION, authzCacheInvalidationVersion);
+    catalogObj.setAuthz_cache_invalidation(authzCacheInvalidation.toThrift());
+    ctx.addCatalogObject(catalogObj, false);
+  }
+
+  /**
    * Returns all user defined functions (aggregate and scalar) in the specified database.
    * Functions are not returned in a defined order.
    */
@@ -920,8 +1223,8 @@ public class CatalogServiceCatalog extends Catalog {
     }
 
     // Contains map of overloaded function names to all functions matching that name.
-    HashMap<String, List<Function>> dbFns = db.getAllFunctions();
-    List<Function> fns = new ArrayList<Function>(dbFns.size());
+    Map<String, List<Function>> dbFns = db.getAllFunctions();
+    List<Function> fns = new ArrayList<>(dbFns.size());
     for (List<Function> fnOverloads: dbFns.values()) {
       for (Function fn: fnOverloads) {
         fns.add(fn);
@@ -988,14 +1291,14 @@ public class CatalogServiceCatalog extends Catalog {
     Db tmpDb;
     try {
       List<org.apache.hadoop.hive.metastore.api.Function> javaFns =
-          Lists.newArrayList();
+          new ArrayList<>();
       for (String javaFn : msClient.getHiveClient().getFunctions(dbName, "*")) {
         javaFns.add(msClient.getHiveClient().getFunction(dbName, javaFn));
       }
       // Contains native functions in it's params map.
       org.apache.hadoop.hive.metastore.api.Database msDb =
           msClient.getHiveClient().getDatabase(dbName);
-      tmpDb = new Db(dbName, null);
+      tmpDb = new Db(dbName, msDb);
       // Load native UDFs into the temporary db.
       loadFunctionsFromDbParams(tmpDb, msDb);
       // Load Java UDFs from HMS into the temporary db.
@@ -1050,7 +1353,7 @@ public class CatalogServiceCatalog extends Catalog {
       MetaStoreClient msClient, String dbName, Db existingDb) {
     try {
       List<org.apache.hadoop.hive.metastore.api.Function> javaFns =
-          Lists.newArrayList();
+          new ArrayList<>();
       for (String javaFn: msClient.getHiveClient().getFunctions(dbName, "*")) {
         javaFns.add(msClient.getHiveClient().getFunction(dbName, javaFn));
       }
@@ -1073,7 +1376,7 @@ public class CatalogServiceCatalog extends Catalog {
       loadJavaFunctions(newDb, javaFns);
       newDb.setCatalogVersion(incrementAndGetCatalogVersion());
 
-      List<TTableName> tblsToBackgroundLoad = Lists.newArrayList();
+      List<TTableName> tblsToBackgroundLoad = new ArrayList<>();
       for (String tableName: msClient.getHiveClient().getAllTables(dbName)) {
         Table incompleteTbl = IncompleteTable.createUninitializedTable(newDb, tableName);
         incompleteTbl.setCatalogVersion(incrementAndGetCatalogVersion());
@@ -1116,6 +1419,20 @@ public class CatalogServiceCatalog extends Catalog {
   }
 
   /**
+   * Refreshes authorization metadata. When authorization is not enabled, this
+   * method is a no-op.
+   */
+  public AuthorizationDelta refreshAuthorization(boolean resetVersions)
+      throws CatalogException {
+    Preconditions.checkState(authzManager_ != null);
+    try {
+      return authzManager_.refreshAuthorization(resetVersions);
+    } catch (Exception e) {
+      throw new CatalogException("Error refreshing authorization policy: ", e);
+    }
+  }
+
+  /**
    * Resets this catalog instance by clearing all cached table and database metadata.
    * Returns the current catalog version before reset has taken any effect. The
    * requesting impalad will use that version to determine when the
@@ -1125,20 +1442,24 @@ public class CatalogServiceCatalog extends Catalog {
     long currentCatalogVersion = getCatalogVersion();
     LOG.info("Invalidating all metadata. Version: " + currentCatalogVersion);
     // First update the policy metadata.
-    if (sentryProxy_ != null) {
-      // Sentry Service is enabled.
-      try {
-        // Update the authorization policy, waiting for the result to complete.
-        sentryProxy_.refresh(true);
-      } catch (Exception e) {
-        throw new CatalogException("Error updating authorization policy: ", e);
-      }
-    }
+    refreshAuthorization(true);
 
+    // Even though we get the current notification event id before stopping the event
+    // processing here there is a small window of time where we could re-process some of
+    // the event ids, if there is external DDL activity on metastore during reset.
+    // Unfortunately, there is no good way to avoid this since HMS does not provide
+    // APIs which can fetch all the tables/databases at a given id. It is OKAY to
+    // re-process some of these events since event processor relies on creationTime of
+    // the objects to uniquely identify tables from create and drop events. In case of
+    // alter events, however it is likely that some tables would be unnecessarily
+    // invalidated. That would happen when during reset, there were external alter events
+    // and by the time we processed them, Catalog had already loaded them.
+    long currentEventId = metastoreEventProcessor_.getCurrentEventId();
+    // pause the event processing since the cache is anyways being cleared
+    metastoreEventProcessor_.pause();
     // Update the HDFS cache pools
     CachePoolReader reader = new CachePoolReader(true);
     reader.run();
-
     versionLock_.writeLock().lock();
     // In case of an empty new catalog, the version should still change to reflect the
     // reset operation itself and to unblock impalads by making the catalog version >
@@ -1157,17 +1478,23 @@ public class CatalogServiceCatalog extends Catalog {
 
       // Build a new DB cache, populate it, and replace the existing cache in one
       // step.
-      ConcurrentHashMap<String, Db> newDbCache = new ConcurrentHashMap<String, Db>();
-      List<TTableName> tblsToBackgroundLoad = Lists.newArrayList();
+      Map<String, Db> newDbCache = new ConcurrentHashMap<String, Db>();
+      List<TTableName> tblsToBackgroundLoad = new ArrayList<>();
       try (MetaStoreClient msClient = getMetaStoreClient()) {
-        for (String dbName: msClient.getHiveClient().getAllDatabases()) {
-          dbName = dbName.toLowerCase();
-          Db oldDb = oldDbCache.get(dbName);
-          Pair<Db, List<TTableName>> invalidatedDb = invalidateDb(msClient,
-              dbName, oldDb);
-          if (invalidatedDb == null) continue;
-          newDbCache.put(dbName, invalidatedDb.first);
-          tblsToBackgroundLoad.addAll(invalidatedDb.second);
+        List<String> allDbs = msClient.getHiveClient().getAllDatabases();
+        int numComplete = 0;
+        for (String dbName: allDbs) {
+          String annotation = String.format("invalidating metadata - %s/%s dbs complete",
+              numComplete++, allDbs.size());
+          try (ThreadNameAnnotator tna = new ThreadNameAnnotator(annotation)) {
+            dbName = dbName.toLowerCase();
+            Db oldDb = oldDbCache.get(dbName);
+            Pair<Db, List<TTableName>> invalidatedDb = invalidateDb(msClient,
+                dbName, oldDb);
+            if (invalidatedDb == null) continue;
+            newDbCache.put(dbName, invalidatedDb.first);
+            tblsToBackgroundLoad.addAll(invalidatedDb.second);
+          }
         }
       }
       dbCache_.set(newDbCache);
@@ -1186,10 +1513,12 @@ public class CatalogServiceCatalog extends Catalog {
         tableLoadingMgr_.backgroundLoad(tblName);
       }
     } catch (Exception e) {
-      LOG.error(e);
+      LOG.error("Error initializing Catalog", e);
       throw new CatalogException("Error initializing Catalog. Catalog may be empty.", e);
     } finally {
       versionLock_.writeLock().unlock();
+      // restart the event processing for id just before the reset
+      metastoreEventProcessor_.start(currentEventId);
     }
     LOG.info("Invalidated all metadata.");
     return currentCatalogVersion;
@@ -1212,6 +1541,25 @@ public class CatalogServiceCatalog extends Catalog {
   }
 
   /**
+   * Adds a database name to the metadata cache if not exists and returns the
+   * true is a new Db Object was added. Used by MetastoreEventProcessor to handle
+   * CREATE_DATABASE events
+   */
+  public boolean addDbIfNotExists(
+      String dbName, org.apache.hadoop.hive.metastore.api.Database msDb) {
+    versionLock_.writeLock().lock();
+    try {
+      Db db = getDb(dbName);
+      if (db == null) {
+        return addDb(dbName, msDb) != null;
+      }
+      return false;
+    } finally {
+      versionLock_.writeLock().unlock();
+    }
+  }
+
+  /**
    * Removes a database from the metadata cache and returns the removed database,
    * or null if the database did not exist in the cache.
    * Used by DROP DATABASE statements.
@@ -1223,6 +1571,39 @@ public class CatalogServiceCatalog extends Catalog {
       Db removedDb = super.removeDb(dbName);
       if (removedDb != null) updateDeleteLog(removedDb);
       return removedDb;
+    } finally {
+      versionLock_.writeLock().unlock();
+    }
+  }
+
+  /**
+   * @param msDb Metastore Database used to remove Db from Catalog
+   * @param dbFound Set to true if Database is found in Catalog
+   * @param dbMatched Set to true if Database is found in Catalog and it's CREATION_TIME
+   * is equal to the metastore DB
+   * @return the DB object removed. Return null if DB does not exist or was not removed
+   * because CREATION_TIME does not match.
+   */
+  public Db removeDbIfExists(org.apache.hadoop.hive.metastore.api.Database msDb,
+      Reference<Boolean> dbFound, Reference<Boolean> dbMatched) {
+    dbFound.setRef(false);
+    dbMatched.setRef(false);
+    versionLock_.writeLock().lock();
+    try {
+      String dbName = msDb.getName();
+      Db catalogDb = getDb(dbName);
+      if (catalogDb == null) return null;
+
+      dbFound.setRef(true);
+      // Remove the DB only if the CREATION_TIME matches with the metastore DB from event.
+      if (msDb.getCreateTime() == catalogDb.getMetaStoreDb().getCreateTime()) {
+        Db removedDb = removeDb(dbName);
+        if (removedDb != null) {
+          dbMatched.setRef(true);
+          return removedDb;
+        }
+      }
+      return null;
     } finally {
       versionLock_.writeLock().unlock();
     }
@@ -1251,6 +1632,31 @@ public class CatalogServiceCatalog extends Catalog {
   }
 
   /**
+   * Adds table with the given db and table name to the catalog if it does not exists.
+   * @return true if the table was successfully added and false if the table already
+   * exists
+   * @throws CatalogException if the db is not found
+   */
+  public boolean addTableIfNotExists(String dbName, String tblName)
+      throws CatalogException {
+    versionLock_.writeLock().lock();
+    try {
+      Db db = getDb(dbName);
+      if (db == null) {
+        throw new CatalogException(String.format("Db %s does not exist", dbName));
+      }
+      Table existingTable = db.getTable(tblName);
+      if (existingTable != null) return false;
+      Table incompleteTable = IncompleteTable.createUninitializedTable(db, tblName);
+      incompleteTable.setCatalogVersion(incrementAndGetCatalogVersion());
+      db.addTable(incompleteTable);
+      return true;
+    } finally {
+      versionLock_.writeLock().unlock();
+    }
+  }
+
+  /**
    * Adds a table with the given name to the catalog and returns the new table,
    * loading the metadata if needed.
    */
@@ -1266,6 +1672,19 @@ public class CatalogServiceCatalog extends Catalog {
       versionLock_.writeLock().unlock();
     }
     return db.getTable(tblName);
+  }
+
+  /**
+   * Adds a table 'table' to the database 'db' and returns the table that was added.
+   */
+  public Table addTable(Db db, Table table) {
+    versionLock_.writeLock().lock();
+    try {
+      Preconditions.checkNotNull(db).addTable(Preconditions.checkNotNull(table));
+    } finally {
+      versionLock_.writeLock().unlock();
+    }
+    return table;
   }
 
   /**
@@ -1326,6 +1745,50 @@ public class CatalogServiceCatalog extends Catalog {
       updatedTbl.setCatalogVersion(incrementAndGetCatalogVersion());
       db.addTable(updatedTbl);
       return updatedTbl;
+    } finally {
+      versionLock_.writeLock().unlock();
+    }
+  }
+
+  /**
+   * Remove a catalog table based on the given metastore table if it exists and its
+   * createTime matches with the metastore table
+   *
+   * @param msTable Metastore table to be used to remove Table
+   * @param tblWasfound is set to true if the table was found in the catalog
+   * @param tblMatched is set to true if the table is found and it matched with the
+   * createTime of the cached metastore table in catalog or if the existing table is a
+   * incomplete table
+   * @return Removed table object. Return null if the table was not removed
+   */
+  public Table removeTableIfExists(org.apache.hadoop.hive.metastore.api.Table msTable,
+      Reference<Boolean> tblWasfound, Reference<Boolean> tblMatched) {
+    tblWasfound.setRef(false);
+    tblMatched.setRef(false);
+    // make sure that the createTime of the input table is valid
+    Preconditions.checkState(msTable.getCreateTime() > 0);
+    versionLock_.writeLock().lock();
+    try {
+      Db db = getDb(msTable.getDbName());
+      if (db == null) return null;
+
+      Table tblToBeRemoved = db.getTable(msTable.getTableName());
+      if (tblToBeRemoved == null) return null;
+
+      tblWasfound.setRef(true);
+      // make sure that you are removing the same instance of the table object which
+      // is given by comparing the metastore createTime. In case the found table is a
+      // Incomplete table remove it
+      if (tblToBeRemoved instanceof IncompleteTable
+          || (msTable.getCreateTime()
+                 == tblToBeRemoved.getMetaStoreTable().getCreateTime())) {
+        tblMatched.setRef(true);
+        Table removedTbl = db.removeTable(tblToBeRemoved.getName());
+        removedTbl.setCatalogVersion(incrementAndGetCatalogVersion());
+        deleteLog_.addRemovedObject(removedTbl.toMinimalTCatalogObject());
+        return removedTbl;
+      }
+      return null;
     } finally {
       versionLock_.writeLock().unlock();
     }
@@ -1435,8 +1898,8 @@ public class CatalogServiceCatalog extends Catalog {
    * 3. T_old, null: Old table was removed but new table was not added.
    * 4. T_old, T_new: Old table was removed and new table was added.
    */
-  public Pair<Table, Table> renameTable(TTableName oldTableName, TTableName newTableName)
-      throws CatalogException {
+  public Pair<Table, Table> renameTable(
+      TTableName oldTableName, TTableName newTableName) {
     // Remove the old table name from the cache and add the new table.
     Db db = getDb(oldTableName.getDb_name());
     if (db == null) return null;
@@ -1447,6 +1910,36 @@ public class CatalogServiceCatalog extends Catalog {
       if (oldTable == null) return Pair.create(null, null);
       return Pair.create(oldTable,
           addTable(newTableName.getDb_name(), newTableName.getTable_name()));
+    } finally {
+      versionLock_.writeLock().unlock();
+    }
+  }
+
+  /**
+   * Renames the table by atomically removing oldTable and adding the newTable. If the
+   * oldTable is not found this operation becomes a add new table if not exists
+   * operation.
+   *
+   * @return a pair of booleans. The first of the pair is set if the oldTableName was
+   *     found and removed. The second boolean is set if the new table didn't exist before
+   *     and hence was added.
+   */
+  public Pair<Boolean, Boolean> renameOrAddTableIfNotExists(TTableName oldTableName,
+      TTableName newTableName)
+      throws CatalogException {
+    boolean oldTableRemoved = false;
+    boolean newTableAdded;
+    versionLock_.writeLock().lock();
+    try {
+      Db db = getDb(oldTableName.db_name);
+      if (db != null) {
+        // remove the oldTable if it exists
+        oldTableRemoved =
+            removeTable(oldTableName.db_name, oldTableName.table_name) != null;
+      }
+      // add the new tbl if it doesn't exist
+      newTableAdded = addTableIfNotExists(newTableName.db_name, newTableName.table_name);
+      return new Pair<>(oldTableRemoved, newTableAdded);
     } finally {
       versionLock_.writeLock().unlock();
     }
@@ -1623,6 +2116,58 @@ public class CatalogServiceCatalog extends Catalog {
   }
 
   /**
+   * Invalidate the table if it exists by overwriting existing entry by a Incomplete
+   * Table.
+   * @return null if the table does not exist else return the invalidated table
+   */
+  public Table invalidateTableIfExists(String dbName, String tblName) {
+    Table incompleteTable;
+    versionLock_.writeLock().lock();
+    try {
+      Db db = getDb(dbName);
+      if (db == null) return null;
+      if (!db.containsTable(tblName)) return null;
+      incompleteTable = IncompleteTable.createUninitializedTable(db, tblName);
+      incompleteTable.setCatalogVersion(incrementAndGetCatalogVersion());
+      db.addTable(incompleteTable);
+    } finally {
+      versionLock_.writeLock().unlock();
+    }
+    if (loadInBackground_) {
+      tableLoadingMgr_.backgroundLoad(
+          new TTableName(dbName.toLowerCase(), tblName.toLowerCase()));
+    }
+    return incompleteTable;
+  }
+
+  /**
+   * Refresh partition if it exists. Returns true if reload of the partition succeeds,
+   * false otherwise.
+   * @throws CatalogException if partition reload is unsuccessful.
+   * @throws DatabaseNotFoundException if Db doesn't exist.
+   */
+  public boolean reloadPartitionIfExists(String dbName, String tblName,
+      List<TPartitionKeyValue> tPartSpec) throws CatalogException {
+    Table table = getTable(dbName, tblName);
+    if (table == null || table instanceof IncompleteTable) return false;
+    reloadPartition(table, tPartSpec);
+    return true;
+  }
+
+  /**
+   * Refresh table if exists. Returns true if reloadTable() succeeds, false
+   * otherwise. Throws CatalogException if reloadTable() is unsuccessful. Throws
+   * DatabaseNotFoundException if Db doesn't exist.
+   */
+  public boolean refreshTableIfExists(String dbName, String tblName)
+      throws CatalogException {
+    Table table = getTable(dbName, tblName);
+    if (table == null || table instanceof IncompleteTable) return false;
+    reloadTable(table);
+    return true;
+  }
+
+  /**
    * Adds a new role with the given name and grant groups to the AuthorizationPolicy.
    * If a role with the same name already exists it will be overwritten.
    */
@@ -1637,7 +2182,7 @@ public class CatalogServiceCatalog extends Catalog {
    * If a user with the same name already exists it will be overwritten.
    */
   public User addUser(String userName) {
-    Principal user = addPrincipal(userName, Sets.<String>newHashSet(),
+    Principal user = addPrincipal(userName, new HashSet<>(),
         TPrincipalType.USER);
     Preconditions.checkState(user instanceof User);
     return (User) user;
@@ -1855,6 +2400,42 @@ public class CatalogServiceCatalog extends Catalog {
     }
   }
 
+  @Override
+  public AuthzCacheInvalidation getAuthzCacheInvalidation(String markerName) {
+    versionLock_.readLock().lock();
+    try {
+      return authzCacheInvalidation_.get(markerName);
+    } finally {
+      versionLock_.readLock().unlock();;
+    }
+  }
+
+  /**
+   * Gets the {@link AuthzCacheInvalidation} for a given marker name or creates a new
+   * {@link AuthzCacheInvalidation} if it does not exist and increment the catalog
+   * version of {@link AuthzCacheInvalidation}. A catalog version update indicates a
+   * an authorization cache invalidation notification.
+   *
+   * @param markerName the authorization cache invalidation marker name
+   * @return the updated {@link AuthzCacheInvalidation} instance
+   */
+  public AuthzCacheInvalidation incrementAuthzCacheInvalidationVersion(
+      String markerName) {
+    versionLock_.writeLock().lock();
+    try {
+      AuthzCacheInvalidation authzCacheInvalidation = getAuthzCacheInvalidation(
+          markerName);
+      if (authzCacheInvalidation == null) {
+        authzCacheInvalidation = new AuthzCacheInvalidation(markerName);
+        authzCacheInvalidation_.add(authzCacheInvalidation);
+      }
+      authzCacheInvalidation.setCatalogVersion(incrementAndGetCatalogVersion());
+      return authzCacheInvalidation;
+    } finally {
+      versionLock_.writeLock().unlock();
+    }
+  }
+
   /**
    * Increments the current Catalog version and returns the new value.
    */
@@ -1880,7 +2461,6 @@ public class CatalogServiceCatalog extends Catalog {
   }
 
   public ReentrantReadWriteLock getLock() { return versionLock_; }
-  public SentryProxy getSentryProxy() { return sentryProxy_; }
   public AuthorizationPolicy getAuthPolicy() { return authPolicy_; }
 
   /**
@@ -1954,8 +2534,9 @@ public class CatalogServiceCatalog extends Catalog {
     // an operation using SYNC_DDL must wait for.
     long maxNumAttempts = 5;
     if (result.isSetUpdated_catalog_objects()) {
-      maxNumAttempts =
-          result.getUpdated_catalog_objects().size() * (MAX_NUM_SKIPPED_TOPIC_UPDATES + 1);
+      maxNumAttempts = Math.max(maxNumAttempts,
+          result.getUpdated_catalog_objects().size() *
+              (MAX_NUM_SKIPPED_TOPIC_UPDATES + 1));
     }
     long numAttempts = 0;
     long begin = System.currentTimeMillis();
@@ -1985,6 +2566,10 @@ public class CatalogServiceCatalog extends Catalog {
         if (lastSentTopicUpdate != currentTopicUpdate) {
           ++numAttempts;
           if (numAttempts > maxNumAttempts) {
+            LOG.error(String.format("Couldn't retrieve the covering topic version for "
+                + "catalog objects. Updated objects: %s, deleted objects: %s",
+                FeCatalogUtils.debugString(result.updated_catalog_objects),
+                FeCatalogUtils.debugString(result.removed_catalog_objects)));
             throw new CatalogException("Couldn't retrieve the catalog topic version " +
                 "for the SYNC_DDL operation after " + maxNumAttempts + " attempts." +
                 "The operation has been successfully executed but its effects may have " +
@@ -2045,8 +2630,9 @@ public class CatalogServiceCatalog extends Catalog {
    */
   public TGetCatalogUsageResponse getCatalogUsage() {
     TGetCatalogUsageResponse usage = new TGetCatalogUsageResponse();
-    usage.setLarge_tables(Lists.<TTableUsageMetrics>newArrayList());
-    usage.setFrequently_accessed_tables(Lists.<TTableUsageMetrics>newArrayList());
+    usage.setLarge_tables(new ArrayList<>());
+    usage.setFrequently_accessed_tables(new ArrayList<>());
+    usage.setHigh_file_count_tables(new ArrayList<>());
     for (Table largeTable: CatalogUsageMonitor.INSTANCE.getLargestTables()) {
       TTableUsageMetrics tableUsageMetrics =
           new TTableUsageMetrics(largeTable.getTableName().toThrift());
@@ -2060,7 +2646,30 @@ public class CatalogServiceCatalog extends Catalog {
       tableUsageMetrics.setNum_metadata_operations(frequentTable.getMetadataOpsCount());
       usage.addToFrequently_accessed_tables(tableUsageMetrics);
     }
+
+    for (Table mostFilesTable:
+        CatalogUsageMonitor.INSTANCE.getHighFileCountTables()) {
+      TTableUsageMetrics tableUsageMetrics =
+          new TTableUsageMetrics(mostFilesTable.getTableName().toThrift());
+      tableUsageMetrics.setNum_files(mostFilesTable.getNumFiles());
+      usage.addToHigh_file_count_tables(tableUsageMetrics);
+    }
     return usage;
+  }
+
+  /**
+   * Gets the events processor metrics. Used for publishing metrics on the webUI
+   */
+  public TEventProcessorMetrics getEventProcessorMetrics() {
+    return metastoreEventProcessor_.getEventProcessorMetrics();
+  }
+
+  /**
+   * Gets the events processor summary. Used for populating the contents of the events
+   * processor detailed view page
+   */
+  public TEventProcessorMetricsSummaryResponse getEventProcessorSummary() {
+    return metastoreEventProcessor_.getEventProcessorSummary();
   }
 
   /**
@@ -2095,13 +2704,68 @@ public class CatalogServiceCatalog extends Catalog {
   }
 
   /**
+   * A wrapper around doGetPartialCatalogObject() that controls the number of concurrent
+   * invocations.
+   */
+  public TGetPartialCatalogObjectResponse getPartialCatalogObject(
+      TGetPartialCatalogObjectRequest req) throws CatalogException {
+    try {
+      if (!partialObjectFetchAccess_.tryAcquire(1,
+          PARTIAL_FETCH_RPC_QUEUE_TIMEOUT_S, TimeUnit.SECONDS)) {
+        // Timed out trying to acquire the semaphore permit.
+        throw new CatalogException("Timed out while fetching partial object metadata. " +
+            "Please check the metric 'catalog.partial-fetch-rpc.queue-len' for the " +
+            "current queue length and consider increasing " +
+            "'catalog_partial_fetch_rpc_queue_timeout_s' and/or " +
+            "'catalog_max_parallel_partial_fetch_rpc'");
+      }
+      // Acquired the permit at this point, should be released before we exit out of
+      // this method.
+      //
+      // Is there a chance that this thread can get interrupted at this point before it
+      // enters the try block, eventually leading to the semaphore permit not
+      // getting released? It can probably happen if the JVM is already in a bad shape.
+      // In the worst case, every permit is blocked and the subsequent requests throw
+      // the timeout exception and the user can monitor the queue metric to see that it
+      // is full, so the issue should be easy to diagnose.
+      // TODO: Figure out if such a race is possible.
+      try (ThreadNameAnnotator tna = new ThreadNameAnnotator(
+            "Get Partial Catalog Object - " +
+            Catalog.toCatalogObjectKey(req.object_desc))) {
+        return doGetPartialCatalogObject(req);
+      } finally {
+        partialObjectFetchAccess_.release();
+      }
+    } catch (InterruptedException e) {
+      throw new CatalogException("Error running getPartialCatalogObject(): ", e);
+    }
+  }
+
+  /**
+   * Gets the id for this catalog service
+   */
+  public String getCatalogServiceId() {
+    return TUniqueIdUtil.PrintId(catalogServiceId_).intern();
+  }
+
+  /**
+   * Returns the number of currently running partial RPCs.
+   */
+  @VisibleForTesting
+  public int getConcurrentPartialRpcReqCount() {
+    // Calculated based on number of currently available semaphore permits.
+    return MAX_PARALLEL_PARTIAL_FETCH_RPC_COUNT - partialObjectFetchAccess_
+        .availablePermits();
+  }
+
+  /**
    * Return a partial view of information about a given catalog object. This services
    * the CatalogdMetaProvider running on impalads when they are configured in
    * "local-catalog" mode. If required objects are not present, for example, the database
    * from which a table is requested, the types of the missing objects will be set in the
    * response's lookup_status.
    */
-  public TGetPartialCatalogObjectResponse getPartialCatalogObject(
+  private TGetPartialCatalogObjectResponse doGetPartialCatalogObject(
       TGetPartialCatalogObjectRequest req) throws CatalogException {
     TCatalogObject objectDesc = Preconditions.checkNotNull(req.object_desc,
         "missing object_desc");
@@ -2132,6 +2796,10 @@ public class CatalogServiceCatalog extends Catalog {
       }
       if (table == null) {
         return createGetPartialCatalogObjectError(CatalogLookupStatus.TABLE_NOT_FOUND);
+      } else if (!table.isLoaded()) {
+        // Table can still remain in an incomplete state if there was a concurrent
+        // invalidate request.
+        return createGetPartialCatalogObjectError(CatalogLookupStatus.TABLE_NOT_LOADED);
       }
       // TODO(todd): consider a read-write lock here.
       table.getLock().lock();
@@ -2216,5 +2884,11 @@ public class CatalogServiceCatalog extends Catalog {
   @VisibleForTesting
   void setCatalogdTableInvalidator(CatalogdTableInvalidator cleaner) {
     catalogdTableInvalidator_ = cleaner;
+  }
+
+  @VisibleForTesting
+  public void setMetastoreEventProcessor(
+      ExternalEventsProcessor metastoreEventProcessor) {
+    this.metastoreEventProcessor_ = metastoreEventProcessor;
   }
 }

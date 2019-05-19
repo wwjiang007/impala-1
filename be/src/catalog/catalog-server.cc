@@ -22,13 +22,14 @@
 
 #include "catalog/catalog-util.h"
 #include "exec/read-write-util.h"
-#include "statestore/statestore-subscriber.h"
-#include "util/debug-util.h"
-#include "util/logging-support.h"
-#include "util/webserver.h"
 #include "gen-cpp/CatalogInternalService_types.h"
 #include "gen-cpp/CatalogObjects_types.h"
 #include "gen-cpp/CatalogService_types.h"
+#include "statestore/statestore-subscriber.h"
+#include "util/debug-util.h"
+#include "util/event-metrics.h"
+#include "util/logging-support.h"
+#include "util/webserver.h"
 
 #include "common/names.h"
 
@@ -62,6 +63,14 @@ DEFINE_validator(catalog_topic_mode, [](const char* name, const string& val) {
   return false;
 });
 
+DEFINE_int32_hidden(catalog_max_parallel_partial_fetch_rpc, 32, "Maximum number of "
+    "partial catalog object fetch RPCs that can run in parallel. Applicable only when "
+    "local catalog mode is configured.");
+
+DEFINE_int64_hidden(catalog_partial_fetch_rpc_queue_timeout_s, LLONG_MAX, "Maximum time "
+    "(in seconds) a partial catalog object fetch RPC spends in the queue waiting "
+    "to run. Must be set to a value greater than zero.");
+
 DECLARE_string(state_store_host);
 DECLARE_int32(state_store_subscriber_port);
 DECLARE_int32(state_store_port);
@@ -73,12 +82,19 @@ string CatalogServer::IMPALA_CATALOG_TOPIC = "catalog-update";
 const string CATALOG_SERVER_TOPIC_PROCESSING_TIMES =
     "catalog-server.topic-processing-time-s";
 
+const string CATALOG_SERVER_PARTIAL_FETCH_RPC_QUEUE_LEN =
+    "catalog.partial-fetch-rpc.queue-len";
+
 const string CATALOG_WEB_PAGE = "/catalog";
 const string CATALOG_TEMPLATE = "catalog.tmpl";
 const string CATALOG_OBJECT_WEB_PAGE = "/catalog_object";
 const string CATALOG_OBJECT_TEMPLATE = "catalog_object.tmpl";
 const string TABLE_METRICS_WEB_PAGE = "/table_metrics";
 const string TABLE_METRICS_TEMPLATE = "table_metrics.tmpl";
+const string EVENT_WEB_PAGE = "/events";
+const string EVENT_METRICS_TEMPLATE = "events.tmpl";
+
+const int REFRESH_METRICS_INTERVAL_MS = 1000;
 
 // Implementation for the CatalogService thrift interface.
 class CatalogServiceThriftIf : public CatalogServiceIf {
@@ -192,7 +208,7 @@ class CatalogServiceThriftIf : public CatalogServiceIf {
   void SentryAdminCheck(TSentryAdminCheckResponse& resp,
       const TSentryAdminCheckRequest& req) override {
     VLOG_RPC << "SentryAdminCheck(): request=" << ThriftDebugString(req);
-    Status status = catalog_server_->catalog()->SentryAdminCheck(req);
+    Status status = catalog_server_->catalog()->SentryAdminCheck(req, &resp);
     if (!status.ok()) LOG(ERROR) << status.GetDetail();
     TStatus thrift_status;
     status.ToThrift(&thrift_status);
@@ -218,6 +234,8 @@ CatalogServer::CatalogServer(MetricGroup* metrics)
     catalog_objects_max_version_(0L) {
   topic_processing_time_metric_ = StatsMetric<double>::CreateAndRegister(metrics,
       CATALOG_SERVER_TOPIC_PROCESSING_TIMES);
+  partial_fetch_rpc_queue_len_metric_ =
+      metrics->AddGauge(CATALOG_SERVER_PARTIAL_FETCH_RPC_QUEUE_LEN, 0);
 }
 
 Status CatalogServer::Start() {
@@ -230,13 +248,11 @@ Status CatalogServer::Start() {
 
   // This will trigger a full Catalog metadata load.
   catalog_.reset(new Catalog());
-  Status status = Thread::Create("catalog-server", "catalog-update-gathering-thread",
+  RETURN_IF_ERROR(Thread::Create("catalog-server", "catalog-update-gathering-thread",
       &CatalogServer::GatherCatalogUpdatesThread, this,
-      &catalog_update_gathering_thread_);
-  if (!status.ok()) {
-    status.AddDetail("CatalogService failed to start");
-    return status;
-  }
+      &catalog_update_gathering_thread_));
+  RETURN_IF_ERROR(Thread::Create("catalog-server", "catalog-metrics-refresh-thread",
+      &CatalogServer::RefreshMetrics, this, &catalog_metrics_refresh_thread_));
 
   statestore_subscriber_.reset(new StatestoreSubscriber(
      Substitute("catalog-server@$0", TNetworkAddressToString(server_address)),
@@ -249,7 +265,7 @@ Status CatalogServer::Start() {
   // prefix of any key. This saves a bit of network communication from the statestore
   // back to the catalog.
   string filter_prefix = "!";
-  status = statestore_subscriber_->AddTopic(IMPALA_CATALOG_TOPIC,
+  Status status = statestore_subscriber_->AddTopic(IMPALA_CATALOG_TOPIC,
       /* is_transient=*/ false, /* populate_min_subscriber_topic_version=*/ false,
       filter_prefix, cb);
   if (!status.ok()) {
@@ -268,12 +284,15 @@ Status CatalogServer::Start() {
 
 void CatalogServer::RegisterWebpages(Webserver* webserver) {
   webserver->RegisterUrlCallback(CATALOG_WEB_PAGE, CATALOG_TEMPLATE,
-      [this](const auto& args, auto* doc) { this->CatalogUrlCallback(args, doc); });
+      [this](const auto& args, auto* doc) { this->CatalogUrlCallback(args, doc); }, true);
   webserver->RegisterUrlCallback(CATALOG_OBJECT_WEB_PAGE, CATALOG_OBJECT_TEMPLATE,
       [this](const auto& args, auto* doc) { this->CatalogObjectsUrlCallback(args, doc); },
       false);
   webserver->RegisterUrlCallback(TABLE_METRICS_WEB_PAGE, TABLE_METRICS_TEMPLATE,
       [this](const auto& args, auto* doc) { this->TableMetricsUrlCallback(args, doc); },
+      false);
+  webserver->RegisterUrlCallback(EVENT_WEB_PAGE, EVENT_METRICS_TEMPLATE,
+      [this](const auto& args, auto* doc) { this->EventMetricsUrlCallback(args, doc); },
       false);
   RegisterLogLevelCallbacks(webserver, true);
 }
@@ -328,7 +347,7 @@ void CatalogServer::UpdateCatalogTopicCallback(
 }
 
 [[noreturn]] void CatalogServer::GatherCatalogUpdatesThread() {
-  while (1) {
+  while (true) {
     unique_lock<mutex> unique_lock(catalog_lock_);
     // Protect against spurious wake-ups by checking the value of topic_updates_ready_.
     // It is only safe to continue on and update the shared pending_topic_updates_
@@ -366,7 +385,23 @@ void CatalogServer::UpdateCatalogTopicCallback(
   }
 }
 
-void CatalogServer::CatalogUrlCallback(const Webserver::ArgumentMap& args,
+[[noreturn]] void CatalogServer::RefreshMetrics() {
+  while (true) {
+    SleepForMs(REFRESH_METRICS_INTERVAL_MS);
+    TGetCatalogServerMetricsResponse response;
+    Status status = catalog_->GetCatalogServerMetrics(&response);
+    if (!status.ok()) {
+      LOG(ERROR) << "Error refreshing catalog metrics: " << status.GetDetail();
+      continue;
+    }
+    partial_fetch_rpc_queue_len_metric_->SetValue(
+        response.catalog_partial_fetch_rpc_queue_len);
+    TEventProcessorMetrics eventProcessorMetrics = response.event_metrics;
+    MetastoreEventMetrics::refresh(&eventProcessorMetrics);
+  }
+}
+
+void CatalogServer::CatalogUrlCallback(const Webserver::WebRequest& req,
     Document* document) {
   GetCatalogUsage(document);
   TGetDbsResult get_dbs_result;
@@ -476,10 +511,53 @@ void CatalogServer::GetCatalogUsage(Document* document) {
   num_frequent_tables.SetInt(catalog_usage_result.frequently_accessed_tables.size());
   document->AddMember("num_frequent_tables", num_frequent_tables,
       document->GetAllocator());
+
+  // Collect information about the most number of files tables.
+  Value high_filecount_tbls(kArrayType);
+  for (int i = 0; i < catalog_usage_result.high_file_count_tables.size(); ++i) {
+    Value tbl_obj(kObjectType);
+    const auto& high_filecount_tbl = catalog_usage_result.high_file_count_tables[i];
+    Value tbl_name(Substitute("$0.$1", high_filecount_tbl.table_name.db_name,
+        high_filecount_tbl.table_name.table_name).c_str(), document->GetAllocator());
+    tbl_obj.AddMember("name", tbl_name, document->GetAllocator());
+    Value num_files;
+    DCHECK(high_filecount_tbl.__isset.num_files);
+    num_files.SetInt64(high_filecount_tbl.num_files);
+    tbl_obj.AddMember("num_files", num_files,
+        document->GetAllocator());
+    high_filecount_tbls.PushBack(tbl_obj, document->GetAllocator());
+  }
+  Value has_high_filecount_tbls;
+  has_high_filecount_tbls.SetBool(true);
+  document->AddMember("has_high_file_count_tables", has_high_filecount_tbls,
+      document->GetAllocator());
+  document->AddMember("high_file_count_tables", high_filecount_tbls,
+      document->GetAllocator());
+  Value num_high_filecount_tbls;
+  num_high_filecount_tbls.SetInt(catalog_usage_result.high_file_count_tables.size());
+  document->AddMember("num_high_file_count_tables", num_high_filecount_tbls,
+      document->GetAllocator());
 }
 
-void CatalogServer::CatalogObjectsUrlCallback(const Webserver::ArgumentMap& args,
+void CatalogServer::EventMetricsUrlCallback(
+    const Webserver::WebRequest& req, Document* document) {
+  TEventProcessorMetricsSummaryResponse event_processor_summary_response;
+  Status status = catalog_->GetEventProcessorSummary(&event_processor_summary_response);
+  if (!status.ok()) {
+    Value error(status.GetDetail().c_str(), document->GetAllocator());
+    document->AddMember("error", error, document->GetAllocator());
+    return;
+  }
+
+  Value event_processor_summary(
+      event_processor_summary_response.summary.c_str(), document->GetAllocator());
+  document->AddMember(
+      "event_processor_metrics", event_processor_summary, document->GetAllocator());
+}
+
+void CatalogServer::CatalogObjectsUrlCallback(const Webserver::WebRequest& req,
     Document* document) {
+  const auto& args = req.parsed_args;
   Webserver::ArgumentMap::const_iterator object_type_arg = args.find("object_type");
   Webserver::ArgumentMap::const_iterator object_name_arg = args.find("object_name");
   if (object_type_arg != args.end() && object_name_arg != args.end()) {
@@ -508,8 +586,9 @@ void CatalogServer::CatalogObjectsUrlCallback(const Webserver::ArgumentMap& args
   }
 }
 
-void CatalogServer::TableMetricsUrlCallback(const Webserver::ArgumentMap& args,
+void CatalogServer::TableMetricsUrlCallback(const Webserver::WebRequest& req,
     Document* document) {
+  const auto& args = req.parsed_args;
   // TODO: Enable json view of table metrics
   Webserver::ArgumentMap::const_iterator object_name_arg = args.find("name");
   if (object_name_arg != args.end()) {

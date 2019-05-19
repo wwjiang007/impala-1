@@ -18,6 +18,8 @@ package org.apache.impala.service;
 
 import java.util.concurrent.atomic.AtomicReference;
 
+import com.google.common.base.Preconditions;
+import org.apache.impala.authorization.AuthorizationChecker;
 import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.FeCatalog;
 import org.apache.impala.catalog.ImpaladCatalog;
@@ -39,6 +41,8 @@ public abstract class FeCatalogManager {
   private static String DEFAULT_KUDU_MASTER_HOSTS =
       BackendConfig.INSTANCE.getBackendCfg().kudu_master_hosts;
 
+  protected AtomicReference<? extends AuthorizationChecker> authzChecker_;
+
   /**
    * @return the appropriate implementation based on the current backend
    * configuration.
@@ -59,12 +63,17 @@ public abstract class FeCatalogManager {
     return new TestImpl(testCatalog);
   }
 
+  public void setAuthzChecker(
+      AtomicReference<? extends AuthorizationChecker> authzChecker) {
+    authzChecker_ = Preconditions.checkNotNull(authzChecker);
+  }
+
   /**
    * @return a Catalog instance to be used for a request or query. Depending
    * on the catalog implementation this may either be a reused instance or a
    * fresh one for each query.
    */
-  abstract FeCatalog getOrCreateCatalog();
+  public abstract FeCatalog getOrCreateCatalog();
 
   /**
    * Update the Catalog based on an update from the state store.
@@ -94,7 +103,7 @@ public abstract class FeCatalogManager {
     }
 
     @Override
-    FeCatalog getOrCreateCatalog() {
+    public FeCatalog getOrCreateCatalog() {
       return catalog_.get();
     }
 
@@ -119,7 +128,7 @@ public abstract class FeCatalogManager {
     }
 
     private ImpaladCatalog createNewCatalog() {
-      return new ImpaladCatalog(DEFAULT_KUDU_MASTER_HOSTS);
+      return new ImpaladCatalog(DEFAULT_KUDU_MASTER_HOSTS, authzChecker_);
     }
   }
 
@@ -132,7 +141,8 @@ public abstract class FeCatalogManager {
         BackendConfig.INSTANCE.getBackendCfg());
 
     @Override
-    FeCatalog getOrCreateCatalog() {
+    public FeCatalog getOrCreateCatalog() {
+      PROVIDER.setAuthzChecker(authzChecker_);
       return new LocalCatalog(PROVIDER, DEFAULT_KUDU_MASTER_HOSTS);
     }
 
@@ -154,7 +164,7 @@ public abstract class FeCatalogManager {
     }
 
     @Override
-    FeCatalog getOrCreateCatalog() {
+    public FeCatalog getOrCreateCatalog() {
       return catalog_;
     }
 

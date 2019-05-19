@@ -17,12 +17,13 @@
 
 package org.apache.impala.catalog.local;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
 import org.apache.impala.analysis.TableName;
-import org.apache.impala.catalog.AuthorizationPolicy;
+import org.apache.impala.authorization.AuthorizationPolicy;
 import org.apache.impala.catalog.BuiltinsDb;
 import org.apache.impala.catalog.Catalog;
 import org.apache.impala.catalog.CatalogException;
@@ -37,10 +38,10 @@ import org.apache.impala.catalog.FeFsTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.Function.CompareMode;
-import org.apache.impala.common.InternalException;
 import org.apache.impala.catalog.HdfsCachePool;
 import org.apache.impala.catalog.PartitionNotFoundException;
 import org.apache.impala.catalog.PrunablePartition;
+import org.apache.impala.common.InternalException;
 import org.apache.impala.thrift.TCatalogObject;
 import org.apache.impala.thrift.TGetPartitionStatsResponse;
 import org.apache.impala.thrift.TPartitionKeyValue;
@@ -50,7 +51,6 @@ import org.apache.thrift.TException;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Maps;
 
 /**
  * Implementation of FeCatalog which runs within the impalad and fetches metadata
@@ -69,7 +69,7 @@ import com.google.common.collect.Maps;
  */
 public class LocalCatalog implements FeCatalog {
   private final MetaProvider metaProvider_;
-  private Map<String, FeDb> dbs_ = Maps.newHashMap();
+  private Map<String, FeDb> dbs_ = new HashMap<>();
   private String nullPartitionKeyValue_;
   private final String defaultKuduMasterHosts_;
 
@@ -86,7 +86,7 @@ public class LocalCatalog implements FeCatalog {
 
   private void loadDbs() {
     if (!dbs_.isEmpty()) return;
-    Map<String, FeDb> dbs = Maps.newHashMap();
+    Map<String, FeDb> dbs = new HashMap<>();
     List<String> names;
     try {
       names = metaProvider_.loadDbList();
@@ -118,6 +118,16 @@ public class LocalCatalog implements FeCatalog {
   public FeTable getTable(String dbName, String tableName)
       throws DatabaseNotFoundException {
     return getDbOrThrow(dbName).getTable(tableName);
+  }
+
+  @Override
+  public FeTable getTableNoThrow(String dbName, String tableName) {
+    try {
+      return getTable(dbName, tableName);
+    } catch (Exception e) {
+      // pass
+    }
+    return null;
   }
 
   @Override

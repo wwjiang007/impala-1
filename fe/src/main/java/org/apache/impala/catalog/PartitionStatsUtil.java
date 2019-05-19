@@ -17,26 +17,25 @@
 
 package org.apache.impala.catalog;
 
-import org.apache.impala.common.Reference;
-import org.apache.impala.thrift.TPartitionStats;
-import org.apache.impala.common.JniUtil;
-import org.apache.impala.common.ImpalaException;
-import org.apache.impala.common.ImpalaRuntimeException;
-import org.apache.impala.util.CompressionUtil;
-import org.apache.impala.util.MetaStoreUtil;
-
-import java.util.Iterator;
+import java.util.ArrayList;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
-import org.apache.commons.codec.binary.Base64;
-import org.apache.thrift.protocol.TCompactProtocol;
-import org.apache.thrift.TSerializer;
+
+import org.apache.impala.common.ImpalaException;
+import org.apache.impala.common.ImpalaRuntimeException;
+import org.apache.impala.common.JniUtil;
+import org.apache.impala.common.Reference;
+import org.apache.impala.thrift.TPartitionStats;
+import org.apache.impala.util.CompressionUtil;
+import org.apache.impala.util.MetaStoreUtil;
 import org.apache.thrift.TException;
-import com.google.common.base.Preconditions;
+import org.apache.thrift.TSerializer;
+import org.apache.thrift.protocol.TCompactProtocol;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.common.collect.Lists;
+import com.google.common.base.Preconditions;
 
 /**
  * Handles serialising and deserialising intermediate statistics from the Hive MetaStore
@@ -110,7 +109,7 @@ public class PartitionStatsUtil {
       }
       encodedStats.append(chunk);
     }
-    byte[] decodedBytes = Base64.decodeBase64(encodedStats.toString());
+    byte[] decodedBytes = Base64.getDecoder().decode(encodedStats.toString());
     TPartitionStats stats = new TPartitionStats();
     JniUtil.deserializeThrift(new TCompactProtocol.Factory(), stats, decodedBytes);
     hasIncrStats.setRef(stats.isSetIntermediate_col_stats());
@@ -178,7 +177,7 @@ public class PartitionStatsUtil {
           "Error decompressing partition stats for " + partition.getPartitionName());
       return;
     }
-    String base64 = new String(Base64.encodeBase64(decompressed));
+    String base64 = new String(Base64.getEncoder().encode(decompressed));
     List<String> chunks =
       chunkStringForHms(base64, MetaStoreUtil.MAX_PROPERTY_VALUE_LENGTH);
     params.put(INCREMENTAL_STATS_NUM_CHUNKS, Integer.toString(chunks.size()));
@@ -189,7 +188,7 @@ public class PartitionStatsUtil {
 
   static private List<String> chunkStringForHms(String data, int chunkLen) {
     int idx = 0;
-    List<String> ret = Lists.newArrayList();
+    List<String> ret = new ArrayList<>();
     while (idx < data.length()) {
       int remaining = data.length() - idx;
       int chunkSize = (chunkLen > remaining) ? remaining : chunkLen;

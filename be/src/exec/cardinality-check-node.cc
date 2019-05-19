@@ -16,10 +16,11 @@
 // under the License.
 
 #include "exec/cardinality-check-node.h"
+#include "exec/exec-node-util.h"
+#include "gen-cpp/PlanNodes_types.h"
 #include "runtime/row-batch.h"
 #include "runtime/runtime-state.h"
 #include "util/runtime-profile-counters.h"
-#include "gen-cpp/PlanNodes_types.h"
 
 #include "common/names.h"
 
@@ -42,10 +43,10 @@ Status CardinalityCheckNode::Prepare(RuntimeState* state) {
 
 Status CardinalityCheckNode::Open(RuntimeState* state) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedOpenEventAdder ea(this);
   RETURN_IF_ERROR(ExecNode::Open(state));
   RETURN_IF_ERROR(child(0)->Open(state));
-  row_batch_.reset(
-      new RowBatch(row_desc(), 1, mem_tracker()));
+  row_batch_.reset(new RowBatch(row_desc(), 1, mem_tracker()));
 
   // Read rows from the child, raise error if there are more rows than one
   RowBatch child_batch(child(0)->row_desc(), state->batch_size(), mem_tracker());
@@ -73,9 +74,10 @@ Status CardinalityCheckNode::Open(RuntimeState* state) {
   return Status::OK();
 }
 
-Status CardinalityCheckNode::GetNext(RuntimeState* state, RowBatch* output_row_batch,
-    bool* eos) {
+Status CardinalityCheckNode::GetNext(
+    RuntimeState* state, RowBatch* output_row_batch, bool* eos) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedGetNextEventAdder ea(this, eos);
   RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::GETNEXT, state));
   RETURN_IF_CANCELLED(state);
   RETURN_IF_ERROR(QueryMaintenance(state));
@@ -87,17 +89,17 @@ Status CardinalityCheckNode::GetNext(RuntimeState* state, RowBatch* output_row_b
     output_row_batch->CopyRow(src_row, dst_row);
     output_row_batch->CommitLastRow();
     row_batch_->TransferResourceOwnership(output_row_batch);
-    num_rows_returned_ = 1;
-    COUNTER_SET(rows_returned_counter_, num_rows_returned_);
+    SetNumRowsReturned(1);
+    COUNTER_SET(rows_returned_counter_, rows_returned());
   }
   *eos = true;
   row_batch_->Reset();
   return Status::OK();
 }
 
-Status CardinalityCheckNode::Reset(RuntimeState* state) {
+Status CardinalityCheckNode::Reset(RuntimeState* state, RowBatch* row_batch) {
   row_batch_->Reset();
-  return ExecNode::Reset(state);
+  return ExecNode::Reset(state, row_batch);
 }
 
 void CardinalityCheckNode::Close(RuntimeState* state) {

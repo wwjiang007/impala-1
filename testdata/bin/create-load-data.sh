@@ -38,14 +38,15 @@ setup_report_build_error
 # Environment variables used to direct the data loading process to an external cluster.
 # TODO: We need a better way of managing how these get set. See IMPALA-4346
 : ${HS2_HOST_PORT=localhost:11050}
-: ${HDFS_NN=localhost:20500}
-: ${IMPALAD=localhost:21000}
+: ${HDFS_NN=${INTERNAL_LISTEN_HOST}:20500}
+: ${IMPALAD=localhost}
 : ${REMOTE_LOAD=}
 : ${CM_HOST=}
 : ${IMPALA_SERIAL_DATALOAD=}
 
 SKIP_METADATA_LOAD=0
 SKIP_SNAPSHOT_LOAD=0
+SKIP_RANGER=0
 SNAPSHOT_FILE=""
 LOAD_DATA_ARGS=""
 EXPLORATION_STRATEGY="exhaustive"
@@ -85,23 +86,27 @@ do
       CM_HOST=${2-}
       shift;
       ;;
+    -skip_ranger)
+      SKIP_RANGER=1
+      ;;
     -help|-h|*)
       echo "create-load-data.sh : Creates data and loads from scratch"
       echo "[-skip_metadata_load] : Skips loading of metadata"
       echo "[-skip_snapshot_load] : Assumes that the snapshot is already loaded"
       echo "[-snapshot_file] : Loads the test warehouse snapshot into hdfs"
       echo "[-cm_host] : Address of the Cloudera Manager host if loading to a remote cluster"
+      echo "[-skip_ranger] : Skip the set-up for Ranger."
       exit 1;
       ;;
     esac
   shift;
 done
 
+if [[ -n $REMOTE_LOAD ]]; then
+  SKIP_RANGER=1
+fi
+
 if [[ $SKIP_METADATA_LOAD -eq 0  && "$SNAPSHOT_FILE" = "" ]]; then
-  if [[ -z "$REMOTE_LOAD" ]]; then
-    run-step "Loading Hive Builtins" load-hive-builtins.log \
-      ${IMPALA_HOME}/testdata/bin/load-hive-builtins.sh
-  fi
   run-step "Generating HBase data" create-hbase.log \
       ${IMPALA_HOME}/testdata/bin/create-hbase.sh
   run-step "Creating /test-warehouse HDFS directory" create-test-warehouse-dir.log \
@@ -137,7 +142,8 @@ echo "REMOTE_LOAD=${REMOTE_LOAD:-}"
 
 function start-impala {
   : ${START_CLUSTER_ARGS=""}
-  START_CLUSTER_ARGS_INT=""
+  # Use a fast statestore update so that DDL operations run faster.
+  START_CLUSTER_ARGS_INT="--state_store_args=--statestore_update_frequency_ms=50"
   if [[ "${TARGET_FILESYSTEM}" == "local" ]]; then
     START_CLUSTER_ARGS_INT+=("--impalad_args=--abort_on_config_error=false -s 1")
   else
@@ -298,10 +304,40 @@ function load-aux-workloads {
   fi
 }
 
-function copy-auth-policy {
-  echo COPYING AUTHORIZATION POLICY FILE
-  hadoop fs -put -f ${IMPALA_HOME}/fe/src/test/resources/authz-policy.ini \
-      ${FILESYSTEM_PREFIX}/test-warehouse/
+function setup-ranger {
+  echo "SETTING UP RANGER"
+
+  RANGER_SETUP_DIR="${IMPALA_HOME}/testdata/cluster/ranger/setup"
+
+  perl -wpl -e 's/\$\{([^}]+)\}/defined $ENV{$1} ? $ENV{$1} : $&/eg' \
+    "${RANGER_SETUP_DIR}/impala_group.json.template" > \
+    "${RANGER_SETUP_DIR}/impala_group.json"
+
+  export GROUP_ID=$(wget -qO - --auth-no-challenge --user=admin --password=admin \
+    --post-file="${RANGER_SETUP_DIR}/impala_group.json" \
+    --header="accept:application/json" \
+    --header="Content-Type:application/json" \
+    http://localhost:6080/service/xusers/secure/groups |
+    python -c "import sys, json; print json.load(sys.stdin)['id']")
+
+  perl -wpl -e 's/\$\{([^}]+)\}/defined $ENV{$1} ? $ENV{$1} : $&/eg' \
+    "${RANGER_SETUP_DIR}/impala_user.json.template" > \
+    "${RANGER_SETUP_DIR}/impala_user.json"
+
+  if grep "\${[A-Z_]*}" "${RANGER_SETUP_DIR}/impala_user.json"; then
+    echo "Found undefined variables in ${RANGER_SETUP_DIR}/impala_user.json."
+    exit 1
+  fi
+
+  wget -O /dev/null --auth-no-challenge --user=admin --password=admin \
+    --post-file="${RANGER_SETUP_DIR}/impala_user.json" \
+    --header="Content-Type:application/json" \
+    http://localhost:6080/service/xusers/secure/users
+
+  wget -O /dev/null --auth-no-challenge --user=admin --password=admin \
+    --post-file="${RANGER_SETUP_DIR}/impala_service.json" \
+    --header="Content-Type:application/json" \
+    http://localhost:6080/service/public/v2/api/service
 }
 
 function copy-and-load-dependent-tables {
@@ -354,6 +390,11 @@ function copy-and-load-dependent-tables {
   # TODO: Find a good way to integrate this with the normal data loading scripts
   beeline -n $USER -u "${JDBC_URL}" -f\
     ${IMPALA_HOME}/testdata/bin/load-dependent-tables.sql
+
+  if [[ "$IMPALA_HIVE_MAJOR_VERSION" == "2" ]]; then
+    beeline -n $USER -u "${JDBC_URL}" -f\
+      ${IMPALA_HOME}/testdata/bin/load-dependent-tables-hive2.sql
+  fi
 }
 
 function create-internal-hbase-table {
@@ -581,8 +622,12 @@ if [ $SKIP_METADATA_LOAD -eq 0 ]; then
   if [[ -n "$CM_HOST" ]]; then
     LOAD_NESTED_ARGS="--cm-host $CM_HOST"
   fi
-  run-step "Loading nested data" load-nested.log \
-    ${IMPALA_HOME}/testdata/bin/load_nested.py ${LOAD_NESTED_ARGS:-}
+  run-step "Loading nested parquet data" load-nested.log \
+    ${IMPALA_HOME}/testdata/bin/load_nested.py \
+    -t tpch_nested_parquet -f parquet/none ${LOAD_NESTED_ARGS:-}
+  run-step "Loading nested orc data" load-nested.log \
+    ${IMPALA_HOME}/testdata/bin/load_nested.py \
+    -t tpch_nested_orc_def -f orc/def ${LOAD_NESTED_ARGS:-}
   run-step "Loading auxiliary workloads" load-aux-workloads.log load-aux-workloads
   run-step "Loading dependent tables" copy-and-load-dependent-tables.log \
       copy-and-load-dependent-tables
@@ -630,4 +675,12 @@ fi
 run-step "Computing table stats" compute-table-stats.log \
     ${IMPALA_HOME}/testdata/bin/compute-table-stats.sh
 
-run-step "Copying auth policy file" copy-auth-policy.log copy-auth-policy
+# IMPALA-8346: this step only applies if the cluster is the local minicluster
+if [[ -z "$REMOTE_LOAD" ]]; then
+  run-step "Creating tpcds testcase data" create-tpcds-testcase-data.log \
+      ${IMPALA_HOME}/testdata/bin/create-tpcds-testcase-files.sh
+fi
+
+if [[ $SKIP_RANGER -eq 0 ]]; then
+  run-step "Setting up Ranger" setup-ranger.log setup-ranger
+fi

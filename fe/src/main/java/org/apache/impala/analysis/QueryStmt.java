@@ -18,20 +18,22 @@
 package org.apache.impala.analysis;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
+import com.google.common.collect.Sets;
 import org.apache.impala.catalog.FeView;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.catalog.View;
 import org.apache.impala.common.AnalysisException;
+import org.apache.impala.common.SqlCastException;
 import org.apache.impala.planner.DataSink;
 import org.apache.impala.planner.PlanRootSink;
 
 import com.google.common.base.Preconditions;
 import com.google.common.base.Predicates;
 import com.google.common.collect.Lists;
-import com.google.common.collect.Sets;
 
 /**
  * Abstract base class for any statement that returns results
@@ -49,7 +51,7 @@ public abstract class QueryStmt extends StatementBase {
 
   protected WithClause withClause_;
 
-  protected ArrayList<OrderByElement> orderByElements_;
+  protected List<OrderByElement> orderByElements_;
   protected LimitElement limitElement_;
 
   // For a select statment:
@@ -57,11 +59,11 @@ public abstract class QueryStmt extends StatementBase {
   // aliases substituted, agg output substituted)
   // For a union statement:
   // list of slotrefs into the tuple materialized by the union.
-  protected ArrayList<Expr> resultExprs_ = Lists.newArrayList();
+  protected List<Expr> resultExprs_ = new ArrayList<>();
 
   // For a select statment: select list exprs resolved to base tbl refs
   // For a union statement: same as resultExprs
-  protected ArrayList<Expr> baseTblResultExprs_ = Lists.newArrayList();
+  protected List<Expr> baseTblResultExprs_ = new ArrayList<>();
 
   /**
    * Map of expression substitutions for replacing aliases
@@ -75,7 +77,7 @@ public abstract class QueryStmt extends StatementBase {
    *   select int_col a, string_col a from alltypessmall;
    * Both columns are using the same alias "a".
    */
-  protected final ArrayList<Expr> ambiguousAliasList_;
+  protected final List<Expr> ambiguousAliasList_;
 
   protected SortInfo sortInfo_;
 
@@ -98,12 +100,12 @@ public abstract class QueryStmt extends StatementBase {
   // returns a single row.
   protected boolean isRuntimeScalar_ = false;
 
-  QueryStmt(ArrayList<OrderByElement> orderByElements, LimitElement limitElement) {
+  QueryStmt(List<OrderByElement> orderByElements, LimitElement limitElement) {
     orderByElements_ = orderByElements;
     sortInfo_ = null;
     limitElement_ = limitElement == null ? new LimitElement(null, null) : limitElement;
     aliasSmap_ = new ExprSubstitutionMap();
-    ambiguousAliasList_ = Lists.newArrayList();
+    ambiguousAliasList_ = new ArrayList<>();
   }
 
   /**
@@ -119,6 +121,12 @@ public abstract class QueryStmt extends StatementBase {
     collectTableRefs(tblRefs, false);
   }
 
+  public List<TableRef> collectTableRefs() {
+    List<TableRef> tableRefs = Lists.newArrayList();
+    collectTableRefs(tableRefs);
+    return tableRefs;
+  }
+
   /**
    * Helper for collectFromClauseTableRefs() and collectTableRefs().
    * If 'fromClauseOnly' is true only collects table references in the FROM clause,
@@ -130,6 +138,12 @@ public abstract class QueryStmt extends StatementBase {
         v.getQueryStmt().collectTableRefs(tblRefs, fromClauseOnly);
       }
     }
+  }
+
+  public List<FeView> collectInlineViews() {
+    Set<FeView> inlineViews = Sets.newHashSet();
+    collectInlineViews(inlineViews);
+    return new ArrayList<>(inlineViews);
   }
 
   /**
@@ -170,18 +184,18 @@ public abstract class QueryStmt extends StatementBase {
    * (3) a mix of correlated table refs and table refs rooted at those refs
    *     (the statement is 'self-contained' with respect to correlation)
    */
-  public List<TupleId> getCorrelatedTupleIds(Analyzer analyzer)
+  public List<TupleId> getCorrelatedTupleIds()
       throws AnalysisException {
     // Correlated tuple ids of this stmt.
-    List<TupleId> correlatedTupleIds = Lists.newArrayList();
+    List<TupleId> correlatedTupleIds = new ArrayList<>();
     // First correlated and absolute table refs. Used for error detection/reporting.
     // We pick the first ones for simplicity. Choosing arbitrary ones is equally valid.
     TableRef correlatedRef = null;
     TableRef absoluteRef = null;
     // Materialized tuple ids of the table refs checked so far.
-    Set<TupleId> tblRefIds = Sets.newHashSet();
+    Set<TupleId> tblRefIds = new HashSet<>();
 
-    List<TableRef> tblRefs = Lists.newArrayList();
+    List<TableRef> tblRefs = new ArrayList<>();
     collectTableRefs(tblRefs, true);
     for (TableRef tblRef: tblRefs) {
       if (absoluteRef == null && !tblRef.isRelative()) absoluteRef = tblRef;
@@ -231,9 +245,9 @@ public abstract class QueryStmt extends StatementBase {
       return;
     }
 
-    ArrayList<Expr> orderingExprs = Lists.newArrayList();
-    ArrayList<Boolean> isAscOrder = Lists.newArrayList();
-    ArrayList<Boolean> nullsFirstParams = Lists.newArrayList();
+    List<Expr> orderingExprs = new ArrayList<>();
+    List<Boolean> isAscOrder = new ArrayList<>();
+    List<Boolean> nullsFirstParams = new ArrayList<>();
 
     // extract exprs
     for (OrderByElement orderByElement: orderByElements_) {
@@ -317,32 +331,6 @@ public abstract class QueryStmt extends StatementBase {
   }
 
   /**
-   * Substitutes an ordinal or an alias. An ordinal is an integer NumericLiteral
-   * that refers to a select-list expression by ordinal. An alias is a SlotRef
-   * that matches the alias of a select-list expression (tracked by 'aliasMap_').
-   * We should substitute by ordinal or alias but not both to avoid an incorrect
-   * double substitution.
-   * Returns clone() of 'expr' if it is not an ordinal, nor an alias.
-   * The returned expr is analyzed regardless of whether substitution was performed.
-   */
-  protected Expr substituteOrdinalOrAlias(Expr expr, String errorPrefix,
-      Analyzer analyzer) throws AnalysisException {
-    Expr substituteExpr = trySubstituteOrdinal(expr, errorPrefix, analyzer);
-    if (substituteExpr != null) return substituteExpr;
-    if (ambiguousAliasList_.contains(expr)) {
-      throw new AnalysisException("Column '" + expr.toSql() +
-          "' in " + errorPrefix + " clause is ambiguous");
-    }
-    if (expr instanceof SlotRef) {
-      substituteExpr = expr.trySubstitute(aliasSmap_, analyzer, false);
-    } else {
-      expr.analyze(analyzer);
-      substituteExpr = expr;
-    }
-    return substituteExpr;
-  }
-
-  /**
    * Substitutes top-level ordinals and aliases. Does not substitute ordinals and
    * aliases in subexpressions.
    * Modifies the 'exprs' list in-place.
@@ -352,41 +340,85 @@ public abstract class QueryStmt extends StatementBase {
   protected void substituteOrdinalsAndAliases(List<Expr> exprs, String errorPrefix,
       Analyzer analyzer) throws AnalysisException {
     for (int i = 0; i < exprs.size(); ++i) {
-      exprs.set(i, substituteOrdinalOrAlias(exprs.get(i), errorPrefix, analyzer));
+      exprs.set(i, resolveReferenceExpr(exprs.get(i), errorPrefix,
+          analyzer, true));
     }
   }
 
-  // Attempt to replace an expression of form "<number>" with the corresponding
-  // select list items.  Return null if not an ordinal expression.
-  private Expr trySubstituteOrdinal(Expr expr, String errorPrefix,
-      Analyzer analyzer) throws AnalysisException {
-    if (!(expr instanceof NumericLiteral)) return null;
-    expr.analyze(analyzer);
-    if (!expr.getType().isIntegerType()) return null;
-    long pos = ((NumericLiteral) expr).getLongValue();
-    if (pos < 1) {
-      throw new AnalysisException(
-          errorPrefix + ": ordinal must be >= 1: " + expr.toSql());
-    }
-    if (pos > resultExprs_.size()) {
-      throw new AnalysisException(
-          errorPrefix + ": ordinal exceeds number of items in select list: "
-          + expr.toSql());
+  /**
+   * Substitutes an ordinal or an alias. An ordinal is an integer NumericLiteral
+   * that refers to a select-list expression by ordinal. An alias is a SlotRef
+   * that matches the alias of a select-list expression (tracked by 'aliasMap_').
+   * We should substitute by ordinal or alias but not both to avoid an incorrect
+   * double substitution.
+   *
+   * Logic is a bit tricky. The SlotRef, if it exists, cannot be resolved until we
+   * check for an alias. (Resolving the SlotRef may find a column, or trigger an
+   * error, which is not what we want.)
+   *
+   * After the alias check, then we can resolve (analyze) the expression.Then, if
+   * the expression is an ordinal, replace it. Else, the expression is "ordinary"
+   * and can be rewritten by the caller.
+   *
+   * @param expr the expression on which to perform substitution
+   * @param allowOrdinal whether the context of the expression allows ordinals.
+   * lists (ORDER BY, GROUP BY) allow ordinals, expressions (HAVING) do not.
+   * (In the 3.x series, for backward compatibility, HAVING continues to allow
+   * ordinals, but the goal is to remove this non-standard support in the future)
+   * @return the rewritten or substituted expression, with analysis completed
+   */
+  protected Expr resolveReferenceExpr(Expr expr,
+      String errorPrefix, Analyzer analyzer, boolean allowOrdinal)
+          throws AnalysisException {
+    // Check for a SlotRef (representing an alias) before analysis. Since
+    // the slot does not reference a real column, the analysis will fail.
+    // TODO: Seems an odd state of affairs. Consider revisiting by putting
+    // alias in a namespace that can be resolved more easily.
+    if (expr instanceof SlotRef) {
+      if (ambiguousAliasList_.contains(expr)) {
+        // Reference to an ambiguous alias
+        // SELECT foo AS a, bar AS a ORDER BY a
+        throw new AnalysisException(errorPrefix +
+            ": ambiguous alias: '" + expr.toSql() + "'");
+      }
+      // Look the name up in the alias substitution map
+      // Returns a clone of the expression if not found
+      return expr.trySubstitute(aliasSmap_, analyzer_, false);
     }
 
-    // Create copy to protect against accidentally shared state.
-    return resultExprs_.get((int) pos - 1).clone();
+    // Ordinal reference?
+    // Only want values that started as numeric literals
+    boolean wasNumber = expr instanceof NumericLiteral;
+    expr.analyze(analyzer);
+    if (allowOrdinal && wasNumber && Expr.IS_INT_LITERAL.apply(expr)) {
+      long pos = ((NumericLiteral) expr).getLongValue();
+      if (pos < 1) {
+        throw new AnalysisException(
+              errorPrefix + ": ordinal must be >= 1: " + expr.toSql());
+      }
+      if (pos > resultExprs_.size()) {
+        throw new AnalysisException(
+              errorPrefix + ": ordinal exceeds the number of items in the SELECT list: " +
+                  expr.toSql());
+      }
+
+      // Create copy to protect against accidentally shared state.
+      return resultExprs_.get((int) pos - 1).clone();
+    }
+
+    // Ordinary expression.
+    return expr;
   }
 
   /**
    * Returns the materialized tuple ids of the output of this stmt.
-   * Used in case this stmt is part of an @InlineViewRef,
+   * Used in case this stmt is part of an InlineViewRef,
    * since we need to know the materialized tupls ids of a TableRef.
    * This call must be idempotent because it may be called more than once for Union stmt.
    * TODO: The name of this function has become outdated due to analytics
    * producing logical (non-materialized) tuples. Re-think and clean up.
    */
-  public abstract void getMaterializedTupleIds(ArrayList<TupleId> tupleIdList);
+  public abstract void getMaterializedTupleIds(List<TupleId> tupleIdList);
 
   @Override
   public List<Expr> getResultExprs() { return resultExprs_; }
@@ -406,12 +438,13 @@ public abstract class QueryStmt extends StatementBase {
   public long getOffset() { return limitElement_.getOffset(); }
   public SortInfo getSortInfo() { return sortInfo_; }
   public boolean evaluateOrderBy() { return evaluateOrderBy_; }
-  public ArrayList<Expr> getBaseTblResultExprs() { return baseTblResultExprs_; }
-  public void setLimit(long limit) throws AnalysisException {
+  public List<Expr> getBaseTblResultExprs() { return baseTblResultExprs_; }
+
+  public void setLimit(long limit) throws SqlCastException {
     Preconditions.checkState(limit >= 0);
     long newLimit = hasLimit() ? Math.min(limit, getLimit()) : limit;
-    limitElement_ = new LimitElement(new NumericLiteral(Long.toString(newLimit),
-        Type.BIGINT), limitElement_.getOffsetExpr());
+    limitElement_ = new LimitElement(NumericLiteral.create(newLimit, Type.BIGINT),
+        limitElement_.getOffsetExpr());
   }
 
   /**
@@ -429,7 +462,7 @@ public abstract class QueryStmt extends StatementBase {
    * Mark slots referenced in exprs as materialized.
    */
   protected void materializeSlots(Analyzer analyzer, List<Expr> exprs) {
-    List<SlotId> slotIds = Lists.newArrayList();
+    List<SlotId> slotIds = new ArrayList<>();
     for (Expr e: exprs) {
       e.getIds(null, slotIds);
     }
@@ -448,9 +481,9 @@ public abstract class QueryStmt extends StatementBase {
     return new PlanRootSink();
   }
 
-  public ArrayList<OrderByElement> cloneOrderByElements() {
+  public List<OrderByElement> cloneOrderByElements() {
     if (orderByElements_ == null) return null;
-    ArrayList<OrderByElement> result =
+    List<OrderByElement> result =
         Lists.newArrayListWithCapacity(orderByElements_.size());
     for (OrderByElement o: orderByElements_) result.add(o.clone());
     return result;

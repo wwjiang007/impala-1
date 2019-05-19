@@ -19,9 +19,7 @@ package org.apache.impala.analysis;
 
 import java.util.ArrayList;
 
-import org.apache.impala.authorization.AuthorizeableFn;
 import org.apache.impala.authorization.Privilege;
-import org.apache.impala.authorization.PrivilegeRequest;
 import org.apache.impala.catalog.FeDb;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.Type;
@@ -55,7 +53,7 @@ public class DropFunctionStmt extends StatementBase {
   private boolean hasSignature() { return fnArgs_ != null; }
 
   @Override
-  public String toSql() {
+  public String toSql(ToSqlOptions options) {
     StringBuilder sb = new StringBuilder("DROP FUNCTION");
     if (ifExists_) sb.append(" IF EXISTS ");
     sb.append(desc_.signatureString());
@@ -81,12 +79,14 @@ public class DropFunctionStmt extends StatementBase {
       desc_ = new Function(fnName_, fnArgs_.getArgTypes(), Type.INVALID,
           fnArgs_.hasVarArgs());
     } else {
-      desc_ = new Function(fnName_, new ArrayList<Type>(), Type.INVALID,
+      desc_ = new Function(fnName_, new ArrayList<>(), Type.INVALID,
           false);
     }
 
-    analyzer.registerPrivReq(new PrivilegeRequest(
-        new AuthorizeableFn(desc_.dbName(), desc_.signatureString()), Privilege.DROP));
+    analyzer.registerPrivReq(builder ->
+        builder.onFunction(desc_.dbName(), desc_.signatureString())
+            .allOf(Privilege.DROP)
+            .build());
 
     FeDb db =  analyzer.getDb(desc_.dbName(), false);
     if (db == null && !ifExists_) {

@@ -338,7 +338,7 @@ class DataStreamTest : public testing::Test {
   // Create a tuple comparator to sort in ascending order on the single bigint column.
   void CreateTupleComparator() {
     SlotRef* lhs_slot = obj_pool_.Add(new SlotRef(TYPE_BIGINT, 0));
-    ASSERT_OK(lhs_slot->Init(RowDescriptor(), runtime_state_.get()));
+    ASSERT_OK(lhs_slot->Init(RowDescriptor(), true, runtime_state_.get()));
     ordering_exprs_.push_back(lhs_slot);
     less_than_ = obj_pool_.Add(new TupleRowComparator(ordering_exprs_,
         is_asc_, nulls_first_));
@@ -379,8 +379,9 @@ class DataStreamTest : public testing::Test {
     receiver_info_.emplace_back(
         make_unique<ReceiverInfo>(stream_type, num_senders, receiver_num));
     ReceiverInfo* info = receiver_info_.back().get();
-    info->stream_recvr = stream_mgr_->CreateRecvr(row_desc_, instance_id, DEST_NODE_ID,
-        num_senders, buffer_size, is_merging, profile, &tracker_, &buffer_pool_client_);
+    info->stream_recvr = stream_mgr_->CreateRecvr(row_desc_, *runtime_state_.get(),
+        instance_id, DEST_NODE_ID, num_senders, buffer_size, is_merging, profile,
+        &tracker_, &buffer_pool_client_);
     if (!is_merging) {
       info->thread_handle.reset(new thread(&DataStreamTest::ReadStream, this, info));
     } else {
@@ -535,7 +536,7 @@ class DataStreamTest : public testing::Test {
     TExpr output_exprs;
     output_exprs.nodes.push_back(expr_node);
 
-    sender.reset(new KrpcDataStreamSender(
+    sender.reset(new KrpcDataStreamSender(-1,
         sender_num, row_desc_, sink.stream_sink, dest_, channel_buffer_size, &state));
     EXPECT_OK(static_cast<KrpcDataStreamSender*>(
         sender.get())->Init(vector<TExpr>({output_exprs}), sink, &state));
@@ -695,8 +696,9 @@ TEST_F(DataStreamTestShortDeserQueue, TestNoDeadlock) {
   receiver_info_.emplace_back(
       make_unique<ReceiverInfo>(TPartitionType::UNPARTITIONED, 4, 1));
   ReceiverInfo* info = receiver_info_.back().get();
-  info->stream_recvr = stream_mgr_->CreateRecvr(row_desc_, instance_id, DEST_NODE_ID,
-      4, 1024 * 1024, false, profile, &tracker_, &buffer_pool_client_);
+  info->stream_recvr = stream_mgr_->CreateRecvr(row_desc_, *runtime_state_.get(),
+      instance_id, DEST_NODE_ID, 4, 1024 * 1024, false, profile, &tracker_,
+      &buffer_pool_client_);
   info->thread_handle.reset(new thread(
       &DataStreamTestShortDeserQueue_TestNoDeadlock_Test::ReadStream, this, info));
 

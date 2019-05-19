@@ -34,6 +34,7 @@
 #include "util/debug-util.h"
 #include "util/disk-info.h"
 #include "util/filesystem-util.h"
+#include "util/pretty-printer.h"
 #include "util/runtime-profile-counters.h"
 
 #include "common/names.h"
@@ -65,11 +66,16 @@ const uint64_t AVAILABLE_SPACE_THRESHOLD_MB = 1024;
 const string TMP_FILE_MGR_ACTIVE_SCRATCH_DIRS = "tmp-file-mgr.active-scratch-dirs";
 const string TMP_FILE_MGR_ACTIVE_SCRATCH_DIRS_LIST =
     "tmp-file-mgr.active-scratch-dirs.list";
+const string TMP_FILE_MGR_SCRATCH_SPACE_BYTES_USED_HIGH_WATER_MARK =
+    "tmp-file-mgr.scratch-space-bytes-used-high-water-mark";
+const string TMP_FILE_MGR_SCRATCH_SPACE_BYTES_USED =
+    "tmp-file-mgr.scratch-space-bytes-used";
 
 TmpFileMgr::TmpFileMgr()
   : initialized_(false),
     num_active_scratch_dirs_metric_(nullptr),
-    active_scratch_dirs_metric_(nullptr) {}
+    active_scratch_dirs_metric_(nullptr),
+    scratch_bytes_used_metric_(nullptr) {}
 
 Status TmpFileMgr::Init(MetricGroup* metrics) {
   string tmp_dirs_spec = FLAGS_scratch_dirs;
@@ -139,6 +145,9 @@ Status TmpFileMgr::InitCustom(const vector<string>& tmp_dirs, bool one_dir_per_d
   for (int i = 0; i < tmp_dirs_.size(); ++i) {
     active_scratch_dirs_metric_->Add(tmp_dirs_[i]);
   }
+  scratch_bytes_used_metric_ =
+      metrics->AddHWMGauge(TMP_FILE_MGR_SCRATCH_SPACE_BYTES_USED_HIGH_WATER_MARK,
+          TMP_FILE_MGR_SCRATCH_SPACE_BYTES_USED, 0);
 
   initialized_ = true;
 
@@ -262,12 +271,7 @@ Status TmpFileMgr::FileGroup::CreateFiles() {
     ++files_allocated;
   }
   DCHECK_EQ(tmp_files_.size(), files_allocated);
-  if (tmp_files_.size() == 0) {
-    Status err_status(TErrorCode::SCRATCH_ALLOCATION_FAILED,
-        join(tmp_file_mgr_->tmp_dirs_, ","), GetBackendString());
-    for (Status& err : scratch_errors_) err_status.MergeStatus(err);
-    return err_status;
-  }
+  if (tmp_files_.size() == 0) return ScratchAllocationFailedStatus();
   // Start allocating on a random device to avoid overloading the first device.
   next_allocation_index_ = rand() % tmp_files_.size();
   return Status::OK();
@@ -284,6 +288,9 @@ void TmpFileMgr::FileGroup::Close() {
                    << "': " << status.msg().msg();
     }
   }
+  tmp_file_mgr_->scratch_bytes_used_metric_->Increment(
+      -1 * scratch_space_bytes_used_counter_->value());
+
   tmp_files_.clear();
 }
 
@@ -314,14 +321,11 @@ Status TmpFileMgr::FileGroup::AllocateSpace(
     if ((*tmp_file)->is_blacklisted()) continue;
     (*tmp_file)->AllocateSpace(scratch_range_bytes, file_offset);
     scratch_space_bytes_used_counter_->Add(scratch_range_bytes);
+    tmp_file_mgr_->scratch_bytes_used_metric_->Increment(scratch_range_bytes);
     current_bytes_allocated_ += num_bytes;
     return Status::OK();
   }
-  Status err_status(TErrorCode::SCRATCH_ALLOCATION_FAILED,
-      join(tmp_file_mgr_->tmp_dirs_, ","), GetBackendString());
-  // Include all previous errors that may have caused the failure.
-  for (Status& err : scratch_errors_) err_status.MergeStatus(err);
-  return err_status;
+  return ScratchAllocationFailedStatus();
 }
 
 void TmpFileMgr::FileGroup::RecycleFileRange(unique_ptr<WriteHandle> handle) {
@@ -375,7 +379,7 @@ Status TmpFileMgr::FileGroup::ReadAsync(WriteHandle* handle, MemRange buffer) {
   handle->read_range_ = scan_range_pool_.Add(new ScanRange);
   handle->read_range_->Reset(nullptr, handle->write_range_->file(),
       handle->write_range_->len(), handle->write_range_->offset(),
-      handle->write_range_->disk_id(), false,
+      handle->write_range_->disk_id(), false, false,
       BufferOpts::ReadInto(buffer.data(), buffer.len()));
   read_counter_->Add(1);
   bytes_read_counter_->Add(buffer.len());
@@ -477,6 +481,16 @@ Status TmpFileMgr::FileGroup::RecoverWriteError(
   // If this fails, the status will include all the errors in 'scratch_errors_'.
   RETURN_IF_ERROR(AllocateSpace(handle->len(), &tmp_file, &file_offset));
   return handle->RetryWrite(io_ctx_.get(), tmp_file, file_offset);
+}
+
+Status TmpFileMgr::FileGroup::ScratchAllocationFailedStatus() {
+  Status status(TErrorCode::SCRATCH_ALLOCATION_FAILED,
+        join(tmp_file_mgr_->tmp_dirs_, ","), GetBackendString(),
+        PrettyPrinter::PrintBytes(scratch_space_bytes_used_counter_->value()),
+        PrettyPrinter::PrintBytes(current_bytes_allocated_));
+  // Include all previous errors that may have caused the failure.
+  for (Status& err : scratch_errors_) status.MergeStatus(err);
+  return status;
 }
 
 string TmpFileMgr::FileGroup::DebugString() {

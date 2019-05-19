@@ -66,15 +66,15 @@ public abstract class AggregateInfoBase {
   // For analytics: indices into the analytic exprs and their corresponding aggregate
   // exprs that need to be materialized.
   // Populated in materializeRequiredSlots() which must be implemented by subclasses.
-  protected List<Integer> materializedSlots_ = Lists.newArrayList();
+  protected List<Integer> materializedSlots_ = new ArrayList<>();
 
   protected AggregateInfoBase(List<Expr> groupingExprs, List<FunctionCallExpr> aggExprs) {
     Preconditions.checkState(groupingExprs != null || aggExprs != null);
     groupingExprs_ =
-        groupingExprs != null ? Expr.cloneList(groupingExprs) : new ArrayList<Expr>();
+        groupingExprs != null ? Expr.cloneList(groupingExprs) : new ArrayList<>();
     Preconditions.checkState(aggExprs != null || !(this instanceof AnalyticInfo));
     aggregateExprs_ =
-        aggExprs != null ? Expr.cloneList(aggExprs) : new ArrayList<FunctionCallExpr>();
+        aggExprs != null ? Expr.cloneList(aggExprs) : new ArrayList<>();
   }
 
   /**

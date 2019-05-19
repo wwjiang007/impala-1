@@ -20,6 +20,7 @@ import java.util.List;
 import java.util.Set;
 
 import org.apache.impala.analysis.TableName;
+import org.apache.impala.authorization.AuthorizationPolicy;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.thrift.TCatalogObject;
 import org.apache.impala.thrift.TGetPartitionStatsResponse;
@@ -41,6 +42,9 @@ public interface FeCatalog {
   /** @see Catalog#getTable(String, String) */
   FeTable getTable(String db_name, String table_name)
       throws DatabaseNotFoundException;
+
+  /** @see Catalog#getTableNoThrow(String, String) */
+  FeTable getTableNoThrow(String db_name, String table_name);
 
   /** @see Catalog#getTCatalogObject(TCatalogObject) */
   TCatalogObject getTCatalogObject(TCatalogObject objectDesc)

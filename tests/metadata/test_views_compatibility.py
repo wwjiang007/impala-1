@@ -23,7 +23,7 @@ from subprocess import call
 
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfS3, SkipIfADLS, SkipIfIsilon, SkipIfLocal
+from tests.common.skip import SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfIsilon, SkipIfLocal
 from tests.common.test_dimensions import create_uncompressed_text_dimension
 from tests.util.test_file_parser import QueryTestSectionReader
 
@@ -47,6 +47,7 @@ from tests.util.test_file_parser import QueryTestSectionReader
 # Missing Coverage: Views created by Hive and Impala being visible and queryble by each
 # other on non hdfs storage.
 @SkipIfS3.hive
+@SkipIfABFS.hive
 @SkipIfADLS.hive
 @SkipIfIsilon.hive
 @SkipIfLocal.hive
@@ -103,7 +104,7 @@ class TestViewCompatibility(ImpalaTestSuite):
       # The table may or may not have been created in Hive. And so, "invalidate metadata"
       # may throw an exception.
       try:
-        self.client.invalidate_table(test_case.hive_view_name)
+        self.client.execute("invalidate metadata {0}".format(test_case.hive_view_name))
       except ImpalaBeeswaxException as e:
         assert "TableNotFoundException" in str(e)
 
@@ -135,7 +136,7 @@ class TestViewCompatibility(ImpalaTestSuite):
       self._exec_in_hive(test_case.get_drop_view_sql('HIVE'),\
                           test_case.get_create_view_sql('HIVE'), None)
       try:
-        self.client.invalidate_table(test_case.hive_view_name)
+        self.client.execute("invalidate metadata {0}".format(test_case.hive_view_name))
       except ImpalaBeeswaxException as e:
         assert "TableNotFoundException" in str(e)
 

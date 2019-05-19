@@ -26,21 +26,27 @@ import org.apache.hadoop.hive.metastore.TableType;
 import org.apache.impala.analysis.StmtMetadataLoader;
 import org.apache.impala.analysis.TableName;
 import org.apache.impala.authorization.User;
+import org.apache.impala.catalog.ArrayType;
 import org.apache.impala.catalog.Catalog;
 import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.FeCatalog;
 import org.apache.impala.catalog.FeDb;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.Function;
+import org.apache.impala.catalog.MapType;
 import org.apache.impala.catalog.PrimitiveType;
 import org.apache.impala.catalog.ScalarType;
+import org.apache.impala.catalog.StructType;
 import org.apache.impala.catalog.Type;
+import org.apache.impala.catalog.local.InconsistentMetadataFetchException;
 import org.apache.impala.common.ImpalaException;
+import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.thrift.TColumn;
 import org.apache.impala.thrift.TColumnValue;
 import org.apache.impala.thrift.TResultRow;
 import org.apache.impala.thrift.TResultSet;
 import org.apache.impala.thrift.TResultSetMetadata;
+import org.apache.impala.thrift.TTypeNodeType;
 import org.apache.impala.util.PatternMatcher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -59,8 +65,8 @@ public class MetadataOp {
   // Static column values
   private static final TColumnValue NULL_COL_VAL = new TColumnValue();
   private static final TColumnValue EMPTY_COL_VAL = createTColumnValue("");
-  private static final String TABLE_TYPE_TABLE = "TABLE";
-  private static final String TABLE_TYPE_VIEW = "VIEW";
+  public static final String TABLE_TYPE_TABLE = "TABLE";
+  public static final String TABLE_TYPE_VIEW = "VIEW";
 
   // Result set schema for each of the metadata operations.
   private final static TResultSetMetadata GET_CATALOGS_MD = new TResultSetMetadata();
@@ -258,6 +264,23 @@ public class MetadataOp {
       PatternMatcher schemaPatternMatcher, PatternMatcher tablePatternMatcher,
       PatternMatcher columnPatternMatcher, PatternMatcher fnPatternMatcher, User user)
       throws ImpalaException {
+    Frontend.RetryTracker retries = new Frontend.RetryTracker(
+        String.format("fetching metadata"));
+    while (true) {
+      try {
+        return doGetDbsMetadata(fe, catalogName,
+            schemaPatternMatcher, tablePatternMatcher,
+            columnPatternMatcher, fnPatternMatcher, user);
+      } catch(InconsistentMetadataFetchException e) {
+        retries.handleRetryOrThrow(e);
+      }
+    }
+  }
+
+  private static DbsMetadata doGetDbsMetadata(Frontend fe, String catalogName,
+      PatternMatcher schemaPatternMatcher, PatternMatcher tablePatternMatcher,
+      PatternMatcher columnPatternMatcher, PatternMatcher fnPatternMatcher, User user)
+      throws ImpalaException {
     DbsMetadata result = new DbsMetadata();
 
     // Hive does not have a catalog concept. Returns nothing if the request specifies an
@@ -279,8 +302,11 @@ public class MetadataOp {
         List<String> tableComments = Lists.newArrayList();
         List<String> tableTypes = Lists.newArrayList();
         for (String tabName: fe.getTableNames(db.getName(), tablePatternMatcher, user)) {
-          FeTable table = catalog.getTable(db.getName(), tabName);
-          if (table == null) continue;
+          FeTable table = catalog.getTableNoThrow(db.getName(), tabName);
+          if (table == null) {
+            result.missingTbls.add(new TableName(db.getName(), tabName));
+            continue;
+          }
 
           String comment = null;
           List<Column> columns = Lists.newArrayList();
@@ -292,7 +318,10 @@ public class MetadataOp {
           } else {
             if (table.getMetaStoreTable() != null) {
               comment = table.getMetaStoreTable().getParameters().get("comment");
-              tableType = mapToInternalTableType(table.getMetaStoreTable().getTableType());
+              String tableTypeStr = table.getMetaStoreTable().getTableType() == null ?
+                  null : table.getMetaStoreTable().getTableType().toUpperCase();
+              tableType = MetastoreShim.HMS_TO_IMPALA_TYPE
+                  .getOrDefault(tableTypeStr, TABLE_TYPE_TABLE);
             }
             columns.addAll(fe.getColumns(table, columnPatternMatcher, user));
           }
@@ -309,28 +338,6 @@ public class MetadataOp {
       }
     }
     return result;
-  }
-
-  private static String mapToInternalTableType(String typeStr) {
-    String defaultTableType = TABLE_TYPE_TABLE;
-    TableType tType;
-
-    if (typeStr == null) return defaultTableType;
-    try {
-      tType = TableType.valueOf(typeStr.toUpperCase());
-    } catch (Exception e) {
-      return defaultTableType;
-    }
-    switch (tType) {
-      case EXTERNAL_TABLE:
-      case MANAGED_TABLE:
-      case INDEX_TABLE:
-        return TABLE_TYPE_TABLE;
-      case VIRTUAL_VIEW:
-        return TABLE_TYPE_VIEW;
-      default:
-        return defaultTableType;
-    }
   }
 
   /**
@@ -590,40 +597,66 @@ public class MetadataOp {
   }
 
   /**
-   * Fills the GET_TYPEINFO_RESULTS with supported primitive types.
+   * Return result row corresponding to the input type.
+   */
+  private static TResultRow createGetTypeInfoResult(String typeName, Type type) {
+    TResultRow row = new TResultRow();
+    row.colVals = Lists.newArrayList();
+    row.colVals.add(createTColumnValue(typeName)); // TYPE_NAME
+    row.colVals.add(createTColumnValue(type.getJavaSqlType())); // DATA_TYPE
+    row.colVals.add(createTColumnValue(type.getPrecision())); // PRECISION
+    row.colVals.add(NULL_COL_VAL); // LITERAL_PREFIX
+    row.colVals.add(NULL_COL_VAL); // LITERAL_SUFFIX
+    row.colVals.add(NULL_COL_VAL); // CREATE_PARAMS
+    row.colVals.add(createTColumnValue(DatabaseMetaData.typeNullable)); // NULLABLE
+    row.colVals.add(createTColumnValue(type.isStringType())); // CASE_SENSITIVE
+    row.colVals.add(createTColumnValue(DatabaseMetaData.typeSearchable)); // SEARCHABLE
+    row.colVals.add(createTColumnValue(!type.isNumericType())); // UNSIGNED_ATTRIBUTE
+    row.colVals.add(createTColumnValue(false)); // FIXED_PREC_SCALE
+    row.colVals.add(createTColumnValue(false)); // AUTO_INCREMENT
+    row.colVals.add(NULL_COL_VAL); // LOCAL_TYPE_NAME
+    row.colVals.add(createTColumnValue(0)); // MINIMUM_SCALE
+    row.colVals.add(createTColumnValue(0)); // MAXIMUM_SCALE
+    row.colVals.add(NULL_COL_VAL); // SQL_DATA_TYPE
+    row.colVals.add(NULL_COL_VAL); // SQL_DATETIME_SUB
+    row.colVals.add(createTColumnValue(type.getNumPrecRadix())); // NUM_PREC_RADIX
+    return row;
+  }
+
+  /**
+   * Fills the GET_TYPEINFO_RESULTS with externally supported primitive types.
+   */
+  private static void createGetPrimitiveTypeInfoResults() {
+    for (PrimitiveType ptype: PrimitiveType.values()) {
+      ScalarType type = Type.getDefaultScalarType(ptype);
+      if (type.isInternalType() || !type.isSupported()) continue;
+      TResultRow row = createGetTypeInfoResult(ptype.name(), type);
+      GET_TYPEINFO_RESULTS.add(row);
+    }
+  }
+
+  /**
+   * Fills the GET_TYPEINFO_RESULTS with externally supported types.
    */
   private static void createGetTypeInfoResults() {
-    for (PrimitiveType ptype: PrimitiveType.values()) {
-      if (ptype.equals(PrimitiveType.INVALID_TYPE) ||
-          ptype.equals(PrimitiveType.DATE) ||
-          ptype.equals(PrimitiveType.DATETIME) ||
-          ptype.equals(PrimitiveType.DECIMAL) ||
-          ptype.equals(PrimitiveType.CHAR) ||
-          ptype.equals(PrimitiveType.VARCHAR) ||
-          ptype.equals(PrimitiveType.FIXED_UDA_INTERMEDIATE)) {
+    // Loop through the types included in the TTypeNodeType enum so that all the types
+    // (both existing and any new ones which get added) are accounted for.
+    for (TTypeNodeType nodeType : TTypeNodeType.values()) {
+      Type type = null;
+      if (nodeType == TTypeNodeType.SCALAR) {
+        createGetPrimitiveTypeInfoResults();
         continue;
+      } else if (nodeType == TTypeNodeType.ARRAY) {
+        type = new ArrayType(ScalarType.createType(PrimitiveType.INT));
+      } else if (nodeType == TTypeNodeType.MAP) {
+        type = new MapType(ScalarType.createType(PrimitiveType.INT),
+            ScalarType.createType(PrimitiveType.INT));
+      } else if (nodeType == TTypeNodeType.STRUCT) {
+        type = new StructType();
       }
-      Type type = ScalarType.createType(ptype);
-      TResultRow row = new TResultRow();
-      row.colVals = Lists.newArrayList();
-      row.colVals.add(createTColumnValue(ptype.name())); // TYPE_NAME
-      row.colVals.add(createTColumnValue(type.getJavaSqlType()));  // DATA_TYPE
-      row.colVals.add(createTColumnValue(type.getPrecision()));  // PRECISION
-      row.colVals.add(NULL_COL_VAL); // LITERAL_PREFIX
-      row.colVals.add(NULL_COL_VAL); // LITERAL_SUFFIX
-      row.colVals.add(NULL_COL_VAL); // CREATE_PARAMS
-      row.colVals.add(createTColumnValue(DatabaseMetaData.typeNullable));  // NULLABLE
-      row.colVals.add(createTColumnValue(type.isStringType())); // CASE_SENSITIVE
-      row.colVals.add(createTColumnValue(DatabaseMetaData.typeSearchable));  // SEARCHABLE
-      row.colVals.add(createTColumnValue(!type.isNumericType())); // UNSIGNED_ATTRIBUTE
-      row.colVals.add(createTColumnValue(false));  // FIXED_PREC_SCALE
-      row.colVals.add(createTColumnValue(false));  // AUTO_INCREMENT
-      row.colVals.add(NULL_COL_VAL); // LOCAL_TYPE_NAME
-      row.colVals.add(createTColumnValue(0));  // MINIMUM_SCALE
-      row.colVals.add(createTColumnValue(0));  // MAXIMUM_SCALE
-      row.colVals.add(NULL_COL_VAL); // SQL_DATA_TYPE
-      row.colVals.add(NULL_COL_VAL); // SQL_DATETIME_SUB
-      row.colVals.add(createTColumnValue(type.getNumPrecRadix()));  // NUM_PREC_RADIX
+
+      if (!type.isSupported()) continue;
+      TResultRow row = createGetTypeInfoResult(nodeType.name(), type);
       GET_TYPEINFO_RESULTS.add(row);
     }
   }

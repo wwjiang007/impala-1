@@ -31,56 +31,61 @@ include "Types.thrift"
 include "ExternalDataSource.thrift"
 
 enum TPlanNodeType {
-  HDFS_SCAN_NODE,
-  HBASE_SCAN_NODE,
-  HASH_JOIN_NODE,
-  AGGREGATION_NODE,
-  SORT_NODE,
-  EMPTY_SET_NODE,
-  EXCHANGE_NODE,
-  UNION_NODE,
-  SELECT_NODE,
-  NESTED_LOOP_JOIN_NODE,
-  DATA_SOURCE_NODE,
-  ANALYTIC_EVAL_NODE,
-  SINGULAR_ROW_SRC_NODE,
-  UNNEST_NODE,
-  SUBPLAN_NODE,
-  KUDU_SCAN_NODE,
-  CARDINALITY_CHECK_NODE,
-  MULTI_AGGREGATION_NODE
+  HDFS_SCAN_NODE = 0
+  HBASE_SCAN_NODE = 1
+  HASH_JOIN_NODE = 2
+  AGGREGATION_NODE = 3
+  SORT_NODE = 4
+  EMPTY_SET_NODE = 5
+  EXCHANGE_NODE = 6
+  UNION_NODE = 7
+  SELECT_NODE = 8
+  NESTED_LOOP_JOIN_NODE = 9
+  DATA_SOURCE_NODE = 10
+  ANALYTIC_EVAL_NODE = 11
+  SINGULAR_ROW_SRC_NODE = 12
+  UNNEST_NODE = 13
+  SUBPLAN_NODE = 14
+  KUDU_SCAN_NODE = 15
+  CARDINALITY_CHECK_NODE = 16
+  MULTI_AGGREGATION_NODE = 17
 }
 
 // phases of an execution node
 // must be kept in sync with tests/failure/test_failpoints.py
 enum TExecNodePhase {
-  PREPARE,
-  PREPARE_SCANNER,
-  OPEN,
-  GETNEXT,
-  GETNEXT_SCANNER,
-  CLOSE,
-  INVALID
+  PREPARE = 0
+  PREPARE_SCANNER = 1
+  OPEN = 2
+  GETNEXT = 3
+  GETNEXT_SCANNER = 4
+  CLOSE = 5
+  // After a scanner thread completes a range with an error but before it propagates the
+  // error.
+  SCANNER_ERROR = 6
+  INVALID = 7
 }
 
 // what to do when hitting a debug point (TImpalaQueryOptions.DEBUG_ACTION)
 enum TDebugAction {
-  WAIT,
-  FAIL,
-  INJECT_ERROR_LOG,
-  MEM_LIMIT_EXCEEDED,
+  WAIT = 0
+  FAIL = 1
+  INJECT_ERROR_LOG = 2
+  MEM_LIMIT_EXCEEDED = 3
   // A floating point number in range [0.0, 1.0] that gives the probability of denying
   // each reservation increase request after the initial reservation.
-  SET_DENY_RESERVATION_PROBABILITY,
+  SET_DENY_RESERVATION_PROBABILITY = 4
+  // Delay for a short amount of time: 100ms
+  DELAY = 5
 }
 
 // Preference for replica selection
 enum TReplicaPreference {
-  CACHE_LOCAL,
-  CACHE_RACK,
-  DISK_LOCAL,
-  DISK_RACK,
-  REMOTE
+  CACHE_LOCAL = 0
+  CACHE_RACK = 1
+  DISK_LOCAL = 2
+  DISK_RACK = 3
+  REMOTE = 4
 }
 
 // Specification of a runtime filter target.
@@ -108,8 +113,8 @@ struct TRuntimeFilterTargetDesc {
 }
 
 enum TRuntimeFilterType {
-  BLOOM,
-  MIN_MAX
+  BLOOM = 0
+  MIN_MAX = 1
 }
 
 // Specification of a runtime filter.
@@ -162,9 +167,9 @@ struct TRuntimeFilterDesc {
 
 // Specification of subsection of a single hdfs file.
 struct THdfsFileSplit {
-  // File name (not the full path).  The path is assumed to be the
+  // File name (not the full path).  The path is assumed to be relative to the
   // 'location' of the THdfsPartition referenced by partition_id.
-  1: required string file_name
+  1: required string relative_path
 
   // starting offset
   2: required i64 offset
@@ -183,6 +188,9 @@ struct THdfsFileSplit {
 
   // last modified time of the file
   7: required i64 mtime
+
+  // whether this file is erasure-coded
+  8: required bool is_erasure_coded
 }
 
 // key range for single THBaseScanNode
@@ -279,7 +287,8 @@ struct TDataSourceScanNode {
 
 struct THBaseFilter {
   1: required string family
-  2: required string qualifier
+  // The qualifier for HBase Key column can be null, thus the field is optional here.
+  2: optional string qualifier
   // Ordinal number into enum HBase CompareFilter.CompareOp.
   // We don't use TExprOperator because the op is interpreted by an HBase Filter, and
   // not the c++ expr eval.
@@ -317,22 +326,22 @@ struct TEqJoinCondition {
 }
 
 enum TJoinOp {
-  INNER_JOIN,
-  LEFT_OUTER_JOIN,
-  LEFT_SEMI_JOIN,
-  LEFT_ANTI_JOIN,
+  INNER_JOIN = 0
+  LEFT_OUTER_JOIN = 1
+  LEFT_SEMI_JOIN = 2
+  LEFT_ANTI_JOIN = 3
 
   // Similar to LEFT_ANTI_JOIN with special handling for NULLs for the join conjuncts
   // on the build side. Those NULLs are considered candidate matches, and therefore could
   // be rejected (ANTI-join), based on the other join conjuncts. This is in contrast
   // to LEFT_ANTI_JOIN where NULLs are not matches and therefore always returned.
-  NULL_AWARE_LEFT_ANTI_JOIN,
+  NULL_AWARE_LEFT_ANTI_JOIN = 4
 
-  RIGHT_OUTER_JOIN,
-  RIGHT_SEMI_JOIN,
-  RIGHT_ANTI_JOIN,
-  FULL_OUTER_JOIN,
-  CROSS_JOIN
+  RIGHT_OUTER_JOIN = 5
+  RIGHT_SEMI_JOIN = 6
+  RIGHT_ANTI_JOIN = 7
+  FULL_OUTER_JOIN = 8
+  CROSS_JOIN = 9
 }
 
 struct THashJoinNode {
@@ -420,13 +429,13 @@ struct TSortInfo {
 
 enum TSortType {
   // Sort the entire input.
-  TOTAL,
+  TOTAL = 0
 
   // Return the first N sorted elements.
-  TOPN,
+  TOPN = 1
 
   // Divide the input into batches, each of which is sorted individually.
-  PARTIAL
+  PARTIAL = 2
 }
 
 struct TSortNode {
@@ -439,21 +448,21 @@ struct TSortNode {
 
 enum TAnalyticWindowType {
   // Specifies the window as a logical offset
-  RANGE,
+  RANGE = 0
 
   // Specifies the window in physical units
-  ROWS
+  ROWS = 1
 }
 
 enum TAnalyticWindowBoundaryType {
   // The window starts/ends at the current row.
-  CURRENT_ROW,
+  CURRENT_ROW = 0
 
   // The window starts/ends at an offset preceding current row.
-  PRECEDING,
+  PRECEDING = 1
 
   // The window starts/ends at an offset following current row.
-  FOLLOWING
+  FOLLOWING = 2
 }
 
 struct TAnalyticWindowBoundary {

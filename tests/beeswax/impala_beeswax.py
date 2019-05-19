@@ -63,6 +63,7 @@ class ImpalaBeeswaxException(Exception):
 class ImpalaBeeswaxResult(object):
   def __init__(self, **kwargs):
     self.query = kwargs.get('query', None)
+    self.query_id = kwargs['query_id']
     self.success = kwargs.get('success', False)
     # Insert returns an int, convert into list to have a uniform data type.
     # TODO: We should revisit this if we have more datatypes to deal with.
@@ -74,6 +75,12 @@ class ImpalaBeeswaxResult(object):
     self.time_taken = kwargs.get('time_taken', 0)
     self.summary = kwargs.get('summary', str())
     self.schema = kwargs.get('schema', None)
+    self.column_types = None
+    self.column_labels = None
+    if self.schema is not None:
+      # Extract labels and types so there is a shared interface with HS2ResultSet.
+      self.column_types = [fs.type.upper() for fs in self.schema.fieldSchemas]
+      self.column_labels = [fs.name.upper() for fs in self.schema.fieldSchemas]
     self.runtime_profile = kwargs.get('runtime_profile', str())
     self.exec_summary = kwargs.get('exec_summary', None)
 
@@ -103,7 +110,12 @@ class ImpalaBeeswaxClient(object):
   def __init__(self, impalad, use_kerberos=False, user=None, password=None,
                use_ssl=False):
     self.connected = False
-    self.impalad = impalad
+    split_impalad = impalad.split(":")
+    assert len(split_impalad) in [1, 2]
+    self.impalad_host = split_impalad[0]
+    self.impalad_port = 21000  # Default beeswax port
+    if len(split_impalad) == 2:
+      self.impalad_port = int(split_impalad[1])
     self.imp_service = None
     self.transport = None
     self.use_kerberos = use_kerberos
@@ -141,7 +153,6 @@ class ImpalaBeeswaxClient(object):
     Raises an exception if the connection is unsuccesful.
     """
     try:
-      self.impalad = self.impalad.split(':')
       self.transport = self.__get_transport()
       self.transport.open()
       protocol = TBinaryProtocol.TBinaryProtocol(self.transport)
@@ -163,7 +174,7 @@ class ImpalaBeeswaxClient(object):
       trans_type = 'kerberos'
     elif self.use_ldap:
       trans_type = 'plain_sasl'
-    return create_transport(host=self.impalad[0], port=int(self.impalad[1]),
+    return create_transport(host=self.impalad_host, port=self.impalad_port,
                             service='impala', transport_type=trans_type, user=self.user,
                             password=self.password, use_ssl=self.use_ssl)
 
@@ -276,11 +287,14 @@ class ImpalaBeeswaxClient(object):
       row["num_hosts"] = len(node.exec_stats)
       row["avg_time"] = avg_time
 
+    is_sink = node.node_id == -1
     # If the node is a broadcast-receiving exchange node, the cardinality of rows produced
     # is the max over all instances (which should all have received the same number of
     # rows). Otherwise, the cardinality is the sum over all instances which process
     # disjoint partitions.
-    if node.is_broadcast:
+    if is_sink:
+      cardinality = -1
+    elif node.is_broadcast:
       cardinality = max_stats.cardinality
     else:
       cardinality = agg_stats.cardinality
@@ -420,21 +434,14 @@ class ImpalaBeeswaxClient(object):
   def get_log(self, query_handle):
     return self.__do_rpc(lambda: self.imp_service.get_log(query_handle))
 
-  def refresh(self):
-    """Invalidate the Impalad catalog"""
-    return self.execute("invalidate metadata")
-
-  def refresh_table(self, db_name, table_name):
-    """Refresh a specific table from the catalog"""
-    return self.execute("refresh %s.%s" % (db_name, table_name))
-
   def fetch_results(self, query_string, query_handle, max_rows = -1):
     """Fetches query results given a handle and query type (insert, use, other)"""
     query_type = self.__get_query_type(query_string)
     if query_type == 'use':
       # TODO: "use <database>" does not currently throw an error. Need to update this
       # to handle the error case once that behavior has been changed.
-      return ImpalaBeeswaxResult(query=query_string, success=True, data=[])
+      return ImpalaBeeswaxResult(query=query_string, query_id=query_handle.id,
+                                 success=True, data=[])
 
     # Result fetching for insert is different from other queries.
     exec_result = None
@@ -458,7 +465,8 @@ class ImpalaBeeswaxClient(object):
         break
 
     # The query executed successfully and all the data was fetched.
-    exec_result = ImpalaBeeswaxResult(success=True, data=result_rows, schema=schema)
+    exec_result = ImpalaBeeswaxResult(query_id=handle.id, success=True, data=result_rows,
+                                      schema=schema)
     exec_result.summary = 'Returned %d rows' % (len(result_rows))
     return exec_result
 
@@ -468,7 +476,7 @@ class ImpalaBeeswaxClient(object):
     # The insert was successful
     num_rows = sum(map(int, result.rows_modified.values()))
     data = ["%s: %s" % row for row in result.rows_modified.iteritems()]
-    exec_result = ImpalaBeeswaxResult(success=True, data=data)
+    exec_result = ImpalaBeeswaxResult(query_id=handle.id, success=True, data=data)
     exec_result.summary = "Inserted %d rows" % (num_rows,)
     return exec_result
 

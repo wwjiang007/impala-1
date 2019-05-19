@@ -20,8 +20,11 @@
 #include <sstream>
 #include <gutil/strings/substitute.h>
 
-#include "exprs/scalar-expr.h"
+#include "common/names.h"
+#include "exec/exec-node-util.h"
 #include "exprs/scalar-expr-evaluator.h"
+#include "exprs/scalar-expr.h"
+#include "gen-cpp/PlanNodes_types.h"
 #include "runtime/mem-pool.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/row-batch.h"
@@ -29,8 +32,6 @@
 #include "util/bitmap.h"
 #include "util/debug-util.h"
 #include "util/runtime-profile-counters.h"
-#include "gen-cpp/PlanNodes_types.h"
-#include "common/names.h"
 
 using namespace impala;
 using namespace strings;
@@ -63,6 +64,7 @@ Status NestedLoopJoinNode::Init(const TPlanNode& tnode, RuntimeState* state) {
 
 Status NestedLoopJoinNode::Open(RuntimeState* state) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedOpenEventAdder ea(this);
   RETURN_IF_ERROR(BlockingJoinNode::Open(state));
   RETURN_IF_ERROR(ScalarExprEvaluator::Open(join_conjunct_evals_, state));
 
@@ -124,14 +126,14 @@ Status NestedLoopJoinNode::Prepare(RuntimeState* state) {
   return Status::OK();
 }
 
-Status NestedLoopJoinNode::Reset(RuntimeState* state) {
+Status NestedLoopJoinNode::Reset(RuntimeState* state, RowBatch* row_batch) {
   builder_->Reset();
   build_batches_ = NULL;
   matched_probe_ = false;
   current_probe_row_ = NULL;
   probe_batch_pos_ = 0;
   process_unmatched_build_rows_ = false;
-  return BlockingJoinNode::Reset(state);
+  return BlockingJoinNode::Reset(state, row_batch);
 }
 
 void NestedLoopJoinNode::Close(RuntimeState* state) {
@@ -194,10 +196,11 @@ void NestedLoopJoinNode::ResetForProbe() {
   matched_probe_ = false;
 }
 
-Status NestedLoopJoinNode::GetNext(RuntimeState* state, RowBatch* output_batch,
-    bool* eos) {
+Status NestedLoopJoinNode::GetNext(
+    RuntimeState* state, RowBatch* output_batch, bool* eos) {
   DCHECK(!output_batch->AtCapacity());
   SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedGetNextEventAdder ea(this, eos);
   RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::GETNEXT, state));
   RETURN_IF_CANCELLED(state);
   RETURN_IF_ERROR(QueryMaintenance(state));
@@ -243,8 +246,11 @@ Status NestedLoopJoinNode::GetNext(RuntimeState* state, RowBatch* output_batch,
 
 end:
   if (ReachedLimit()) {
-    output_batch->set_num_rows(
-        output_batch->num_rows() - (num_rows_returned_ - limit_));
+    int64_t extra_rows = rows_returned() - limit_;
+    DCHECK_GE(extra_rows, 0);
+    DCHECK_LE(extra_rows, output_batch->num_rows());
+    output_batch->set_num_rows(output_batch->num_rows() - extra_rows);
+    SetNumRowsReturned(limit_);
     eos_ = true;
   }
   if (eos_) {
@@ -252,6 +258,7 @@ end:
     probe_batch_->TransferResourceOwnership(output_batch);
     build_batches_->TransferResourceOwnership(output_batch);
   }
+  COUNTER_SET(rows_returned_counter_, rows_returned());
   return Status::OK();
 }
 
@@ -314,10 +321,9 @@ Status NestedLoopJoinNode::GetNextLeftSemiJoin(RuntimeState* state,
       output_batch->CopyRow(current_probe_row_, output_row);
       VLOG_ROW << "match row: " << PrintRow(output_row, *row_desc());
       output_batch->CommitLastRow();
-      ++num_rows_returned_;
+      IncrementNumRowsReturned(1);
       if (ReachedLimit()) {
         eos_ = true;
-        COUNTER_ADD(rows_returned_counter_, output_batch->num_rows());
         return Status::OK();
       }
       // Stop scanning the build rows for the current probe row. If we reach
@@ -327,7 +333,6 @@ Status NestedLoopJoinNode::GetNextLeftSemiJoin(RuntimeState* state,
     RETURN_IF_ERROR(NextProbeRow(state, output_batch));
     if (output_batch->AtCapacity()) break;
   }
-  COUNTER_ADD(rows_returned_counter_, output_batch->num_rows());
   return Status::OK();
 }
 
@@ -402,7 +407,6 @@ Status NestedLoopJoinNode::GetNextRightSemiJoin(RuntimeState* state,
       if ((current_build_row_idx_ & (N - 1)) == 0) {
         if (ReachedLimit()) {
           eos_ = true;
-          COUNTER_ADD(rows_returned_counter_, output_batch->num_rows());
           return Status::OK();
         }
         RETURN_IF_CANCELLED(state);
@@ -431,16 +435,12 @@ Status NestedLoopJoinNode::GetNextRightSemiJoin(RuntimeState* state,
       ++current_build_row_idx_;
       VLOG_ROW << "match row: " << PrintRow(output_row, *row_desc());
       output_batch->CommitLastRow();
-      ++num_rows_returned_;
-      if (output_batch->AtCapacity()) {
-        COUNTER_ADD(rows_returned_counter_, output_batch->num_rows());
-        return Status::OK();
-      }
+      IncrementNumRowsReturned(1);
+      if (output_batch->AtCapacity()) return Status::OK();
     }
     RETURN_IF_ERROR(NextProbeRow(state, output_batch));
     if (output_batch->AtCapacity()) break;
   }
-  COUNTER_ADD(rows_returned_counter_, output_batch->num_rows());
   return Status::OK();
 }
 
@@ -519,8 +519,7 @@ Status NestedLoopJoinNode::ProcessUnmatchedProbeRow(RuntimeState* state,
   if (EvalConjuncts(conjunct_evals, num_conjuncts, output_row)) {
     VLOG_ROW << "match row:" << PrintRow(output_row, *row_desc());
     output_batch->CommitLastRow();
-    ++num_rows_returned_;
-    COUNTER_ADD(rows_returned_counter_, 1);
+    IncrementNumRowsReturned(1);
     if (ReachedLimit()) eos_ = true;
   }
   return Status::OK();
@@ -546,7 +545,6 @@ Status NestedLoopJoinNode::ProcessUnmatchedBuildRows(
     if ((current_build_row_idx_ & (N - 1)) == 0) {
       if (ReachedLimit()) {
         eos_ = true;
-        COUNTER_ADD(rows_returned_counter_, output_batch->num_rows());
         return Status::OK();
       }
       RETURN_IF_CANCELLED(state);
@@ -574,15 +572,11 @@ Status NestedLoopJoinNode::ProcessUnmatchedBuildRows(
     if (EvalConjuncts(conjunct_evals, num_conjuncts, output_row)) {
       VLOG_ROW << "match row: " << PrintRow(output_row, *row_desc());
       output_batch->CommitLastRow();
-      ++num_rows_returned_;
-      if (output_batch->AtCapacity()) {
-        COUNTER_ADD(rows_returned_counter_, output_batch->num_rows());
-        return Status::OK();
-      }
+      IncrementNumRowsReturned(1);
+      if (output_batch->AtCapacity()) return Status::OK();
     }
   }
   eos_ = true;
-  COUNTER_ADD(rows_returned_counter_, output_batch->num_rows());
   return Status::OK();
 }
 
@@ -610,7 +604,6 @@ Status NestedLoopJoinNode::FindBuildMatches(
       if (ReachedLimit()) {
         eos_ = true;
         *return_output_batch = true;
-        COUNTER_ADD(rows_returned_counter_, output_batch->num_rows());
         return Status::OK();
       }
       RETURN_IF_CANCELLED(state);
@@ -626,14 +619,12 @@ Status NestedLoopJoinNode::FindBuildMatches(
     if (!EvalConjuncts(conjunct_evals, num_conjuncts, output_row)) continue;
     VLOG_ROW << "match row: " << PrintRow(output_row, *row_desc());
     output_batch->CommitLastRow();
-    ++num_rows_returned_;
+    IncrementNumRowsReturned(1);
     if (output_batch->AtCapacity()) {
       *return_output_batch = true;
-      COUNTER_ADD(rows_returned_counter_, output_batch->num_rows());
       return Status::OK();
     }
   }
-  COUNTER_ADD(rows_returned_counter_, output_batch->num_rows());
   return Status::OK();
 }
 

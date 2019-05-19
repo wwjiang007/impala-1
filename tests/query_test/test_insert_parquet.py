@@ -20,20 +20,21 @@
 import os
 
 from collections import namedtuple
-from datetime import datetime
+from datetime import (datetime, date)
 from decimal import Decimal
-from shutil import rmtree
 from subprocess import check_call
-from parquet.ttypes import ColumnOrder, SortingColumn, TypeDefinedOrder
+from parquet.ttypes import ColumnOrder, SortingColumn, TypeDefinedOrder, ConvertedType
 
 from tests.common.environ import impalad_basedir
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.parametrize import UniqueDatabase
-from tests.common.skip import SkipIfEC, SkipIfIsilon, SkipIfLocal, SkipIfS3, SkipIfADLS
+from tests.common.skip import (SkipIfEC, SkipIfIsilon, SkipIfLocal, SkipIfS3, SkipIfABFS,
+    SkipIfADLS)
 from tests.common.test_dimensions import create_exec_option_dimension
 from tests.common.test_vector import ImpalaTestDimension
 from tests.util.filesystem_utils import get_fs_path
-from tests.util.get_parquet_metadata import get_parquet_metadata, decode_stats_value
+from tests.util.get_parquet_metadata import (decode_stats_value,
+    get_parquet_metadata_from_hdfs_folder)
 
 PARQUET_CODECS = ['none', 'snappy', 'gzip']
 
@@ -63,6 +64,17 @@ class TimeStamp():
   def __eq__(self, other_timetuple):
     """Compares this objects's value to another timetuple."""
     return self.timetuple == other_timetuple
+
+
+class Date():
+  """Class to compare dates specified as year-month-day to dates specified as days since
+  epoch.
+  """
+  def __init__(self, year, month, day):
+    self.days_since_epoch = (date(year, month, day) - date(1970, 1, 1)).days
+
+  def __eq__(self, other_days_since_eopch):
+    return self.days_since_epoch == other_days_since_eopch
 
 
 ColumnStats = namedtuple('ColumnStats', ['name', 'min', 'max', 'null_count'])
@@ -103,6 +115,7 @@ class TestInsertParquetQueries(ImpalaTestSuite):
 
   @SkipIfEC.oom
   @SkipIfLocal.multiple_impalad
+  @SkipIfS3.eventually_consistent
   @UniqueDatabase.parametrize(sync_ddl=True)
   def test_insert_parquet(self, vector, unique_database):
     vector.get_value('exec_option')['PARQUET_FILE_SIZE'] = \
@@ -245,14 +258,11 @@ class TestHdfsParquetTableWriter(ImpalaTestSuite):
     self.execute_query(query)
 
     # Download hdfs files and extract rowgroup metadata
+    file_metadata_list = get_parquet_metadata_from_hdfs_folder(hdfs_path, tmpdir.strpath)
     row_groups = []
-    check_call(['hdfs', 'dfs', '-get', hdfs_path, tmpdir.strpath])
 
-    for root, subdirs, files in os.walk(tmpdir.strpath):
-      for f in files:
-        parquet_file = os.path.join(root, str(f))
-        file_meta_data = get_parquet_metadata(parquet_file)
-        row_groups.extend(file_meta_data.row_groups)
+    for file_metadata in file_metadata_list:
+      row_groups.extend(file_metadata.row_groups)
 
     # Verify that the files have the sorted_columns set
     expected = [SortingColumn(4, False, False), SortingColumn(0, False, False)]
@@ -278,21 +288,18 @@ class TestHdfsParquetTableWriter(ImpalaTestSuite):
     self.execute_query(query)
 
     # Download hdfs files and verify column orders
-    check_call(['hdfs', 'dfs', '-get', hdfs_path, tmpdir.strpath])
+    file_metadata_list = get_parquet_metadata_from_hdfs_folder(hdfs_path, tmpdir.strpath)
 
     expected_col_orders = [ColumnOrder(TYPE_ORDER=TypeDefinedOrder())] * 11
 
-    for root, subdirs, files in os.walk(tmpdir.strpath):
-      for f in files:
-        parquet_file = os.path.join(root, str(f))
-        file_meta_data = get_parquet_metadata(parquet_file)
-        assert file_meta_data.column_orders == expected_col_orders
+    for file_metadata in file_metadata_list:
+      assert file_metadata.column_orders == expected_col_orders
 
-  def test_read_write_logical_types(self, vector, unique_database, tmpdir):
+  def test_read_write_integer_logical_types(self, vector, unique_database, tmpdir):
     """IMPALA-5052: Read and write signed integer parquet logical types
     This test creates a src_tbl like a parquet file. The parquet file was generated
     to have columns with different signed integer logical types. The test verifies
-    that parquet file written by the hdfs parquet table writer using the genererated
+    that parquet file written by the hdfs parquet table writer using the generated
     file has the same column type metadata as the generated one."""
     hdfs_path = (os.environ['DEFAULT_FS'] + "/test-warehouse/{0}.db/"
                  "signed_integer_logical_types.parquet").format(unique_database)
@@ -357,9 +364,149 @@ class TestHdfsParquetTableWriter(ImpalaTestSuite):
             % dst_tbl)
     assert result_src.data == result_dst.data
 
+  def _ctas_and_get_metadata(self, vector, unique_database, tmp_dir, source_table,
+                             table_name="test_hdfs_parquet_table_writer"):
+    """CTAS 'source_table' into a Parquet table and returns its Parquet metadata."""
+    qualified_table_name = "{0}.{1}".format(unique_database, table_name)
+    hdfs_path = get_fs_path('/test-warehouse/{0}.db/{1}/'.format(unique_database,
+                                                                 table_name))
+
+    # Setting num_nodes = 1 ensures that the query is executed on the coordinator,
+    # resulting in a single parquet file being written.
+    query = ("create table {0} stored as parquet as select * from {1}").format(
+      qualified_table_name, source_table)
+    vector.get_value('exec_option')['num_nodes'] = 1
+    self.execute_query_expect_success(self.client, query,
+                                      vector.get_value('exec_option'))
+
+    file_metadata_list = get_parquet_metadata_from_hdfs_folder(hdfs_path, tmp_dir)
+    assert len(file_metadata_list) == 1
+    assert file_metadata_list[0] is not None
+    return file_metadata_list[0]
+
+  @staticmethod
+  def _get_schema(schemas, column_name):
+    """Searches 'schemas' for a schema with name 'column_name'. Asserts if non is found.
+    """
+    for schema in schemas:
+      if schema.name == column_name:
+        return schema
+    assert False, "schema element %s not found" % column_name
+
+  @staticmethod
+  def _check_only_one_member_var_is_set(obj, var_name):
+    """Checks that 'var_name' is the only member of 'obj' that is not None. Useful to
+    check Thrift unions."""
+    keys = [k for k, v in vars(obj).iteritems() if v is not None]
+    assert keys == [var_name]
+
+  def _check_no_logical_type(self, schemas, column_name):
+    """Checks that the schema with name 'column_name' has no logical or converted type."""
+    schema = self._get_schema(schemas, column_name)
+    assert schema.converted_type is None
+    assert schema.logicalType is None
+
+  def _check_int_logical_type(self, schemas, column_name, bit_width):
+    """Checks that the schema with name 'column_name' has logical and converted type that
+    describe a signed integer with 'bit_width' bits."""
+    schema = self._get_schema(schemas, column_name)
+    bit_width_to_converted_type_map = {
+        8: ConvertedType.INT_8,
+        16: ConvertedType.INT_16,
+        32: ConvertedType.INT_32,
+        64: ConvertedType.INT_64
+    }
+    assert schema.converted_type == bit_width_to_converted_type_map[bit_width]
+    assert schema.logicalType is not None
+    self._check_only_one_member_var_is_set(schema.logicalType, "INTEGER")
+    assert schema.logicalType.INTEGER is not None
+    assert schema.logicalType.INTEGER.bitWidth == bit_width
+    assert schema.logicalType.INTEGER.isSigned
+
+  def _check_decimal_logical_type(self, schemas, column_name, precision, scale):
+    """Checks that the schema with name 'column_name' has logical and converted type that
+    describe a decimal with given 'precision' and 'scale'."""
+    schema = self._get_schema(schemas, column_name)
+    assert schema.converted_type == ConvertedType.DECIMAL
+    assert schema.precision == precision
+    assert schema.scale == scale
+    assert schema.logicalType is not None
+    self._check_only_one_member_var_is_set(schema.logicalType, "DECIMAL")
+    assert schema.logicalType.DECIMAL.precision == precision
+    assert schema.logicalType.DECIMAL.scale == scale
+
+  def test_logical_types(self, vector, unique_database, tmpdir):
+    """Tests that the Parquet writers set logical type and converted type correctly
+    for all types except DECIMAL"""
+    source = "functional.alltypestiny"
+    file_metadata = \
+        self._ctas_and_get_metadata(vector, unique_database, tmpdir.strpath, source)
+    schemas = file_metadata.schema
+
+    self._check_int_logical_type(schemas, "tinyint_col", 8)
+    self._check_int_logical_type(schemas, "smallint_col", 16)
+    self._check_int_logical_type(schemas, "int_col", 32)
+    self._check_int_logical_type(schemas, "bigint_col", 64)
+
+    self._check_no_logical_type(schemas, "bool_col")
+    self._check_no_logical_type(schemas, "float_col")
+    self._check_no_logical_type(schemas, "double_col")
+
+    # By default STRING has no logical type, see IMPALA-5982.
+    self._check_no_logical_type(schemas, "string_col")
+
+    # Currently TIMESTAMP is written as INT96 and has no logical type.
+    # This test will break once INT64 becomes the default Parquet type for TIMESTAMP
+    # columns in the future (IMPALA-5049).
+    self._check_no_logical_type(schemas, "timestamp_col")
+
+  def test_decimal_logical_types(self, vector, unique_database, tmpdir):
+    """Tests that the Parquet writers set logical type and converted type correctly
+       for DECIMAL type."""
+    source = "functional.decimal_tiny"
+    file_metadata = \
+        self._ctas_and_get_metadata(vector, unique_database, tmpdir.strpath, source)
+    schemas = file_metadata.schema
+
+    self._check_decimal_logical_type(schemas, "c1", 10, 4)
+    self._check_decimal_logical_type(schemas, "c2", 15, 5)
+    self._check_decimal_logical_type(schemas, "c3", 1, 1)
+
+  def _check_int64_timestamp_logical_type(self, schemas, column_name, unit):
+    """Checks that the schema with name 'column_name' has logical and converted type that
+       describe a timestamp with the given unit."""
+    schema = self._get_schema(schemas, column_name)
+    assert schema.logicalType is not None
+    self._check_only_one_member_var_is_set(schema.logicalType, "TIMESTAMP")
+    assert schema.logicalType.TIMESTAMP.unit is not None
+    self._check_only_one_member_var_is_set(
+        schema.logicalType.TIMESTAMP.unit, unit.upper())
+    # Non UTC-normalized timestamps have no converted_type to avoid confusing older
+    # readers that would interpret these as UTC-normalized.
+    assert schema.converted_type is None
+    assert not schema.logicalType.TIMESTAMP.isAdjustedToUTC
+
+  def _ctas_and_check_int64_timestamps(self, vector, unique_database, tmpdir, unit):
+    """CTAS a table using 'unit' int64 timestamps and checks columns metadata."""
+    source = "functional.alltypestiny"
+    timestamp_type = 'int64_' + unit
+    vector.get_value('exec_option')['parquet_timestamp_type'] = timestamp_type
+    file_metadata = self._ctas_and_get_metadata(vector, unique_database, tmpdir.strpath,
+                                                source, table_name=timestamp_type)
+    schemas = file_metadata.schema
+    self._check_int64_timestamp_logical_type(schemas, "timestamp_col", unit)
+
+  def test_int64_timestamp_logical_type(self, vector, unique_database, tmpdir):
+    """Tests that correct metadata is written for int64 timestamps."""
+    self._ctas_and_check_int64_timestamps(vector, unique_database, tmpdir, "millis")
+    self._ctas_and_check_int64_timestamps(vector, unique_database, tmpdir, "micros")
+    self._ctas_and_check_int64_timestamps(vector, unique_database, tmpdir, "nanos")
+
+
 @SkipIfIsilon.hive
 @SkipIfLocal.hive
 @SkipIfS3.hive
+@SkipIfABFS.hive
 @SkipIfADLS.hive
 # TODO: Should we move this to test_parquet_stats.py?
 class TestHdfsParquetTableStatsWriter(ImpalaTestSuite):
@@ -397,14 +544,14 @@ class TestHdfsParquetTableStatsWriter(ImpalaTestSuite):
     assert len(decoded) == len(schemas)
     return decoded
 
-  def _get_row_group_stats_from_file(self, parquet_file):
-    """Returns a list of statistics for each row group in file 'parquet_file'. The result
-    is a two-dimensional list, containing stats by row group and column."""
-    file_meta_data = get_parquet_metadata(parquet_file)
+  def _get_row_group_stats_from_file_metadata(self, file_metadata):
+    """Returns a list of statistics for each row group in Parquet file metadata
+    'file_metadata'. The result is a two-dimensional list, containing stats by
+    row group and column."""
     # We only support flat schemas, the additional element is the root element.
-    schemas = file_meta_data.schema[1:]
+    schemas = file_metadata.schema[1:]
     file_stats = []
-    for row_group in file_meta_data.row_groups:
+    for row_group in file_metadata.row_groups:
       num_columns = len(row_group.columns)
       assert num_columns == len(schemas)
       column_stats = [c.meta_data.statistics for c in row_group.columns]
@@ -419,12 +566,9 @@ class TestHdfsParquetTableStatsWriter(ImpalaTestSuite):
     two-dimensional list, containing stats by row group and column."""
     row_group_stats = []
 
-    check_call(['hdfs', 'dfs', '-get', hdfs_path, tmp_dir])
-
-    for root, subdirs, files in os.walk(tmp_dir):
-      for f in files:
-        parquet_file = os.path.join(root, str(f))
-        row_group_stats.extend(self._get_row_group_stats_from_file(parquet_file))
+    file_metadata_list = get_parquet_metadata_from_hdfs_folder(hdfs_path, tmp_dir)
+    for file_metadata in file_metadata_list:
+      row_group_stats.extend(self._get_row_group_stats_from_file_metadata(file_metadata))
 
     return row_group_stats
 
@@ -456,13 +600,13 @@ class TestHdfsParquetTableStatsWriter(ImpalaTestSuite):
       assert stats == expected
 
   def _ctas_table_and_verify_stats(self, vector, unique_database, tmp_dir, source_table,
-                                   expected_values):
+                                   expected_values,
+                                   table_name="test_hdfs_parquet_table_writer"):
     """Copies 'source_table' into a parquet table and makes sure that the row group
     statistics in the resulting parquet file match those in 'expected_values'. 'tmp_dir'
     needs to be supplied by the caller and will be used to store temporary files. The
     caller is responsible for cleaning up 'tmp_dir'.
     """
-    table_name = "test_hdfs_parquet_table_writer"
     qualified_table_name = "{0}.{1}".format(unique_database, table_name)
     hdfs_path = get_fs_path('/test-warehouse/{0}.db/{1}/'.format(unique_database,
                                                                  table_name))
@@ -501,18 +645,33 @@ class TestHdfsParquetTableStatsWriter(ImpalaTestSuite):
     self._ctas_table_and_verify_stats(vector, unique_database, tmpdir.strpath,
                                       "functional.alltypes", expected_min_max_values)
 
+  def test_write_statistics_date(self, vector, unique_database, tmpdir):
+    """Test that writing Date values to a parquet file populates the rowgroup statistics
+    with the correct values.
+    Date column statistics are tested separately as Date type is not supported across
+    all file formats, therefore we couldn't add a Date column to 'alltypes' table yet.
+    """
+    expected_min_max_values = [
+        ColumnStats('id_col', 0, 31, 0),
+        ColumnStats('date_col', Date(1, 1, 1), Date(9999, 12, 31), 2),
+        ColumnStats('date_part', Date(1, 1, 1), Date(9999, 12, 31), 0),
+    ]
+
+    self._ctas_table_and_verify_stats(vector, unique_database, tmpdir.strpath,
+                                      "functional.date_tbl", expected_min_max_values)
+
   def test_write_statistics_decimal(self, vector, unique_database, tmpdir):
     """Test that writing a parquet file populates the rowgroup statistics with the correct
     values for decimal columns.
     """
     # Expected values for functional.decimal_tbl
     expected_min_max_values = [
-      ColumnStats('d1', 1234, 132842, 0),
-      ColumnStats('d2', 111, 2222, 0),
-      ColumnStats('d3', Decimal('1.23456789'), Decimal('12345.6789'), 0),
-      ColumnStats('d4', Decimal('0.123456789'), Decimal('0.123456789'), 0),
-      ColumnStats('d5', Decimal('0.1'), Decimal('12345.789'), 0),
-      ColumnStats('d6', 1, 1, 0)
+        ColumnStats('d1', 1234, 132842, 0),
+        ColumnStats('d2', 111, 2222, 0),
+        ColumnStats('d3', Decimal('1.23456789'), Decimal('12345.6789'), 0),
+        ColumnStats('d4', Decimal('0.123456789'), Decimal('0.123456789'), 0),
+        ColumnStats('d5', Decimal('0.1'), Decimal('12345.789'), 0),
+        ColumnStats('d6', 1, 1, 0)
     ]
 
     self._ctas_table_and_verify_stats(vector, unique_database, tmpdir.strpath,
@@ -668,15 +827,63 @@ class TestHdfsParquetTableStatsWriter(ImpalaTestSuite):
 
     # Expected values for tpch_parquet.customer
     expected_min_max_values = [
-      ColumnStats('id', '8600000US00601', '8600000US999XX', 0),
-      ColumnStats('zip', '00601', '999XX', 0),
-      ColumnStats('description1', '\"00601 5-Digit ZCTA', '\"999XX 5-Digit ZCTA', 0),
-      ColumnStats('description2', ' 006 3-Digit ZCTA\"', ' 999 3-Digit ZCTA\"', 0),
-      ColumnStats('income', 0, 189570, 29),
+        ColumnStats('id', '8600000US00601', '8600000US999XX', 0),
+        ColumnStats('zip', '00601', '999XX', 0),
+        ColumnStats('description1', '\"00601 5-Digit ZCTA', '\"999XX 5-Digit ZCTA', 0),
+        ColumnStats('description2', ' 006 3-Digit ZCTA\"', ' 999 3-Digit ZCTA\"', 0),
+        ColumnStats('income', 0, 189570, 29),
     ]
 
     self._ctas_table_and_verify_stats(vector, unique_database, tmpdir.strpath,
       "functional_parquet.zipcode_incomes", expected_min_max_values)
+
+  def test_write_int64_timestamp_statistics(self, vector, unique_database, tmpdir):
+    """Test that writing a parquet file populates the rowgroup statistics correctly for
+    int64 milli/micro/nano timestamps."""
+    table_name = "int96_nanos"
+    qualified_table_name = "{0}.{1}".format(unique_database, table_name)
+
+    create_table_stmt = "create table {0} (ts timestamp);".format(qualified_table_name)
+    self.execute_query(create_table_stmt)
+
+    insert_stmt = """insert into {0} values
+        ("1969-12-31 23:59:59.999999999"),
+        ("1970-01-01 00:00:00.001001001")""".format(qualified_table_name)
+    self.execute_query(insert_stmt)
+
+    vector.get_value('exec_option')['parquet_timestamp_type'] = "int64_millis"
+    expected_min_max_values = [
+      ColumnStats('ts', -1, 1, 0)
+    ]
+    self._ctas_table_and_verify_stats(vector, unique_database, tmpdir.strpath,
+                                      qualified_table_name,
+                                      expected_min_max_values,
+                                      table_name="int64_millis")
+
+    vector.get_value('exec_option')['parquet_timestamp_type'] = "int64_micros"
+    expected_min_max_values = [
+      ColumnStats('ts', -1, 1001, 0)
+    ]
+    self._ctas_table_and_verify_stats(vector, unique_database, tmpdir.strpath,
+                                      qualified_table_name,
+                                      expected_min_max_values,
+                                      table_name="int64_micros")
+
+    # Insert values that fall outside the valid range for int64_nanos. These should
+    # be inserted as NULLs and not affect min/max stats.
+    insert_stmt = """insert into {0} values
+        ("1677-09-21 00:12:43.145224191"),
+        ("2262-04-11 23:47:16.854775808")""".format(qualified_table_name)
+    self.execute_query(insert_stmt)
+
+    vector.get_value('exec_option')['parquet_timestamp_type'] = "int64_nanos"
+    expected_min_max_values = [
+      ColumnStats('ts', -1, 1001001, 2)
+    ]
+    self._ctas_table_and_verify_stats(vector, unique_database, tmpdir.strpath,
+                                      qualified_table_name,
+                                      expected_min_max_values,
+                                      table_name="int64_nanos")
 
   def test_too_many_columns(self, vector, unique_database):
     """Test that writing a Parquet table with too many columns results in an error."""
@@ -684,5 +891,5 @@ class TestHdfsParquetTableStatsWriter(ImpalaTestSuite):
     query = "create table %s.wide stored as parquet as select \n" % unique_database
     query += ", ".join(map(str, xrange(num_cols)))
     query += ";\n"
-    result = self.execute_query_expect_failure(self.client, query);
+    result = self.execute_query_expect_failure(self.client, query)
     assert "Minimum required block size must be less than 2GB" in str(result)

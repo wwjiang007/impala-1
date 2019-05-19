@@ -76,7 +76,6 @@ HdfsTextScanner::~HdfsTextScanner() {
 Status HdfsTextScanner::IssueInitialRanges(HdfsScanNodeBase* scan_node,
     const vector<HdfsFileDesc*>& files) {
   vector<ScanRange*> compressed_text_scan_ranges;
-  int compressed_text_files = 0;
   map<string, vector<HdfsFileDesc*>> plugin_text_files;
   for (int i = 0; i < files.size(); ++i) {
     THdfsCompression::type compression = files[i]->file_compression;
@@ -84,14 +83,13 @@ Status HdfsTextScanner::IssueInitialRanges(HdfsScanNodeBase* scan_node,
       case THdfsCompression::NONE:
         // For uncompressed text we just issue all ranges at once.
         // TODO: Lz4 is splittable, should be treated similarly.
-        RETURN_IF_ERROR(scan_node->AddDiskIoRanges(files[i]));
+        RETURN_IF_ERROR(scan_node->AddDiskIoRanges(files[i], EnqueueLocation::TAIL));
         break;
 
       case THdfsCompression::GZIP:
       case THdfsCompression::SNAPPY:
       case THdfsCompression::SNAPPY_BLOCKED:
       case THdfsCompression::BZIP2:
-        ++compressed_text_files;
         for (int j = 0; j < files[i]->splits.size(); ++j) {
           // In order to decompress gzip-, snappy- and bzip2-compressed text files, we
           // need to read entire files. Only read a file if we're assigned the first split
@@ -118,6 +116,7 @@ Status HdfsTextScanner::IssueInitialRanges(HdfsScanNodeBase* scan_node,
           ScanRange* file_range = scan_node->AllocateScanRange(files[i]->fs,
               files[i]->filename.c_str(), files[i]->file_length, 0,
               metadata->partition_id, split->disk_id(), split->expected_local(),
+              files[i]->is_erasure_coded,
               BufferOpts(split->try_cache(), files[i]->mtime));
           compressed_text_scan_ranges.push_back(file_range);
           scan_node->max_compressed_text_file_length()->Set(files[i]->file_length);
@@ -146,7 +145,7 @@ Status HdfsTextScanner::IssueInitialRanges(HdfsScanNodeBase* scan_node,
   }
   if (compressed_text_scan_ranges.size() > 0) {
     RETURN_IF_ERROR(scan_node->AddDiskIoRanges(compressed_text_scan_ranges,
-        compressed_text_files));
+          EnqueueLocation::TAIL));
   }
   for (const auto& entry : plugin_text_files) {
     DCHECK_GT(entry.second.size(), 0) << "List should be non-empty";
@@ -416,7 +415,7 @@ Status HdfsTextScanner::ProcessRange(RowBatch* row_batch, int* num_tuples) {
       break;
     }
 
-    if (row_batch->AtCapacity() || scan_node_->ReachedLimit()) break;
+    if (row_batch->AtCapacity() || scan_node_->ReachedLimitShared()) break;
   }
   return Status::OK();
 }
@@ -447,7 +446,7 @@ Status HdfsTextScanner::GetNextInternal(RowBatch* row_batch) {
     int num_tuples;
     RETURN_IF_ERROR(ProcessRange(row_batch, &num_tuples));
   }
-  if (scan_node_->ReachedLimit()) {
+  if (scan_node_->ReachedLimitShared()) {
     eos_ = true;
     scan_state_ = DONE;
     return Status::OK();
@@ -846,7 +845,8 @@ int HdfsTextScanner::WriteFields(int num_fields, int num_tuples, MemPool* pool,
     const bool copy_strings = !string_slot_offsets_.empty() &&
         stream_->file_desc()->file_compression == THdfsCompression::NONE;
     int max_added_tuples = (scan_node_->limit() == -1) ?
-        num_tuples : scan_node_->limit() - scan_node_->rows_returned();
+        num_tuples :
+        scan_node_->limit() - scan_node_->rows_returned_shared();
     int tuples_returned = 0;
     // Call jitted function if possible
     if (write_tuples_fn_ != nullptr) {

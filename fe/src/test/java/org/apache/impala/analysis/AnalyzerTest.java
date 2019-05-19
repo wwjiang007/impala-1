@@ -17,15 +17,18 @@
 
 package org.apache.impala.analysis;
 
-import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.function.BiConsumer;
 
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.ScalarType;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FrontendTestBase;
+import org.apache.impala.util.FunctionUtils;
 import org.junit.Assert;
 import org.junit.Test;
 import org.slf4j.Logger;
@@ -33,12 +36,14 @@ import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Preconditions;
 
+import static org.junit.Assert.assertEquals;
+
 public class AnalyzerTest extends FrontendTestBase {
   protected final static Logger LOG = LoggerFactory.getLogger(AnalyzerTest.class);
 
   // maps from type to string that will result in literal of that type
   protected static Map<ScalarType, String> typeToLiteralValue_ =
-      new HashMap<ScalarType, String>();
+      new HashMap<>();
   static {
     typeToLiteralValue_.put(Type.BOOLEAN, "true");
     typeToLiteralValue_.put(Type.TINYINT, "1");
@@ -51,6 +56,7 @@ public class AnalyzerTest extends FrontendTestBase {
         "cast(" + (Float.MAX_VALUE + 1) + " as double)");
     typeToLiteralValue_.put(Type.TIMESTAMP,
         "cast('2012-12-21 00:00:00.000' as timestamp)");
+    typeToLiteralValue_.put(Type.DATE, "cast('2012-12-21' as date)");
     typeToLiteralValue_.put(Type.STRING, "'Hello, World!'");
     typeToLiteralValue_.put(Type.NULL, "NULL");
   }
@@ -109,27 +115,35 @@ public class AnalyzerTest extends FrontendTestBase {
   }
 
   private void testSelectStar() throws AnalysisException {
-    SelectStmt stmt = (SelectStmt) AnalyzesOk("select * from functional.AllTypes");
+    SelectStmt stmt = (SelectStmt) AnalyzesOk(
+        "select * from functional.AllTypes, functional.date_tbl");
     Analyzer analyzer = stmt.getAnalyzer();
     DescriptorTable descTbl = analyzer.getDescTbl();
     TupleDescriptor tupleDesc = descTbl.getTupleDesc(new TupleId(0));
     tupleDesc.materializeSlots();
+    TupleDescriptor dateTblTupleDesc = descTbl.getTupleDesc(new TupleId(1));
+    dateTblTupleDesc.materializeSlots();
     descTbl.computeMemLayout();
 
-    Assert.assertEquals(97.0f, tupleDesc.getAvgSerializedSize(), 0.0);
-    checkLayoutParams("functional.alltypes.date_string_col", 16, 0, 88, 0, analyzer);
-    checkLayoutParams("functional.alltypes.string_col", 16, 16, 88, 1, analyzer);
-    checkLayoutParams("functional.alltypes.timestamp_col", 16, 32, 88, 2, analyzer);
-    checkLayoutParams("functional.alltypes.bigint_col", 8, 48, 88, 3, analyzer);
-    checkLayoutParams("functional.alltypes.double_col", 8, 56, 88, 4, analyzer);
-    checkLayoutParams("functional.alltypes.id", 4, 64, 88, 5, analyzer);
-    checkLayoutParams("functional.alltypes.int_col", 4, 68, 88, 6, analyzer);
-    checkLayoutParams("functional.alltypes.float_col", 4, 72, 88, 7, analyzer);
-    checkLayoutParams("functional.alltypes.year", 4, 76, 89, 0, analyzer);
-    checkLayoutParams("functional.alltypes.month", 4, 80, 89, 1, analyzer);
-    checkLayoutParams("functional.alltypes.smallint_col", 2, 84, 89, 2, analyzer);
-    checkLayoutParams("functional.alltypes.bool_col", 1, 86, 89, 3, analyzer);
-    checkLayoutParams("functional.alltypes.tinyint_col", 1, 87, 89, 4, analyzer);
+    assertEquals(89.0f, tupleDesc.getAvgSerializedSize(), 0.0);
+    checkLayoutParams("functional.alltypes.timestamp_col", 16, 0, 80, 0, analyzer);
+    checkLayoutParams("functional.alltypes.date_string_col", 12, 16, 80, 1, analyzer);
+    checkLayoutParams("functional.alltypes.string_col", 12, 28, 80, 2, analyzer);
+    checkLayoutParams("functional.alltypes.bigint_col", 8, 40, 80, 3, analyzer);
+    checkLayoutParams("functional.alltypes.double_col", 8, 48, 80, 4, analyzer);
+    checkLayoutParams("functional.alltypes.id", 4, 56, 80, 5, analyzer);
+    checkLayoutParams("functional.alltypes.int_col", 4, 60, 80, 6, analyzer);
+    checkLayoutParams("functional.alltypes.float_col", 4, 64, 80, 7, analyzer);
+    checkLayoutParams("functional.alltypes.year", 4, 68, 81, 0, analyzer);
+    checkLayoutParams("functional.alltypes.month", 4, 72, 81, 1, analyzer);
+    checkLayoutParams("functional.alltypes.smallint_col", 2, 76, 81, 2, analyzer);
+    checkLayoutParams("functional.alltypes.bool_col", 1, 78, 81, 3, analyzer);
+    checkLayoutParams("functional.alltypes.tinyint_col", 1, 79, 81, 4, analyzer);
+
+    Assert.assertEquals(12, dateTblTupleDesc.getAvgSerializedSize(), 0.0);
+    checkLayoutParams("functional.date_tbl.id_col", 4, 0, 12, 0, analyzer);
+    checkLayoutParams("functional.date_tbl.date_col", 4, 4, 12, 1, analyzer);
+    checkLayoutParams("functional.date_tbl.date_part", 4, 8, 12, 2, analyzer);
   }
 
   private void testNonNullable() throws AnalysisException {
@@ -143,8 +157,8 @@ public class AnalyzerTest extends FrontendTestBase {
     TupleDescriptor aggDesc = descTbl.getTupleDesc(new TupleId(1));
     aggDesc.materializeSlots();
     descTbl.computeMemLayout();
-    Assert.assertEquals(16.0f, aggDesc.getAvgSerializedSize(), 0.0);
-    Assert.assertEquals(16, aggDesc.getByteSize());
+    assertEquals(16.0f, aggDesc.getAvgSerializedSize(), 0.0);
+    assertEquals(16, aggDesc.getByteSize());
     checkLayoutParams(aggDesc.getSlots().get(0), 8, 0, 0, -1);
     checkLayoutParams(aggDesc.getSlots().get(1), 8, 8, 0, -1);
   }
@@ -161,8 +175,8 @@ public class AnalyzerTest extends FrontendTestBase {
     TupleDescriptor aggDesc = descTbl.getTupleDesc(new TupleId(1));
     aggDesc.materializeSlots();
     descTbl.computeMemLayout();
-    Assert.assertEquals(16.0f, aggDesc.getAvgSerializedSize(), 0.0);
-    Assert.assertEquals(17, aggDesc.getByteSize());
+    assertEquals(16.0f, aggDesc.getAvgSerializedSize(), 0.0);
+    assertEquals(17, aggDesc.getByteSize());
     checkLayoutParams(aggDesc.getSlots().get(0), 8, 0, 16, 0);
     checkLayoutParams(aggDesc.getSlots().get(1), 8, 8, 0, -1);
   }
@@ -171,42 +185,58 @@ public class AnalyzerTest extends FrontendTestBase {
    * Tests that computeMemLayout() ignores non-materialized slots.
    */
   private void testNonMaterializedSlots() throws AnalysisException {
-    SelectStmt stmt = (SelectStmt) AnalyzesOk("select * from functional.alltypes");
+    SelectStmt stmt = (SelectStmt) AnalyzesOk(
+        "select * from functional.alltypes, functional.date_tbl");
     Analyzer analyzer = stmt.getAnalyzer();
     DescriptorTable descTbl = analyzer.getDescTbl();
     TupleDescriptor tupleDesc = descTbl.getTupleDesc(new TupleId(0));
     tupleDesc.materializeSlots();
     // Mark slots 0 (id), 7 (double_col), 9 (string_col) as non-materialized.
-    ArrayList<SlotDescriptor> slots = tupleDesc.getSlots();
+    List<SlotDescriptor> slots = tupleDesc.getSlots();
     slots.get(0).setIsMaterialized(false);
     slots.get(7).setIsMaterialized(false);
     slots.get(9).setIsMaterialized(false);
+
+    TupleDescriptor dateTblTupleDesc = descTbl.getTupleDesc(new TupleId(1));
+    dateTblTupleDesc.materializeSlots();
+    // Mark slots 0 and 1 (id_col and date_col) non-materialized.
+    slots = dateTblTupleDesc.getSlots();
+    slots.get(0).setIsMaterialized(false);
+    slots.get(1).setIsMaterialized(false);
+
     descTbl.computeMemLayout();
 
-    Assert.assertEquals(68.0f, tupleDesc.getAvgSerializedSize(), 0.0);
+    assertEquals(64.0f, tupleDesc.getAvgSerializedSize(), 0.0);
     // Check non-materialized slots.
     checkLayoutParams("functional.alltypes.id", 0, -1, 0, 0, analyzer);
     checkLayoutParams("functional.alltypes.double_col", 0, -1, 0, 0, analyzer);
     checkLayoutParams("functional.alltypes.string_col", 0, -1, 0, 0, analyzer);
     // Check materialized slots.
-    checkLayoutParams("functional.alltypes.date_string_col", 16, 0, 60, 0, analyzer);
-    checkLayoutParams("functional.alltypes.timestamp_col", 16, 16, 60, 1, analyzer);
-    checkLayoutParams("functional.alltypes.bigint_col", 8, 32, 60, 2, analyzer);
-    checkLayoutParams("functional.alltypes.int_col", 4, 40, 60, 3, analyzer);
-    checkLayoutParams("functional.alltypes.float_col", 4, 44, 60, 4, analyzer);
-    checkLayoutParams("functional.alltypes.year", 4, 48, 60, 5, analyzer);
-    checkLayoutParams("functional.alltypes.month", 4, 52, 60, 6, analyzer);
-    checkLayoutParams("functional.alltypes.smallint_col", 2, 56, 60, 7, analyzer);
-    checkLayoutParams("functional.alltypes.bool_col", 1, 58, 61, 0, analyzer);
-    checkLayoutParams("functional.alltypes.tinyint_col", 1, 59, 61, 1, analyzer);
+    checkLayoutParams("functional.alltypes.timestamp_col", 16, 0, 56, 0, analyzer);
+    checkLayoutParams("functional.alltypes.date_string_col", 12, 16, 56, 1, analyzer);
+    checkLayoutParams("functional.alltypes.bigint_col", 8, 28, 56, 2, analyzer);
+    checkLayoutParams("functional.alltypes.int_col", 4, 36, 56, 3, analyzer);
+    checkLayoutParams("functional.alltypes.float_col", 4, 40, 56, 4, analyzer);
+    checkLayoutParams("functional.alltypes.year", 4, 44, 56, 5, analyzer);
+    checkLayoutParams("functional.alltypes.month", 4, 48, 56, 6, analyzer);
+    checkLayoutParams("functional.alltypes.smallint_col", 2, 52, 56, 7, analyzer);
+    checkLayoutParams("functional.alltypes.bool_col", 1, 54, 57, 0, analyzer);
+    checkLayoutParams("functional.alltypes.tinyint_col", 1, 55, 57, 1, analyzer);
+
+    Assert.assertEquals(4, dateTblTupleDesc.getAvgSerializedSize(), 0.0);
+    // Non-materialized slots.
+    checkLayoutParams("functional.date_tbl.id_col", 0, -1, 0, 0, analyzer);
+    checkLayoutParams("functional.date_tbl.date_col", 0, -1, 0, 0, analyzer);
+    // Materialized slot.
+    checkLayoutParams("functional.date_tbl.date_part", 4, 0, 4, 0, analyzer);
   }
 
   private void checkLayoutParams(SlotDescriptor d, int byteSize, int byteOffset,
       int nullIndicatorByte, int nullIndicatorBit) {
-    Assert.assertEquals(byteSize, d.getByteSize());
-    Assert.assertEquals(byteOffset, d.getByteOffset());
-    Assert.assertEquals(nullIndicatorByte, d.getNullIndicatorByte());
-    Assert.assertEquals(nullIndicatorBit, d.getNullIndicatorBit());
+    assertEquals(byteSize, d.getByteSize());
+    assertEquals(byteOffset, d.getByteOffset());
+    assertEquals(nullIndicatorByte, d.getNullIndicatorByte());
+    assertEquals(nullIndicatorBit, d.getNullIndicatorBit());
   }
 
   private void checkLayoutParams(String colAlias, int byteSize, int byteOffset,
@@ -219,7 +249,7 @@ public class AnalyzerTest extends FrontendTestBase {
   // Requires query to parse to a SelectStmt.
   protected void checkExprType(String query, Type type) {
     SelectStmt select = (SelectStmt) AnalyzesOk(query);
-    Assert.assertEquals(select.getResultExprs().get(0).getType(), type);
+    assertEquals(select.getResultExprs().get(0).getType(), type);
   }
 
   /**
@@ -236,28 +266,26 @@ public class AnalyzerTest extends FrontendTestBase {
   @Test
   public void TestUnsupportedTypes() {
     // Select supported types from a table with mixed supported/unsupported types.
-    AnalyzesOk("select int_col, str_col, bigint_col from functional.unsupported_types");
-
-    // Select supported types from a table with mixed supported/unsupported types.
-    AnalyzesOk("select int_col, str_col, bigint_col from functional.unsupported_types");
+    AnalyzesOk("select int_col, date_col, str_col, bigint_col " +
+        "from functional.unsupported_types");
 
     // Unsupported type binary.
     AnalysisError("select bin_col from functional.unsupported_types",
         "Unsupported type 'BINARY' in 'bin_col'.");
-    // Unsupported type date in a star expansion.
+    // Unsupported type binary in a star expansion.
     AnalysisError("select * from functional.unsupported_types",
-        "Unsupported type 'DATE' in 'functional.unsupported_types.date_col'.");
+        "Unsupported type 'BINARY' in 'functional.unsupported_types.bin_col'.");
     // Mixed supported/unsupported types.
     AnalysisError("select int_col, str_col, bin_col " +
         "from functional.unsupported_types",
         "Unsupported type 'BINARY' in 'bin_col'.");
     AnalysisError("create table tmp as select * from functional.unsupported_types",
-        "Unsupported type 'DATE' in 'functional.unsupported_types.date_col'.");
+        "Unsupported type 'BINARY' in 'functional.unsupported_types.bin_col'.");
     // Unsupported type in the target insert table.
     AnalysisError("insert into functional.unsupported_types " +
         "values(null, null, null, null, null, null)",
         "Unable to INSERT into target table (functional.unsupported_types) because " +
-        "the column 'date_col' has an unsupported type 'DATE'");
+        "the column 'bin_col' has an unsupported type 'BINARY'");
     // Unsupported partition-column type.
     AnalysisError("select * from functional.unsupported_partition_types",
         "Failed to load metadata for table: 'functional.unsupported_partition_types'");
@@ -307,6 +335,25 @@ public class AnalyzerTest extends FrontendTestBase {
   }
 
   @Test
+  public void TestCopyTestCase() {
+    AnalyzesOk("copy testcase to 'hdfs:///tmp' select * from functional.alltypes");
+    AnalyzesOk("copy testcase to 'hdfs:///tmp' select * from functional.alltypes union " +
+        "select * from functional.alltypes");
+    // Containing views
+    AnalyzesOk("copy testcase to 'hdfs:///tmp' select * from functional.alltypes_view");
+    // Mix of view and table
+    AnalyzesOk("copy testcase to 'hdfs:///tmp' select * from functional.alltypes_view " +
+        "union all select * from functional.alltypes");
+    AnalyzesOk("copy testcase to 'hdfs:///tmp' with v as (select 1) select * from v");
+    // Target directory does not exist
+    AnalysisError("copy testcase to 'hdfs:///foo' select 1", "Path does not exist: " +
+        "hdfs://localhost:20500/foo");
+    // Testcase file does not exist
+    AnalysisError("copy testcase from 'hdfs:///tmp/file-doesnot-exist'", "Path does not" +
+        " exist");
+  }
+
+  @Test
   public void TestBinaryHBaseTable() {
     AnalyzesOk("select * from functional_hbase.alltypessmallbinary");
   }
@@ -319,20 +366,42 @@ public class AnalyzerTest extends FrontendTestBase {
 
   @Test
   public void TestResetMetadata() {
-    AnalyzesOk("invalidate metadata");
-    AnalyzesOk("invalidate metadata functional.alltypessmall");
-    AnalyzesOk("invalidate metadata functional.alltypes_view");
-    AnalyzesOk("invalidate metadata functional.bad_serde");
-    AnalyzesOk("refresh functional.alltypessmall");
-    AnalyzesOk("refresh functional.alltypes_view");
-    AnalyzesOk("refresh functional.bad_serde");
-    AnalyzesOk("refresh functional.alltypessmall partition (year=2009, month=1)");
-    AnalyzesOk("refresh functional.alltypessmall partition (year=2009, month=NULL)");
+    BiConsumer<ParseNode, ResetMetadataStmt.Action> assertAction =
+        (parseNode, action) -> {
+          Preconditions.checkArgument(parseNode instanceof ResetMetadataStmt);
+          assertEquals(action, ((ResetMetadataStmt) parseNode).getAction());
+        };
+
+    assertAction.accept(AnalyzesOk("invalidate metadata"),
+        ResetMetadataStmt.Action.INVALIDATE_METADATA_ALL);
+    assertAction.accept(AnalyzesOk("invalidate metadata functional.alltypessmall"),
+        ResetMetadataStmt.Action.INVALIDATE_METADATA_TABLE);
+    assertAction.accept(AnalyzesOk("invalidate metadata functional.alltypes_view"),
+        ResetMetadataStmt.Action.INVALIDATE_METADATA_TABLE);
+    assertAction.accept(AnalyzesOk("invalidate metadata functional.bad_serde"),
+        ResetMetadataStmt.Action.INVALIDATE_METADATA_TABLE);
+    assertAction.accept(AnalyzesOk("refresh functional.alltypessmall"),
+        ResetMetadataStmt.Action.REFRESH_TABLE);
+    assertAction.accept(AnalyzesOk("refresh functional.alltypes_view"),
+        ResetMetadataStmt.Action.REFRESH_TABLE);
+    assertAction.accept(AnalyzesOk("refresh functional.bad_serde"),
+        ResetMetadataStmt.Action.REFRESH_TABLE);
+    assertAction.accept(AnalyzesOk(
+        "refresh functional.alltypessmall partition (year=2009, month=1)"),
+        ResetMetadataStmt.Action.REFRESH_PARTITION);
+    assertAction.accept(AnalyzesOk(
+        "refresh functional.alltypessmall partition (year=2009, month=NULL)"),
+        ResetMetadataStmt.Action.REFRESH_PARTITION);
+    assertAction.accept(AnalyzesOk(
+        "refresh authorization", createAnalysisCtx(createAuthorizationFactory())),
+        ResetMetadataStmt.Action.REFRESH_AUTHORIZATION);
 
     // invalidate metadata <table name> checks the Hive Metastore for table existence
     // and should not throw an AnalysisError if the table or db does not exist.
-    AnalyzesOk("invalidate metadata functional.unknown_table");
-    AnalyzesOk("invalidate metadata unknown_db.unknown_table");
+    assertAction.accept(AnalyzesOk("invalidate metadata functional.unknown_table"),
+        ResetMetadataStmt.Action.INVALIDATE_METADATA_TABLE);
+    assertAction.accept(AnalyzesOk("invalidate metadata unknown_db.unknown_table"),
+        ResetMetadataStmt.Action.INVALIDATE_METADATA_TABLE);
 
     AnalysisError("refresh functional.unknown_table",
         "Table does not exist: functional.unknown_table");
@@ -468,7 +537,7 @@ public class AnalyzerTest extends FrontendTestBase {
   @Test
   // Test matching function signatures.
   public void TestFunctionMatching() {
-    Function[] fns = new Function[14];
+    Function[] fns = new Function[18];
     // test()
     fns[0] = createFunction(false);
 
@@ -513,6 +582,15 @@ public class AnalyzerTest extends FrontendTestBase {
     fns[13] = createFunction(false, Type.TINYINT, Type.STRING, Type.BIGINT, Type.INT,
         Type.TINYINT);
 
+    // test(date, string, date)
+    fns[14] = createFunction(false, Type.DATE, Type.STRING, Type.DATE);
+    // test(timestamp...)
+    fns[15] = createFunction(true, Type.TIMESTAMP);
+    // test(date...)
+    fns[16] = createFunction(true, Type.DATE);
+    // test(string...)
+    fns[17] = createFunction(true, Type.STRING);
+
     Assert.assertFalse(fns[1].compare(fns[0], Function.CompareMode.IS_SUPERTYPE_OF));
     Assert.assertTrue(fns[1].compare(fns[2], Function.CompareMode.IS_SUPERTYPE_OF));
     Assert.assertTrue(fns[1].compare(fns[3], Function.CompareMode.IS_SUPERTYPE_OF));
@@ -542,6 +620,35 @@ public class AnalyzerTest extends FrontendTestBase {
     Assert.assertTrue(fns[11].compare(fns[12], Function.CompareMode.IS_SUPERTYPE_OF));
     Assert.assertFalse(fns[11].compare(fns[13], Function.CompareMode.IS_SUPERTYPE_OF));
 
+    Assert.assertFalse(fns[15].compare(fns[14], Function.CompareMode.IS_SUPERTYPE_OF));
+    Assert.assertTrue(fns[15].compare(fns[14],
+        Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF));
+    Assert.assertFalse(fns[15].compare(fns[16],
+        Function.CompareMode.IS_SUPERTYPE_OF));
+    Assert.assertTrue(fns[15].compare(fns[16],
+        Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF));
+    Assert.assertFalse(fns[15].compare(fns[17],
+        Function.CompareMode.IS_SUPERTYPE_OF));
+    Assert.assertTrue(fns[15].compare(fns[17],
+        Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF));
+
+    Assert.assertFalse(fns[16].compare(fns[14], Function.CompareMode.IS_SUPERTYPE_OF));
+    Assert.assertTrue(fns[16].compare(fns[14],
+        Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF));
+    Assert.assertFalse(fns[16].compare(fns[15],
+        Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF));
+    Assert.assertFalse(fns[16].compare(fns[17],
+        Function.CompareMode.IS_SUPERTYPE_OF));
+    Assert.assertTrue(fns[16].compare(fns[17],
+        Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF));
+
+    Assert.assertFalse(fns[17].compare(fns[14],
+        Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF));
+    Assert.assertFalse(fns[17].compare(fns[15],
+        Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF));
+    Assert.assertFalse(fns[17].compare(fns[16],
+        Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF));
+
     for (int i = 0; i < fns.length; ++i) {
       for (int j = 0; j < fns.length; ++j) {
         if (i == j) {
@@ -559,13 +666,111 @@ public class AnalyzerTest extends FrontendTestBase {
             Assert.assertTrue(
                 fns[i].compare(fns[j], Function.CompareMode.IS_SUPERTYPE_OF) ||
                 fns[j].compare(fns[i], Function.CompareMode.IS_SUPERTYPE_OF));
-          } else if (fns[i].compare(fns[j], Function.CompareMode.IS_INDISTINGUISHABLE)) {
             // This is reflexive
             Assert.assertTrue(
                 fns[j].compare(fns[i], Function.CompareMode.IS_INDISTINGUISHABLE));
+          } else if (fns[i].compare(fns[j], Function.CompareMode.IS_INDISTINGUISHABLE)) {
           }
         }
       }
     }
+  }
+
+  @Test
+  public void testFunctionMatchScore() {
+    // test(date, date, int)
+    Function fnDate = createFunction(false, Type.DATE, Type.DATE, Type.INT);
+    // test(timestamp, timestamp, int)
+    Function fnTimestamp = createFunction(false, Type.TIMESTAMP, Type.TIMESTAMP,
+        Type.INT);
+
+    // test(string, date, tinyint)
+    Function fn = createFunction(false, Type.STRING, Type.DATE, Type.TINYINT);
+    Assert.assertEquals(-1,
+        fnDate.calcMatchScore(fn, Function.CompareMode.IS_SUPERTYPE_OF));
+    int fnDateScore = fnDate.calcMatchScore(fn,
+        Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
+    Assert.assertTrue(fnDateScore >= 0);
+
+    Assert.assertEquals(-1,
+        fnTimestamp.calcMatchScore(fn, Function.CompareMode.IS_SUPERTYPE_OF));
+    int fnTimestampScore = fnTimestamp.calcMatchScore(fn,
+        Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
+    Assert.assertTrue(fnTimestampScore >= 0);
+
+    Assert.assertTrue(fnDateScore > fnTimestampScore);
+
+    // test(string, timestamp, tinyint)
+    fn = createFunction(false, Type.STRING, Type.TIMESTAMP, Type.TINYINT);
+    Assert.assertEquals(-1,
+        fnDate.calcMatchScore(fn, Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF));
+
+    Assert.assertEquals(-1,
+        fnTimestamp.calcMatchScore(fn, Function.CompareMode.IS_SUPERTYPE_OF));
+    Assert.assertTrue(
+        fnTimestamp.calcMatchScore(fn, Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF)
+        >= 0);
+
+    // test(string, string, tinyint)
+    fn = createFunction(false, Type.STRING, Type.STRING, Type.TINYINT);
+    Assert.assertEquals(-1,
+        fnDate.calcMatchScore(fn, Function.CompareMode.IS_SUPERTYPE_OF));
+    fnDateScore = fnDate.calcMatchScore(fn,
+        Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
+    Assert.assertTrue(fnDateScore >= 0);
+
+    Assert.assertEquals(-1,
+        fnTimestamp.calcMatchScore(fn, Function.CompareMode.IS_SUPERTYPE_OF));
+    fnTimestampScore = fnTimestamp.calcMatchScore(fn,
+        Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
+    Assert.assertTrue(fnTimestampScore >= 0);
+
+    Assert.assertTrue(fnDateScore == fnTimestampScore);
+  }
+
+  @Test
+  public void testResolveFunction() {
+    Function[] fns = new Function[] {
+        createFunction(false, Type.TIMESTAMP, Type.TIMESTAMP, Type.INT),
+        createFunction(false, Type.DATE, Type.DATE, Type.INT)};
+
+    // fns[0] and fns[1] has the same match score, so fns[0] will be chosen.
+    Function fnStr = createFunction(false, Type.STRING, Type.STRING, Type.TINYINT);
+    Assert.assertEquals(fns[0],
+        FunctionUtils.resolveFunction(Arrays.asList(fns), fnStr,
+            Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF));
+
+    // fns[0] is a better match. First argument is an exact match.
+    Function fnTimestamp = createFunction(false, Type.TIMESTAMP, Type.STRING,
+        Type.TINYINT);
+    Assert.assertEquals(fns[0],
+        FunctionUtils.resolveFunction(Arrays.asList(fns), fnTimestamp,
+            Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF));
+
+    // fns[0] is a better match. First argument is an exact match.
+    fnTimestamp = createFunction(false, Type.TIMESTAMP, Type.DATE,
+        Type.TINYINT);
+    Assert.assertEquals(fns[0],
+        FunctionUtils.resolveFunction(Arrays.asList(fns), fnTimestamp,
+            Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF));
+
+    // fns[0] is a better match. Second argument is an exact match.
+    fnTimestamp = createFunction(false, Type.DATE, Type.TIMESTAMP,
+        Type.TINYINT);
+    Assert.assertEquals(fns[0],
+        FunctionUtils.resolveFunction(Arrays.asList(fns), fnTimestamp,
+            Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF));
+
+    // fns[1] is a better match. First argument is an exact match.
+    Function fnDate = createFunction(false, Type.DATE, Type.STRING, Type.TINYINT);
+    Assert.assertEquals(fns[1],
+        FunctionUtils.resolveFunction(Arrays.asList(fns), fnDate,
+            Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF));
+
+    // fns[1] is a better match. Second argument is an exact match.
+    fnDate = createFunction(false, Type.STRING, Type.DATE, Type.TINYINT);
+    Assert.assertEquals(fns[1],
+        FunctionUtils.resolveFunction(Arrays.asList(fns), fnDate,
+            Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF));
   }
 }

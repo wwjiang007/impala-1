@@ -30,6 +30,9 @@ if (NOT DEFINED BUILD_SHARED_LIBS)
   set(BUILD_SHARED_LIBS OFF)
 endif()
 
+# Store BUILD_SHARED_LIBS in a variable so it can be read in config.h.in
+set(IMPALA_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
+
 # Build compile commands database
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -47,8 +50,14 @@ endif(NOT CMAKE_BUILD_TYPE)
 STRING (TOUPPER ${CMAKE_BUILD_TYPE} CMAKE_BUILD_TYPE)
 
 message(STATUS "Build type is ${CMAKE_BUILD_TYPE}")
-# Write the build type to a file so that tests can determine the current build type.
-file(WRITE "${CMAKE_SOURCE_DIR}/.cmake_build_type" ${CMAKE_BUILD_TYPE})
+
+# Write build flags to a file so that they can be read by tests
+file(WRITE "${CMAKE_SOURCE_DIR}/.cmake_build_type" ${CMAKE_BUILD_TYPE}\n)
+file(APPEND "${CMAKE_SOURCE_DIR}/.cmake_build_type" ${BUILD_SHARED_LIBS}\n)
+
+# Store CMAKE_BUILD_TYPE in a variable so it can be read in config.h.in
+string(REPLACE "_" "-" ESCAPED_CMAKE_BUILD_TYPE ${CMAKE_BUILD_TYPE})
+set(IMPALA_CMAKE_BUILD_TYPE ${ESCAPED_CMAKE_BUILD_TYPE})
 
 set(ENABLE_CODE_COVERAGE false)
 if ("${CMAKE_BUILD_TYPE}" STREQUAL "CODE_COVERAGE_DEBUG")
@@ -60,6 +69,13 @@ elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "CODE_COVERAGE_RELEASE")
 endif()
 
 message(STATUS "ENABLE_CODE_COVERAGE: ${ENABLE_CODE_COVERAGE}")
+
+if (ENABLE_CODE_COVERAGE
+    OR "${CMAKE_BUILD_TYPE}" STREQUAL "ADDRESS_SANITIZER"
+    OR "${CMAKE_BUILD_TYPE}" STREQUAL "TSAN"
+    OR "${CMAKE_BUILD_TYPE}" STREQUAL "UBSAN")
+  set (SLOW_BUILD true)
+endif()
 
 # Helper function that given a package name constructs the package_ROOT variable based on
 # the version number extracted from the environment
@@ -96,6 +112,7 @@ set_dep_root(RE2)
 set_dep_root(RAPIDJSON)
 set_dep_root(SNAPPY)
 set_dep_root(THRIFT)
+set(THRIFT11_ROOT $ENV{IMPALA_TOOLCHAIN}/thrift-$ENV{IMPALA_THRIFT11_VERSION})
 set_dep_root(ZLIB)
 set_dep_root(CCTZ)
 
@@ -213,6 +230,7 @@ if ("${CMAKE_BUILD_TYPE}" STREQUAL "DEBUG"
     OR "${CMAKE_BUILD_TYPE}" STREQUAL "ADDRESS_SANITIZER"
     OR "${CMAKE_BUILD_TYPE}" STREQUAL "TIDY"
     OR "${CMAKE_BUILD_TYPE}" STREQUAL "UBSAN"
+    OR "${CMAKE_BUILD_TYPE}" STREQUAL "UBSAN_FULL"
     OR "${CMAKE_BUILD_TYPE}" STREQUAL "TSAN")
   # Use the LLVM libaries with assertions for debug builds.
   set(LLVM_ROOT ${LLVM_DEBUG_ROOT})
@@ -245,6 +263,12 @@ IMPALA_ADD_THIRDPARTY_LIB(thrift ${THRIFT_INCLUDE_DIR} ${THRIFT_STATIC_LIB} "")
 message(STATUS "Thrift version: ${THRIFT_VERSION}")
 message(STATUS "Thrift contrib dir: ${THRIFT_CONTRIB_DIR}")
 message(STATUS "Thrift compiler: ${THRIFT_COMPILER}")
+
+if (NOT EXISTS ${THRIFT11_ROOT}/bin/thrift)
+  message(FATAL_ERROR "Unable to find Thrift 11 compiler")
+endif(NOT EXISTS ${THRIFT11_ROOT}/bin/thrift)
+
+set(THRIFT11_COMPILER ${THRIFT11_ROOT}/bin/thrift)
 
 # find flatbuffers headers, lib and compiler
 find_package(FlatBuffers REQUIRED)
@@ -376,6 +400,8 @@ add_subdirectory(common/fbs)
 add_subdirectory(common/yarn-extras)
 add_subdirectory(common/protobuf)
 add_subdirectory(be)
+add_subdirectory(docker)
+add_subdirectory(shaded-deps)
 add_subdirectory(fe)
 add_subdirectory(impala-parent)
 add_subdirectory(ext-data-source)

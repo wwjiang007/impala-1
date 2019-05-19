@@ -18,6 +18,7 @@
 package org.apache.impala.analysis;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
@@ -27,7 +28,6 @@ import java.util.Map;
 import java.util.Set;
 
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
-import org.apache.hadoop.hive.common.FileUtils;
 import org.apache.impala.authorization.Privilege;
 import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.FeCatalogUtils;
@@ -39,22 +39,25 @@ import org.apache.impala.catalog.HdfsFileFormat;
 import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
 import org.apache.impala.catalog.HdfsTable;
 import org.apache.impala.catalog.PartitionStatsUtil;
-import org.apache.impala.catalog.PrunablePartition;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.PrintUtils;
 import org.apache.impala.common.RuntimeEnv;
+import org.apache.impala.planner.HdfsScanNode;
 import org.apache.impala.service.BackendConfig;
 import org.apache.impala.service.CatalogOpExecutor;
+import org.apache.impala.service.FrontendProfile;
 import org.apache.impala.thrift.TComputeStatsParams;
 import org.apache.impala.thrift.TErrorCode;
 import org.apache.impala.thrift.TGetPartitionStatsResponse;
 import org.apache.impala.thrift.TPartitionStats;
 import org.apache.impala.thrift.TTableName;
+import org.apache.impala.thrift.TUnit;
 import org.apache.log4j.Logger;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
+import com.google.common.base.Stopwatch;
 import com.google.common.base.Throwables;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
@@ -114,6 +117,28 @@ public class ComputeStatsStmt extends StatementBase {
   private static String AVRO_SCHEMA_MSG_SUFFIX = "Please re-create the table with " +
           "column definitions, e.g., using the result of 'SHOW CREATE TABLE'";
 
+  // Metrics collected when fetching incremental statistics from Catalogd. All metrics
+  // are per query.
+  private static final String STATS_FETCH_PREFIX = "StatsFetch";
+  // Time (ms) needed to fetch all partitions stats from catalogd.
+  private static final String STATS_FETCH_TIME = STATS_FETCH_PREFIX + ".Time";
+  // Number of compressed bytes received for all partitions.
+  private static final String STATS_FETCH_COMPRESSED_BYTES =
+      STATS_FETCH_PREFIX + ".CompressedBytes";
+  // Number of partitions sent from Catalogd.
+  private static final String STATS_FETCH_TOTAL_PARTITIONS =
+      STATS_FETCH_PREFIX + ".TotalPartitions";
+  // Number of partitions sent from Catalogd that include statistics.
+  private static final String STATS_FETCH_NUM_PARTITIONS_WITH_STATS =
+      STATS_FETCH_PREFIX + ".NumPartitionsWithStats";
+
+  // The maximum number of partitions that may be explicitly selected by filter
+  // predicates. Any query that selects more than this automatically drops back to a full
+  // incremental stats recomputation.
+  // TODO: We can probably do better than this, e.g. running several queries, each of
+  // which selects up to MAX_INCREMENTAL_PARTITIONS partitions.
+  private static final int MAX_INCREMENTAL_PARTITIONS = 1000;
+
   protected final TableName tableName_;
   protected final TableSampleClause sampleParams_;
 
@@ -125,10 +150,6 @@ public class ComputeStatsStmt extends StatementBase {
   // We run the regular COMPUTE STATS for 0.0 and 1.0 where sampling has no benefit.
   protected double effectiveSamplePerc_ = -1;
 
-  // The Null count is not currently being used in optimization or run-time,
-  // and compute stats runs 2x faster in many cases when not counting NULLs.
-  private static final boolean COUNT_NULLS = false;
-
   // Query for getting the per-partition row count and the total row count.
   // Set during analysis.
   protected String tableStatsQueryStr_;
@@ -138,45 +159,38 @@ public class ComputeStatsStmt extends StatementBase {
   protected String columnStatsQueryStr_;
 
   // If true, stats will be gathered incrementally per-partition.
-  private boolean isIncremental_ = false;
+  private boolean isIncremental_;
 
   // If true, expect the compute stats process to produce output for all partitions in the
   // target table. In that case, 'expectedPartitions_' will be empty. The point of this
   // flag is to optimize the case where all partitions are targeted.
   // False for unpartitioned HDFS tables, non-HDFS tables or when stats extrapolation
   // is enabled.
-  private boolean expectAllPartitions_ = false;
+  private boolean expectAllPartitions_;
 
   // The list of valid partition statistics that can be used in an incremental computation
   // without themselves being recomputed. Populated in analyze().
-  private final List<TPartitionStats> validPartStats_ = Lists.newArrayList();
+  private final List<TPartitionStats> validPartStats_ = new ArrayList<>();
 
   // For incremental computations, the list of partitions (identified by list of partition
   // column values) that we expect to receive results for. Used to ensure that even empty
   // partitions emit results.
   // TODO: Consider using partition IDs (and adding them to the child queries with a
   // PARTITION_ID() builtin)
-  private final List<List<String>> expectedPartitions_ = Lists.newArrayList();
+  private final List<List<String>> expectedPartitions_ = new ArrayList<>();
 
   // If non-null, partitions that an incremental computation might apply to. Must be
   // null if this is a non-incremental computation.
-  private PartitionSet partitionSet_ = null;
+  private PartitionSet partitionSet_;
 
   // If non-null, represents the user-specified list of columns for computing statistics.
   // Not supported for incremental statistics.
-  private List<String> columnWhitelist_ = null;
+  private List<String> columnWhitelist_;
 
   // The set of columns to be analyzed. Each column is valid: it must exist in the table
   // schema, it must be of a type that can be analyzed, and cannot refer to a partitioning
   // column for HDFS tables. If the set is null, no columns are restricted.
-  private Set<Column> validatedColumnWhitelist_ = null;
-
-  // The maximum number of partitions that may be explicitly selected by filter
-  // predicates. Any query that selects more than this automatically drops back to a full
-  // incremental stats recomputation.
-  // TODO: We can probably do better than this, e.g. running several queries, each of
-  // which selects up to MAX_INCREMENTAL_PARTITIONS partitions.
-  private static final int MAX_INCREMENTAL_PARTITIONS = 1000;
+  private Set<Column> validatedColumnWhitelist_;
 
   /**
    * Should only be constructed via static creation functions.
@@ -223,7 +237,7 @@ public class ComputeStatsStmt extends StatementBase {
   }
 
   private List<String> getBaseColumnStatsQuerySelectList(Analyzer analyzer) {
-    List<String> columnStatsSelectList = Lists.newArrayList();
+    List<String> columnStatsSelectList = new ArrayList<>();
     // For Hdfs tables, exclude partition columns from stats gathering because Hive
     // cannot store them as part of the non-partition column stats. For HBase tables,
     // include the single clustering column (the row key).
@@ -250,17 +264,9 @@ public class ComputeStatsStmt extends StatementBase {
         columnStatsSelectList.add("NDV(" + colRefSql + ") AS " + colRefSql);
       }
 
-      if (COUNT_NULLS) {
-        // Count the number of NULL values.
-        columnStatsSelectList.add("COUNT(IF(" + colRefSql + " IS NULL, 1, NULL))");
-      } else {
-        // Using -1 to indicate "unknown". We need cast to BIGINT because backend expects
-        // an i64Val as the number of NULLs returned by the COMPUTE STATS column stats
-        // child query. See CatalogOpExecutor::SetColumnStats(). If we do not cast, then
-        // the -1 will be treated as TINYINT resulting a 0 to be placed in the #NULLs
-        // column (see IMPALA-1068).
-        columnStatsSelectList.add("CAST(-1 as BIGINT)");
-      }
+      // Count the number of NULL values.
+      columnStatsSelectList.add("COUNT(CASE WHEN " + colRefSql +
+          " IS NULL THEN 1 ELSE NULL END)");
 
       // For STRING columns also compute the max and avg string length.
       Type type = c.getType();
@@ -364,7 +370,7 @@ public class ComputeStatsStmt extends StatementBase {
     }
 
     if (columnWhitelist_ != null) {
-      validatedColumnWhitelist_ = Sets.newHashSet();
+      validatedColumnWhitelist_ = new HashSet<>();
       for (String colName : columnWhitelist_) {
         Column col = table_.getColumn(colName);
         if (col == null) {
@@ -417,7 +423,7 @@ public class ComputeStatsStmt extends StatementBase {
 
     // Build partition filters that only select partitions without valid statistics for
     // incremental computation.
-    List<String> filterPreds = Lists.newArrayList();
+    List<String> filterPreds = new ArrayList<>();
     if (isIncremental_) {
       if (partitionSet_ == null) {
         // If any column does not have stats, we recompute statistics for all partitions
@@ -481,7 +487,7 @@ public class ComputeStatsStmt extends StatementBase {
         }
         // Create a hash set out of partitionSet_ for O(1) lookups.
         // TODO(todd) avoid loading all partitions.
-        HashSet<Long> targetPartitions =
+        Set<Long> targetPartitions =
             Sets.newHashSetWithExpectedSize(partitionSet_.getPartitions().size());
         for (FeFsPartition p: partitionSet_.getPartitions()) {
           targetPartitions.add(p.getId());
@@ -530,7 +536,7 @@ public class ComputeStatsStmt extends StatementBase {
     }
     List<String> tableStatsSelectList = Lists.newArrayList(countSql);
     // Add group by columns for incremental stats or with extrapolation disabled.
-    List<String> groupByCols = Lists.newArrayList();
+    List<String> groupByCols = new ArrayList<>();
     if (!updateTableStatsOnly()) {
       for (Column partCol: hdfsTable.getClusteringColumns()) {
         groupByCols.add(ToSqlUtils.getIdentSql(partCol.getName()));
@@ -597,11 +603,16 @@ public class ComputeStatsStmt extends StatementBase {
     int expectedNumStats = partitions.size() - excludedPartitions.size();
     Preconditions.checkArgument(expectedNumStats >= 0);
 
+    // Incremental stats are fetched only when configured to do so except
+    // when also using a local catalog or when testing. When using a local
+    // catalog, it makes more sense to use the getPartitions api which is
+    // designed to fetch specific fields and specific partitions.
     if (BackendConfig.INSTANCE.pullIncrementalStatistics()
+        && !BackendConfig.INSTANCE.getBackendCfg().use_local_catalog
         && !RuntimeEnv.INSTANCE.isTestEnv()) {
       // We're configured to fetch the statistics from catalogd, so collect the relevant
       // partition ids.
-      List<FeFsPartition> partitionsToFetch = Lists.newArrayList();
+      List<FeFsPartition> partitionsToFetch = new ArrayList<>();
       for (FeFsPartition p: partitions) {
         if (excludedPartitions.contains(p.getId())) continue;
         partitionsToFetch.add(p);
@@ -627,8 +638,6 @@ public class ComputeStatsStmt extends StatementBase {
    * - incremental statistics are present
    * - the partition is whitelisted in 'partitions'
    * - the partition is present in the local impalad catalog
-   * TODO(vercegovac): Add metrics to track time spent for these rpc's when fetching
-   *                   from catalog. Look into adding to timeline.
    * TODO(vercegovac): Look into parallelizing the fetch while child-queries are
    *                   running. Easiest would be to move this fetch to the backend.
    */
@@ -638,6 +647,10 @@ public class ComputeStatsStmt extends StatementBase {
     Preconditions.checkState(BackendConfig.INSTANCE.pullIncrementalStatistics()
         && !RuntimeEnv.INSTANCE.isTestEnv());
     if (partitions.isEmpty()) return Collections.emptyMap();
+    Stopwatch sw = new Stopwatch().start();
+    int numCompressedBytes = 0;
+    int totalPartitions = 0;
+    int numPartitionsWithStats = 0;
     try {
       TGetPartitionStatsResponse response =
           analyzer.getCatalog().getPartitionStats(table.getTableName());
@@ -657,16 +670,19 @@ public class ComputeStatsStmt extends StatementBase {
       // local catalogs are returned.
       Map<Long, TPartitionStats> partitionStats =
           Maps.newHashMapWithExpectedSize(partitions.size());
+      totalPartitions = partitions.size();
       for (FeFsPartition part: partitions) {
         ByteBuffer compressedStats = response.partition_stats.get(
             FeCatalogUtils.getPartitionName(part));
         if (compressedStats != null) {
           byte[] compressedStatsBytes = new byte[compressedStats.remaining()];
+          numCompressedBytes += compressedStatsBytes.length;
           compressedStats.get(compressedStatsBytes);
           TPartitionStats remoteStats =
               PartitionStatsUtil.partStatsFromCompressedBytes(
                   compressedStatsBytes, part);
           if (remoteStats != null && remoteStats.isSetIntermediate_col_stats()) {
+            ++numPartitionsWithStats;
             partitionStats.put(part.getId(), remoteStats);
           }
         }
@@ -675,7 +691,23 @@ public class ComputeStatsStmt extends StatementBase {
     } catch (Exception e) {
       Throwables.propagateIfInstanceOf(e, AnalysisException.class);
       throw new AnalysisException("Error fetching partition statistics", e);
+    } finally {
+      recordFetchMetrics(numCompressedBytes, totalPartitions, numPartitionsWithStats, sw);
     }
+  }
+
+  /**
+   * Adds metrics to the frontend profile when fetching incremental stats from catalogd.
+   */
+  private static void recordFetchMetrics(int numCompressedBytes,
+      int totalPartitions, int numPartitionsWithStats, Stopwatch stopwatch) {
+    FrontendProfile profile = FrontendProfile.getCurrentOrNull();
+    if (profile == null) return;
+    profile.addToCounter(STATS_FETCH_COMPRESSED_BYTES, TUnit.BYTES, numCompressedBytes);
+    profile.addToCounter(STATS_FETCH_TOTAL_PARTITIONS, TUnit.NONE, totalPartitions);
+    profile.addToCounter(STATS_FETCH_NUM_PARTITIONS_WITH_STATS, TUnit.NONE,
+        numPartitionsWithStats);
+    profile.addToCounter(STATS_FETCH_TIME, TUnit.TIME_MS, stopwatch.elapsedMillis());
   }
 
   /**
@@ -716,7 +748,8 @@ public class ComputeStatsStmt extends StatementBase {
     // TODO(todd): can we avoid loading all the partitions for this?
     Collection<? extends FeFsPartition> partitions =
         FeCatalogUtils.loadAllPartitions(hdfsTable);
-    Map<Long, List<FileDescriptor>> sample = FeFsTable.Utils.getFilesSample(hdfsTable,
+    Map<HdfsScanNode.SampledPartitionMetadata, List<FileDescriptor>> sample =
+            FeFsTable.Utils.getFilesSample(hdfsTable,
         partitions, samplePerc, minSampleBytes, sampleSeed);
     long sampleFileBytes = 0;
     for (List<FileDescriptor> fds: sample.values()) {
@@ -875,7 +908,7 @@ public class ComputeStatsStmt extends StatementBase {
   }
 
   @Override
-  public String toSql() {
+  public String toSql(ToSqlOptions options) {
     if (!isIncremental_) {
       StringBuilder columnList = new StringBuilder();
       if (columnWhitelist_ != null) {
@@ -884,11 +917,11 @@ public class ComputeStatsStmt extends StatementBase {
         columnList.append(")");
       }
       String tblsmpl = "";
-      if (sampleParams_ != null) tblsmpl = " " + sampleParams_.toSql();
+      if (sampleParams_ != null) tblsmpl = " " + sampleParams_.toSql(options);
       return "COMPUTE STATS " + tableName_.toSql() + columnList.toString() + tblsmpl;
     } else {
-      return "COMPUTE INCREMENTAL STATS " + tableName_.toSql() +
-          (partitionSet_ == null ? "" : partitionSet_.toSql());
+      return "COMPUTE INCREMENTAL STATS " + tableName_.toSql()
+          + (partitionSet_ == null ? "" : partitionSet_.toSql(options));
     }
   }
 

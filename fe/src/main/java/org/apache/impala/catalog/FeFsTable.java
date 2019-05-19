@@ -16,8 +16,10 @@
 // under the License.
 package org.apache.impala.catalog;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -26,17 +28,18 @@ import java.util.Set;
 import java.util.TreeMap;
 
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
+import org.apache.impala.analysis.Expr;
 import org.apache.impala.analysis.LiteralExpr;
-import org.apache.impala.analysis.NullLiteral;
 import org.apache.impala.analysis.PartitionKeyValue;
 import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
 import org.apache.impala.common.AnalysisException;
+import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.common.PrintUtils;
+import org.apache.impala.planner.HdfsScanNode;
 import org.apache.impala.service.BackendConfig;
 import org.apache.impala.thrift.TColumn;
 import org.apache.impala.thrift.TNetworkAddress;
 import org.apache.impala.thrift.TPartitionKeyValue;
-import org.apache.impala.thrift.TResultRow;
 import org.apache.impala.thrift.TResultSet;
 import org.apache.impala.thrift.TResultSetMetadata;
 import org.apache.impala.thrift.TTableStats;
@@ -46,8 +49,6 @@ import org.apache.impala.util.TResultRowBuilder;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
-import com.google.common.collect.Sets;
 
 /**
  * Frontend interface for interacting with a filesystem-backed table.
@@ -94,6 +95,11 @@ public interface FeFsTable extends FeTable {
    * @return the base HDFS directory where files of this table are stored.
    */
   public String getHdfsBaseDir();
+
+  /**
+   * @return the FsType where files of this table are stored.
+   */
+  public FileSystemUtil.FsType getFsType();
 
   /**
    * @return the total number of bytes stored for this table.
@@ -158,7 +164,7 @@ public interface FeFsTable extends FeTable {
    * @return a map from value to a set of partitions for which column 'col'
    * has that value.
    */
-  TreeMap<LiteralExpr, HashSet<Long>> getPartitionValueMap(int col);
+  TreeMap<LiteralExpr, Set<Long>> getPartitionValueMap(int col);
 
   /**
    * @return the set of partitions which have a null value for column
@@ -178,7 +184,15 @@ public interface FeFsTable extends FeTable {
    * value is not set for the table, returns 0. If parsing fails or a value < 0 is found,
    * the error parameter is updated to contain an error message.
    */
-  int parseSkipHeaderLineCount(StringBuilder error);
+  default int parseSkipHeaderLineCount(StringBuilder error) {
+    org.apache.hadoop.hive.metastore.api.Table msTbl = getMetaStoreTable();
+    if (msTbl == null ||
+        !msTbl.getParameters().containsKey(
+          FeFsTable.Utils.TBL_PROP_SKIP_HEADER_LINE_COUNT)) {
+      return 0;
+    }
+    return Utils.parseSkipHeaderLineCount(msTbl.getParameters(), error);
+  }
 
   /**
    * @return the index of hosts that store replicas of blocks of this table.
@@ -190,6 +204,9 @@ public interface FeFsTable extends FeTable {
    * these can become default methods of the interface.
    */
   abstract class Utils {
+    // Table property key for skip.header.line.count
+    public static final String TBL_PROP_SKIP_HEADER_LINE_COUNT = "skip.header.line.count";
+
     /**
      * Returns true if stats extrapolation is enabled for this table, false otherwise.
      * Reconciles the Impalad-wide --enable_stats_extrapolation flag and the
@@ -201,6 +218,21 @@ public interface FeFsTable extends FeTable {
           HdfsTable.TBL_PROP_ENABLE_STATS_EXTRAPOLATION);
       if (propVal == null) return BackendConfig.INSTANCE.isStatsExtrapolationEnabled();
       return Boolean.parseBoolean(propVal);
+    }
+
+    /**
+     * Returns true if the file contents within a partition should be recursively listed.
+     * Reconciles the Impalad-wide --recursively_list_partitions and the
+     * TBL_PROP_DISABLE_RECURSIVE_LISTING table property
+     */
+    public static boolean shouldRecursivelyListPartitions(FeFsTable table) {
+      org.apache.hadoop.hive.metastore.api.Table msTbl = table.getMetaStoreTable();
+      String propVal = msTbl.getParameters().get(
+          HdfsTable.TBL_PROP_DISABLE_RECURSIVE_LISTING);
+      if (propVal == null) return BackendConfig.INSTANCE.recursivelyListPartitions();
+      // TODO(todd): we should detect if this flag is set on an ACID table and
+      // give some kind of error (we _must_ recursively list such tables)
+      return !Boolean.parseBoolean(propVal);
     }
 
     /**
@@ -242,7 +274,7 @@ public interface FeFsTable extends FeTable {
       resultSchema.addToColumns(new TColumn("Path", Type.STRING.toThrift()));
       resultSchema.addToColumns(new TColumn("Size", Type.STRING.toThrift()));
       resultSchema.addToColumns(new TColumn("Partition", Type.STRING.toThrift()));
-      result.setRows(Lists.<TResultRow>newArrayList());
+      result.setRows(new ArrayList<>());
 
       List<? extends FeFsPartition> orderedPartitions;
       if (partitionSet == null) {
@@ -258,7 +290,7 @@ public interface FeFsTable extends FeTable {
         Collections.sort(orderedFds);
         for (FileDescriptor fd: orderedFds) {
           TResultRowBuilder rowBuilder = new TResultRowBuilder();
-          rowBuilder.add(p.getLocation() + "/" + fd.getFileName());
+          rowBuilder.add(p.getLocation() + "/" + fd.getRelativePath());
           rowBuilder.add(PrintUtils.printBytes(fd.getFileLength()));
           rowBuilder.add(p.getPartitionName());
           result.addToRows(rowBuilder.get());
@@ -278,11 +310,9 @@ public interface FeFsTable extends FeTable {
      * The given 'randomSeed' is used for random number generation.
      * The 'percentBytes' parameter must be between 0 and 100.
      */
-    public static Map<Long, List<FileDescriptor>> getFilesSample(
-        FeFsTable table,
-        Collection<? extends FeFsPartition> inputParts,
-        long percentBytes, long minSampleBytes,
-        long randomSeed) {
+    public static Map<HdfsScanNode.SampledPartitionMetadata, List<FileDescriptor>>
+        getFilesSample(FeFsTable table, Collection<? extends FeFsPartition> inputParts,
+            long percentBytes, long minSampleBytes, long randomSeed) {
       Preconditions.checkState(percentBytes >= 0 && percentBytes <= 100);
       Preconditions.checkState(minSampleBytes >= 0);
 
@@ -338,16 +368,15 @@ public interface FeFsTable extends FeTable {
       // selected.
       Random rnd = new Random(randomSeed);
       long selectedBytes = 0;
-      Map<Long, List<FileDescriptor>> result = Maps.newHashMap();
+      Map<HdfsScanNode.SampledPartitionMetadata, List<FileDescriptor>> result =
+          new HashMap<>();
       while (selectedBytes < targetBytes && numFilesRemaining > 0) {
         int selectedIdx = Math.abs(rnd.nextInt()) % numFilesRemaining;
         FeFsPartition part = parts[selectedIdx];
-        Long partId = Long.valueOf(part.getId());
-        List<FileDescriptor> sampleFileIdxs = result.get(partId);
-        if (sampleFileIdxs == null) {
-          sampleFileIdxs = Lists.newArrayList();
-          result.put(partId, sampleFileIdxs);
-        }
+        HdfsScanNode.SampledPartitionMetadata sampledPartitionMetadata =
+            new HdfsScanNode.SampledPartitionMetadata(part.getId(), part.getFsType());
+        List<FileDescriptor> sampleFileIdxs = result.computeIfAbsent(
+            sampledPartitionMetadata, partMetadata -> Lists.newArrayList());
         FileDescriptor fd = part.getFileDescriptors().get(fileIdxs[selectedIdx]);
         sampleFileIdxs.add(fd);
         selectedBytes += fd.getFileLength();
@@ -364,7 +393,7 @@ public interface FeFsTable extends FeTable {
      */
     public static List<? extends FeFsPartition> getPartitionsFromPartitionSet(
         FeFsTable table, List<List<TPartitionKeyValue>> partitionSet) {
-      List<Long> partitionIds = Lists.newArrayList();
+      List<Long> partitionIds = new ArrayList<>();
       for (List<TPartitionKeyValue> kv : partitionSet) {
         PrunablePartition partition = getPartitionFromThriftPartitionSpec(table, kv);
         if (partition != null) partitionIds.add(partition.getId());
@@ -381,8 +410,8 @@ public interface FeFsTable extends FeTable {
         List<TPartitionKeyValue> partitionSpec) {
       // First, build a list of the partition values to search for in the same order they
       // are defined in the table.
-      List<String> targetValues = Lists.newArrayList();
-      Set<String> keys = Sets.newHashSet();
+      List<String> targetValues = new ArrayList<>();
+      Set<String> keys = new HashSet<>();
       for (FieldSchema fs: table.getMetaStoreTable().getPartitionKeys()) {
         for (TPartitionKeyValue kv: partitionSpec) {
           if (fs.getName().toLowerCase().equals(kv.getName().toLowerCase())) {
@@ -409,7 +438,7 @@ public interface FeFsTable extends FeTable {
         boolean matchFound = true;
         for (int i = 0; i < targetValues.size(); ++i) {
           String value;
-          if (partitionValues.get(i) instanceof NullLiteral) {
+          if (Expr.IS_NULL_LITERAL.apply(partitionValues.get(i))) {
             value = table.getNullPartitionKeyValue();
           } else {
             value = partitionValues.get(i).getStringValue();
@@ -473,6 +502,31 @@ public interface FeFsTable extends FeTable {
           throw new AnalysisException(noWriteAccessErrorMsg + badPath);
         }
       }
+    }
+
+    /**
+     * Parses and returns the value of the 'skip.header.line.count' table property. The
+     * caller must ensure that the property is contained in the 'tblProperties' map. If
+     * parsing fails or a value < 0 is found, the error parameter is updated to contain an
+     * error message.
+     */
+    public static int parseSkipHeaderLineCount(Map<String, String> tblProperties,
+        StringBuilder error) {
+      Preconditions.checkState(tblProperties != null);
+      Preconditions.checkState(
+          tblProperties.containsKey(TBL_PROP_SKIP_HEADER_LINE_COUNT));
+      // Try to parse.
+      String string_value = tblProperties.get(TBL_PROP_SKIP_HEADER_LINE_COUNT);
+      int skipHeaderLineCount = 0;
+      String error_msg = String.format("Invalid value for table property %s: %s (value " +
+          "must be an integer >= 0)", TBL_PROP_SKIP_HEADER_LINE_COUNT, string_value);
+      try {
+        skipHeaderLineCount = Integer.parseInt(string_value);
+      } catch (NumberFormatException exc) {
+        error.append(error_msg);
+      }
+      if (skipHeaderLineCount < 0) error.append(error_msg);
+      return skipHeaderLineCount;
     }
   }
 }

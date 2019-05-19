@@ -18,6 +18,23 @@
 # under the License.
 #
 
+# We do not use Impala's python environment here, nor do we depend on
+# non-standard python libraries to avoid needing extra build steps before
+# triggering this.
+import argparse
+import datetime
+import itertools
+import logging
+import multiprocessing
+import multiprocessing.pool
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
 CLI_HELP = """\
 Runs tests inside of docker containers, parallelizing different types of
 tests. This script first creates a docker container, checks out this repo
@@ -100,22 +117,6 @@ as part of the build, in logs/docker/*/timeline.html.
 #     or move to different suite.
 #   - Run BE tests earlier (during data load)
 
-# We do not use Impala's python environment here, nor do we depend on
-# non-standard python libraries to avoid needing extra build steps before
-# triggering this.
-import argparse
-import datetime
-import logging
-import multiprocessing
-import multiprocessing.pool
-import os
-import re
-import subprocess
-import sys
-import tempfile
-import threading
-import time
-
 if __name__ == '__main__' and __package__ is None:
   sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
   import monitor
@@ -154,6 +155,8 @@ def main():
       action='store_true', default=True,
       help="Whether to remove image when done.")
   group.add_argument('--no-cleanup-image', dest="cleanup_image", action='store_false')
+  parser.add_argument('--base-image', dest="base_image", default="ubuntu:16.04",
+      help="Base OS image to use. ubuntu:16.04 and centos:6 are known to work.")
   parser.add_argument(
       '--build-image', metavar='IMAGE',
       help='Skip building, and run tests on pre-existing image.')
@@ -181,6 +184,15 @@ def main():
                       default=os.path.expanduser("~/.ccache"))
   parser.add_argument('--tail', action="store_true",
       help="Run tail on all container log files.")
+  parser.add_argument('--impala-lzo-repo',
+      default="https://github.com/cloudera/impala-lzo.git",
+      help="Git repo for Impala-lzo repo")
+  parser.add_argument('--impala-lzo-ref', default='master',
+      help="Branch name for Impala-lzo repo.")
+  parser.add_argument('--env', metavar='K=V', default=[], action='append',
+      help="""Passes given environment variables (expressed as KEY=VALUE)
+           through containers.
+           """)
   parser.add_argument('--test', action="store_true")
   args = parser.parse_args()
 
@@ -197,7 +209,10 @@ def main():
       parallel_test_concurrency=args.parallel_test_concurrency,
       suite_concurrency=args.suite_concurrency,
       impalad_mem_limit_bytes=args.impalad_mem_limit_bytes,
-      tail=args.tail)
+      tail=args.tail,
+      impala_lzo_repo=args.impala_lzo_repo,
+      impala_lzo_ref=args.impala_lzo_ref,
+      env=args.env, base_image=args.base_image)
 
   fh = logging.FileHandler(os.path.join(_make_dir_if_not_exist(t.log_dir), "log.txt"))
   fh.setFormatter(logging.Formatter(LOG_FORMAT))
@@ -430,7 +445,8 @@ class TestWithDocker(object):
   def __init__(self, build_image, suite_names, name, cleanup_containers,
                cleanup_image, ccache_dir, test_mode,
                suite_concurrency, parallel_test_concurrency,
-               impalad_mem_limit_bytes, tail):
+               impalad_mem_limit_bytes, tail,
+               impala_lzo_repo, impala_lzo_ref, env, base_image):
     self.build_image = build_image
     self.name = name
     self.containers = []
@@ -466,6 +482,10 @@ class TestWithDocker(object):
     self.parallel_test_concurrency = parallel_test_concurrency
     self.impalad_mem_limit_bytes = impalad_mem_limit_bytes
     self.tail = tail
+    self.impala_lzo_repo = impala_lzo_repo
+    self.impala_lzo_ref = impala_lzo_ref
+    self.env = env
+    self.base_image = base_image
 
     # Map suites back into objects; we ignore case for this mapping.
     suites = []
@@ -502,9 +522,18 @@ class TestWithDocker(object):
       extras = ["-e", "TEST_TEST_WITH_DOCKER=true"] + extras
 
     # According to localtime(5), /etc/localtime is supposed
-    # to be a symlink to somewhere inside /usr/share/zoneinfo
+    # to be a symlink to somewhere inside /usr/share/zoneinfo.
+    # Note that sometimes the symlink tree may be
+    # complicated, e.g.:
+    #  /etc/localtime ->
+    #    /usr/share/zoneinfo/America/Los_Angeles ->  (readlink)
+    #      ../US/Pacific-New                         (realpath)
+    # Using both readlink and realpath should work, but we've
+    # encountered one scenario (centos:6) where the Java tzdata
+    # database doesn't have US/Pacific-New, but has America/Los_Angeles.
+    # This is deemed sufficient to tip the scales to using readlink.
     assert os.path.islink("/etc/localtime")
-    localtime_link_target = os.path.realpath("/etc/localtime")
+    localtime_link_target = os.readlink("/etc/localtime")
     assert localtime_link_target.startswith("/usr/share/zoneinfo")
 
     # Workaround for what appears to be https://github.com/moby/moby/issues/13885
@@ -539,12 +568,16 @@ class TestWithDocker(object):
           "-v", self.git_root + ":/repo:ro",
           "-v", self.git_common_dir + ":/git_common_dir:ro",
           "-e", "GIT_HEAD_REV=" + self.git_head_rev,
+          "-e", "IMPALA_LZO_REPO=" + self.impala_lzo_repo,
+          "-e", "IMPALA_LZO_REF=" + self.impala_lzo_ref,
           # Share timezone between host and container
           "-e", "LOCALTIME_LINK_TARGET=" + localtime_link_target,
           "-v", self.ccache_dir + ":/ccache",
+          "-e", "CCACHE_TEMPDIR=" + "/ccache/" + name,
           "-v", _make_dir_if_not_exist(self.log_dir,
                                        logdir) + ":/logs",
           "-v", base + ":/mnt/base:ro"]
+          + list(itertools.chain(*[["-e", env] for env in self.env]))
           + extras
           + [image]
           + entrypoint).strip()
@@ -616,7 +649,7 @@ class TestWithDocker(object):
   def _create_build_image(self):
     """Creates the "build image", with Impala compiled and data loaded."""
     container = self._create_container(
-        image="ubuntu:16.04", name=self.name,
+        image=self.base_image, name=self.name + "-build",
         logdir="build",
         logname="log-build.txt",
         # entrypoint.sh will create a user with our uid; this
@@ -633,6 +666,9 @@ class TestWithDocker(object):
       self.image = _check_output(
           ["docker", "commit",
            "-c", "LABEL pwd=" + self.git_root,
+           "-c", "USER impdev",
+           "-c", "WORKDIR /home/impdev/Impala",
+           "-c", 'CMD ["/home/impdev/Impala/docker/entrypoint.sh", "shell"]',
            container.id, "impala:built-" + self.name]).strip()
       logging.info("Committed docker image: %s", self.image)
     finally:
@@ -709,7 +745,8 @@ class TestWithDocker(object):
     timeline = monitor.Timeline(
         monitor_file=self.monitoring_output_file,
         containers=self.containers,
-        interesting_re=self._INTERESTING_RE)
+        interesting_re=self._INTERESTING_RE,
+        buildname=self.name)
     timeline.create(os.path.join(self.log_dir, "timeline.html"))
 
   def log_summary(self):
@@ -760,6 +797,7 @@ class TestSuiteRunner(object):
     # io-file-mgr-test expects a real-ish file system at /tmp;
     # we mount a temporary directory into the container to appease it.
     tmpdir = tempfile.mkdtemp(prefix=test_with_docker.name + "-" + self.name)
+    os.chmod(tmpdir, 01777)
     # Container names are sometimes used as hostnames, and DNS names shouldn't
     # have underscores.
     container_name = test_with_docker.name + "-" + self.name.replace("_", "-")

@@ -17,26 +17,21 @@
 
 package org.apache.impala.analysis;
 
-import java.util.LinkedHashMap;
+import static org.apache.impala.analysis.ToSqlOptions.REWRITTEN;
+
+import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 
 import org.apache.impala.analysis.StmtMetadataLoader.StmtTableCache;
 import org.apache.impala.authorization.AuthorizationChecker;
-import org.apache.impala.authorization.AuthorizationConfig;
-import org.apache.impala.authorization.AuthorizeableColumn;
-import org.apache.impala.authorization.AuthorizeableTable;
-import org.apache.impala.authorization.Privilege;
+import org.apache.impala.authorization.AuthorizationFactory;
 import org.apache.impala.authorization.PrivilegeRequest;
-import org.apache.impala.catalog.AuthorizationException;
+import org.apache.impala.authorization.AuthorizationException;
 import org.apache.impala.catalog.FeCatalog;
-import org.apache.impala.catalog.FeDb;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.ImpalaException;
-import org.apache.impala.common.InternalException;
-import org.apache.impala.common.Pair;
 import org.apache.impala.common.RuntimeEnv;
 import org.apache.impala.rewrite.ExprRewriter;
 import org.apache.impala.thrift.TAccessEvent;
@@ -48,10 +43,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Preconditions;
-import com.google.common.base.Strings;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Lists;
 
 /**
  * Wrapper class for parsing, analyzing and rewriting a SQL stmt.
@@ -59,7 +52,7 @@ import com.google.common.collect.ImmutableList;
 public class AnalysisContext {
   private final static Logger LOG = LoggerFactory.getLogger(AnalysisContext.class);
   private final TQueryCtx queryCtx_;
-  private final AuthorizationConfig authzConfig_;
+  private final AuthorizationFactory authzFactory_;
   private final EventSequence timeline_;
 
   // Set in analyzeAndAuthorize().
@@ -69,10 +62,10 @@ public class AnalysisContext {
   // Use Hive's scheme for auto-generating column labels. Only used for testing.
   private boolean useHiveColLabels_;
 
-  public AnalysisContext(TQueryCtx queryCtx, AuthorizationConfig authzConfig,
+  public AnalysisContext(TQueryCtx queryCtx, AuthorizationFactory authzFactory,
       EventSequence timeline) {
     queryCtx_ = queryCtx;
-    authzConfig_ = authzConfig;
+    authzFactory_ = authzFactory;
     timeline_ = timeline;
   }
 
@@ -161,6 +154,8 @@ public class AnalysisContext {
       return isUseStmt() || isViewMetadataStmt() || isDdlStmt();
     }
 
+    public boolean isTestCaseStmt() { return stmt_ instanceof CopyTestCaseStmt; }
+
     private boolean isDdlStmt() {
       return isCreateTableLikeStmt() || isCreateTableStmt() ||
           isCreateViewStmt() || isCreateDbStmt() || isDropDbStmt() ||
@@ -193,7 +188,8 @@ public class AnalysisContext {
      */
     public boolean isHierarchicalAuthStmt() {
       return isQueryStmt() || isInsertStmt() || isUpdateStmt() || isDeleteStmt()
-          || isCreateTableAsSelectStmt() || isCreateViewStmt() || isAlterViewStmt();
+          || isCreateTableAsSelectStmt() || isCreateViewStmt() || isAlterViewStmt()
+          || isTestCaseStmt();
     }
 
     /**
@@ -380,7 +376,7 @@ public class AnalysisContext {
           && !(stmt_ instanceof AlterViewStmt) && !(stmt_ instanceof ShowCreateTableStmt);
     }
     public boolean requiresExprRewrite() {
-      return isQueryStmt() ||isInsertStmt() || isCreateTableAsSelectStmt()
+      return isQueryStmt() || isInsertStmt() || isCreateTableAsSelectStmt()
           || isUpdateStmt() || isDeleteStmt();
     }
     public TLineageGraph getThriftLineageGraph() {
@@ -391,7 +387,7 @@ public class AnalysisContext {
   }
 
   public Analyzer createAnalyzer(StmtTableCache stmtTableCache) {
-    Analyzer result = new Analyzer(stmtTableCache, queryCtx_, authzConfig_);
+    Analyzer result = new Analyzer(stmtTableCache, queryCtx_, authzFactory_);
     result.setUseHiveColLabels(useHiveColLabels_);
     return result;
   }
@@ -422,7 +418,7 @@ public class AnalysisContext {
     // collected during analysis.
     AuthorizationException authException = null;
     try {
-      authorize(authzChecker);
+      authzChecker.authorize(analysisResult_, catalog_);
     } catch (AuthorizationException e) {
       authException = e;
     }
@@ -458,217 +454,55 @@ public class AnalysisContext {
       new StmtRewriter.SubqueryRewriter().rewrite(analysisResult_);
       reAnalyze = true;
     }
-    if (reAnalyze) {
-      // The rewrites should have no user-visible effect. Remember the original result
-      // types and column labels to restore them after the rewritten stmt has been
-      // reset() and re-analyzed. For a CTAS statement, the types represent column types
-      // of the table that will be created, including the partition columns, if any.
-      List<Type> origResultTypes = Lists.newArrayList();
-      for (Expr e : analysisResult_.stmt_.getResultExprs()) {
-        origResultTypes.add(e.getType());
-      }
-      List<String> origColLabels =
-          Lists.newArrayList(analysisResult_.stmt_.getColLabels());
+    if (!reAnalyze) return;
 
-      // Some expressions, such as function calls with constant arguments, can get
-      // folded into literals. Since literals do not require privilege requests, we
-      // must save the original privileges in order to not lose them during
-      // re-analysis.
-      ImmutableList<PrivilegeRequest> origPrivReqs =
-          analysisResult_.analyzer_.getPrivilegeReqs();
-
-      // Re-analyze the stmt with a new analyzer.
-      analysisResult_.analyzer_ = createAnalyzer(stmtTableCache);
-      analysisResult_.stmt_.reset();
-      try {
-        analysisResult_.stmt_.analyze(analysisResult_.analyzer_);
-      } catch (AnalysisException e) {
-        LOG.error(String.format("Error analyzing the rewritten query.\n" +
-            "Original SQL: %s\nRewritten SQL: %s", analysisResult_.stmt_.toSql(),
-            analysisResult_.stmt_.toSql(true)));
-        throw e;
-      }
-
-      // Restore the original result types and column labels.
-      analysisResult_.stmt_.castResultExprs(origResultTypes);
-      analysisResult_.stmt_.setColLabels(origColLabels);
-      if (LOG.isTraceEnabled()) {
-        LOG.trace("Rewritten SQL: " + analysisResult_.stmt_.toSql(true));
-      }
-
-      // Restore privilege requests found during the first pass
-      for (PrivilegeRequest req : origPrivReqs) {
-        analysisResult_.analyzer_.registerPrivReq(req);
-      }
-      if (isExplain) analysisResult_.stmt_.setIsExplain();
-      Preconditions.checkState(!analysisResult_.requiresSubqueryRewrite());
+    // The rewrites should have no user-visible effect. Remember the original result
+    // types and column labels to restore them after the rewritten stmt has been
+    // reset() and re-analyzed. For a CTAS statement, the types represent column types
+    // of the table that will be created, including the partition columns, if any.
+    List<Type> origResultTypes = new ArrayList<>();
+    for (Expr e : analysisResult_.stmt_.getResultExprs()) {
+      origResultTypes.add(e.getType());
     }
-  }
+    List<String> origColLabels =
+        Lists.newArrayList(analysisResult_.stmt_.getColLabels());
 
-  /**
-   * Authorize an analyzed statement.
-   * analyze() must have already been called. Throws an AuthorizationException if the
-   * user doesn't have sufficient privileges to run this statement.
-   */
-  private void authorize(AuthorizationChecker authzChecker)
-      throws AuthorizationException, InternalException {
-    Preconditions.checkNotNull(analysisResult_);
-    Analyzer analyzer = getAnalyzer();
-    // Authorize statements that may produce several hierarchical privilege requests.
-    // Such a statement always has a corresponding table-level privilege request if it
-    // has column-level privilege request. The hierarchical nature requires special
-    // logic to process correctly and efficiently.
-    if (analysisResult_.isHierarchicalAuthStmt()) {
-      // Map of table name to a list of privilege requests associated with that table.
-      // These include both table-level and column-level privilege requests. We use a
-      // LinkedHashMap to preserve the order in which requests are inserted.
-      LinkedHashMap<String, List<PrivilegeRequest>> tablePrivReqs =
-          Maps.newLinkedHashMap();
-      // Privilege requests that are not column or table-level.
-      List<PrivilegeRequest> otherPrivReqs = Lists.newArrayList();
-      // Group the registered privilege requests based on the table they reference.
-      for (PrivilegeRequest privReq: analyzer.getPrivilegeReqs()) {
-        String tableName = privReq.getAuthorizeable().getFullTableName();
-        if (tableName == null) {
-          otherPrivReqs.add(privReq);
-        } else {
-          List<PrivilegeRequest> requests = tablePrivReqs.get(tableName);
-          if (requests == null) {
-            requests = Lists.newArrayList();
-            tablePrivReqs.put(tableName, requests);
-          }
-          // The table-level SELECT must be the first table-level request, and it
-          // must precede all column-level privilege requests.
-          Preconditions.checkState((requests.isEmpty() ||
-              !(privReq.getAuthorizeable() instanceof AuthorizeableColumn)) ||
-              (requests.get(0).getAuthorizeable() instanceof AuthorizeableTable &&
-              requests.get(0).getPrivilege() == Privilege.SELECT));
-          requests.add(privReq);
-        }
-      }
+    // Some expressions, such as function calls with constant arguments, can get
+    // folded into literals. Since literals do not require privilege requests, we
+    // must save the original privileges in order to not lose them during
+    // re-analysis.
+    ImmutableList<PrivilegeRequest> origPrivReqs =
+        analysisResult_.analyzer_.getPrivilegeReqs();
 
-      // Check any non-table, non-column privilege requests first.
-      for (PrivilegeRequest request: otherPrivReqs) {
-        authorizePrivilegeRequest(authzChecker, request);
-      }
-
-      // Authorize table accesses, one table at a time, by considering both table and
-      // column-level privilege requests.
-      for (Map.Entry<String, List<PrivilegeRequest>> entry: tablePrivReqs.entrySet()) {
-        authorizeTableAccess(authzChecker, entry.getValue());
-      }
-    } else {
-      for (PrivilegeRequest privReq: analyzer.getPrivilegeReqs()) {
-        Preconditions.checkState(
-            !(privReq.getAuthorizeable() instanceof AuthorizeableColumn) ||
-            analysisResult_.isSingleColumnPrivStmt());
-        authorizePrivilegeRequest(authzChecker, privReq);
-      }
+    // Re-analyze the stmt with a new analyzer.
+    analysisResult_.analyzer_ = createAnalyzer(stmtTableCache);
+    // We restore the privileges collected in the first pass below. So, no point in
+    // collecting them again.
+    analysisResult_.analyzer_.setEnablePrivChecks(false);
+    analysisResult_.stmt_.reset();
+    try {
+      analysisResult_.stmt_.analyze(analysisResult_.analyzer_);
+      analysisResult_.analyzer_.setEnablePrivChecks(true); // restore
+    } catch (AnalysisException e) {
+      LOG.error(String.format("Error analyzing the rewritten query.\n" +
+          "Original SQL: %s\nRewritten SQL: %s", analysisResult_.stmt_.toSql(),
+          analysisResult_.stmt_.toSql(REWRITTEN)));
+      throw e;
     }
 
-    // Check all masked requests. If a masked request has an associated error message,
-    // an AuthorizationException is thrown if authorization fails. Masked requests with no
-    // error message are used to check if the user can access the runtime profile.
-    // These checks don't result in an AuthorizationException but set the
-    // 'user_has_profile_access' flag in queryCtx_.
-    for (Pair<PrivilegeRequest, String> maskedReq: analyzer.getMaskedPrivilegeReqs()) {
-      try {
-        authorizePrivilegeRequest(authzChecker, maskedReq.first);
-      } catch (AuthorizationException e) {
-        analysisResult_.setUserHasProfileAccess(false);
-        if (!Strings.isNullOrEmpty(maskedReq.second)) {
-          throw new AuthorizationException(maskedReq.second);
-        }
-        break;
-      }
+    // Restore the original result types and column labels.
+    analysisResult_.stmt_.castResultExprs(origResultTypes);
+    analysisResult_.stmt_.setColLabels(origColLabels);
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("Rewritten SQL: " + analysisResult_.stmt_.toSql(REWRITTEN));
     }
-  }
 
-  /**
-   * Authorize a privilege request.
-   * Throws an AuthorizationException if the user doesn't have sufficient privileges for
-   * this request. Also, checks if the request references a system database.
-   */
-  private void authorizePrivilegeRequest(AuthorizationChecker authzChecker,
-    PrivilegeRequest request) throws AuthorizationException, InternalException {
-    Preconditions.checkNotNull(request);
-    String dbName = null;
-    if (request.getAuthorizeable() != null) {
-      dbName = request.getAuthorizeable().getDbName();
+    // Restore privilege requests found during the first pass
+    for (PrivilegeRequest req : origPrivReqs) {
+      analysisResult_.analyzer_.registerPrivReq(req);
     }
-    // If this is a system database, some actions should always be allowed
-    // or disabled, regardless of what is in the auth policy.
-    if (dbName != null && checkSystemDbAccess(dbName, request.getPrivilege())) {
-      return;
-    }
-    authzChecker.checkAccess(getAnalyzer().getUser(), request);
-  }
-
-  /**
-   * Authorize a list of privilege requests associated with a single table.
-   * It checks if the user has sufficient table-level privileges and if that is
-   * not the case, it falls back on checking column-level privileges, if any. This
-   * function requires 'SELECT' requests to be ordered by table and then by column
-   * privilege requests. Throws an AuthorizationException if the user doesn't have
-   * sufficient privileges.
-   */
-  private void authorizeTableAccess(AuthorizationChecker authzChecker,
-      List<PrivilegeRequest> requests)
-      throws AuthorizationException, InternalException {
-    Preconditions.checkState(!requests.isEmpty());
-    Analyzer analyzer = getAnalyzer();
-    boolean hasTableSelectPriv = true;
-    boolean hasColumnSelectPriv = false;
-    for (PrivilegeRequest request: requests) {
-      if (request.getAuthorizeable() instanceof AuthorizeableTable) {
-        try {
-          authorizePrivilegeRequest(authzChecker, request);
-        } catch (AuthorizationException e) {
-          // Authorization fails if we fail to authorize any table-level request that is
-          // not a SELECT privilege (e.g. INSERT).
-          if (request.getPrivilege() != Privilege.SELECT) throw e;
-          hasTableSelectPriv = false;
-        }
-      } else {
-        Preconditions.checkState(
-            request.getAuthorizeable() instanceof AuthorizeableColumn);
-        if (hasTableSelectPriv) continue;
-        if (authzChecker.hasAccess(analyzer.getUser(), request)) {
-          hasColumnSelectPriv = true;
-          continue;
-        }
-        // Make sure we don't reveal any column names in the error message.
-        throw new AuthorizationException(String.format("User '%s' does not have " +
-          "privileges to execute '%s' on: %s", analyzer.getUser().getName(),
-          request.getPrivilege().toString(),
-          request.getAuthorizeable().getFullTableName()));
-      }
-    }
-    if (!hasTableSelectPriv && !hasColumnSelectPriv) {
-       throw new AuthorizationException(String.format("User '%s' does not have " +
-          "privileges to execute 'SELECT' on: %s", analyzer.getUser().getName(),
-          requests.get(0).getAuthorizeable().getFullTableName()));
-    }
-  }
-
-  /**
-   * Throws an AuthorizationException if the dbName is a system db
-   * and the user is trying to modify it.
-   * Returns true if this is a system db and the action is allowed.
-   */
-  private boolean checkSystemDbAccess(String dbName, Privilege privilege)
-      throws AuthorizationException {
-    FeDb db = catalog_.getDb(dbName);
-    if (db != null && db.isSystemDb()) {
-      switch (privilege) {
-        case VIEW_METADATA:
-        case ANY:
-          return true;
-        default:
-          throw new AuthorizationException("Cannot modify system database.");
-      }
-    }
-    return false;
+    if (isExplain) analysisResult_.stmt_.setIsExplain();
+    Preconditions.checkState(!analysisResult_.requiresSubqueryRewrite());
   }
 
   public Analyzer getAnalyzer() { return analysisResult_.getAnalyzer(); }

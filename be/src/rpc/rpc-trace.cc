@@ -49,13 +49,13 @@ class RpcEventHandlerManager {
   // { "servers": [
   //  .. list of output from RpcEventHandler::ToJson()
   //  ] }
-  void JsonCallback(const Webserver::ArgumentMap& args, Document* document);
+  void JsonCallback(const Webserver::WebRequest& req, Document* document);
 
   // Resets method statistics. Takes two optional arguments: 'server' and 'method'. If
   // neither are specified, all server statistics are reset. If only the former is
   // specified, all statistics for that server are reset. If both arguments are present,
   // resets the statistics for a single method only. Produces no JSON output.
-  void ResetCallback(const Webserver::ArgumentMap& args, Document* document);
+  void ResetCallback(const Webserver::WebRequest& req, Document* document);
 
  private:
   // Protects event_handlers_
@@ -82,7 +82,7 @@ void impala::InitRpcEventTracing(Webserver* webserver, RpcMgr* rpc_mgr) {
   if (webserver != nullptr) {
     Webserver::UrlCallback json = bind<void>(
         mem_fn(&RpcEventHandlerManager::JsonCallback), handler_manager.get(), _1, _2);
-    webserver->RegisterUrlCallback("/rpcz", "rpcz.tmpl", json);
+    webserver->RegisterUrlCallback("/rpcz", "rpcz.tmpl", json, true);
 
     Webserver::UrlCallback reset = bind<void>(
         mem_fn(&RpcEventHandlerManager::ResetCallback), handler_manager.get(), _1, _2);
@@ -96,7 +96,7 @@ void RpcEventHandlerManager::RegisterEventHandler(RpcEventHandler* event_handler
   event_handlers_.push_back(event_handler);
 }
 
-void RpcEventHandlerManager::JsonCallback(const Webserver::ArgumentMap& args,
+void RpcEventHandlerManager::JsonCallback(const Webserver::WebRequest& req,
     Document* document) {
   lock_guard<mutex> l(lock_);
   Value servers(kArrayType);
@@ -109,8 +109,9 @@ void RpcEventHandlerManager::JsonCallback(const Webserver::ArgumentMap& args,
   if (rpc_mgr_ != nullptr) rpc_mgr_->ToJson(document);
 }
 
-void RpcEventHandlerManager::ResetCallback(const Webserver::ArgumentMap& args,
+void RpcEventHandlerManager::ResetCallback(const Webserver::WebRequest& req,
     Document* document) {
+  const auto& args = req.parsed_args;
   Webserver::ArgumentMap::const_iterator server_it = args.find("server");
   bool reset_all_servers = (server_it == args.end());
   Webserver::ArgumentMap::const_iterator method_it = args.find("method");

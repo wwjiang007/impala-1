@@ -17,6 +17,8 @@
 
 package org.apache.impala.analysis;
 
+import static org.apache.impala.analysis.ToSqlOptions.DEFAULT;
+
 import java.util.ArrayList;
 import java.util.List;
 
@@ -27,7 +29,6 @@ import org.apache.impala.common.AnalysisException;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
 
 /**
  * Representation of the WITH clause that may appear before a query statement or insert
@@ -47,16 +48,16 @@ import com.google.common.collect.Lists;
  *
  * Views defined within the same WITH-clause may not use the same alias.
  */
-public class WithClause implements ParseNode {
+public class WithClause extends StmtNode {
   /////////////////////////////////////////
   // BEGIN: Members that need to be reset()
 
-  private final ArrayList<View> views_;
+  private final List<View> views_;
 
   // END: Members that need to be reset()
   /////////////////////////////////////////
 
-  public WithClause(ArrayList<View> views) {
+  public WithClause(List<View> views) {
     Preconditions.checkNotNull(views);
     Preconditions.checkState(!views.isEmpty());
     views_ = views;
@@ -74,7 +75,7 @@ public class WithClause implements ParseNode {
     // during analysis of the WITH clause. withClauseAnalyzer is a child of 'analyzer' so
     // that local views registered in parent blocks are visible here.
     Analyzer withClauseAnalyzer = Analyzer.createWithNewGlobalState(analyzer);
-    withClauseAnalyzer.setIsWithClause();
+    withClauseAnalyzer.setHasWithClause();
     if (analyzer.isExplain()) withClauseAnalyzer.setIsExplain();
     for (View view: views_) {
       Analyzer viewAnalyzer = new Analyzer(withClauseAnalyzer);
@@ -101,7 +102,7 @@ public class WithClause implements ParseNode {
    */
   private WithClause(WithClause other) {
     Preconditions.checkNotNull(other);
-    views_ = Lists.newArrayList();
+    views_ = new ArrayList<>();
     for (View view: other.views_) {
       views_.add(new View(view.getName(), view.getQueryStmt().clone(),
           view.getOriginalColLabels()));
@@ -116,12 +117,13 @@ public class WithClause implements ParseNode {
   public WithClause clone() { return new WithClause(this); }
 
   @Override
-  public String toSql() {
-    return toSql(false);
+  public final String toSql() {
+    return toSql(DEFAULT);
   }
 
-  public String toSql(boolean rewritten) {
-    List<String> viewStrings = Lists.newArrayList();
+  @Override
+  public String toSql(ToSqlOptions options) {
+    List<String> viewStrings = new ArrayList<>();
     for (View view: views_) {
       // Enclose the view alias and explicit labels in quotes if Hive cannot parse it
       // without quotes. This is needed for view compatibility between Impala and Hive.
@@ -130,7 +132,7 @@ public class WithClause implements ParseNode {
         aliasSql += "(" + Joiner.on(", ").join(
             ToSqlUtils.getIdentSqlList(view.getOriginalColLabels())) + ")";
       }
-      viewStrings.add(aliasSql + " AS (" + view.getQueryStmt().toSql(rewritten) + ")");
+      viewStrings.add(aliasSql + " AS (" + view.getQueryStmt().toSql(options) + ")");
     }
     return "WITH " + Joiner.on(",").join(viewStrings);
   }

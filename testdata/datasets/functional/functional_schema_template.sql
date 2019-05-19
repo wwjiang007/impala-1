@@ -699,8 +699,29 @@ nested_struct struct<a: int, b: array<int>, c: struct<d: array<array<struct<e: i
 hadoop fs -put -f ${IMPALA_HOME}/testdata/ComplexTypesTbl/nullable.parq \
 /test-warehouse/complextypestbl_parquet/ && \
 hadoop fs -put -f ${IMPALA_HOME}/testdata/ComplexTypesTbl/nonnullable.parq \
-/test-warehouse/complextypestbl_parquet/
+/test-warehouse/complextypestbl_parquet/ && \
+hadoop fs -mkdir -p /test-warehouse/complextypestbl_orc_def && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/ComplexTypesTbl/nullable.orc \
+/test-warehouse/complextypestbl_orc_def/ && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/ComplexTypesTbl/nonnullable.orc \
+/test-warehouse/complextypestbl_orc_def/
 ---- LOAD
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+complextypestbl_medium
+---- COLUMNS
+id bigint
+int_array array<int>
+int_array_array array<array<int>>
+int_map map<string, int>
+int_map_array array<map<string, int>>
+nested_struct struct<a: int, b: array<int>, c: struct<d: array<array<struct<e: int, f: string>>>>, g: map<string, struct<h: struct<i: array<double>>>>>
+---- DEPENDENT_LOAD_HIVE
+-- This INSERT must run in Hive, because Impala doesn't support inserting into tables
+-- with complex types.
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} SELECT c.* FROM functional_parquet.complextypestbl c join functional.alltypes sort by id;
 ====
 ---- DATASET
 functional
@@ -972,15 +993,17 @@ functional
 alltypes_hive_view
 ---- CREATE_HIVE
 -- Test that Impala can handle incorrect column metadata created by Hive (IMPALA-994).
+DROP VIEW IF EXISTS {db_name}{db_suffix}.{table_name};
 -- Beeline cannot handle the stmt below when broken up into multiple lines.
-CREATE VIEW IF NOT EXISTS {db_name}{db_suffix}.{table_name} AS SELECT * FROM {db_name}{db_suffix}.alltypes;
+CREATE VIEW {db_name}{db_suffix}.{table_name} AS SELECT * FROM {db_name}{db_suffix}.alltypes;
 ====
 ---- DATASET
 functional
 ---- BASE_TABLE_NAME
 alltypes_view_sub
 ---- CREATE
-CREATE VIEW IF NOT EXISTS {db_name}{db_suffix}.{table_name} (x, y, z)
+DROP VIEW IF EXISTS {db_name}{db_suffix}.{table_name};
+CREATE VIEW {db_name}{db_suffix}.{table_name} (x, y, z)
 AS SELECT int_col, string_col, timestamp_col FROM {db_name}{db_suffix}.alltypes;
 ---- LOAD
 ====
@@ -1332,6 +1355,30 @@ create table {db_name}{db_suffix}.{table_name} (
   f string null, g string null
 )
 partition by hash(a) partitions 3 stored as kudu;
+====
+---- DATASET
+-- Table with varying ratios of nulls. Used to test NDV with nulls
+-- Also useful to test null counts as the count varies from 0 to
+-- some to all rows.
+functional
+---- BASE_TABLE_NAME
+nullrows
+---- COLUMNS
+id string
+blank string
+null_str string
+null_int int
+null_double double
+group_str string
+some_nulls string
+bool_nulls boolean
+---- ROW_FORMAT
+delimited fields terminated by ','
+---- DEPENDENT_LOAD
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} select * from functional.nullrows;
+---- LOAD
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/NullRows/data.csv'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 functional
@@ -1751,6 +1798,164 @@ STORED AS KUDU;
 ---- DEPENDENT_LOAD_KUDU
 INSERT into TABLE {db_name}{db_suffix}.{table_name}
 SELECT d1, d2, d3, d4, d5, d6
+FROM {db_name}.{table_name};
+====
+---- DATASET
+-- Reasonably large table with decimal values.  This is used for
+-- testing min-max filters with decimal types on kudu tables
+functional
+---- BASE_TABLE_NAME
+decimal_rtf_tbl
+---- COLUMNS
+d5_0   DECIMAL(5, 0)
+d5_1   DECIMAL(5, 1)
+d5_3   DECIMAL(5, 3)
+d5_5   DECIMAL(5, 5)
+d9_0   DECIMAL(9, 0)
+d9_1   DECIMAL(9, 1)
+d9_5   DECIMAL(9, 5)
+d9_9   DECIMAL(9, 9)
+d14_0  DECIMAL(14, 0)
+d14_1  DECIMAL(14, 1)
+d14_7  DECIMAL(14, 7)
+d14_14 DECIMAL(14, 14)
+d18_0  DECIMAL(18, 0)
+d18_1  DECIMAL(18, 1)
+d18_9  DECIMAL(18, 9)
+d18_18 DECIMAL(18, 18)
+d28_0  DECIMAL(28, 0)
+d28_1  DECIMAL(28, 1)
+d28_14 DECIMAL(28, 14)
+d28_28 DECIMAL(28, 28)
+d38_0  DECIMAL(38, 0)
+d38_1  DECIMAL(38, 1)
+d38_19 DECIMAL(38, 19)
+d38_38 DECIMAL(38, 38)
+---- PARTITION_COLUMNS
+dpc    DECIMAL(9, 0)
+---- ALTER
+ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION(dpc=1);
+---- ROW_FORMAT
+delimited fields terminated by ','
+---- LOAD
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/decimal_rtf_tbl.txt'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name} PARTITION(dpc=1);
+---- DEPENDENT_LOAD
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} partition(dpc)
+select * from functional.{table_name};
+---- CREATE_KUDU
+DROP TABLE IF EXISTS {db_name}{db_suffix}.{table_name};
+CREATE TABLE {db_name}{db_suffix}.{table_name} (
+  d5_0   DECIMAL(5, 0),
+  d5_1   DECIMAL(5, 1),
+  d5_3   DECIMAL(5, 3),
+  d5_5   DECIMAL(5, 5),
+  d9_0   DECIMAL(9, 0),
+  d9_1   DECIMAL(9, 1),
+  d9_5   DECIMAL(9, 5),
+  d9_9   DECIMAL(9, 9),
+  d14_0  DECIMAL(14, 0),
+  d14_1  DECIMAL(14, 1),
+  d14_7  DECIMAL(14, 7),
+  d14_14 DECIMAL(14, 14),
+  d18_0  DECIMAL(18, 0),
+  d18_1  DECIMAL(18, 1),
+  d18_9  DECIMAL(18, 9),
+  d18_18 DECIMAL(18, 18),
+  d28_0  DECIMAL(28, 0),
+  d28_1  DECIMAL(28, 1),
+  d28_14 DECIMAL(28, 14),
+  d28_28 DECIMAL(28, 28),
+  d38_0  DECIMAL(38, 0),
+  d38_1  DECIMAL(38, 1),
+  d38_19 DECIMAL(38, 19),
+  d38_38 DECIMAL(38, 38),
+  PRIMARY KEY (d5_0, d5_1, d5_3, d5_5, d9_0, d9_1, d9_5, d9_9, d14_0, d14_1, d14_7, d14_14, d18_0, d18_1, d18_9, d18_18, d28_0, d28_1, d28_14, d28_28, d38_0, d38_1, d38_19, d38_38)
+)
+PARTITION BY HASH PARTITIONS 10
+STORED AS KUDU;
+---- DEPENDENT_LOAD_KUDU
+INSERT into TABLE {db_name}{db_suffix}.{table_name}
+SELECT d5_0, d5_1, d5_3, d5_5, d9_0, d9_1, d9_5, d9_9, d14_0, d14_1, d14_7, d14_14, d18_0, d18_1, d18_9, d18_18, d28_0, d28_1, d28_14, d28_28, d38_0, d38_1, d38_19, d38_38
+FROM {db_name}.{table_name};
+====
+---- DATASET
+-- Small table with decimal values.  This is used for
+-- testing min-max filters with decimal types on kudu tables
+functional
+---- BASE_TABLE_NAME
+decimal_rtf_tiny_tbl
+---- COLUMNS
+d5_0   DECIMAL(5, 0)
+d5_1   DECIMAL(5, 1)
+d5_3   DECIMAL(5, 3)
+d5_5   DECIMAL(5, 5)
+d9_0   DECIMAL(9, 0)
+d9_1   DECIMAL(9, 1)
+d9_5   DECIMAL(9, 5)
+d9_9   DECIMAL(9, 9)
+d14_0  DECIMAL(14, 0)
+d14_1  DECIMAL(14, 1)
+d14_7  DECIMAL(14, 7)
+d14_14 DECIMAL(14, 14)
+d18_0  DECIMAL(18, 0)
+d18_1  DECIMAL(18, 1)
+d18_9  DECIMAL(18, 9)
+d18_18 DECIMAL(18, 18)
+d28_0  DECIMAL(28, 0)
+d28_1  DECIMAL(28, 1)
+d28_14 DECIMAL(28, 14)
+d28_28 DECIMAL(28, 28)
+d38_0  DECIMAL(38, 0)
+d38_1  DECIMAL(38, 1)
+d38_19 DECIMAL(38, 19)
+d38_38 DECIMAL(38, 38)
+---- PARTITION_COLUMNS
+dpc    DECIMAL(9, 0)
+---- ALTER
+ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION(dpc=1);
+---- ROW_FORMAT
+delimited fields terminated by ','
+---- LOAD
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/decimal_rtf_tiny_tbl.txt'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name} PARTITION(dpc=1);
+---- DEPENDENT_LOAD
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} partition(dpc)
+select * from functional.{table_name};
+---- CREATE_KUDU
+DROP TABLE IF EXISTS {db_name}{db_suffix}.{table_name};
+CREATE TABLE {db_name}{db_suffix}.{table_name} (
+  d5_0   DECIMAL(5, 0),
+  d5_1   DECIMAL(5, 1),
+  d5_3   DECIMAL(5, 3),
+  d5_5   DECIMAL(5, 5),
+  d9_0   DECIMAL(9, 0),
+  d9_1   DECIMAL(9, 1),
+  d9_5   DECIMAL(9, 5),
+  d9_9   DECIMAL(9, 9),
+  d14_0  DECIMAL(14, 0),
+  d14_1  DECIMAL(14, 1),
+  d14_7  DECIMAL(14, 7),
+  d14_14 DECIMAL(14, 14),
+  d18_0  DECIMAL(18, 0),
+  d18_1  DECIMAL(18, 1),
+  d18_9  DECIMAL(18, 9),
+  d18_18 DECIMAL(18, 18),
+  d28_0  DECIMAL(28, 0),
+  d28_1  DECIMAL(28, 1),
+  d28_14 DECIMAL(28, 14),
+  d28_28 DECIMAL(28, 28),
+  d38_0  DECIMAL(38, 0),
+  d38_1  DECIMAL(38, 1),
+  d38_19 DECIMAL(38, 19),
+  d38_38 DECIMAL(38, 38),
+  PRIMARY KEY (d5_0, d5_1, d5_3, d5_5, d9_0, d9_1, d9_5, d9_9, d14_0, d14_1, d14_7, d14_14, d18_0, d18_1, d18_9, d18_18, d28_0, d28_1, d28_14, d28_28, d38_0, d38_1, d38_19, d38_38)
+)
+PARTITION BY HASH PARTITIONS 10
+STORED AS KUDU;
+---- DEPENDENT_LOAD_KUDU
+INSERT into TABLE {db_name}{db_suffix}.{table_name}
+SELECT d5_0, d5_1, d5_3, d5_5, d9_0, d9_1, d9_5, d9_9, d14_0, d14_1, d14_7, d14_14, d18_0, d18_1, d18_9, d18_18, d28_0, d28_1, d28_14, d28_28, d38_0, d38_1, d38_19, d38_38
 FROM {db_name}.{table_name};
 ====
 ---- DATASET
@@ -2193,4 +2398,174 @@ table_with_header_insert
 CREATE TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name} (i1 integer)
 STORED AS {file_format}
 TBLPROPERTIES('skip.header.line.count'='2');
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+strings_with_quotes
+---- COLUMNS
+s string
+i int
+---- ROW_FORMAT
+delimited fields terminated by ','  escaped by '\\'
+---- LOAD
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/strings_with_quotes.csv'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
+---- DEPENDENT_LOAD
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name}
+SELECT s, i
+FROM {db_name}.{table_name};
+---- CREATE_KUDU
+DROP TABLE IF EXISTS {db_name}{db_suffix}.{table_name};
+CREATE TABLE {db_name}{db_suffix}.{table_name} (
+  s string PRIMARY KEY,
+  i int
+)
+PARTITION BY HASH (s) PARTITIONS 3 STORED AS KUDU;
+---- DEPENDENT_LOAD_KUDU
+INSERT into TABLE {db_name}{db_suffix}.{table_name}
+SELECT s, i
+FROM {db_name}.{table_name};
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+manynulls
+---- COLUMNS
+id int
+nullcol int
+---- ALTER
+-- Ensure the nulls are clustered together.
+ALTER TABLE {table_name} SORT BY (id);
+---- CREATE_KUDU
+DROP VIEW IF EXISTS {db_name}{db_suffix}.{table_name};
+DROP TABLE IF EXISTS {db_name}{db_suffix}.{table_name}_idx;
+
+CREATE TABLE {db_name}{db_suffix}.{table_name}_idx (
+  kudu_idx BIGINT PRIMARY KEY,
+  id INT,
+  nullcol INT NULL
+)
+PARTITION BY HASH (kudu_idx) PARTITIONS 3 STORED AS KUDU;
+CREATE VIEW {db_name}{db_suffix}.{table_name} AS
+SELECT id, nullcol
+FROM {db_name}{db_suffix}.{table_name}_idx;
+---- DEPENDENT_LOAD
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name}
+SELECT id, nullcol
+FROM {db_name}.{table_name};
+---- DEPENDENT_LOAD_KUDU
+INSERT into TABLE {db_name}{db_suffix}.{table_name}_idx
+SELECT row_number() over (order by id),
+       id, nullcol
+FROM {db_name}.{table_name};
+---- LOAD
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name}
+SELECT id, if((id div 500) % 2 = 0, NULL, id) as nullcol
+FROM functional.alltypesagg;
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+chars_medium
+---- COLUMNS
+id int
+date_char_col char(8)
+char_col char(3)
+date_varchar_col varchar(8)
+varchar_col varchar(3)
+---- DEPENDENT_LOAD
+insert overwrite table {db_name}{db_suffix}.{table_name}
+select id, date_char_col, char_col, date_varchar_col, varchar_col
+from {db_name}.{table_name};
+---- LOAD
+insert overwrite table {db_name}{db_suffix}.{table_name}
+select id, date_string_col, case when id % 3 in (0, 1) then string_col end, date_string_col, case when id % 3 = 0 then string_col end
+from functional.alltypesagg;
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+date_tbl
+---- PARTITION_COLUMNS
+date_part DATE
+---- COLUMNS
+id_col INT
+date_col DATE
+---- ALTER
+ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION(date_part='0001-01-01');
+ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION(date_part='1399-06-27');
+ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION(date_part='2017-11-27');
+ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION(date_part='9999-12-31');
+---- ROW_FORMAT
+delimited fields terminated by ','
+---- HBASE_REGION_SPLITS
+'1','3','5','7','9'
+---- LOAD
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/date_tbl/0000.txt' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name} PARTITION(date_part='0001-01-01');
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/date_tbl/0001.txt' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name} PARTITION(date_part='1399-06-27');
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/date_tbl/0002.txt' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name} PARTITION(date_part='2017-11-27');
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/date_tbl/0003.txt' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name} PARTITION(date_part='9999-12-31');
+---- DEPENDENT_LOAD
+insert overwrite table {db_name}{db_suffix}.{table_name} partition(date_part)
+select id_col, date_col, date_part from functional.{table_name};
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+date_tbl_error
+---- CREATE
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name} (
+  id_col int,
+  date_col date)
+partitioned by (date_part date)
+row format delimited fields terminated by ','  escaped by '\\'
+stored as {file_format}
+LOCATION '{hdfs_location}';
+USE {db_name}{db_suffix};
+ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION(date_part='0001-01-01');
+ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION(date_part='1399-06-27');
+ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION(date_part='2017-11-27');
+ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION(date_part='9999-12-31');
+
+-- Create external temp table with desired file format with same data file location
+-- Tmp tables must not specify an escape character we don't want any
+-- data transformation to happen when inserting it into tmp tables.
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name}_tmp (
+  id_col STRING,
+  date_col STRING)
+PARTITIONED BY (date_part DATE)
+ROW FORMAT DELIMITED
+  FIELDS TERMINATED BY ','
+STORED AS {file_format}
+LOCATION '{hdfs_location}';
+
+-- Make metastore aware of the partition directories for the temp table
+ALTER TABLE {table_name}_tmp ADD IF NOT EXISTS PARTITION(date_part='0001-01-01');
+ALTER TABLE {table_name}_tmp ADD IF NOT EXISTS PARTITION(date_part='1399-06-27');
+ALTER TABLE {table_name}_tmp ADD IF NOT EXISTS PARTITION(date_part='2017-11-27');
+ALTER TABLE {table_name}_tmp ADD IF NOT EXISTS PARTITION(date_part='9999-12-31');
+---- DEPENDENT_LOAD
+USE {db_name}{db_suffix};
+-- Step 4: Stream the data from tmp text table to desired format tmp table
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name}_tmp PARTITION (date_part)
+SELECT * FROM {db_name}.{table_name}_tmp;
+
+-- Cleanup the temp table
+DROP TABLE IF EXISTS {db_name}{db_suffix}.{table_name}_tmp;
+---- LOAD
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/date_tbl_error/0000.txt' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name} PARTITION(date_part='0001-01-01');
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/date_tbl_error/0001.txt' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name} PARTITION(date_part='1399-06-27');
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/date_tbl_error/0002.txt' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name} PARTITION(date_part='2017-11-27');
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/date_tbl_error/0003.txt' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name} PARTITION(date_part='9999-12-31');
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+insert_date_tbl
+---- PARTITION_COLUMNS
+date_part DATE
+---- COLUMNS
+id_col INT
+date_col DATE
 ====

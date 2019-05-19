@@ -17,9 +17,11 @@
 
 package org.apache.impala.analysis;
 
-import java.lang.reflect.Method;
+import static org.apache.impala.analysis.ToSqlOptions.DEFAULT;
+
 import java.util.ArrayList;
 import java.util.BitSet;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.ListIterator;
@@ -34,6 +36,7 @@ import org.apache.impala.catalog.ScalarType;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.InternalException;
+import org.apache.impala.common.SqlCastException;
 import org.apache.impala.common.TreeNode;
 import org.apache.impala.rewrite.ExprRewriter;
 import org.apache.impala.service.FeSupport;
@@ -50,54 +53,56 @@ import com.google.common.base.Preconditions;
 import com.google.common.base.Predicates;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
-import com.google.common.collect.Sets;
 
 /**
  * Root of the expr node hierarchy.
- *
  */
 abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneable {
-  private final static Logger LOG = LoggerFactory.getLogger(Expr.class);
+  private static final Logger LOG = LoggerFactory.getLogger(Expr.class);
 
   // Limits on the number of expr children and the depth of an expr tree. These maximum
   // values guard against crashes due to stack overflows (IMPALA-432) and were
   // experimentally determined to be safe.
-  public final static int EXPR_CHILDREN_LIMIT = 10000;
+  public static final int EXPR_CHILDREN_LIMIT = 10000;
   // The expr depth limit is mostly due to our recursive implementation of clone().
-  public final static int EXPR_DEPTH_LIMIT = 1000;
+  public static final int EXPR_DEPTH_LIMIT = 1000;
 
   // Name of the function that needs to be implemented by every Expr that
   // supports negation.
-  private final static String NEGATE_FN = "negate";
+  private static final String NEGATE_FN = "negate";
 
   // To be used where we cannot come up with a better estimate (selectivity_ is -1).
-  public static double DEFAULT_SELECTIVITY = 0.1;
+  public static final double DEFAULT_SELECTIVITY = 0.1;
 
   // The relative costs of different Exprs. These numbers are not intended as a precise
   // reflection of running times, but as simple heuristics for ordering Exprs from cheap
   // to expensive.
   // TODO(tmwarshall): Get these costs in a more principled way, eg. with a benchmark.
-  public final static float ARITHMETIC_OP_COST = 1;
-  public final static float BINARY_PREDICATE_COST = 1;
-  public final static float VAR_LEN_BINARY_PREDICATE_COST = 5;
-  public final static float CAST_COST = 1;
-  public final static float COMPOUND_PREDICATE_COST = 1;
-  public final static float FUNCTION_CALL_COST = 10;
-  public final static float IS_NOT_EMPTY_COST = 1;
-  public final static float IS_NULL_COST = 1;
-  public final static float LIKE_COST = 10;
-  public final static float LITERAL_COST = 1;
-  public final static float SLOT_REF_COST = 1;
-  public final static float TIMESTAMP_ARITHMETIC_COST = 5;
-  public final static float UNKNOWN_COST = -1;
+  public static final float ARITHMETIC_OP_COST = 1;
+  public static final float BINARY_PREDICATE_COST = 1;
+  public static final float VAR_LEN_BINARY_PREDICATE_COST = 5;
+  public static final float CAST_COST = 1;
+  public static final float COMPOUND_PREDICATE_COST = 1;
+  public static final float FUNCTION_CALL_COST = 10;
+  public static final float IS_NOT_EMPTY_COST = 1;
+  public static final float IS_NULL_COST = 1;
+  public static final float LIKE_COST = 10;
+  public static final float LITERAL_COST = 1;
+  public static final float SLOT_REF_COST = 1;
+  public static final float TIMESTAMP_ARITHMETIC_COST = 5;
+  public static final float UNKNOWN_COST = -1;
+
+  // Arbitrary max exprs considered for constant propagation due to O(n^2) complexity.
+  private static final int CONST_PROPAGATION_EXPR_LIMIT = 200;
 
   // To be used when estimating the cost of Exprs of type string where we don't otherwise
   // have an estimate of how long the strings produced by that Expr are.
-  public final static int DEFAULT_AVG_STRING_LENGTH = 5;
+  public static final int DEFAULT_AVG_STRING_LENGTH = 5;
 
   // returns true if an Expr is a non-analytic aggregate.
-  private final static com.google.common.base.Predicate<Expr> isAggregatePredicate_ =
+  public static final com.google.common.base.Predicate<Expr> IS_AGGREGATE =
       new com.google.common.base.Predicate<Expr>() {
+        @Override
         public boolean apply(Expr arg) {
           return arg instanceof FunctionCallExpr &&
               ((FunctionCallExpr)arg).isAggregateFunction();
@@ -105,7 +110,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
       };
 
   // Returns true if an Expr is a NOT CompoundPredicate.
-  public final static com.google.common.base.Predicate<Expr> IS_NOT_PREDICATE =
+  public static final com.google.common.base.Predicate<Expr> IS_NOT_PREDICATE =
       new com.google.common.base.Predicate<Expr>() {
         @Override
         public boolean apply(Expr arg) {
@@ -115,7 +120,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
       };
 
   // Returns true if an Expr is an OR CompoundPredicate.
-  public final static com.google.common.base.Predicate<Expr> IS_OR_PREDICATE =
+  public static final com.google.common.base.Predicate<Expr> IS_OR_PREDICATE =
       new com.google.common.base.Predicate<Expr>() {
         @Override
         public boolean apply(Expr arg) {
@@ -125,7 +130,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
       };
 
   // Returns true if an Expr is a scalar subquery
-  public final static com.google.common.base.Predicate<Expr> IS_SCALAR_SUBQUERY =
+  public static final com.google.common.base.Predicate<Expr> IS_SCALAR_SUBQUERY =
       new com.google.common.base.Predicate<Expr>() {
         @Override
         public boolean apply(Expr arg) {
@@ -135,7 +140,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
 
   // Returns true if an Expr is an aggregate function that returns non-null on
   // an empty set (e.g. count).
-  public final static com.google.common.base.Predicate<Expr>
+  public static final com.google.common.base.Predicate<Expr>
       NON_NULL_EMPTY_AGG = new com.google.common.base.Predicate<Expr>() {
         @Override
         public boolean apply(Expr arg) {
@@ -145,7 +150,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
       };
 
   // Returns true if an Expr is a builtin aggregate function.
-  public final static com.google.common.base.Predicate<Expr> IS_BUILTIN_AGG_FN =
+  public static final com.google.common.base.Predicate<Expr> IS_BUILTIN_AGG_FN =
       new com.google.common.base.Predicate<Expr>() {
         @Override
         public boolean apply(Expr arg) {
@@ -155,16 +160,16 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
       };
 
   // Returns true if an Expr is a user-defined aggregate function.
-  public final static com.google.common.base.Predicate<Expr> IS_UDA_FN =
+  public static final com.google.common.base.Predicate<Expr> IS_UDA_FN =
       new com.google.common.base.Predicate<Expr>() {
         @Override
         public boolean apply(Expr arg) {
-          return isAggregatePredicate_.apply(arg) &&
+          return IS_AGGREGATE.apply(arg) &&
               !((FunctionCallExpr)arg).getFnName().isBuiltin();
         }
       };
 
-  public final static com.google.common.base.Predicate<Expr> IS_TRUE_LITERAL =
+  public static final com.google.common.base.Predicate<Expr> IS_TRUE_LITERAL =
       new com.google.common.base.Predicate<Expr>() {
         @Override
         public boolean apply(Expr arg) {
@@ -172,7 +177,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
         }
       };
 
-  public final static com.google.common.base.Predicate<Expr> IS_FALSE_LITERAL =
+  public static final com.google.common.base.Predicate<Expr> IS_FALSE_LITERAL =
       new com.google.common.base.Predicate<Expr>() {
         @Override
         public boolean apply(Expr arg) {
@@ -180,13 +185,13 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
         }
       };
 
-  public final static com.google.common.base.Predicate<Expr> IS_EQ_BINARY_PREDICATE =
+  public static final com.google.common.base.Predicate<Expr> IS_EQ_BINARY_PREDICATE =
       new com.google.common.base.Predicate<Expr>() {
         @Override
         public boolean apply(Expr arg) { return BinaryPredicate.getEqSlots(arg) != null; }
       };
 
-  public final static com.google.common.base.Predicate<Expr> IS_NOT_EQ_BINARY_PREDICATE =
+  public static final com.google.common.base.Predicate<Expr> IS_NOT_EQ_BINARY_PREDICATE =
       new com.google.common.base.Predicate<Expr>() {
         @Override
         public boolean apply(Expr arg) {
@@ -196,23 +201,23 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
         }
       };
 
-  public final static com.google.common.base.Predicate<Expr> IS_BINARY_PREDICATE =
+  public static final com.google.common.base.Predicate<Expr> IS_BINARY_PREDICATE =
       new com.google.common.base.Predicate<Expr>() {
         @Override
         public boolean apply(Expr arg) { return arg instanceof BinaryPredicate; }
       };
 
-  public final static com.google.common.base.Predicate<Expr> IS_EXPR_EQ_LITERAL_PREDICATE =
-      new com.google.common.base.Predicate<Expr>() {
+  public static final com.google.common.base.Predicate<Expr>
+    IS_EXPR_EQ_LITERAL_PREDICATE = new com.google.common.base.Predicate<Expr>() {
     @Override
     public boolean apply(Expr arg) {
       return arg instanceof BinaryPredicate
           && ((BinaryPredicate) arg).getOp() == Operator.EQ
-          && (((BinaryPredicate) arg).getChild(1).isLiteral());
+          && IS_LITERAL.apply(((BinaryPredicate) arg).getChild(1));
     }
   };
 
-  public final static com.google.common.base.Predicate<Expr>
+  public static final com.google.common.base.Predicate<Expr>
       IS_NONDETERMINISTIC_BUILTIN_FN_PREDICATE =
       new com.google.common.base.Predicate<Expr>() {
         @Override
@@ -222,7 +227,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
         }
       };
 
-  public final static com.google.common.base.Predicate<Expr> IS_UDF_PREDICATE =
+  public static final com.google.common.base.Predicate<Expr> IS_UDF_PREDICATE =
       new com.google.common.base.Predicate<Expr>() {
         @Override
         public boolean apply(Expr arg) {
@@ -230,6 +235,73 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
               && !((FunctionCallExpr) arg).getFnName().isBuiltin();
         }
       };
+
+  /**
+   * @return true if the expression is a literal.
+   */
+  public static final com.google.common.base.Predicate<Expr> IS_LITERAL =
+    new com.google.common.base.Predicate<Expr>() {
+      @Override
+      public boolean apply(Expr arg) {
+        return arg instanceof LiteralExpr;
+      }
+    };
+
+  /**
+   * @return true if the expression is a null literal.
+   */
+  public static final com.google.common.base.Predicate<Expr> IS_NULL_LITERAL =
+    new com.google.common.base.Predicate<Expr>() {
+      @Override
+      public boolean apply(Expr arg) {
+        return arg instanceof NullLiteral;
+      }
+    };
+
+  /**
+   * @return true if the expression is a literal value other than NULL.
+   */
+  public static final com.google.common.base.Predicate<Expr> IS_NON_NULL_LITERAL =
+    new com.google.common.base.Predicate<Expr>() {
+      @Override
+      public boolean apply(Expr arg) {
+        return IS_LITERAL.apply(arg) && !IS_NULL_LITERAL.apply(arg);
+      }
+    };
+
+  /**
+   * @return true if the expression is a null literal, or a
+   * cast of a null (as created by the ConstantFoldingRule.)
+   */
+  public static final com.google.common.base.Predicate<Expr> IS_NULL_VALUE =
+    new com.google.common.base.Predicate<Expr>() {
+      @Override
+      public boolean apply(Expr arg) {
+        if (arg instanceof NullLiteral) return true;
+        if (! (arg instanceof CastExpr)) return false;
+        return IS_NULL_VALUE.apply(((CastExpr) arg).getChild(0));
+      }
+    };
+
+  /**
+   * @return true if the expression is a  literal, or a
+   * cast of a null (as created by the ConstantFoldingRule.)
+   */
+  public static final com.google.common.base.Predicate<Expr> IS_LITERAL_VALUE =
+    new com.google.common.base.Predicate<Expr>() {
+      @Override
+      public boolean apply(Expr arg) {
+        return IS_LITERAL.apply(arg) || IS_NULL_VALUE.apply(arg);
+      }
+    };
+
+  public static final com.google.common.base.Predicate<Expr> IS_INT_LITERAL =
+    new com.google.common.base.Predicate<Expr>() {
+      @Override
+      public boolean apply(Expr arg) {
+        return IS_LITERAL.apply(arg) && arg.getType().isIntegerType();
+      }
+    };
 
   // id that's unique across the entire query statement and is assigned by
   // Analyzer.registerConjuncts(); only assigned for the top-level terms of a
@@ -276,7 +348,6 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
   private boolean isAnalyzed_ = false;
 
   protected Expr() {
-    super();
     type_ = Type.INVALID;
     selectivity_ = -1.0;
     evalCost_ = -1.0f;
@@ -326,6 +397,9 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
    * Throws exception if any errors found.
    * @see ParseNode#analyze(Analyzer)
    */
+  // TODO: Analyze for expressions should return a possibly-rewritten
+  // expression, leaving the StmtNode version to analyze statements
+  // in-place.
   public final void analyze(Analyzer analyzer) throws AnalysisException {
     if (isAnalyzed()) return;
 
@@ -450,7 +524,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
     Type resolvedWildcardType = getResolvedWildCardType(strictDecimal);
     if (resolvedWildcardType != null) {
       if (resolvedWildcardType.isNull()) {
-        throw new AnalysisException(String.format(
+        throw new SqlCastException(String.format(
             "Cannot resolve DECIMAL precision and scale from NULL type in %s function.",
             fn_.getFunctionName().getFunction()));
       }
@@ -461,7 +535,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
           Type childType = children_.get(j).type_;
           argTypes.append(childType.toSql());
         }
-        throw new AnalysisException(String.format(
+        throw new SqlCastException(String.format(
             "Cannot resolve DECIMAL types of the %s(%s) function arguments. You need " +
             "to wrap the arguments in a CAST.", fn_.getFunctionName().getFunction(),
             argTypes.toString()));
@@ -545,7 +619,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
       Type targetType) throws AnalysisException {
     if (!targetType.isFloatingPointType() && !targetType.isIntegerType()) return child;
     if (targetType.isIntegerType()) targetType = Type.DOUBLE;
-    List<NumericLiteral> literals = Lists.newArrayList();
+    List<NumericLiteral> literals = new ArrayList<>();
     child.collectAll(Predicates.instanceOf(NumericLiteral.class), literals);
     ExprSubstitutionMap smap = new ExprSubstitutionMap();
     for (NumericLiteral l: literals) {
@@ -589,8 +663,8 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
         this instanceof BinaryPredicate);
     // This heuristic conversion is not part of DECIMAL_V2.
     if (analyzer.getQueryOptions().isDecimal_v2()) return;
-    if (children_.size() == 1) return; // Do not attempt to convert for unary ops
-    Preconditions.checkState(children_.size() == 2);
+    if (getChildCount() == 1) return; // Do not attempt to convert for unary ops
+    Preconditions.checkState(getChildCount() == 2);
     Type t0 = getChild(0).getType();
     Type t1 = getChild(1).getType();
     boolean c0IsConstantDecimal = getChild(0).isConstant() && t0.isDecimal();
@@ -622,15 +696,26 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
   }
 
   @Override
-  public String toSql() {
-    return (printSqlInParens_) ? "(" + toSqlImpl() + ")" : toSqlImpl();
+  public final String toSql() {
+    return toSql(DEFAULT);
+  }
+
+  /**
+   * Some expression nodes are also statement-like and know about
+   * before/after rewrite expressions.
+   */
+  @Override
+  public String toSql(ToSqlOptions options) {
+    return (printSqlInParens_) ? "(" + toSqlImpl(options) + ")" : toSqlImpl(options);
   }
 
   /**
    * Returns a SQL string representing this expr. Subclasses should override this method
    * instead of toSql() to ensure that parenthesis are properly added around the toSql().
    */
-  protected abstract String toSqlImpl();
+  protected abstract String toSqlImpl(ToSqlOptions options);
+
+  protected String toSqlImpl() { return toSqlImpl(DEFAULT); };
 
   // Convert this expr, including all children, to its Thrift representation.
   public TExpr treeToThrift() {
@@ -638,7 +723,8 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
       // Hack to ensure BE never sees TYPE_NULL. If an expr makes it this far without
       // being cast to a non-NULL type, the type doesn't matter and we can cast it
       // arbitrarily.
-      Preconditions.checkState(this instanceof NullLiteral || this instanceof SlotRef);
+      Preconditions.checkState(IS_NULL_LITERAL.apply(this) ||
+          this instanceof SlotRef);
       return NullLiteral.create(ScalarType.BOOLEAN).treeToThrift();
     }
     TExpr result = new TExpr();
@@ -692,25 +778,21 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
   }
 
   public static List<TExpr> treesToThrift(List<? extends Expr> exprs) {
-    List<TExpr> result = Lists.newArrayList();
+    List<TExpr> result = new ArrayList<>();
     for (Expr expr: exprs) {
       result.add(expr.treeToThrift());
     }
     return result;
   }
 
-  public static com.google.common.base.Predicate<Expr> isAggregatePredicate() {
-    return isAggregatePredicate_;
-  }
-
   public boolean isAggregate() {
-    return isAggregatePredicate_.apply(this);
+    return IS_AGGREGATE.apply(this);
   }
 
-  public List<String> childrenToSql() {
-    List<String> result = Lists.newArrayList();
+  public List<String> childrenToSql(ToSqlOptions options) {
+    List<String> result = new ArrayList<>();
     for (Expr child: children_) {
-      result.add(child.toSql());
+      result.add(child.toSql(options));
     }
     return result;
   }
@@ -721,18 +803,18 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
 
   public static String debugString(List<? extends Expr> exprs) {
     if (exprs == null || exprs.isEmpty()) return "";
-    List<String> strings = Lists.newArrayList();
+    List<String> strings = new ArrayList<>();
     for (Expr expr: exprs) {
       strings.add(expr.debugString());
     }
     return Joiner.on(" ").join(strings);
   }
 
-  public static String toSql(List<? extends Expr> exprs) {
+  public static String toSql(List<? extends Expr> exprs, ToSqlOptions options) {
     if (exprs == null || exprs.isEmpty()) return "";
-    List<String> strings = Lists.newArrayList();
+    List<String> strings = new ArrayList<>();
     for (Expr expr: exprs) {
-      strings.add(expr.toSql());
+      strings.add(expr.toSql(options));
     }
     return Joiner.on(", ").join(strings);
   }
@@ -813,7 +895,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
    * Return the intersection of l1 and l2.
    */
   public static <C extends Expr> List<C> intersect(List<C> l1, List<C> l2) {
-    List<C> result = new ArrayList<C>();
+    List<C> result = new ArrayList<>();
     for (C element: l1) {
       if (l2.contains(element)) result.add(element);
     }
@@ -835,7 +917,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
    * SlotRefs, etc. Hence, this method is placed here and not in Predicate.
    */
   public List<Expr> getConjuncts() {
-    List<Expr> list = Lists.newArrayList();
+    List<Expr> list = new ArrayList<>();
     if (this instanceof CompoundPredicate
         && ((CompoundPredicate) this).getOp() == CompoundPredicate.Operator.AND) {
       // TODO: we have to convert CompoundPredicate.AND to two expr trees for
@@ -891,18 +973,18 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
     }
   }
 
-  public static ArrayList<Expr> trySubstituteList(Iterable<? extends Expr> exprs,
+  public static List<Expr> trySubstituteList(Iterable<? extends Expr> exprs,
       ExprSubstitutionMap smap, Analyzer analyzer, boolean preserveRootTypes)
           throws AnalysisException {
     if (exprs == null) return null;
-    ArrayList<Expr> result = new ArrayList<Expr>();
+    List<Expr> result = new ArrayList<>();
     for (Expr e: exprs) {
       result.add(e.trySubstitute(smap, analyzer, preserveRootTypes));
     }
     return result;
   }
 
-  public static ArrayList<Expr> substituteList(Iterable<? extends Expr> exprs,
+  public static List<Expr> substituteList(Iterable<? extends Expr> exprs,
       ExprSubstitutionMap smap, Analyzer analyzer, boolean preserveRootTypes) {
     try {
       return trySubstituteList(exprs, smap, analyzer, preserveRootTypes);
@@ -962,7 +1044,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
     return this;
   }
 
-  public static ArrayList<Expr> resetList(ArrayList<Expr> l) {
+  public static List<Expr> resetList(List<Expr> l) {
     for (int i = 0; i < l.size(); ++i) {
       l.set(i, l.get(i).reset());
     }
@@ -980,9 +1062,9 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
    * Create a deep copy of 'l'. The elements of the returned list are of the same
    * type as the input list.
    */
-  public static <C extends Expr> ArrayList<C> cloneList(List<C> l) {
+  public static <C extends Expr> List<C> cloneList(List<C> l) {
     Preconditions.checkNotNull(l);
-    ArrayList<C> result = new ArrayList<C>(l.size());
+    List<C> result = new ArrayList<>(l.size());
     for (Expr element: l) {
       result.add((C) element.clone());
     }
@@ -1004,7 +1086,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
    */
   public static <C extends Expr> List<C> removeDuplicates(List<C> l,
       SlotRef.Comparator cmp) {
-    List<C> newList = Lists.newArrayList();
+    List<C> newList = new ArrayList<>();
     for (C expr: l) {
       boolean exists = false;
       for (C newExpr : newList) {
@@ -1029,9 +1111,6 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
       if (e.isConstant()) it.remove();
     }
   }
-
-  // Arbitrary max exprs considered for constant propagation due to O(n^2) complexity.
-  private final static int CONST_PROPAGATION_EXPR_LIMIT = 200;
 
   /**
    * Propagates constant expressions of the form <slot ref> = <constant> to
@@ -1106,13 +1185,13 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
           // Remove constant boolean literal expressions.  N.B. - we may have
           // expressions determined to be constant which can not yet be discarded
           // because they can't be evaluated if expr rewriting is turned off.
-          if (rewritten instanceof NullLiteral ||
-              Expr.IS_FALSE_LITERAL.apply(rewritten)) {
+          if (IS_NULL_LITERAL.apply(rewritten) ||
+              IS_FALSE_LITERAL.apply(rewritten)) {
             conjuncts.clear();
             conjuncts.add(rewritten);
             return false;
           }
-          if (Expr.IS_TRUE_LITERAL.apply(rewritten)) {
+          if (IS_TRUE_LITERAL.apply(rewritten)) {
             pruned++;
             conjuncts.remove(index);
           }
@@ -1161,8 +1240,8 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
   }
 
   public void getIds(List<TupleId> tupleIds, List<SlotId> slotIds) {
-    Set<TupleId> tupleIdSet = Sets.newHashSet();
-    Set<SlotId> slotIdSet = Sets.newHashSet();
+    Set<TupleId> tupleIdSet = new HashSet<>();
+    Set<SlotId> slotIdSet = new HashSet<>();
     getIdsHelper(tupleIdSet, slotIdSet);
     if (tupleIds != null) tupleIds.addAll(tupleIdSet);
     if (slotIds != null) slotIds.addAll(slotIdSet);
@@ -1180,13 +1259,6 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
     for (Expr e: exprs) {
       e.getIds(tupleIds, slotIds);
     }
-  }
-
-  /**
-   * @return true if this is an instance of LiteralExpr
-   */
-  public boolean isLiteral() {
-    return this instanceof LiteralExpr;
   }
 
   /**
@@ -1217,17 +1289,6 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
       if (!expr.isConstant()) return false;
     }
     return true;
-  }
-
-  /**
-   * @return true if this expr is either a null literal or a cast from
-   * a null literal.
-   */
-  public boolean isNullLiteral() {
-    if (this instanceof NullLiteral) return true;
-    if (!(this instanceof CastExpr)) return false;
-    Preconditions.checkState(children_.size() == 1);
-    return children_.get(0).isNullLiteral();
   }
 
   /**
@@ -1276,8 +1337,10 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
     if (!targetType.isDecimal()) {
       // requested cast must be to assignment-compatible type
       // (which implies no loss of precision)
-      Preconditions.checkArgument(targetType.equals(type),
+      if (!targetType.equals(type)) {
+        throw new SqlCastException(
           "targetType=" + targetType + " type=" + type);
+      }
     }
     return uncheckedCastTo(targetType);
   }
@@ -1314,7 +1377,6 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
     setChild(childIndex, newChild);
   }
 
-
   /**
    * Convert child to to targetType, possibly by inserting an implicit cast, or by
    * returning an altogether new expression, or by returning 'this' with a modified
@@ -1334,24 +1396,19 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
   /**
    * Returns child expr if this expr is an implicit cast, otherwise returns 'this'.
    */
-  public Expr ignoreImplicitCast() {
-    if (isImplicitCast()) return getChild(0).ignoreImplicitCast();
-    return this;
-  }
+  public Expr ignoreImplicitCast() { return this; }
 
   /**
    * Returns true if 'this' is an implicit cast expr.
    */
-  public boolean isImplicitCast() {
-    return this instanceof CastExpr && ((CastExpr) this).isImplicit();
-  }
+  public boolean isImplicitCast() { return false; }
 
   @Override
   public String toString() {
     return Objects.toStringHelper(this.getClass())
         .add("id", id_)
         .add("type", type_)
-        .add("toSql", toSql())
+        .add("toSql", toSql(ToSqlOptions.SHOW_IMPLICIT_CASTS))
         .add("sel", selectivity_)
         .add("evalCost", evalCost_)
         .add("#distinct", numDistinctValues_)
@@ -1404,11 +1461,11 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
    */
   public static Expr pushNegationToOperands(Expr root) {
     Preconditions.checkNotNull(root);
-    if (Expr.IS_NOT_PREDICATE.apply(root)) {
+    if (IS_NOT_PREDICATE.apply(root)) {
       try {
         // Make sure we call function 'negate' only on classes that support it,
         // otherwise we may recurse infinitely.
-        Method m = root.getChild(0).getClass().getDeclaredMethod(NEGATE_FN);
+        root.getChild(0).getClass().getDeclaredMethod(NEGATE_FN);
         return pushNegationToOperands(root.getChild(0).negate());
       } catch (NoSuchMethodException e) {
         // The 'negate' function is not implemented. Break the recursion.
@@ -1445,7 +1502,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
    */
   public Subquery getSubquery() {
     if (!contains(Subquery.class)) return null;
-    List<Subquery> subqueries = Lists.newArrayList();
+    List<Subquery> subqueries = new ArrayList<>();
     collect(Subquery.class, subqueries);
     Preconditions.checkState(subqueries.size() == 1);
     return subqueries.get(0);
@@ -1486,7 +1543,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
         return DEFAULT_AVG_STRING_LENGTH;
       }
     } else if (e instanceof StringLiteral) {
-      return ((StringLiteral) e).getValue().length();
+      return ((StringLiteral) e).getUnescapedValue().length();
     } else {
       // TODO(tmarshall): Extend this to support other string Exprs, such as
       // function calls that return string.
@@ -1498,12 +1555,12 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
    * Generates a comma-separated string from the toSql() string representations of
    * 'exprs'.
    */
-  public static String listToSql(List<Expr> exprs) {
+  public static String listToSql(List<Expr> exprs, ToSqlOptions options) {
     com.google.common.base.Function<Expr, String> toSql =
         new com.google.common.base.Function<Expr, String>() {
         @Override
         public String apply(Expr arg) {
-          return arg.toSql();
+          return arg.toSql(options);
         }
     };
     return Joiner.on(",").join(Iterables.transform(exprs, toSql));

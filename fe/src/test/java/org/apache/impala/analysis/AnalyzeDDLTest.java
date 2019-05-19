@@ -23,6 +23,7 @@ import static org.junit.Assert.assertTrue;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
@@ -78,6 +79,19 @@ public class AnalyzeDDLTest extends FrontendTestBase {
           " partition(month=10, year=2050)");
       AnalyzesOk("alter table functional.insert_string_partitioned " + kw +
           " partition(s2='1234')");
+      // Add/drop date partitions
+      AnalyzesOk("alter table functional.date_tbl " + kw +
+          " partition(date_part='1874-06-04')");
+      AnalyzesOk("alter table functional.date_tbl " + kw +
+          " partition(date_part=date '1874-06-04')");
+      AnalyzesOk("alter table functional.date_tbl " + kw +
+          " partition(date_part='1874-6-04')");
+      AnalyzesOk("alter table functional.date_tbl " + kw +
+          " partition(date_part=date '1874-6-04')");
+      AnalyzesOk("alter table functional.date_tbl " + kw +
+          " partition(date_part='1874-6-4')");
+      AnalyzesOk("alter table functional.date_tbl " + kw +
+          " partition(date_part=date '1874-6-4')");
 
       // Can't add/drop partitions to/from unpartitioned tables
       AnalysisError("alter table functional.alltypesnopart " + kw + " partition (i=1)",
@@ -91,6 +105,8 @@ public class AnalyzeDDLTest extends FrontendTestBase {
       // Arbitrary exprs as partition key values. Constant exprs are ok.
       AnalyzesOk("alter table functional.alltypes " + kw +
           " partition(year=-1, month=cast((10+5*4) as INT))");
+      AnalyzesOk("alter table functional.date_tbl " + kw +
+          " partition(date_part=cast('1874-6-4' as date))");
 
       // Table/Db does not exist
       AnalysisError("alter table db_does_not_exist.alltypes " + kw +
@@ -116,16 +132,23 @@ public class AnalyzeDDLTest extends FrontendTestBase {
           " partition(year=NULL, month=NULL)");
       AnalyzesOk("alter table functional.alltypes " + kw +
           " partition(year=ascii(null), month=ascii(NULL))");
+      AnalyzesOk("alter table functional.date_tbl " + kw +
+          " partition(date_part=NULL)");
+      AnalyzesOk("alter table functional.date_tbl " + kw +
+          " partition(date_part=cast(NULL as date))");
     }
 
     // Data types don't match
-    AnalysisError("alter table functional.insert_string_partitioned add" +
-                  " partition(s2=1234)",
-                  "Value of partition spec (column=s2) has incompatible type: " +
-                  "'SMALLINT'. Expected type: 'STRING'.");
-    AnalysisError("alter table functional.insert_string_partitioned drop" +
-                  " partition(s2=1234)",
-                  "operands of type STRING and SMALLINT are not comparable: s2 = 1234");
+    AnalysisError("alter table functional.insert_string_partitioned add " +
+        "partition(s2=1234)",
+        "Value of partition spec (column=s2) has incompatible type: 'SMALLINT'. " +
+        "Expected type: 'STRING'.");
+    AnalysisError("alter table functional.insert_string_partitioned drop " +
+        "partition(s2=1234)",
+        "operands of type STRING and SMALLINT are not comparable: s2 = 1234");
+    AnalysisError("alter table functional.date_tbl add partition (date_part=123)",
+        "Value of partition spec (column=date_part) has incompatible type: 'TINYINT'. " +
+        "Expected type: 'DATE'.");
 
     // Loss of precision
     AnalysisError(
@@ -134,9 +157,41 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "Partition key value may result in loss of precision.\nWould need to cast " +
         "'100000000000' to 'INT' for partition column: year");
 
+    // Invalid date literal
+    AnalysisError(
+        "alter table functional.date_tbl add partition (date_part='1874-06-')",
+        "Invalid date literal: '1874-06-'");
+    AnalysisError(
+        "alter table functional.date_tbl add partition (date_part=date '1874-06-')",
+        "Invalid date literal: '1874-06-'");
+
     // Duplicate partition key name
     AnalysisError("alter table functional.alltypes add " +
         "partition(year=2050, year=2051)", "Duplicate partition key name: year");
+
+    // Duplicate date partition key name. Date literals may have different variations.
+    AnalysisError(
+        "alter table functional.date_tbl add partition (date_part='0001-01-01')",
+        "Partition spec already exists: (date_part=DATE '0001-01-01').");
+    AnalysisError(
+        "alter table functional.date_tbl add partition (date_part=DATE '0001-01-01')",
+        "Partition spec already exists: (date_part=DATE '0001-01-01').");
+    AnalysisError(
+        "alter table functional.date_tbl add partition (date_part='0001-01-1')",
+        "Partition spec already exists: (date_part=DATE '0001-01-01').");
+    AnalysisError(
+        "alter table functional.date_tbl add partition (date_part=date '0001-01-1')",
+        "Partition spec already exists: (date_part=DATE '0001-01-01').");
+    AnalysisError(
+        "alter table functional.date_tbl add partition (date_part='0001-01-1')",
+        "Partition spec already exists: (date_part=DATE '0001-01-01').");
+    AnalysisError(
+        "alter table functional.date_tbl add partition (date_part=date '0001-1-1')",
+        "Partition spec already exists: (date_part=DATE '0001-01-01').");
+    AnalysisError(
+        "alter table functional.date_tbl add partition " +
+        "(date_part=cast('0001-1-01' as date))",
+        "Partition spec already exists: (date_part=CAST('0001-1-01' AS DATE)).");
 
     // Arbitrary exprs as partition key values. Non-constant exprs should fail.
     AnalysisError("alter table functional.alltypes add " +
@@ -156,11 +211,11 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     // Arbitrary exprs as partition key values. Non-partition columns should fail.
     AnalysisError("alter table functional.alltypes drop " +
         "partition(year=2050, month=int_col) ",
-        "Partition exprs cannot contain non-partition column(s): month = int_col.");
+        "Partition exprs cannot contain non-partition column(s): `month` = int_col.");
     AnalysisError("alter table functional.alltypes drop " +
         "partition(year=cast(int_col as int), month=12) ",
         "Partition exprs cannot contain non-partition column(s): " +
-        "year = CAST(int_col AS INT).");
+        "`year` = CAST(int_col AS INT).");
 
     // IF NOT EXISTS properly checks for partition existence
     AnalyzesOk("alter table functional.alltypes add " +
@@ -191,6 +246,8 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalysisError("alter table functional.alltypes drop " +
       "partition(year=NULL, month is NULL)",
       "No matching partition(s) found.");
+    AnalysisError("alter table functional.date_tbl drop partition(date_part=NULL)",
+      "No matching partition(s) found.");
 
     // Drop partition using predicates
     // IF EXISTS is added here
@@ -212,6 +269,10 @@ public class AnalyzeDDLTest extends FrontendTestBase {
       "partition(year>9050, month=10)");
     AnalyzesOk("alter table functional.alltypes drop if exists " +
         "partition(year>9050, month=10)");
+    AnalyzesOk("alter table functional.date_tbl drop if exists " +
+        "partition(date_part > '1874-6-2')");
+    AnalyzesOk("alter table functional.date_tbl drop if exists " +
+        "partition(date_part > date '1874-6-02')");
 
     // Not a valid column
     AnalysisError("alter table functional.alltypes add " +
@@ -275,12 +336,24 @@ public class AnalyzeDDLTest extends FrontendTestBase {
           " partition(year=2050, month=10)" +
           " partition(year=2050, month=11)" +
           " partition(year=2050, month=12)");
+      // Add multiple DATE partitions with different formatting.
+      AnalyzesOk("alter table functional.date_tbl add " + cl +
+          " partition(date_part='1970-11-1')" +
+          " partition(date_part='1971-2-01')" +
+          " partition(date_part=DATE '1972-1-1')");
+
       // Duplicate partition specifications.
       AnalysisError("alter table functional.alltypes add " + cl +
           " partition(year=2050, month=10)" +
           " partition(year=2050, month=11)" +
           " partition(Month=10, YEAR=2050)",
           "Duplicate partition spec: (month=10, year=2050)");
+      // Duplicate DATE partition specifications with different formatting.
+      AnalysisError("alter table functional.date_tbl add " + cl +
+          " partition(date_part='1970-1-1')" +
+          " partition(date_part='1971-1-03')" +
+          " partition(date_part='1970-01-01')",
+          "Duplicate partition spec: (date_part=DATE '1970-01-01')");
 
       // Multiple partitions with locations and caching.
       AnalyzesOk("alter table functional.alltypes add " + cl +
@@ -321,39 +394,104 @@ public class AnalyzeDDLTest extends FrontendTestBase {
   }
 
   @Test
-  public void TestAlterTableAddReplaceColumns() throws AnalysisException {
+  public void TestAlterTableAddColumn() {
+    AnalyzesOk("alter table functional.alltypes add column new_col int");
+    AnalyzesOk("alter table functional.alltypes add column NEW_COL int");
+    AnalyzesOk("alter table functional.alltypes add column if not exists int_col int");
+    AnalyzesOk("alter table functional.alltypes add column if not exists INT_COL int");
+
+    // Column name must be unique for add.
+    AnalysisError("alter table functional.alltypes add column int_col int",
+        "Column already exists: int_col");
+    AnalysisError("alter table functional.alltypes add column INT_COL int",
+        "Column already exists: int_col");
+    // Add a column with same name as a partition column.
+    AnalysisError("alter table functional.alltypes add column year int",
+        "Column name conflicts with existing partition column: year");
+    AnalysisError("alter table functional.alltypes add column if not exists year int",
+        "Column name conflicts with existing partition column: year");
+    AnalysisError("alter table functional.alltypes add column YEAR int",
+        "Column name conflicts with existing partition column: year");
+    AnalysisError("alter table functional.alltypes add column if not exists YEAR int",
+        "Column name conflicts with existing partition column: year");
+    // Invalid column name.
+    AnalysisError("alter table functional.alltypes add column `???` int",
+        "Invalid column/field name: ???");
+
+    // Table/Db does not exist.
+    AnalysisError("alter table db_does_not_exist.alltypes add column i int",
+        "Could not resolve table reference: 'db_does_not_exist.alltypes'");
+    AnalysisError("alter table functional.table_does_not_exist add column i int",
+        "Could not resolve table reference: 'functional.table_does_not_exist'");
+
+    // Cannot ALTER TABLE a view.
+    AnalysisError("alter table functional.alltypes_view add column c1 string",
+        "ALTER TABLE not allowed on a view: functional.alltypes_view");
+    // Cannot ALTER TABLE a nested collection.
+    AnalysisError("alter table allcomplextypes.int_array_col add column c1 string",
+        createAnalysisCtx("functional"),
+        "ALTER TABLE not allowed on a nested collection: allcomplextypes.int_array_col");
+    // Cannot ALTER TABLE produced by a data source.
+    AnalysisError("alter table functional.alltypes_datasource add column c1 string",
+        "ALTER TABLE not allowed on a table produced by a data source: " +
+        "functional.alltypes_datasource");
+
+    // Cannot ALTER TABLE ADD COLUMNS on an HBase table.
+    AnalysisError("alter table functional_hbase.alltypes add column i int",
+        "ALTER TABLE ADD COLUMNS not currently supported on HBase tables.");
+
+    // Cannot ALTER ADD COLUMN primary key on Kudu table.
+    AnalysisError("alter table functional_kudu.alltypes add column " +
+        "new_col int primary key",
+        "Cannot add a primary key using an ALTER TABLE ADD COLUMNS statement: " +
+        "new_col INT PRIMARY KEY");
+
+    // A non-null column must have a default on Kudu table.
+    AnalysisError("alter table functional_kudu.alltypes add column new_col int not null",
+        "A new non-null column must have a default value: new_col INT NOT NULL");
+
+    // Cannot ALTER ADD COLUMN complex type on Kudu table.
+    AnalysisError("alter table functional_kudu.alltypes add column c struct<f1:int>",
+        "Kudu tables do not support complex types: c STRUCT<f1:INT>");
+
+    // A not null is a Kudu only option..
+    AnalysisError("alter table functional.alltypes add column new_col int not null",
+        "The specified column options are only supported in Kudu tables: " +
+        "new_col INT NOT NULL");
+  }
+
+  @Test
+  public void TestAlterTableAddColumns() {
     AnalyzesOk("alter table functional.alltypes add columns (new_col int)");
+    AnalyzesOk("alter table functional.alltypes add columns (NEW_COL int)");
     AnalyzesOk("alter table functional.alltypes add columns (c1 string comment 'hi')");
     AnalyzesOk("alter table functional.alltypes add columns (c struct<f1:int>)");
-    AnalyzesOk(
-        "alter table functional.alltypes replace columns (c1 int comment 'c', c2 int)");
-    AnalyzesOk("alter table functional.alltypes replace columns (c array<string>)");
+    AnalyzesOk("alter table functional.alltypes add if not exists columns (int_col int)");
+    AnalyzesOk("alter table functional.alltypes add if not exists columns (INT_COL int)");
 
-    // Column name must be unique for add
+    // Column name must be unique for add.
     AnalysisError("alter table functional.alltypes add columns (int_col int)",
         "Column already exists: int_col");
-    // Add a column with same name as a partition column
+    // Add a column with same name as a partition column.
     AnalysisError("alter table functional.alltypes add columns (year int)",
+        "Column name conflicts with existing partition column: year");
+    AnalysisError("alter table functional.alltypes add if not exists columns (year int)",
         "Column name conflicts with existing partition column: year");
     // Invalid column name.
     AnalysisError("alter table functional.alltypes add columns (`???` int)",
         "Invalid column/field name: ???");
-    AnalysisError("alter table functional.alltypes replace columns (`???` int)",
-        "Invalid column/field name: ???");
 
-    // Replace should not throw an error if the column already exists
-    AnalyzesOk("alter table functional.alltypes replace columns (int_col int)");
-    // It is not possible to replace a partition column
-    AnalysisError("alter table functional.alltypes replace columns (Year int)",
-        "Column name conflicts with existing partition column: year");
-
-    // Duplicate column names
+    // Duplicate column names.
     AnalysisError("alter table functional.alltypes add columns (c1 int, c1 int)",
         "Duplicate column name: c1");
-    AnalysisError("alter table functional.alltypes replace columns (c1 int, C1 int)",
+    AnalysisError("alter table functional.alltypes add columns (c1 int, C1 int)",
         "Duplicate column name: c1");
+    AnalysisError("alter table functional.alltypes add if not exists columns " +
+        "(c1 int, c1 int)", "Duplicate column name: c1");
+    AnalysisError("alter table functional.alltypes add if not exists columns " +
+        "(c1 int, C1 int)", "Duplicate column name: c1");
 
-    // Table/Db does not exist
+    // Table/Db does not exist.
     AnalysisError("alter table db_does_not_exist.alltypes add columns (i int)",
         "Could not resolve table reference: 'db_does_not_exist.alltypes'");
     AnalysisError("alter table functional.table_does_not_exist add columns (i int)",
@@ -374,9 +512,85 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "ALTER TABLE not allowed on a table produced by a data source: " +
         "functional.alltypes_datasource");
 
-    // Cannot ALTER TABLE ADD/REPLACE COLUMNS on an HBase table.
+    // Cannot ALTER TABLE ADD COLUMNS on an HBase table.
     AnalysisError("alter table functional_hbase.alltypes add columns (i int)",
-        "ALTER TABLE ADD|REPLACE COLUMNS not currently supported on HBase tables.");
+        "ALTER TABLE ADD COLUMNS not currently supported on HBase tables.");
+
+    // Cannot ALTER ADD COLUMNS primary key on Kudu table.
+    AnalysisError("alter table functional_kudu.alltypes add columns " +
+        "(new_col int primary key)",
+        "Cannot add a primary key using an ALTER TABLE ADD COLUMNS statement: " +
+        "new_col INT PRIMARY KEY");
+
+    // A non-null column must have a default on Kudu table.
+    AnalysisError("alter table functional_kudu.alltypes add columns" +
+        "(new_col int not null)",
+        "A new non-null column must have a default value: new_col INT NOT NULL");
+
+    // Cannot ALTER ADD COLUMN complex type on Kudu table.
+    AnalysisError("alter table functional_kudu.alltypes add columns (c struct<f1:int>)",
+        "Kudu tables do not support complex types: c STRUCT<f1:INT>");
+
+    // A not null is a Kudu only option..
+    AnalysisError("alter table functional.alltypes add columns(new_col int not null)",
+        "The specified column options are only supported in Kudu tables: " +
+        "new_col INT NOT NULL");
+  }
+
+  @Test
+  public void TestAlterTableReplaceColumns() {
+    AnalyzesOk("alter table functional.alltypes replace columns " +
+        "(c1 int comment 'c', c2 int)");
+    AnalyzesOk("alter table functional.alltypes replace columns " +
+        "(C1 int comment 'c', C2 int)");
+    AnalyzesOk("alter table functional.alltypes replace columns (c array<string>)");
+    // Invalid column name.
+    AnalysisError("alter table functional.alltypes replace columns (`???` int)",
+        "Invalid column/field name: ???");
+
+    // Replace should not throw an error if the column already exists.
+    AnalyzesOk("alter table functional.alltypes replace columns (int_col int)");
+    AnalyzesOk("alter table functional.alltypes replace columns (INT_COL int)");
+    // It is not possible to replace a partition column.
+    AnalysisError("alter table functional.alltypes replace columns (year int)",
+        "Column name conflicts with existing partition column: year");
+    AnalysisError("alter table functional.alltypes replace columns (Year int)",
+        "Column name conflicts with existing partition column: year");
+
+    // Duplicate column names.
+    AnalysisError("alter table functional.alltypes replace columns (c1 int, c1 int)",
+        "Duplicate column name: c1");
+    AnalysisError("alter table functional.alltypes replace columns (c1 int, C1 int)",
+        "Duplicate column name: c1");
+
+    // Table/Db does not exist
+    AnalysisError("alter table db_does_not_exist.alltypes replace columns (i int)",
+        "Could not resolve table reference: 'db_does_not_exist.alltypes'");
+    AnalysisError("alter table functional.table_does_not_exist replace columns (i int)",
+        "Could not resolve table reference: 'functional.table_does_not_exist'");
+
+    // Cannot ALTER TABLE a view.
+    AnalysisError("alter table functional.alltypes_view " +
+            "replace columns (c1 string comment 'hi')",
+        "ALTER TABLE not allowed on a view: functional.alltypes_view");
+    // Cannot ALTER TABLE a nested collection.
+    AnalysisError("alter table allcomplextypes.int_array_col " +
+            "replace columns (c1 string comment 'hi')",
+        createAnalysisCtx("functional"),
+        "ALTER TABLE not allowed on a nested collection: allcomplextypes.int_array_col");
+    // Cannot ALTER TABLE produced by a data source.
+    AnalysisError("alter table functional.alltypes_datasource " +
+            "replace columns (c1 string comment 'hi')",
+        "ALTER TABLE not allowed on a table produced by a data source: " +
+            "functional.alltypes_datasource");
+
+    // Cannot ALTER TABLE REPLACE COLUMNS on an HBase table.
+    AnalysisError("alter table functional_hbase.alltypes replace columns (i int)",
+        "ALTER TABLE REPLACE COLUMNS not currently supported on HBase tables.");
+
+    // Cannot ALTER TABLE REPLACE COLUMNS on an Kudu table.
+    AnalysisError("alter table functional_kudu.alltypes replace columns (i int)",
+        "ALTER TABLE REPLACE COLUMNS is not supported on Kudu tables.");
   }
 
   @Test
@@ -758,8 +972,8 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalysisError("alter table functional.alltypestiny partition (year=2009,month=1) " +
         "set location '/test-warehouse/new_location'",
         "Target partition is cached, please uncache before changing the location " +
-        "using: ALTER TABLE functional.alltypestiny PARTITION (year = 2009, month = 1) " +
-        "SET UNCACHED");
+        "using: ALTER TABLE functional.alltypestiny " +
+        "PARTITION (`year` = 2009, `month` = 1) SET UNCACHED");
 
     // Table/db/partition do not exist
     AnalysisError("alter table baddb.alltypestiny set cached in 'testPool'",
@@ -775,7 +989,7 @@ public class AnalyzeDDLTest extends FrontendTestBase {
   public void TestAlterTableSetColumnStats() {
     // Contains entries of the form 'statsKey'='statsValue' for every
     // stats key. A dummy value is used for 'statsValue'.
-    List<String> testKeyValues = Lists.newArrayList();
+    List<String> testKeyValues = new ArrayList<>();
     for (ColumnStats.StatsKey statsKey: ColumnStats.StatsKey.values()) {
       testKeyValues.add(String.format("'%s'='10'", statsKey));
     }
@@ -1216,6 +1430,17 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "select * from temp_view union distinct " +
         "select tinyint_col, int_col, bigint_col from functional.alltypes",
         "Self-reference not allowed on view: functional.alltypes_view");
+
+    // IMPALA-7679: Inserting a null column type without an explicit type should
+    // throw an error.
+    AnalyzesOk("alter view functional.alltypes_view as " +
+        "select cast(null as int) as new_col");
+    AnalyzesOk("alter view functional.alltypes_view as " +
+        "select cast(null as int) as null_col, 1 as one_col");
+    AnalysisError("alter view functional.alltypes_view " +
+        "as select null as new_col", "Unable to infer the column type for " +
+        "column 'new_col'. Use cast() to explicitly specify the column type for " +
+        "column 'new_col'.");
   }
 
   @Test
@@ -1254,6 +1479,7 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "compression LZ4 encoding RLE");
     AnalyzesOk("alter table functional.alltypes alter int_col set comment 'a'");
     AnalyzesOk("alter table functional_kudu.alltypes alter int_col drop default");
+    AnalyzesOk("alter table functional_kudu.alltypes alter int_col set comment 'a'");
 
     AnalysisError("alter table functional_kudu.alltypes alter id set default 0",
         "Cannot set default value for primary key column 'id'");
@@ -1268,8 +1494,6 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "Altering a column to be a primary key is not supported.");
     AnalysisError("alter table functional_kudu.alltypes alter int_col set not null",
         "Altering the nullability of a column is not supported.");
-    AnalysisError("alter table functional_kudu.alltypes alter int_col set comment 'a'",
-        "Kudu does not support column comments.");
     AnalysisError("alter table functional.alltypes alter int_col set compression lz4",
         "Unsupported column options for non-Kudu table: 'int_col INT COMPRESSION LZ4'");
     AnalysisError("alter table functional.alltypes alter int_col drop default",
@@ -1310,7 +1534,7 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     Set<Column> actCols = parsedStmt.getValidatedColumnWhitelist();
     if (expColNames == null) assertTrue("Expected no whitelist.", actCols == null);
     assertTrue("Expected whitelist.", actCols != null);
-    Set<String> actColSet = Sets.newHashSet();
+    Set<String> actColSet = new HashSet<>();
     for (Column col: actCols) actColSet.add(col.getName());
     Set<String> expColSet = Sets.newHashSet(expColNames);
     assertEquals(actColSet, expColSet);
@@ -1930,6 +2154,14 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         " stored as kudu as SELECT INT_COL, SMALLINT_COL, ID, BIGINT_COL," +
         " DATE_STRING_COL, STRING_COL, TIMESTAMP_COL, YEAR, MONTH FROM " +
         " functional.alltypes");
+
+    // IMPALA-7679: Inserting a null column type without an explicit type should
+    // throw an error.
+    AnalyzesOk("create table t as select cast(null as int) as new_col");
+    AnalyzesOk("create table t as select cast(null as int) as null_col, 1 as one_col");
+    AnalysisError("create table t as select null as new_col",
+        "Unable to infer the column type for column 'new_col'. Use cast() to " +
+        "explicitly specify the column type for column 'new_col'.");
   }
 
   @Test
@@ -2371,14 +2603,13 @@ public class AnalyzeDDLTest extends FrontendTestBase {
 
     // ALTER TABLE CHANGE COLUMN on Kudu tables
     AnalyzesOk("alter table functional_kudu.testtbl change column name new_name string");
+    AnalyzesOk("alter table functional_kudu.testtbl change column zip " +
+        "zip int comment 'comment'");
     // Unsupported column options
     AnalysisError("alter table functional_kudu.testtbl change column zip zip_code int " +
         "encoding rle compression lz4 default 90000", "Unsupported column options in " +
         "ALTER TABLE CHANGE COLUMN statement: 'zip_code INT ENCODING RLE COMPRESSION " +
         "LZ4 DEFAULT 90000'. Use ALTER TABLE ALTER COLUMN instead.");
-    AnalysisError(
-        "alter table functional_kudu.testtbl change column zip zip int comment 'comment'",
-        "Kudu does not support column comments.");
     // Changing the column type is not supported for Kudu tables
     AnalysisError("alter table functional_kudu.testtbl change column zip zip bigint",
         "Cannot change the type of a Kudu column using an ALTER TABLE CHANGE COLUMN " +
@@ -2786,6 +3017,10 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "ts timestamp not null default '2009-1 foo') " +
         "partition by hash(id) partitions 3 stored as kudu",
         "String '2009-1 foo' cannot be cast to a TIMESTAMP literal.");
+
+    // Test column comments.
+    AnalyzesOk("create table tab (x int comment 'x', y int comment 'y', " +
+        "primary key (x, y)) stored as kudu");
   }
 
   @Test
@@ -3131,6 +3366,14 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "from functional.allcomplextypes",
         "Expr 'int_array_col' in select list returns a complex type 'ARRAY<INT>'.\n" +
         "Only scalar types are allowed in the select list.");
+
+    // IMPALA-7679: Inserting a null column type without an explicit type should
+    // throw an error.
+    AnalyzesOk("create view v as select cast(null as int) as new_col");
+    AnalyzesOk("create view v as select cast(null as int) as null_col, 1 as one_col");
+    AnalysisError("create view v as select null as new_col",
+        "Unable to infer the column type for column 'new_col'. Use cast() to " +
+            "explicitly specify the column type for column 'new_col'.");
   }
 
   @Test
@@ -3179,10 +3422,16 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "'/test-warehouse/hive-exec.jar' SYMBOL='a'");
 
     // Test Java UDFs for unsupported types
-    AnalysisError("create function foo() RETURNS timestamp LOCATION '/test-warehouse/hive-exec.jar' SYMBOL='a'",
+    AnalysisError("create function foo() RETURNS timestamp LOCATION " +
+        "'/test-warehouse/hive-exec.jar' SYMBOL='a'",
         "Type TIMESTAMP is not supported for Java UDFs.");
     AnalysisError("create function foo(timestamp) RETURNS int LOCATION '/a.jar'",
         "Type TIMESTAMP is not supported for Java UDFs.");
+    AnalysisError("create function foo() RETURNS date LOCATION " +
+        "'/test-warehouse/hive-exec.jar' SYMBOL='a'",
+        "Type DATE is not supported for Java UDFs.");
+    AnalysisError("create function foo(date) RETURNS int LOCATION '/a.jar'",
+        "Type DATE is not supported for Java UDFs.");
     AnalysisError("create function foo() RETURNS decimal LOCATION '/a.jar'",
         "Type DECIMAL(9,0) is not supported for Java UDFs.");
     AnalysisError("create function foo(Decimal) RETURNS int LOCATION '/a.jar'",
@@ -3340,7 +3589,7 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalyzesOk("create function identity(string) RETURNS int " +
         "LOCATION '/test-warehouse/libTestUdfs.so' " + "SYMBOL='Identity'");
     AnalyzesOk("create function all_types_fn(string, boolean, tinyint, " +
-        "smallint, int, bigint, float, double, decimal) returns int " +
+        "smallint, int, bigint, float, double, decimal, date) returns int " +
         "location '/test-warehouse/libTestUdfs.so' symbol='AllTypes'");
 
     // Try creating functions with illegal function names.
@@ -3654,6 +3903,7 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     TypeDefsAnalyzeOk("CHAR(1)", "CHAR(20)");
     TypeDefsAnalyzeOk("DECIMAL");
     TypeDefsAnalyzeOk("TIMESTAMP");
+    TypeDefsAnalyzeOk("DATE");
 
     // Test decimal.
     TypeDefsAnalyzeOk("DECIMAL");
@@ -4077,7 +4327,8 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         new Pair<>("functional.alltypes.id", createAnalysisCtx()),
         new Pair<>("alltypes.id", createAnalysisCtx("functional")),
         new Pair<>("functional.alltypes_view.id", createAnalysisCtx()),
-        new Pair<>("alltypes_view.id", createAnalysisCtx("functional"))}) {
+        new Pair<>("alltypes_view.id", createAnalysisCtx("functional")),
+        new Pair<>("functional_kudu.alltypes.id", createAnalysisCtx())}) {
       AnalyzesOk(String.format("comment on column %s is 'comment'", pair.first),
           pair.second);
       AnalyzesOk(String.format("comment on column %s is ''", pair.first), pair.second);

@@ -401,12 +401,13 @@ bool MathFunctions::DecimalInBaseToDecimal(int64_t src_num, int8_t src_base,
       *result = 0;
       place = 1;
     } else {
-      *result += digit * place;
-      place *= src_base;
+      *result +=
+          ArithmeticUtil::AsUnsigned<std::multiplies>(static_cast<int64_t>(digit), place);
       // Overflow.
       if (UNLIKELY(*result < digit)) {
         return false;
       }
+      place *= src_base;
     }
     temp_num /= 10;
   } while (temp_num > 0);
@@ -702,6 +703,23 @@ template <bool ISLEAST> DecimalVal MathFunctions::LeastGreatest(
   return result_val;
 }
 
+template <bool ISLEAST> DateVal MathFunctions::LeastGreatest(
+    FunctionContext* ctx, int num_args, const DateVal* args) {
+  DCHECK_GT(num_args, 0);
+  if (args[0].is_null) return DateVal::null();
+  DateValue result_val = DateValue::FromDateVal(args[0]);
+  for (int i = 1; i < num_args; ++i) {
+    if (args[i].is_null) return DateVal::null();
+    DateValue val = DateValue::FromDateVal(args[i]);
+    if (ISLEAST) {
+      if (val < result_val) result_val = val;
+    } else {
+      if (val > result_val) result_val = val;
+    }
+  }
+  return result_val.ToDateVal();
+}
+
 template TinyIntVal MathFunctions::Positive<TinyIntVal>(
     FunctionContext* ctx, const TinyIntVal& val);
 template SmallIntVal MathFunctions::Positive<SmallIntVal>(
@@ -770,5 +788,10 @@ template DecimalVal MathFunctions::LeastGreatest<true>(
     FunctionContext* ctx, int num_args, const DecimalVal* args);
 template DecimalVal MathFunctions::LeastGreatest<false>(
     FunctionContext* ctx, int num_args, const DecimalVal* args);
+
+template DateVal MathFunctions::LeastGreatest<true>(
+    FunctionContext* ctx, int num_args, const DateVal* args);
+template DateVal MathFunctions::LeastGreatest<false>(
+    FunctionContext* ctx, int num_args, const DateVal* args);
 
 }

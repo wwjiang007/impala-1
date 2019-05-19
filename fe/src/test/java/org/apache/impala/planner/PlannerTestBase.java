@@ -41,6 +41,7 @@ import org.apache.impala.common.FrontendTestBase;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.RuntimeEnv;
 import org.apache.impala.datagenerator.HBaseTestDataRegionAssignment;
+import org.apache.impala.service.Frontend.PlanCtx;
 import org.apache.impala.testutil.TestFileParser;
 import org.apache.impala.testutil.TestFileParser.Section;
 import org.apache.impala.testutil.TestFileParser.TestCase;
@@ -73,8 +74,8 @@ import org.apache.impala.util.ExecutorMembershipSnapshot;
 import org.apache.kudu.client.KuduClient;
 import org.apache.kudu.client.KuduScanToken;
 import org.junit.AfterClass;
-import org.junit.BeforeClass;
 import org.junit.Before;
+import org.junit.BeforeClass;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -289,7 +290,7 @@ public class PlannerTestBase extends FrontendTestBase {
               file_location =
                   table.getPartition_prefixes().get(location.prefix_index) + file_location;
             }
-            Path filePath = new Path(file_location, split.file_name);
+            Path filePath = new Path(file_location, split.relative_path);
             filePath = cleanseFilePath(filePath);
             result.append("HDFS SPLIT " + filePath.toString() + " "
                 + Long.toString(split.offset) + ":" + Long.toString(split.length));
@@ -356,7 +357,8 @@ public class PlannerTestBase extends FrontendTestBase {
 
   private void handleException(String query, String expectedErrorMsg,
       StringBuilder errorLog, StringBuilder actualOutput, Throwable e) {
-    actualOutput.append(e.toString() + "\n");
+    String actualErrorMsg = e.getClass().getSimpleName() + ": " + e.getMessage();
+    actualOutput.append(actualErrorMsg).append("\n");
     if (expectedErrorMsg == null) {
       // Exception is unexpected
       errorLog.append(String.format("Query:\n%s\nError Stack:\n%s\n", query,
@@ -364,7 +366,6 @@ public class PlannerTestBase extends FrontendTestBase {
     } else {
       // Compare actual and expected error messages.
       if (expectedErrorMsg != null && !expectedErrorMsg.isEmpty()) {
-        String actualErrorMsg = e.getClass().getSimpleName() + ": " + e.getMessage();
         if (!actualErrorMsg.toLowerCase().startsWith(expectedErrorMsg.toLowerCase())) {
           errorLog.append("query:\n" + query + "\nExpected error message: '"
               + expectedErrorMsg + "'\nActual error message: '" + actualErrorMsg + "'\n");
@@ -414,6 +415,8 @@ public class PlannerTestBase extends FrontendTestBase {
     TQueryCtx queryCtx = TestUtils.createQueryContext(
         dbName, System.getProperty("user.name"));
     queryCtx.client_request.query_options = testCase.getOptions();
+    queryCtx.setDisable_hbase_row_est(
+        testOptions.contains(PlannerTestOption.DISABLE_HBASE_KEY_ESTIMATE));
     // Test single node plan, scan range locations, and column lineage.
     TExecRequest singleNodeExecRequest = testPlan(testCase, Section.PLAN, queryCtx.deepCopy(),
         testOptions, errorLog, actualOutput);
@@ -505,11 +508,13 @@ public class PlannerTestBase extends FrontendTestBase {
     boolean sectionExists = expectedPlan != null && !expectedPlan.isEmpty();
     String expectedErrorMsg = getExpectedErrorMessage(expectedPlan);
 
-    StringBuilder explainBuilder = new StringBuilder();
     TExecRequest execRequest = null;
     if (sectionExists) actualOutput.append(section.getHeader() + "\n");
+    String explainStr = "";
     try {
-      execRequest = frontend_.createExecRequest(queryCtx, explainBuilder);
+      PlanCtx planCtx = new PlanCtx(queryCtx);
+      execRequest = frontend_.createExecRequest(planCtx);
+      explainStr = planCtx.getExplainString();
     } catch (Exception e) {
       if (!sectionExists) return null;
       handleException(query, expectedErrorMsg, errorLog, actualOutput, e);
@@ -519,9 +524,7 @@ public class PlannerTestBase extends FrontendTestBase {
     // Failed to produce an exec request.
     if (execRequest == null) return null;
 
-    String explainStr = explainBuilder.toString();
-    explainStr = removeExplainHeader(explainBuilder.toString(), testOptions);
-
+    explainStr = removeExplainHeader(explainStr, testOptions);
     actualOutput.append(explainStr);
     LOG.info(section.toString() + ":" + explainStr);
     if (expectedErrorMsg != null) {
@@ -534,6 +537,14 @@ public class PlannerTestBase extends FrontendTestBase {
       if (!testOptions.contains(PlannerTestOption.VALIDATE_RESOURCES)) {
         resultFilters.addAll(TestUtils.RESOURCE_FILTERS);
       }
+      if (!testOptions.contains(PlannerTestOption.VALIDATE_CARDINALITY)) {
+        resultFilters.add(TestUtils.ROW_SIZE_FILTER);
+        resultFilters.add(TestUtils.CARDINALITY_FILTER);
+      }
+      if (!testOptions.contains(PlannerTestOption.VALIDATE_SCAN_FS)) {
+        resultFilters.add(TestUtils.SCAN_NODE_SCHEME_FILTER);
+      }
+
       String planDiff = TestUtils.compareOutput(
           Lists.newArrayList(explainStr.split("\n")), expectedPlan, true, resultFilters);
       if (!planDiff.isEmpty()) {
@@ -553,13 +564,15 @@ public class PlannerTestBase extends FrontendTestBase {
    * if an error occurred while creating the plan.
    */
   private String getVerboseExplainPlan(TQueryCtx queryCtx) {
-    StringBuilder explainBuilder = new StringBuilder();
+    String explainStr;
     TExecRequest execRequest = null;
     TExplainLevel origExplainLevel =
         queryCtx.client_request.getQuery_options().getExplain_level();
     try {
       queryCtx.client_request.getQuery_options().setExplain_level(TExplainLevel.VERBOSE);
-      execRequest = frontend_.createExecRequest(queryCtx, explainBuilder);
+      PlanCtx planCtx = new PlanCtx(queryCtx);
+      execRequest = frontend_.createExecRequest(planCtx);
+      explainStr = planCtx.getExplainString();
     } catch (ImpalaException e) {
       return ExceptionUtils.getStackTrace(e);
     } finally {
@@ -567,7 +580,7 @@ public class PlannerTestBase extends FrontendTestBase {
     }
     Preconditions.checkNotNull(execRequest);
     return removeExplainHeader(
-        explainBuilder.toString(), Collections.<PlannerTestOption>emptySet());
+        explainStr, Collections.<PlannerTestOption>emptySet());
   }
 
   private void checkScanRangeLocations(TestCase testCase, TExecRequest execRequest,
@@ -676,8 +689,8 @@ public class PlannerTestBase extends FrontendTestBase {
     TQueryCtx queryCtx = TestUtils.createQueryContext(Catalog.DEFAULT_DB,
         System.getProperty("user.name"));
     queryCtx.client_request.setStmt(query);
-    StringBuilder explainBuilder = new StringBuilder();
-    TExecRequest execRequest = frontend_.createExecRequest(queryCtx, explainBuilder);
+    PlanCtx planCtx = new PlanCtx(queryCtx);
+    TExecRequest execRequest = frontend_.createExecRequest(planCtx);
 
     if (!execRequest.isSetQuery_exec_request()
         || execRequest.query_exec_request == null
@@ -744,15 +757,22 @@ public class PlannerTestBase extends FrontendTestBase {
   }
 
   /**
-   * If required by 'testOptions', strip out all or part of the the header containing
-   * resource estimates and the warning about missing stats from the given explain plan.
+   * Strip out all or part of the the explain header.
+   * This can be used to remove lines containing resource estimates and the warning about
+   * missing stats from the given explain plan.
+   * explain is the original explain output
+   * testOptions controls which parts of the header to include
    */
   private String removeExplainHeader(String explain, Set<PlannerTestOption> testOptions) {
     if (testOptions.contains(PlannerTestOption.INCLUDE_EXPLAIN_HEADER)) return explain;
     boolean keepResources =
         testOptions.contains(PlannerTestOption.INCLUDE_RESOURCE_HEADER);
+    boolean keepQueryWithImplicitCasts =
+        testOptions.contains(PlannerTestOption.INCLUDE_QUERY_WITH_IMPLICIT_CASTS);
     StringBuilder builder = new StringBuilder();
     boolean inHeader = true;
+    boolean inImplictCasts = false;
+
     for (String line: explain.split("\n")) {
       if (inHeader) {
         // The first empty line indicates the end of the header.
@@ -760,6 +780,13 @@ public class PlannerTestBase extends FrontendTestBase {
           inHeader = false;
         } else if (keepResources && line.contains("Resource")) {
           builder.append(line).append("\n");
+        } else if (keepQueryWithImplicitCasts) {
+          inImplictCasts |= line.contains("Analyzed query:");
+          if (inImplictCasts) {
+            // Keep copying the query with implicit casts.
+            // This works because this is the last thing in the header.
+            builder.append(line).append("\n");
+          }
         }
       } else {
         builder.append(line).append("\n");
@@ -780,10 +807,34 @@ public class PlannerTestBase extends FrontendTestBase {
     // Include the part of the explain header that has top-level resource consumption.
     // If INCLUDE_EXPLAIN_HEADER is enabled, these are already included.
     INCLUDE_RESOURCE_HEADER,
+    // Include the part of the extended explain header that has the query including
+    // implicit casts. Equivalent to enabling INCLUDE_EXPLAIN_HEADER and EXTENDED_EXPLAIN.
+    INCLUDE_QUERY_WITH_IMPLICIT_CASTS,
     // Validate the values of resource requirement values within the plan (default is to
     // ignore differences in resource values). Operator- and fragment-level resource
     // requirements are only included if EXTENDED_EXPLAIN is also enabled.
     VALIDATE_RESOURCES,
+    // Verify the row size and cardinality fields in the plan. Default is
+    // to ignore these values (for backward compatibility.) Turn this option
+    // on for test that validate cardinality calculations: joins, scan
+    // cardinality, etc.
+    VALIDATE_CARDINALITY,
+    // If set, disables the normal HBase key estimate scan in favor of using
+    // HMS table stats and key predicate selectivity. Enable this to test
+    // the case when HBase key stats are unavailable (such as due to overly
+    // restrictive key predicates).
+    DISABLE_HBASE_KEY_ESTIMATE,
+    // Validate the filesystem schemes shown in the scan node plan. An example of a scan
+    // node profile that contains fs specific information is:
+    //
+    //   00:SCAN HDFS [functional.testtbl]
+    //     HDFS partitions=1/1 files=0 size=0B
+    //     S3 partitions=1/0 files=0 size=0B
+    //     ADLS partitions=1/0 files=0 size=0B
+    //
+    // By default, this flag is disabled. So tests will ignore the values of 'HDFS',
+    // 'S3', and 'ADLS' in the above explain plan.
+    VALIDATE_SCAN_FS
   }
 
   protected void runPlannerTestFile(String testFile, TQueryOptions options) {

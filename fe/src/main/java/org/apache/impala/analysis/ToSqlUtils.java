@@ -20,18 +20,10 @@ package org.apache.impala.analysis;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 
-import com.google.common.base.Joiner;
-import com.google.common.base.Preconditions;
-import com.google.common.base.Splitter;
-import com.google.common.base.Strings;
-import com.google.common.collect.ImmutableSet;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
 import org.antlr.runtime.ANTLRStringStream;
 import org.antlr.runtime.Token;
 import org.apache.commons.lang.ObjectUtils;
@@ -55,6 +47,15 @@ import org.apache.impala.catalog.RowFormat;
 import org.apache.impala.catalog.Table;
 import org.apache.impala.util.KuduUtil;
 
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Joiner;
+import com.google.common.base.Preconditions;
+import com.google.common.base.Splitter;
+import com.google.common.base.Strings;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
+
 /**
  * Contains utility methods for creating SQL strings, for example,
  * for creating identifier strings that are compatible with Hive or Impala.
@@ -63,23 +64,33 @@ public class ToSqlUtils {
   // Table properties to hide when generating the toSql() statement
   // EXTERNAL, SORT BY, and comment are hidden because they are part of the toSql result,
   // e.g., "CREATE EXTERNAL TABLE <name> ... SORT BY (...) ... COMMENT <comment> ..."
-  private static final ImmutableSet<String> HIDDEN_TABLE_PROPERTIES = ImmutableSet.of(
+  @VisibleForTesting
+  protected static final ImmutableSet<String> HIDDEN_TABLE_PROPERTIES = ImmutableSet.of(
       "EXTERNAL", "comment", AlterTableSortByStmt.TBL_PROP_SORT_COLUMNS);
 
   /**
    * Removes all hidden properties from the given 'tblProperties' map.
    */
-  private static void removeHiddenTableProperties(Map<String, String> tblProperties,
-      Map<String, String> generatedTblProperties) {
+  @VisibleForTesting
+  protected static void removeHiddenTableProperties(Map<String, String> tblProperties) {
     for (String key: HIDDEN_TABLE_PROPERTIES) tblProperties.remove(key);
-    generatedTblProperties.remove(KuduTable.KEY_TABLE_NAME);
+  }
+
+  /**
+   * Removes all hidden Kudu from the given 'tblProperties' map.
+   */
+  @VisibleForTesting
+  protected static void removeHiddenKuduTableProperties(
+      Map<String, String> tblProperties) {
+    tblProperties.remove(KuduTable.KEY_TABLE_NAME);
   }
 
   /**
    * Returns the list of sort columns from 'properties' or 'null' if 'properties' doesn't
    * contain 'sort.columns'.
    */
-  private static List<String> getSortColumns(Map<String, String> properties) {
+  @VisibleForTesting
+  protected static List<String> getSortColumns(Map<String, String> properties) {
     String sortByKey = AlterTableSortByStmt.TBL_PROP_SORT_COLUMNS;
     if (!properties.containsKey(sortByKey)) return null;
     return Lists.newArrayList(Splitter.on(",").trimResults().omitEmptyStrings().split(
@@ -94,11 +105,60 @@ public class ToSqlUtils {
     List<KuduPartitionParam> partitionParams = stmt.getKuduPartitionParams();
     Preconditions.checkNotNull(partitionParams);
     if (partitionParams.isEmpty()) return null;
-    List<String> paramStrings = Lists.newArrayList();
+    List<String> paramStrings = new ArrayList<>();
     for (KuduPartitionParam p : partitionParams) {
       paramStrings.add(p.toSql());
     }
     return Joiner.on(", ").join(paramStrings);
+  }
+
+  /**
+   * Check if a column (or table) name will be parsed by Hive as an identifier.
+   * If not, then the identifier must be quoted.
+   * @param ident name to check
+   * @return true if the name must be quoted for Hive, false if the
+   * name is a valid identifier and so needs no quoting
+   */
+  public static boolean hiveNeedsQuotes(String ident) {
+    // Lexer catches only upper-case keywords: "SELECT", but not "select".
+    // So, do the check on an upper-case version of the identifier.
+    // Hive uses ANTLRNoCaseStringStream to upper-case text, but that
+    // class is a non-static inner class so we can't use it here.
+    HiveLexer hiveLexer = new HiveLexer(new ANTLRStringStream(ident.toUpperCase()));
+    try {
+      Token t = hiveLexer.nextToken();
+      // Check that the lexer recognizes an identifier and then EOF.
+      // Not an identifier? Needs quotes.
+      if (t.getType() != HiveLexer.Identifier) return true;
+      // Not a single identifier? Needs quotes.
+      t = hiveLexer.nextToken();
+      return t.getType() != HiveLexer.EOF;
+    } catch (Exception e) {
+      // Ignore exception and just quote the identifier to be safe.
+      return true;
+    }
+  }
+
+  /**
+   * Determines if an identifier must be quoted for Impala. This is a very
+   * weak test, it works only for simple identifiers. Use this in conjunction
+   * with {@link #hiveNeedsQuotes} for a complete check.
+   * @param ident the identifier to check
+   * @return true if the identifier is an Impala keyword, or if starts
+   * with a digit
+   */
+  public static boolean impalaNeedsQuotes(String ident) {
+    return SqlScanner.isReserved(ident) ||
+      // Quote numbers to avoid odd cases.
+      // SELECT id AS 3a3 FROM functional.alltypestiny
+      // is valid, but
+      // SELECT id AS 3e3 FROM functional.alltypestiny
+      // Is not. The "e" changes the meaning from identifier to number.
+      Character.isDigit(ident.charAt(0)) ||
+      // The parser-based checks fail if the identifier contains a comment
+      // character: the parser ignores those characters and the rest of
+      // the identifier. Treat them specially.
+      ident.contains("#") || ident.contains("--");
   }
 
   /**
@@ -108,39 +168,37 @@ public class ToSqlUtils {
    * names "_c0", "_c1" etc. unless they are quoted. Impala and Hive keywords
    * must also be quoted.
    *
-   * Impala's lexer recognizes a superset of the unquoted identifiers that Hive can.
-   * At the same time, Impala's and Hive's list of keywords differ.
-   * This method always returns an identifier that Impala and Hive can recognize,
-   * although for some identifiers the quotes may not be strictly necessary for
-   * one or the other system.
+   * The Impala and Hive lexical analyzers recognize a mostly-overlapping,
+   * but sometimes distinct set of keywords. Impala further imposes certain
+   * syntactic rules around identifiers that start with digits. To ensure
+   * that views generated by Impala are readable both both Impala and Hive,
+   * we quote names which are either Hive keywords, Impala keywords, or
+   * are ambiguous in Impala.
+   *
+   * The wildcard ("*") is never quoted though it is not an identifier.
    */
   public static String getIdentSql(String ident) {
-    boolean hiveNeedsQuotes = true;
-    HiveLexer hiveLexer = new HiveLexer(new ANTLRStringStream(ident));
-    try {
-      Token t = hiveLexer.nextToken();
-      // Check that the lexer recognizes an identifier and then EOF.
-      boolean identFound = t.getType() == HiveLexer.Identifier;
-      t = hiveLexer.nextToken();
-      // No enclosing quotes are necessary for Hive.
-      hiveNeedsQuotes = !(identFound && t.getType() == HiveLexer.EOF);
-    } catch (Exception e) {
-      // Ignore exception and just quote the identifier to be safe.
+    // Don't quote the wildcard used in SELECT *.
+    if (ident.equals("*")) return ident;
+    return hiveNeedsQuotes(ident) || impalaNeedsQuotes(ident)
+        ? "`" + ident + "`" : ident;
+  }
+
+  /**
+   * Test case version of {@link #getIdentSql(String)}, with
+   * special handling for the wildcard and multi-part names.
+   * For creating generic expected values in tests.
+   */
+  public static String identSql(String ident) {
+    List<String> parts = new ArrayList<>();
+    for (String part : Splitter.on('.').split(ident)) {
+      parts.add(ident.equals("*") ? part : getIdentSql(part));
     }
-    boolean isImpalaReserved = SqlScanner.isReserved(ident.toUpperCase());
-    // Impala's scanner recognizes the ".123" portion of "db.123_tbl" as a decimal,
-    // so while the quoting is not necessary for the given identifier itself, the quotes
-    // are needed if this identifier will be preceded by a ".".
-    boolean startsWithNumber = false;
-    if (!hiveNeedsQuotes && !isImpalaReserved) {
-      startsWithNumber = Character.isDigit(ident.charAt(0));
-    }
-    if (hiveNeedsQuotes || isImpalaReserved || startsWithNumber) return "`" + ident + "`";
-    return ident;
+    return Joiner.on('.').join(parts);
   }
 
   public static List<String> getIdentSqlList(List<String> identList) {
-    List<String> identSqlList = Lists.newArrayList();
+    List<String> identSqlList = new ArrayList<>();
     for (String ident: identList) {
       identSqlList.add(getIdentSql(ident));
     }
@@ -161,19 +219,20 @@ public class ToSqlUtils {
    * statement.
    */
   public static String getCreateTableSql(CreateTableStmt stmt) {
-    ArrayList<String> colsSql = Lists.newArrayList();
+    List<String> colsSql = new ArrayList<>();
     for (ColumnDef col: stmt.getColumnDefs()) {
       colsSql.add(col.toString());
     }
-    ArrayList<String> partitionColsSql = Lists.newArrayList();
+    List<String> partitionColsSql = new ArrayList<>();
     for (ColumnDef col: stmt.getPartitionColumnDefs()) {
       partitionColsSql.add(col.toString());
     }
-    LinkedHashMap<String, String> properties = Maps.newLinkedHashMap(
+    Map<String, String> properties = Maps.newLinkedHashMap(
         stmt.getTblProperties());
-    LinkedHashMap<String, String> generatedProperties = Maps.newLinkedHashMap(
+    Map<String, String> generatedProperties = Maps.newLinkedHashMap(
         stmt.getGeneratedKuduProperties());
-    removeHiddenTableProperties(properties, generatedProperties);
+    removeHiddenTableProperties(properties);
+    removeHiddenKuduTableProperties(generatedProperties);
     properties.putAll(generatedProperties);
     String kuduParamsSql = getKuduPartitionByParams(stmt);
     // TODO: Pass the correct compression, if applicable.
@@ -192,21 +251,22 @@ public class ToSqlUtils {
    * instead. It is the caller's responsibility to know if/when the statement was indeed
    * rewritten.
    */
-  public static String getCreateTableSql(CreateTableAsSelectStmt stmt,
-      boolean rewritten) {
+  public static String getCreateTableSql(
+      CreateTableAsSelectStmt stmt, ToSqlOptions options) {
     CreateTableStmt innerStmt = stmt.getCreateStmt();
     // Only add partition column labels to output. Table columns must not be specified as
     // they are deduced from the select statement.
-    ArrayList<String> partitionColsSql = Lists.newArrayList();
+    List<String> partitionColsSql = new ArrayList<>();
     for (ColumnDef col: innerStmt.getPartitionColumnDefs()) {
       partitionColsSql.add(col.getColName());
     }
     // Use a LinkedHashMap to preserve the ordering of the table properties.
-    LinkedHashMap<String, String> properties =
+    Map<String, String> properties =
         Maps.newLinkedHashMap(innerStmt.getTblProperties());
-    LinkedHashMap<String, String> generatedProperties = Maps.newLinkedHashMap(
+    Map<String, String> generatedProperties = Maps.newLinkedHashMap(
         stmt.getCreateStmt().getGeneratedKuduProperties());
-    removeHiddenTableProperties(properties, generatedProperties);
+    removeHiddenTableProperties(properties);
+    removeHiddenKuduTableProperties(generatedProperties);
     properties.putAll(generatedProperties);
     String kuduParamsSql = getKuduPartitionByParams(innerStmt);
     // TODO: Pass the correct compression, if applicable.
@@ -217,7 +277,7 @@ public class ToSqlUtils {
         innerStmt.isExternal(), innerStmt.getIfNotExists(), innerStmt.getRowFormat(),
         HdfsFileFormat.fromThrift(innerStmt.getFileFormat()), HdfsCompression.NONE, null,
         innerStmt.getLocation());
-    return createTableSql + " AS " + stmt.getQueryStmt().toSql(rewritten);
+    return createTableSql + " AS " + stmt.getQueryStmt().toSql(options);
   }
 
   /**
@@ -229,7 +289,7 @@ public class ToSqlUtils {
     if (table instanceof FeView) return getCreateViewSql((FeView)table);
     org.apache.hadoop.hive.metastore.api.Table msTable = table.getMetaStoreTable();
     // Use a LinkedHashMap to preserve the ordering of the table properties.
-    LinkedHashMap<String, String> properties = Maps.newLinkedHashMap(msTable.getParameters());
+    Map<String, String> properties = Maps.newLinkedHashMap(msTable.getParameters());
     if (properties.containsKey(Table.TBL_PROP_LAST_DDL_TIME)) {
       properties.remove(Table.TBL_PROP_LAST_DDL_TIME);
     }
@@ -237,9 +297,9 @@ public class ToSqlUtils {
         msTable.getTableType().equals(TableType.EXTERNAL_TABLE.toString());
     List<String> sortColsSql = getSortColumns(properties);
     String comment = properties.get("comment");
-    removeHiddenTableProperties(properties, Maps.<String, String>newHashMap());
-    ArrayList<String> colsSql = Lists.newArrayList();
-    ArrayList<String> partitionColsSql = Lists.newArrayList();
+    removeHiddenTableProperties(properties);
+    List<String> colsSql = new ArrayList<>();
+    List<String> partitionColsSql = new ArrayList<>();
     boolean isHbaseTable = table instanceof FeHBaseTable;
     for (int i = 0; i < table.getColumns().size(); i++) {
       if (!isHbaseTable && i < table.getNumClusteringCols()) {
@@ -255,7 +315,7 @@ public class ToSqlUtils {
     Map<String, String> serdeParameters = msTable.getSd().getSerdeInfo().getParameters();
 
     String storageHandlerClassName = table.getStorageHandlerClassName();
-    List<String> primaryKeySql = Lists.newArrayList();
+    List<String> primaryKeySql = new ArrayList<>();
     String kuduPartitionByParams = null;
     if (table instanceof FeKuduTable) {
       FeKuduTable kuduTable = (FeKuduTable) table;
@@ -277,7 +337,7 @@ public class ToSqlUtils {
       if (!isExternal) {
         primaryKeySql.addAll(kuduTable.getPrimaryKeyColumnNames());
 
-        List<String> paramsSql = Lists.newArrayList();
+        List<String> paramsSql = new ArrayList<>();
         for (KuduPartitionParam param: kuduTable.getPartitionBy()) {
           paramsSql.add(param.toSql());
         }
@@ -406,9 +466,10 @@ public class ToSqlUtils {
     Preconditions.checkNotNull(functions);
     StringBuilder sb = new StringBuilder();
     for (Function fn: functions) {
+      if (sb.length() > 0) sb.append(";\n");
       sb.append(fn.toSql(false));
     }
-    return sb.toString();
+    return sb.append("\n").toString();
   }
 
   public static String getCreateViewSql(FeView view) {
@@ -450,11 +511,12 @@ public class ToSqlUtils {
     // Sort entries on the key to ensure output is deterministic for tests (IMPALA-5757).
     List<Entry<String, String>> mapEntries = Lists.newArrayList(propertyMap.entrySet());
     Collections.sort(mapEntries, new Comparator<Entry<String, String>>() {
+      @Override
       public int compare(Entry<String, String> o1, Entry<String, String> o2) {
         return ObjectUtils.compare(o1.getKey(), o2.getKey());
       } });
 
-    List<String> properties = Lists.newArrayList();
+    List<String> properties = new ArrayList<>();
     for (Map.Entry<String, String> entry: mapEntries) {
       properties.add(String.format("'%s'='%s'", entry.getKey(),
           // Properties may contain characters that need to be escaped.
@@ -471,13 +533,24 @@ public class ToSqlUtils {
    * commented plan hint style such that hinted views created by Impala are readable by
    * Hive (parsed as a comment by Hive).
    */
-  public static String getPlanHintsSql(List<PlanHint> hints) {
+  public static String getPlanHintsSql(ToSqlOptions options, List<PlanHint> hints) {
     Preconditions.checkNotNull(hints);
     if (hints.isEmpty()) return "";
     StringBuilder sb = new StringBuilder();
-    sb.append("\n-- +");
-    sb.append(Joiner.on(",").join(hints));
-    sb.append("\n");
+    if (options.showRewritten()) {
+      sb.append("/* +");
+      sb.append(Joiner.on(",").join(hints));
+      sb.append(" */");
+    } else {
+      sb.append("\n-- +");
+      sb.append(Joiner.on(",").join(hints));
+      sb.append("\n");
+    }
     return sb.toString();
+  }
+
+  public static String formatAlias(String alias) {
+    if (alias == null) return "";
+    return " " + getIdentSql(alias);
   }
 }

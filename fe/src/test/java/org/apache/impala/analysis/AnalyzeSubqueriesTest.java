@@ -99,6 +99,12 @@ public class AnalyzeSubqueriesTest extends AnalyzerTest {
       AnalyzesOk(String.format("select * from functional.alltypes t where " +
             "t.string_col %s (select cast(a.string_col as varchar(1)) from " +
             "functional.alltypestiny a)", op));
+      // Date in the subquery predicate
+      AnalyzesOk(String.format("select * from functional.alltypes where " +
+            "timestamp_col %s (select date_col from functional.date_tbl)", op));
+      // Timestamp in the subquery predicate
+      AnalyzesOk(String.format("select * from functional.date_tbl where " +
+            "date_col %s (select timestamp_col from functional.alltypes)", op));
 
       // Subqueries with multiple predicates in the WHERE clause
       AnalyzesOk(String.format("select * from functional.alltypes t where t.id %s " +
@@ -924,6 +930,11 @@ public class AnalyzeSubqueriesTest extends AnalyzerTest {
           "int_col %s (select max(timestamp_col) from functional.alltypessmall)", cmpOp),
           String.format("operands of type INT and TIMESTAMP are not comparable: " +
           "int_col %s (SELECT max(timestamp_col) FROM functional.alltypessmall)", cmpOp));
+      // Compatible comparison types
+      AnalyzesOk(String.format("select date_col from functional.date_tbl where " +
+          "date_col %s (select max(timestamp_col) from functional.alltypessmall)",
+          cmpOp));
+
       // Distinct in the outer select block
       if (cmpOp == "=") {
         AnalyzesOk(String.format("select distinct id from functional.alltypes a " +
@@ -985,6 +996,9 @@ public class AnalyzeSubqueriesTest extends AnalyzerTest {
         "(select max(string_col) from functional.alltypesagg) = 1",
         "operands of type STRING and TINYINT are not comparable: (SELECT " +
         "max(string_col) FROM functional.alltypesagg) = 1");
+    // Comparison between valid types
+    AnalyzesOk("select * from functional.alltypes where " +
+        "(select max(date_col) from functional.date_tbl) = '2011-01-01'");
 
     // Aggregate subquery with a LIMIT 1 clause
     AnalyzesOk("select id from functional.alltypestiny t where int_col = " +
@@ -1140,11 +1154,15 @@ public class AnalyzeSubqueriesTest extends AnalyzerTest {
   }
 
   @Test
-  public void TestSubqueries() throws AnalysisException {
+  public void testColResolution() throws AnalysisException {
     // Test resolution of column references inside subqueries.
     // Correlated column references can be qualified or unqualified.
     AnalyzesOk("select * from functional.jointbl t where exists " +
         "(select id from functional.alltypes where id = test_id and id = t.test_id)");
+  }
+
+  @Test
+  public void testCoorelatedColRef() throws AnalysisException {
     // Correlated column references are invalid outside of WHERE and ON clauses.
     AnalysisError("select * from functional.jointbl t where exists " +
         "(select t.test_id = id from functional.alltypes)",
@@ -1155,11 +1173,18 @@ public class AnalyzeSubqueriesTest extends AnalyzerTest {
     AnalysisError("select * from functional.jointbl t where exists " +
         "(select 1 from functional.alltypes order by t.test_id limit 1)",
         "Could not resolve column/field reference: 't.test_id'");
+  }
+
+  @Test
+  public void testParentWildcard() throws AnalysisException {
     // Star exprs cannot reference an alias from a parent block.
     AnalysisError("select * from functional.jointbl t where exists " +
         "(select t.* from functional.alltypes)",
         "Could not resolve star expression: 't.*'");
+  }
 
+  @Test
+  public void testScalarSubqueries() throws AnalysisException {
     // Scalar subquery check is done at runtime, not during analysis
     for (String cmpOp: cmpOperators) {
       AnalyzesOk(String.format(
@@ -1182,7 +1207,10 @@ public class AnalyzeSubqueriesTest extends AnalyzerTest {
         "(select id from functional.alltypes t2 where t1.int_col = t2.int_col)",
         "Unsupported correlated subquery with runtime scalar check: " +
         "SELECT id FROM functional.alltypes t2 WHERE t1.int_col = t2.int_col");
+  }
 
+  @Test
+  public void testCorrelatedTableRef() throws AnalysisException {
     // Test resolution of correlated table references inside subqueries. The testing
     // here is rather basic, because the analysis goes through the same codepath
     // as the analysis of correlated inline views, which are more thoroughly tested.
@@ -1192,7 +1220,10 @@ public class AnalyzeSubqueriesTest extends AnalyzerTest {
         "where id in (select item cnt from t.int_array_col)");
     AnalyzesOk("select id from functional.allcomplextypes t " +
         "where id < (select count(*) from t.int_array_col)");
+  }
 
+  @Test
+  public void testAliases() throws AnalysisException {
     // Test behavior of aliases in subqueries with correlated table references.
     // Inner reference resolves to the base table, not the implicit parent alias.
     AnalyzesOk("select id from functional.allcomplextypes t " +
@@ -1202,6 +1233,10 @@ public class AnalyzeSubqueriesTest extends AnalyzerTest {
     AnalyzesOk("select id from functional.allcomplextypes " +
         "where id < (select count(1) cnt from allcomplextypes)",
         createAnalysisCtx("functional"));
+  }
+
+  @Test
+  public void testSubqueryTableRef() throws AnalysisException {
     // Illegal correlated table references.
     AnalysisError("select id from (select * from functional.alltypestiny) t " +
         "where t.int_col = (select count(*) from t)",
@@ -1233,7 +1268,10 @@ public class AnalyzeSubqueriesTest extends AnalyzerTest {
     //    "'v1.arr' correlated with an outer block as well as an " +
     //    "uncorrelated one 'functional.alltypestiny':\n" +
     //    "SELECT item FROM v1.arr, functional.alltypestiny");
+  }
 
+  @Test
+  public void testExists() throws AnalysisException {
     // EXISTS, IN and aggregate subqueries
     AnalyzesOk("select * from functional.alltypes t where exists " +
         "(select * from functional.alltypesagg a where a.int_col = " +
@@ -1258,7 +1296,10 @@ public class AnalyzeSubqueriesTest extends AnalyzerTest {
         "(select id from functional.alltypessmall s where exists (select " +
         "* from functional.alltypestiny a where a.int_col = s.int_col and " +
         "a.bigint_col < 10)))");
+  }
 
+  @Test
+  public void testInsertSelect() throws AnalysisException {
     // INSERT SELECT
     AnalyzesOk("insert into functional.alltypessmall partition (year, month) " +
         "select * from functional.alltypes where id in (select id from " +
@@ -1271,7 +1312,10 @@ public class AnalyzeSubqueriesTest extends AnalyzerTest {
     AnalyzesOk("insert into functional.alltypessmall partition (year, month) " +
         "select * from functional.alltypestiny where id = (select 1) " +
         "union select * from functional.alltypestiny where id = (select 2)");
+  }
 
+  @Test
+  public void testUpsert() throws AnalysisException {
     // UPSERT
     AnalyzesOk("upsert into functional_kudu.testtbl select * from " +
         "functional_kudu.testtbl where id in (select id from functional_kudu.testtbl " +
@@ -1279,7 +1323,10 @@ public class AnalyzeSubqueriesTest extends AnalyzerTest {
     AnalyzesOk("upsert into functional_kudu.testtbl select * from " +
         "functional_kudu.testtbl union select bigint_col, string_col, int_col from " +
         "functional.alltypes");
+  }
 
+  @Test
+  public void testCtasSubquery() throws AnalysisException {
     // CTAS with correlated subqueries
     AnalyzesOk("create table functional.test_tbl as select * from " +
         "functional.alltypes t where t.id in (select id from functional.alltypesagg " +
@@ -1289,7 +1336,10 @@ public class AnalyzeSubqueriesTest extends AnalyzerTest {
     AnalyzesOk("create table functional.test_tbl as " +
         "select * from functional.alltypestiny where id = (select 1) " +
         "union select * from functional.alltypestiny where id = (select 2)");
+  }
 
+  @Test
+  public void TestIllegalSubquery() throws AnalysisException {
     // Predicate with a child subquery in the HAVING clause
     AnalysisError("select id, count(*) from functional.alltypestiny t group by " +
         "id having count(*) > (select count(*) from functional.alltypesagg)",
@@ -1312,7 +1362,10 @@ public class AnalyzeSubqueriesTest extends AnalyzerTest {
     AnalysisError("select id from functional.alltypestiny " +
         "order by (select int_col from functional.alltypestiny)",
         "Subqueries are not supported in the ORDER BY clause.");
+  }
 
+  @Test
+  public void testInlineView() throws AnalysisException {
     // Subquery with an inline view
     AnalyzesOk("select id from functional.alltypestiny t where exists " +
         "(select * from (select id, int_col from functional.alltypesagg) a where " +
@@ -1324,11 +1377,17 @@ public class AnalyzeSubqueriesTest extends AnalyzerTest {
     // Same view referenced in both the inner and outer block
     AnalyzesOk("select * from functional.alltypes_view a where exists " +
         "(select * from functional.alltypes_view b where a.id = b.id)");
+  }
 
+  @Test
+  public void testTableRefCollection() throws AnalysisException {
     // Subquery with collection table ref.
     AnalyzesOk("select int_col from functional.alltypes where int_col < " +
         "(select count(a.item) from functional.allcomplextypes t, t.int_array_col a)");
+  }
 
+  @Test
+  public void testUnionWithSubquery() throws AnalysisException {
     // Union query with subqueries
     AnalyzesOk("select * from functional.alltypes where id = " +
         "(select max(id) from functional.alltypestiny) union " +
@@ -1350,13 +1409,19 @@ public class AnalyzeSubqueriesTest extends AnalyzerTest {
         "SELECT id FROM functional.alltypesagg)");
     AnalysisError("select * from functional.alltypes where exists (values(1))",
         "A subquery must contain a single select block: (VALUES(1))");
+  }
 
+  @Test
+  public void testSubqueryInLimit() throws AnalysisException {
     // Subquery in LIMIT
     AnalysisError("select * from functional.alltypes limit " +
         "(select count(*) from functional.alltypesagg)",
         "LIMIT expression must be a constant expression: " +
         "(SELECT count(*) FROM functional.alltypesagg)");
+  }
 
+  @Test
+  public void testSubqueryExprs() throws AnalysisException {
     // NOT predicates in conjunction with subqueries
     AnalyzesOk("select * from functional.alltypes t where t.id not in " +
         "(select id from functional.alltypesagg g where g.bool_col = false) " +
@@ -1370,7 +1435,10 @@ public class AnalyzeSubqueriesTest extends AnalyzerTest {
     // IS NULL with a BinaryPredicate that contains a subquery
     AnalyzesOk("select * from functional.alltypestiny where (id = " +
         "(select max(id) from functional.alltypessmall)) is null");
+  }
 
+  @Test
+  public void testBetween() throws AnalysisException {
     // between predicates with subqueries
     AnalyzesOk("select * from functional.alltypestiny where " +
         "(select avg(id) from functional.alltypesagg where bool_col = true) " +
@@ -1400,7 +1468,10 @@ public class AnalyzeSubqueriesTest extends AnalyzerTest {
     AnalyzesOk("select * from functional.alltypestiny a where " +
         "double_col between cast(1 as double) and cast(10 as double) and " +
         "exists (select 1 from functional.alltypessmall b where a.id = b.id)");
+  }
 
+  @Test
+  public void testWhereSubqueries() throws AnalysisException {
     AnalyzesOk("select count(1) from functional.alltypes " +
         "where (select int_col > 10 from functional.alltypes)");
     AnalyzesOk("select count(1) from functional.alltypes " +

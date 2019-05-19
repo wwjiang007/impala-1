@@ -17,14 +17,14 @@
 
 #include "exec/hdfs-scan-node-base.h"
 
-#include "exec/hdfs-plugin-text-scanner.h"
 #include "exec/base-sequence-scanner.h"
-#include "exec/hdfs-text-scanner.h"
-#include "exec/hdfs-sequence-scanner.h"
-#include "exec/hdfs-rcfile-scanner.h"
 #include "exec/hdfs-avro-scanner.h"
-#include "exec/hdfs-parquet-scanner.h"
 #include "exec/hdfs-orc-scanner.h"
+#include "exec/hdfs-plugin-text-scanner.h"
+#include "exec/hdfs-rcfile-scanner.h"
+#include "exec/hdfs-sequence-scanner.h"
+#include "exec/hdfs-text-scanner.h"
+#include "exec/parquet/hdfs-parquet-scanner.h"
 
 #include <avro/errors.h>
 #include <avro/schema.h>
@@ -46,6 +46,7 @@
 #include "util/disk-info.h"
 #include "util/hdfs-util.h"
 #include "util/periodic-counter-updater.h"
+#include "util/scope-exit-trigger.h"
 
 #include "common/names.h"
 
@@ -206,7 +207,7 @@ Status HdfsScanNodeBase::Prepare(RuntimeState* state) {
     }
 
     filesystem::path file_path(partition_desc->location());
-    file_path.append(split.file_name, filesystem::path::codecvt());
+    file_path.append(split.relative_path, filesystem::path::codecvt());
     const string& native_file_path = file_path.native();
 
     auto file_desc_map_key = make_pair(partition_desc->id(), native_file_path);
@@ -219,9 +220,9 @@ Status HdfsScanNodeBase::Prepare(RuntimeState* state) {
       file_desc->file_length = split.file_length;
       file_desc->mtime = split.mtime;
       file_desc->file_compression = split.file_compression;
+      file_desc->is_erasure_coded = split.is_erasure_coded;
       RETURN_IF_ERROR(HdfsFsCache::instance()->GetConnection(
           native_file_path, &file_desc->fs, &fs_cache));
-      num_unqueued_files_.Add(1);
       per_type_files_[partition_desc->file_format()].push_back(file_desc);
     } else {
       // File already processed
@@ -235,7 +236,7 @@ Status HdfsScanNodeBase::Prepare(RuntimeState* state) {
     file_desc->splits.push_back(
         AllocateScanRange(file_desc->fs, file_desc->filename.c_str(), split.length,
             split.offset, split.partition_id, params.volume_id, expected_local,
-            BufferOpts(try_cache, file_desc->mtime)));
+            file_desc->is_erasure_coded, BufferOpts(try_cache, file_desc->mtime)));
   }
 
   // Update server wide metrics for number of scan ranges and ranges that have
@@ -359,11 +360,28 @@ Status HdfsScanNodeBase::Open(RuntimeState* state) {
   } else {
     num_disks_accessed_counter_ = NULL;
   }
+
+  data_cache_hit_count_ = ADD_COUNTER(runtime_profile(),
+      "DataCacheHitCount", TUnit::UNIT);
+  data_cache_partial_hit_count_ = ADD_COUNTER(runtime_profile(),
+      "DataCachePartialHitCount", TUnit::UNIT);
+  data_cache_miss_count_ = ADD_COUNTER(runtime_profile(),
+      "DataCacheMissCount", TUnit::UNIT);
+  data_cache_hit_bytes_ = ADD_COUNTER(runtime_profile(),
+      "DataCacheHitBytes", TUnit::BYTES);
+  data_cache_miss_bytes_ = ADD_COUNTER(runtime_profile(),
+      "DataCacheMissBytes", TUnit::BYTES);
+
   reader_context_->set_bytes_read_counter(bytes_read_counter());
   reader_context_->set_read_timer(hdfs_read_timer_);
   reader_context_->set_open_file_timer(hdfs_open_file_timer_);
   reader_context_->set_active_read_thread_counter(&active_hdfs_read_thread_counter_);
   reader_context_->set_disks_accessed_bitmap(&disks_accessed_bitmap_);
+  reader_context_->set_data_cache_hit_counter(data_cache_hit_count_);
+  reader_context_->set_data_cache_partial_hit_counter(data_cache_partial_hit_count_);
+  reader_context_->set_data_cache_miss_counter(data_cache_miss_count_);
+  reader_context_->set_data_cache_hit_bytes_counter(data_cache_hit_bytes_);
+  reader_context_->set_data_cache_miss_bytes_counter(data_cache_miss_bytes_);
 
   average_hdfs_read_thread_concurrency_ = runtime_profile()->AddSamplingCounter(
       AVERAGE_HDFS_READ_THREAD_CONCURRENCY, &active_hdfs_read_thread_counter_);
@@ -372,6 +390,11 @@ Status HdfsScanNodeBase::Open(RuntimeState* state) {
       "InitialRangeIdealReservation", TUnit::BYTES);
   initial_range_actual_reservation_stats_ = ADD_SUMMARY_STATS_COUNTER(runtime_profile(),
       "InitialRangeActualReservation", TUnit::BYTES);
+
+  uncompressed_bytes_read_per_column_counter_ = ADD_SUMMARY_STATS_COUNTER(
+      runtime_profile(), "ParquetUncompressedBytesReadPerColumn", TUnit::BYTES);
+  compressed_bytes_read_per_column_counter_ = ADD_SUMMARY_STATS_COUNTER(
+      runtime_profile(), "ParquetCompressedBytesReadPerColumn", TUnit::BYTES);
 
   bytes_read_local_ = ADD_COUNTER(runtime_profile(), "BytesReadLocal",
       TUnit::BYTES);
@@ -391,6 +414,7 @@ Status HdfsScanNodeBase::Open(RuntimeState* state) {
   max_compressed_text_file_length_ = runtime_profile()->AddHighWaterMarkCounter(
       "MaxCompressedTextFileLength", TUnit::BYTES);
 
+  scanner_io_wait_time_ = ADD_TIMER(runtime_profile(), "ScannerIoWaitTime");
   hdfs_read_thread_concurrency_bucket_ = runtime_profile()->AddBucketingCounters(
       &active_hdfs_read_thread_counter_,
       ExecEnv::GetInstance()->disk_io_mgr()->num_total_disks() + 1);
@@ -403,7 +427,7 @@ Status HdfsScanNodeBase::Open(RuntimeState* state) {
   return Status::OK();
 }
 
-Status HdfsScanNodeBase::Reset(RuntimeState* state) {
+Status HdfsScanNodeBase::Reset(RuntimeState* state, RowBatch* row_batch) {
   DCHECK(false) << "Internal error: Scan nodes should not appear in subplans.";
   return Status("Internal error: Scan nodes should not appear in subplans.");
 }
@@ -441,9 +465,12 @@ void HdfsScanNodeBase::Close(RuntimeState* state) {
 Status HdfsScanNodeBase::IssueInitialScanRanges(RuntimeState* state) {
   DCHECK(!initial_ranges_issued_);
   initial_ranges_issued_ = true;
+  // We want to decrement this remaining_scan_range_submissions in all cases.
+  auto remaining_scan_range_submissions_trigger =
+    MakeScopeExitTrigger([&](){ UpdateRemainingScanRangeSubmissions(-1); });
 
   // No need to issue ranges with limit 0.
-  if (ReachedLimit()) {
+  if (ReachedLimitShared()) {
     DCHECK_EQ(limit_, 0);
     return Status::OK();
   }
@@ -456,6 +483,8 @@ Status HdfsScanNodeBase::IssueInitialScanRanges(RuntimeState* state) {
     for (HdfsFileDesc* file: v.second) {
       if (FilePassesFilterPredicates(filter_ctxs_, v.first, file)) {
         matching_files->push_back(file);
+      } else {
+        SkipFile(v.first, file);
       }
     }
   }
@@ -484,6 +513,9 @@ Status HdfsScanNodeBase::IssueInitialScanRanges(RuntimeState* state) {
         DCHECK(false) << "Unexpected file type " << entry.first;
     }
   }
+  // Except for BaseSequenceScanner, IssueInitialRanges() takes care of
+  // issuing all the ranges. For BaseSequenceScanner, IssueInitialRanges()
+  // will have incremented the counter.
   return Status::OK();
 }
 
@@ -498,7 +530,6 @@ bool HdfsScanNodeBase::FilePassesFilterPredicates(
       static_cast<ScanRangeMetadata*>(file->splits[0]->meta_data());
   if (!PartitionPassesFilters(metadata->partition_id, FilterStats::FILES_KEY,
           filter_ctxs)) {
-    SkipFile(format, file);
     return false;
   }
   return true;
@@ -550,16 +581,34 @@ int64_t HdfsScanNodeBase::IncreaseReservationIncrementally(int64_t curr_reservat
 
 ScanRange* HdfsScanNodeBase::AllocateScanRange(hdfsFS fs, const char* file,
     int64_t len, int64_t offset, int64_t partition_id, int disk_id, bool expected_local,
-    const BufferOpts& buffer_opts,
+    bool is_erasure_coded, const BufferOpts& buffer_opts,
     const ScanRange* original_split) {
   ScanRangeMetadata* metadata = runtime_state_->obj_pool()->Add(
         new ScanRangeMetadata(partition_id, original_split));
-  return AllocateScanRange(fs, file, len, offset, metadata, disk_id, expected_local,
-      buffer_opts);
+  return AllocateScanRange(fs, file, len, offset, {}, metadata, disk_id, expected_local,
+      is_erasure_coded, buffer_opts);
 }
 
 ScanRange* HdfsScanNodeBase::AllocateScanRange(hdfsFS fs, const char* file,
-    int64_t len, int64_t offset, ScanRangeMetadata* metadata, int disk_id, bool expected_local,
+    int64_t len, int64_t offset, ScanRangeMetadata* metadata, int disk_id,
+    bool expected_local, bool is_erasure_coded, const BufferOpts& buffer_opts) {
+  return AllocateScanRange(fs, file, len, offset, {}, metadata, disk_id, expected_local,
+      is_erasure_coded, buffer_opts);
+}
+
+ScanRange* HdfsScanNodeBase::AllocateScanRange(hdfsFS fs, const char* file,
+    int64_t len, int64_t offset, vector<ScanRange::SubRange>&& sub_ranges,
+    int64_t partition_id, int disk_id, bool expected_local, bool is_erasure_coded,
+    const BufferOpts& buffer_opts, const ScanRange* original_split) {
+  ScanRangeMetadata* metadata = runtime_state_->obj_pool()->Add(
+      new ScanRangeMetadata(partition_id, original_split));
+  return AllocateScanRange(fs, file, len, offset, move(sub_ranges), metadata,
+      disk_id, expected_local, is_erasure_coded, buffer_opts);
+}
+
+ScanRange* HdfsScanNodeBase::AllocateScanRange(hdfsFS fs, const char* file,
+    int64_t len, int64_t offset, vector<ScanRange::SubRange>&& sub_ranges,
+    ScanRangeMetadata* metadata, int disk_id, bool expected_local, bool is_erasure_coded,
     const BufferOpts& buffer_opts) {
   DCHECK_GE(disk_id, -1);
   // Require that the scan range is within [0, file_length). While this cannot be used
@@ -574,25 +623,25 @@ ScanRange* HdfsScanNodeBase::AllocateScanRange(hdfsFS fs, const char* file,
       file, disk_id, expected_local);
 
   ScanRange* range = runtime_state_->obj_pool()->Add(new ScanRange);
-  range->Reset(fs, file, len, offset, disk_id, expected_local, buffer_opts, metadata);
+  range->Reset(fs, file, len, offset, disk_id, expected_local, is_erasure_coded,
+      buffer_opts, move(sub_ranges), metadata);
   return range;
 }
 
 ScanRange* HdfsScanNodeBase::AllocateScanRange(hdfsFS fs, const char* file,
     int64_t len, int64_t offset, int64_t partition_id, int disk_id, bool try_cache,
-    bool expected_local, int mtime, const ScanRange* original_split) {
+    bool expected_local, int mtime, bool is_erasure_coded,
+    const ScanRange* original_split) {
   return AllocateScanRange(fs, file, len, offset, partition_id, disk_id, expected_local,
-      BufferOpts(try_cache, mtime), original_split);
+      is_erasure_coded, BufferOpts(try_cache, mtime), original_split);
 }
 
-Status HdfsScanNodeBase::AddDiskIoRanges(
-    const vector<ScanRange*>& ranges, int num_files_queued) {
+Status HdfsScanNodeBase::AddDiskIoRanges(const vector<ScanRange*>& ranges,
+    EnqueueLocation enqueue_location) {
   DCHECK(!progress_.done()) << "Don't call AddScanRanges() after all ranges finished.";
+  DCHECK_GT(remaining_scan_range_submissions_.Load(), 0);
   DCHECK_GT(ranges.size(), 0);
-  RETURN_IF_ERROR(reader_context_->AddScanRanges(ranges));
-  num_unqueued_files_.Add(-num_files_queued);
-  DCHECK_GE(num_unqueued_files_.Load(), 0);
-  return Status::OK();
+  return reader_context_->AddScanRanges(ranges, enqueue_location);
 }
 
 HdfsFileDesc* HdfsScanNodeBase::GetFileDesc(int64_t partition_id, const string& filename) {
@@ -624,9 +673,10 @@ void* HdfsScanNodeBase::GetCodegenFn(THdfsFileFormat::type type) {
   return it->second;
 }
 
-Status HdfsScanNodeBase::CreateAndOpenScanner(HdfsPartitionDescriptor* partition,
+Status HdfsScanNodeBase::CreateAndOpenScannerHelper(HdfsPartitionDescriptor* partition,
     ScannerContext* context, scoped_ptr<HdfsScanner>* scanner) {
-  DCHECK(context != NULL);
+  DCHECK(context != nullptr);
+  DCHECK(scanner->get() == nullptr);
   THdfsCompression::type compression =
       context->GetStream()->file_desc()->file_compression;
 
@@ -663,19 +713,10 @@ Status HdfsScanNodeBase::CreateAndOpenScanner(HdfsPartitionDescriptor* partition
       return Status(Substitute("Unknown Hdfs file format type: $0",
           partition->file_format()));
   }
-  DCHECK(scanner->get() != NULL);
-  Status status = ScanNodeDebugAction(TExecNodePhase::PREPARE_SCANNER);
-  if (status.ok()) {
-    status = scanner->get()->Open(context);
-    if (!status.ok()) {
-      scanner->get()->Close(nullptr);
-      scanner->reset();
-    }
-  } else {
-    context->ClearStreams();
-    scanner->reset();
-  }
-  return status;
+  DCHECK(scanner->get() != nullptr);
+  RETURN_IF_ERROR(scanner->get()->Open(context));
+  // Inject the error after the scanner is opened, to test the scanner close path.
+  return ScanNodeDebugAction(TExecNodePhase::PREPARE_SCANNER);
 }
 
 Tuple* HdfsScanNodeBase::InitTemplateTuple(const vector<ScalarExprEvaluator*>& evals,
@@ -899,6 +940,25 @@ void HdfsScanNodeBase::StopAndFinalizeCounters() {
   runtime_profile()->AppendExecOption(
       Substitute("Codegen enabled: $0 out of $1", num_enabled, total));
 
+  // Locking here should not be necessary since bytes_read_per_col_ is only updated inside
+  // column readers, and all column readers should have completed at this point; however,
+  // we acquire a read lock in case the update semantics of bytes_read_per_col_ change
+  {
+    shared_lock<shared_mutex> bytes_read_per_col_guard_read_lock(
+        bytes_read_per_col_lock_);
+    for (const auto& bytes_read : bytes_read_per_col_) {
+      int64_t uncompressed_bytes_read = bytes_read.second.uncompressed_bytes_read.Load();
+      if (uncompressed_bytes_read > 0) {
+        uncompressed_bytes_read_per_column_counter_->UpdateCounter(
+            uncompressed_bytes_read);
+      }
+      int64_t compressed_bytes_read = bytes_read.second.compressed_bytes_read.Load();
+      if (compressed_bytes_read > 0) {
+        compressed_bytes_read_per_column_counter_->UpdateCounter(compressed_bytes_read);
+      }
+    }
+  }
+
   if (reader_context_ != nullptr) {
     bytes_read_local_->Set(reader_context_->bytes_read_local());
     bytes_read_short_circuit_->Set(reader_context_->bytes_read_short_circuit());
@@ -932,4 +992,25 @@ void HdfsScanNodeBase::StopAndFinalizeCounters() {
 
 Status HdfsScanNodeBase::ScanNodeDebugAction(TExecNodePhase::type phase) {
   return ExecDebugAction(phase, runtime_state_);
+}
+
+void HdfsScanNodeBase::UpdateBytesRead(
+    SlotId slot_id, int64_t uncompressed_bytes_read, int64_t compressed_bytes_read) {
+  // Acquire a read lock first and check if the slot_id is in bytes_read_per_col_, if it
+  // is then update the value and release the read lock; if not then release the read
+  // lock, acquire the write lock, and then initialize the slot_id with the give value for
+  // bytes_read
+  shared_lock<shared_mutex> bytes_read_per_col_guard_read_lock(
+      bytes_read_per_col_lock_);
+  auto bytes_read_itr = bytes_read_per_col_.find(slot_id);
+  if (bytes_read_itr != bytes_read_per_col_.end()) {
+    bytes_read_itr->second.uncompressed_bytes_read.Add(uncompressed_bytes_read);
+    bytes_read_itr->second.compressed_bytes_read.Add(compressed_bytes_read);
+  } else {
+    bytes_read_per_col_guard_read_lock.unlock();
+    lock_guard<shared_mutex> bytes_read_per_col_guard_write_lock(
+        bytes_read_per_col_lock_);
+    bytes_read_per_col_[slot_id].uncompressed_bytes_read.Add(uncompressed_bytes_read);
+    bytes_read_per_col_[slot_id].compressed_bytes_read.Add(compressed_bytes_read);
+  }
 }

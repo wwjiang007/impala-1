@@ -23,6 +23,8 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 import org.apache.impala.authorization.Privilege;
 import org.apache.impala.catalog.Column;
@@ -36,9 +38,6 @@ import org.apache.impala.rewrite.ExprRewriter;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
-import com.google.common.collect.Sets;
 
 /**
  * Abstract super class for statements that modify existing data like
@@ -87,7 +86,7 @@ public abstract class ModifyStmt extends StatementBase {
   // Position mapping of output expressions of the sourceStmt_ to column indices in the
   // target table. The i'th position in this list maps to the referencedColumns_[i]'th
   // position in the target table. Set in createSourceStmt() during analysis.
-  protected ArrayList<Integer> referencedColumns_;
+  protected List<Integer> referencedColumns_;
 
   // SQL string of the ModifyStmt. Set in analyze().
   protected String sqlString_;
@@ -106,7 +105,7 @@ public abstract class ModifyStmt extends StatementBase {
     fromClause_.collectTableRefs(tblRefs);
     if (wherePredicate_ != null) {
       // Collect TableRefs in WHERE-clause subqueries.
-      List<Subquery> subqueries = Lists.newArrayList();
+      List<Subquery> subqueries = new ArrayList<>();
       wherePredicate_.collect(Subquery.class, subqueries);
       for (Subquery sq : subqueries) {
         sq.getStatement().collectTableRefs(tblRefs);
@@ -193,8 +192,8 @@ public abstract class ModifyStmt extends StatementBase {
   private void createSourceStmt(Analyzer analyzer)
       throws AnalysisException {
     // Builds the select list and column position mapping for the target table.
-    ArrayList<SelectListItem> selectList = Lists.newArrayList();
-    referencedColumns_ = Lists.newArrayList();
+    ArrayList<SelectListItem> selectList = new ArrayList<>();
+    referencedColumns_ = new ArrayList<>();
     buildAndValidateAssignmentExprs(analyzer, selectList, referencedColumns_);
 
     // Analyze the generated select statement.
@@ -224,22 +223,22 @@ public abstract class ModifyStmt extends StatementBase {
    * are always prepended to the list of expression representing the assignments.
    */
   private void buildAndValidateAssignmentExprs(Analyzer analyzer,
-      ArrayList<SelectListItem> selectList, ArrayList<Integer> referencedColumns)
+      List<SelectListItem> selectList, List<Integer> referencedColumns)
       throws AnalysisException {
     // The order of the referenced columns equals the order of the result expressions
-    HashSet<SlotId> uniqueSlots = Sets.newHashSet();
-    HashSet<SlotId> keySlots = Sets.newHashSet();
+    Set<SlotId> uniqueSlots = new HashSet<>();
+    Set<SlotId> keySlots = new HashSet<>();
 
     // Mapping from column name to index
     List<Column> cols = table_.getColumnsInHiveOrder();
-    HashMap<String, Integer> colIndexMap = Maps.newHashMap();
+    Map<String, Integer> colIndexMap = new HashMap<>();
     for (int i = 0; i < cols.size(); i++) {
       colIndexMap.put(cols.get(i).getName(), i);
     }
 
     // Add the key columns as slot refs
     for (String k : table_.getPrimaryKeyColumnNames()) {
-      ArrayList<String> path = Path.createRawPath(targetTableRef_.getUniqueAlias(), k);
+      List<String> path = Path.createRawPath(targetTableRef_.getUniqueAlias(), k);
       SlotRef ref = new SlotRef(path);
       ref.analyze(analyzer);
       selectList.add(new SelectListItem(ref, null));
@@ -289,7 +288,7 @@ public abstract class ModifyStmt extends StatementBase {
       }
 
       rhsExpr = checkTypeCompatibility(targetTableRef_.getDesc().getTable().getFullName(),
-          c, rhsExpr, analyzer.isDecimalV2());
+          c, rhsExpr, analyzer.isDecimalV2(), null /*widestTypeSrcExpr*/);
       uniqueSlots.add(lhsSlotRef.getSlotId());
       selectList.add(new SelectListItem(rhsExpr, null));
       referencedColumns.add(colIndexMap.get(c.getName()));
@@ -316,5 +315,5 @@ public abstract class ModifyStmt extends StatementBase {
   public QueryStmt getQueryStmt() { return sourceStmt_; }
   public abstract DataSink createDataSink();
   @Override
-  public abstract String toSql(boolean rewritten);
+  public abstract String toSql(ToSqlOptions options);
 }

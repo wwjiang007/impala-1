@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "common/status.h"
 #include "exec/unnest-node.h"
+
+#include "common/status.h"
+#include "exec/exec-node-util.h"
 #include "exec/subplan-node.h"
 #include "exprs/scalar-expr-evaluator.h"
 #include "exprs/slot-ref.h"
@@ -99,6 +101,8 @@ Status UnnestNode::Prepare(RuntimeState* state) {
 }
 
 Status UnnestNode::Open(RuntimeState* state) {
+  DCHECK(IsInSubplan());
+  // Omit ScopedOpenEventAdder since this is always in a subplan.
   SCOPED_TIMER(runtime_profile_->total_time_counter());
   RETURN_IF_ERROR(ExecNode::Open(state));
   RETURN_IF_ERROR(coll_expr_eval_->Open(state));
@@ -161,23 +165,19 @@ Status UnnestNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) 
       if (row_batch->AtCapacity()) break;
     }
   }
-  num_rows_returned_ += row_batch->num_rows();
 
   // Checking the limit here is simpler/cheaper than doing it in the loop above.
-  if (ReachedLimit()) {
-    *eos = true;
-    row_batch->set_num_rows(row_batch->num_rows() - (num_rows_returned_ - limit_));
-    num_rows_returned_ = limit_;
-  } else if (item_idx_ == coll_value_->num_tuples) {
+  const bool reached_limit = CheckLimitAndTruncateRowBatchIfNeeded(row_batch, eos);
+  if (!reached_limit && item_idx_ == coll_value_->num_tuples) {
     *eos = true;
   }
-  COUNTER_SET(rows_returned_counter_, num_rows_returned_);
+  COUNTER_SET(rows_returned_counter_, rows_returned());
   return Status::OK();
 }
 
-Status UnnestNode::Reset(RuntimeState* state) {
+Status UnnestNode::Reset(RuntimeState* state, RowBatch* row_batch) {
   item_idx_ = 0;
-  return ExecNode::Reset(state);
+  return ExecNode::Reset(state, row_batch);
 }
 
 void UnnestNode::Close(RuntimeState* state) {

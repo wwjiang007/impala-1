@@ -24,11 +24,13 @@ import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.THdfsCachingOp;
 import com.google.common.base.Preconditions;
 
+import static org.apache.impala.analysis.ToSqlOptions.DEFAULT;
+
 /**
  * Represents the partial SQL statement of specifying whether a table/partition
  * should or should not be marked as cached.
  */
-public class HdfsCachingOp implements ParseNode {
+public class HdfsCachingOp extends StmtNode {
   private final THdfsCachingOp cacheOp_;
   private final BigDecimal parsedReplication_;
 
@@ -78,7 +80,12 @@ public class HdfsCachingOp implements ParseNode {
   }
 
   @Override
-  public String toSql() {
+  public final String toSql() {
+    return toSql(DEFAULT);
+  }
+
+  @Override
+  public String toSql(ToSqlOptions options) {
     if (!shouldCache()) return "UNCACHED";
     StringBuilder sb = new StringBuilder();
     sb.append("CACHED IN '" + getCachePoolName() + "'");

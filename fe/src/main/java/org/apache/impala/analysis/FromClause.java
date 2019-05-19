@@ -17,6 +17,8 @@
 
 package org.apache.impala.analysis;
 
+import static org.apache.impala.analysis.ToSqlOptions.DEFAULT;
+
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
@@ -31,9 +33,9 @@ import com.google.common.collect.Lists;
  * analyzed independently of the statement using them. To increase the flexibility of
  * the class it implements the Iterable interface.
  */
-public class FromClause implements ParseNode, Iterable<TableRef> {
+public class FromClause extends StmtNode implements Iterable<TableRef> {
 
-  private final ArrayList<TableRef> tableRefs_;
+  private final List<TableRef> tableRefs_;
 
   private boolean analyzed_ = false;
 
@@ -45,7 +47,7 @@ public class FromClause implements ParseNode, Iterable<TableRef> {
     }
   }
 
-  public FromClause() { tableRefs_ = Lists.newArrayList(); }
+  public FromClause() { tableRefs_ = new ArrayList<>(); }
   public List<TableRef> getTableRefs() { return tableRefs_; }
 
   @Override
@@ -86,7 +88,7 @@ public class FromClause implements ParseNode, Iterable<TableRef> {
 
   @Override
   public FromClause clone() {
-    ArrayList<TableRef> clone = Lists.newArrayList();
+    List<TableRef> clone = new ArrayList<>();
     for (TableRef tblRef: tableRefs_) clone.add(tblRef.clone());
     return new FromClause(clone);
   }
@@ -112,16 +114,17 @@ public class FromClause implements ParseNode, Iterable<TableRef> {
   }
 
   @Override
-  public String toSql() {
-    return toSql(false);
+  public final String toSql() {
+    return toSql(DEFAULT);
   }
 
-  public String toSql(boolean rewritten) {
+  @Override
+  public String toSql(ToSqlOptions options) {
     StringBuilder builder = new StringBuilder();
     if (!tableRefs_.isEmpty()) {
       builder.append(" FROM ");
       for (int i = 0; i < tableRefs_.size(); ++i) {
-        builder.append(tableRefs_.get(i).toSql(rewritten));
+        builder.append(tableRefs_.get(i).toSql(options));
       }
     }
     return builder.toString();

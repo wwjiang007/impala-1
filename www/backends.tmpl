@@ -24,18 +24,26 @@ under the License.
   <thead>
     <tr>
       <th>Address</th>
+      <th>Krpc Address</th>
       <th>Coordinator</th>
       <th>Executor</th>
       <th>Quiescing</th>
+      <th>Memory Limit for Admission</th>
+      <th>Memory Reserved</th>
+      <th>Memory Admitted by Queries Submitted to this Coordinator</th>
     </tr>
   </thead>
   <tbody>
     {{#backends}}
     <tr>
       <td>{{address}}</td>
+      <td>{{krpc_address}}</td>
       <td>{{is_coordinator}}</td>
       <td>{{is_executor}}</td>
       <td>{{is_quiescing}}</td>
+      <td>{{admit_mem_limit}}</td>
+      <td>{{mem_reserved}}</td>
+      <td>{{mem_admitted}}</td>
     </tr>
     {{/backends}}
   </tbody>

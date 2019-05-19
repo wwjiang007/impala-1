@@ -18,6 +18,7 @@
 # under the License.
 
 import sasl
+import sys
 import time
 
 from beeswaxd import BeeswaxService
@@ -57,11 +58,16 @@ class DisconnectedException(Exception):
 
 class QueryCancelledByShellException(Exception): pass
 
+
+def print_to_stderr(message):
+  print >> sys.stderr, message
+
 class ImpalaClient(object):
 
   def __init__(self, impalad, kerberos_host_fqdn, use_kerberos=False,
                kerberos_service_name="impala", use_ssl=False, ca_cert=None, user=None,
-               ldap_password=None, use_ldap=False):
+               ldap_password=None, use_ldap=False, client_connect_timeout_ms=60000,
+               verbose=True):
     self.connected = False
     self.impalad_host = impalad[0].encode('ascii', 'ignore')
     self.impalad_port = int(impalad[1])
@@ -74,6 +80,7 @@ class ImpalaClient(object):
     self.ca_cert = ca_cert
     self.user, self.ldap_password = user, ldap_password
     self.use_ldap = use_ldap
+    self.client_connect_timeout_ms = int(client_connect_timeout_ms)
     self.default_query_options = {}
     self.query_option_levels = {}
     self.query_state = QueryState._NAMES_TO_VALUES
@@ -82,6 +89,7 @@ class ImpalaClient(object):
     # from command line via CTRL+C. It is used to suppress error messages of
     # query cancellation.
     self.is_query_cancelled = False
+    self.verbose = verbose
 
   def _options_to_string_list(self, set_query_options):
     return ["%s=%s" % (k, v) for (k, v) in set_query_options.iteritems()]
@@ -195,12 +203,13 @@ class ImpalaClient(object):
     hosts = 0
     if node.exec_stats is not None:
       hosts = len(node.exec_stats)
+    is_sink = node.node_id == -1
     row = [ label_prefix + node.label,
             hosts,
             prettyprint_time(avg_time),
             prettyprint_time(max_stats.latency_ns),
-            prettyprint_units(cardinality),
-            prettyprint_units(est_stats.cardinality),
+            "" if is_sink else prettyprint_units(cardinality),
+            "" if is_sink else prettyprint_units(est_stats.cardinality),
             prettyprint_bytes(max_stats.memory_used),
             prettyprint_bytes(est_stats.memory_used),
             node.label_detail ]
@@ -250,8 +259,15 @@ class ImpalaClient(object):
       self.transport = None
 
     self.connected = False
-    self.transport = self._get_transport()
+    sock, self.transport = self._get_socket_and_transport()
+    if self.client_connect_timeout_ms > 0:
+      sock.setTimeout(self.client_connect_timeout_ms)
     self.transport.open()
+    if self.verbose:
+      print_to_stderr('Opened TCP connection to %s:%s' % (self.impalad_host,
+          self.impalad_port))
+    # Setting a timeout of None disables timeouts on sockets
+    sock.setTimeout(None)
     protocol = TBinaryProtocol.TBinaryProtocol(self.transport)
     self.imp_service = ImpalaService.Client(protocol)
     result = self.ping_impala_service()
@@ -266,7 +282,7 @@ class ImpalaClient(object):
     if self.transport:
       self.transport.close()
 
-  def _get_transport(self):
+  def _get_socket_and_transport(self):
     """Create a Transport.
 
        A non-kerberized impalad just needs a simple buffered transport. For
@@ -274,6 +290,7 @@ class ImpalaClient(object):
 
        If SSL is enabled, a TSSLSocket underlies the transport stack; otherwise a TSocket
        is used.
+       This function returns the socket and the transport object.
     """
     if self.use_ssl:
       # TSSLSocket needs the ssl module, which may not be standard on all Operating
@@ -304,7 +321,8 @@ class ImpalaClient(object):
     else:
       sock = TSocket(sock_host, sock_port)
     if not (self.use_ldap or self.use_kerberos):
-      return TBufferedTransport(sock)
+      return sock, TBufferedTransport(sock)
+
     # Initializes a sasl client
     def sasl_factory():
       sasl_client = sasl.Client()
@@ -318,9 +336,9 @@ class ImpalaClient(object):
       return sasl_client
     # GSSASPI is the underlying mechanism used by kerberos to authenticate.
     if self.use_kerberos:
-      return TSaslClientTransport(sasl_factory, "GSSAPI", sock)
+      return sock, TSaslClientTransport(sasl_factory, "GSSAPI", sock)
     else:
-      return TSaslClientTransport(sasl_factory, "PLAIN", sock)
+      return sock, TSaslClientTransport(sasl_factory, "PLAIN", sock)
 
   def create_beeswax_query(self, query_str, set_query_options):
     """Create a beeswax query object from a query string"""
@@ -346,7 +364,7 @@ class ImpalaClient(object):
         break
       elif query_state == self.query_state["EXCEPTION"]:
         if self.connected:
-          raise QueryStateException(self.get_warning_log(last_query_handle))
+          raise QueryStateException(self.get_error_log(last_query_handle))
         else:
           raise DisconnectedException("Not connected to impalad.")
 
@@ -500,14 +518,31 @@ class ImpalaClient(object):
       return False
     return True
 
-  def get_warning_log(self, last_query_handle):
+  def get_warn_or_error_log(self, last_query_handle, warn):
+    """Returns all messages from the error log prepended with 'WARNINGS:' or 'ERROR:' for
+    last_query_handle, depending on whether warn is True or False. Note that the error
+    log may contain messages that are not errors (e.g. warnings)."""
     if last_query_handle is None:
       return "Query could not be executed"
     rpc_result = self._do_rpc(
         lambda: self.imp_service.get_log(last_query_handle.log_context))
     log, status = rpc_result
     if status != RpcStatus.OK:
-      return "Failed to get error log: %s" % status
+      type_str = "warn" if warn is True else "error"
+      return "Failed to get %s log: %s" % (type_str, status)
     if log and log.strip():
-      return "WARNINGS: %s" % log
+      type_str = "WARNINGS" if warn is True else "ERROR"
+      return "%s: %s" % (type_str, log)
     return ""
+
+  def get_warning_log(self, last_query_handle):
+    """Returns all messages from the error log prepended with 'WARNINGS:' for
+    last_query_handle. Note that the error log may contain messages that are not errors
+    (e.g. warnings)."""
+    return self.get_warn_or_error_log(last_query_handle, True)
+
+  def get_error_log(self, last_query_handle):
+    """Returns all messages from the error log prepended with 'ERROR:' for
+    last_query_handle. Note that the error log may contain messages that are not errors
+    (e.g. warnings)."""
+    return self.get_warn_or_error_log(last_query_handle, False)

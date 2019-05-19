@@ -20,21 +20,23 @@
 #include <vector>
 #include <gutil/strings/substitute.h>
 
-#include "exec/parquet-common.h"
+#include "exec/exec-node-util.h"
+#include "exec/parquet/parquet-common.h"
 #include "exec/read-write-util.h"
 #include "exprs/scalar-expr.h"
 #include "gen-cpp/parquet_types.h"
+#include "runtime/date-value.h"
 #include "runtime/mem-pool.h"
 #include "runtime/mem-tracker.h"
-#include "runtime/runtime-state.h"
 #include "runtime/row-batch.h"
+#include "runtime/runtime-state.h"
 #include "runtime/string-value.h"
-#include "runtime/timestamp-value.h"
+#include "runtime/timestamp-value.inline.h"
 #include "runtime/tuple-row.h"
 #include "util/jni-util.h"
 #include "util/periodic-counter-updater.h"
-#include "util/ubsan.h"
 #include "util/runtime-profile-counters.h"
+#include "util/ubsan.h"
 
 #include "common/names.h"
 
@@ -95,6 +97,7 @@ Status DataSourceScanNode::Prepare(RuntimeState* state) {
 
 Status DataSourceScanNode::Open(RuntimeState* state) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedOpenEventAdder ea(this);
   RETURN_IF_ERROR(ExecNode::Open(state));
   RETURN_IF_CANCELLED(state);
 
@@ -304,6 +307,12 @@ Status DataSourceScanNode::MaterializeNextRow(const Timezone& local_tz,
             val.size(), slot));
         break;
       }
+      case TYPE_DATE:
+        if (val_idx >= col.int_vals.size()) {
+          return Status(Substitute(ERROR_INVALID_COL_DATA, "DATE"));
+        }
+        *reinterpret_cast<DateValue*>(slot) = DateValue(col.int_vals[val_idx]);
+        break;
       default:
         DCHECK(false);
     }
@@ -312,10 +321,11 @@ Status DataSourceScanNode::MaterializeNextRow(const Timezone& local_tz,
 }
 
 Status DataSourceScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
+  SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedGetNextEventAdder ea(this, eos);
   RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::GETNEXT, state));
   RETURN_IF_CANCELLED(state);
   RETURN_IF_ERROR(QueryMaintenance(state));
-  SCOPED_TIMER(runtime_profile_->total_time_counter());
   if (ReachedLimit()) {
     *eos = true;
     return Status::OK();
@@ -349,13 +359,13 @@ Status DataSourceScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, boo
           row_batch->CommitLastRow();
           tuple = reinterpret_cast<Tuple*>(
               reinterpret_cast<uint8_t*>(tuple) + tuple_desc_->byte_size());
-          ++num_rows_returned_;
+          IncrementNumRowsReturned(1);
         }
         ++next_row_idx_;
       }
-      if (ReachedLimit() || row_batch->AtCapacity() || input_batch_->eos) {
-        *eos = ReachedLimit() || input_batch_->eos;
-        COUNTER_SET(rows_returned_counter_, num_rows_returned_);
+      if (row_batch->AtCapacity() || input_batch_->eos || ReachedLimit()) {
+        *eos = input_batch_->eos || ReachedLimit();
+        COUNTER_SET(rows_returned_counter_, rows_returned());
         COUNTER_ADD(rows_read_counter_, rows_read);
         return Status::OK();
       }
@@ -367,7 +377,7 @@ Status DataSourceScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, boo
   }
 }
 
-Status DataSourceScanNode::Reset(RuntimeState* state) {
+Status DataSourceScanNode::Reset(RuntimeState* state, RowBatch* row_batch) {
   DCHECK(false) << "NYI";
   return Status("NYI");
 }

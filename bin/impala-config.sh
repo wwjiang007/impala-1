@@ -68,7 +68,7 @@ fi
 # moving to a different build of the toolchain, e.g. when a version is bumped or a
 # compile option is changed. The build id can be found in the output of the toolchain
 # build jobs, it is constructed from the build number and toolchain git hash prefix.
-export IMPALA_TOOLCHAIN_BUILD_ID=185-ec90313c05
+export IMPALA_TOOLCHAIN_BUILD_ID=35-4c4c185a57
 # Versions of toolchain dependencies.
 # -----------------------------------
 export IMPALA_AVRO_VERSION=1.7.4-p4
@@ -83,7 +83,7 @@ export IMPALA_BZIP2_VERSION=1.0.6-p2
 unset IMPALA_BZIP2_URL
 export IMPALA_CCTZ_VERSION=2.2
 unset IMPALA_CCTZ_URL
-export IMPALA_CMAKE_VERSION=3.8.2-p1
+export IMPALA_CMAKE_VERSION=3.14.3
 unset IMPALA_CMAKE_URL
 export IMPALA_CRCUTIL_VERSION=440ba7babeff77ffad992df3a10c767f184e946e-p1
 unset IMPALA_CRCUTIL_URL
@@ -93,9 +93,9 @@ export IMPALA_FLATBUFFERS_VERSION=1.6.0
 unset IMPALA_FLATBUFFERS_URL
 export IMPALA_GCC_VERSION=4.9.2
 unset IMPALA_GCC_URL
-export IMPALA_GDB_VERSION=7.9.1
+export IMPALA_GDB_VERSION=7.9.1-p1
 unset IMPALA_GDB_URL
-export IMPALA_GFLAGS_VERSION=2.2.0-p1
+export IMPALA_GFLAGS_VERSION=2.2.0-p2
 unset IMPALA_GFLAGS_URL
 export IMPALA_GLOG_VERSION=0.3.4-p3
 unset IMPALA_GLOG_URL
@@ -118,19 +118,19 @@ export IMPALA_LLVM_DEBUG_VERSION=5.0.1-asserts-p1
 unset IMPALA_LLVM_DEBUG_URL
 export IMPALA_LZ4_VERSION=1.7.5
 unset IMPALA_LZ4_URL
-export IMPALA_OPENLDAP_VERSION=2.4.25
+export IMPALA_OPENLDAP_VERSION=2.4.47
 unset IMPALA_OPENLDAP_URL
 export IMPALA_OPENSSL_VERSION=1.0.2l
 unset IMPALA_OPENSSL_URL
-export IMPALA_ORC_VERSION=1.4.3-p2
+export IMPALA_ORC_VERSION=1.5.5-p1
 unset IMPALA_ORC_URL
 export IMPALA_PROTOBUF_VERSION=3.5.1
 unset IMPALA_PROTOBUF_URL
-export IMPALA_POSTGRES_JDBC_DRIVER_VERSION=9.0-801
+export IMPALA_POSTGRES_JDBC_DRIVER_VERSION=42.2.5
 unset IMPALA_POSTGRES_JDBC_DRIVER_URL
 export IMPALA_RAPIDJSON_VERSION=1.1.0
 unset IMPALA_RAPIDJSON_URL
-export IMPALA_RE2_VERSION=20130115-p1
+export IMPALA_RE2_VERSION=20190301
 unset IMPALA_RE2_URL
 export IMPALA_SNAPPY_VERSION=1.1.4
 unset IMPALA_SNAPPY_URL
@@ -141,8 +141,10 @@ export IMPALA_TPC_DS_VERSION=2.1.0
 unset IMPALA_TPC_DS_URL
 export IMPALA_TPC_H_VERSION=2.17.0
 unset IMPALA_TPC_H_URL
-export IMPALA_THRIFT_VERSION=0.9.3-p4
+export IMPALA_THRIFT_VERSION=0.9.3-p5
 unset IMPALA_THRIFT_URL
+export IMPALA_THRIFT11_VERSION=0.11.0-p2
+unset IMPALA_THRIFT11_URL
 export IMPALA_ZLIB_VERSION=1.2.8
 unset IMPALA_ZLIB_URL
 
@@ -155,19 +157,23 @@ if [[ $OSTYPE == "darwin"* ]]; then
   unset IMPALA_OPENSSL_URL
 fi
 
-: ${CDH_DOWNLOAD_HOST:=native-toolchain.s3.amazonaws.com}
-export CDH_DOWNLOAD_HOST
+: ${IMPALA_TOOLCHAIN_HOST:=native-toolchain.s3.amazonaws.com}
+export IMPALA_TOOLCHAIN_HOST
 export CDH_MAJOR_VERSION=6
-export CDH_BUILD_NUMBER=559250
-export IMPALA_HADOOP_VERSION=3.0.0-cdh6.x-SNAPSHOT
+export CDH_BUILD_NUMBER=1055188
+export CDP_BUILD_NUMBER=1056671
+export CDH_HADOOP_VERSION=3.0.0-cdh6.x-SNAPSHOT
+export CDP_HADOOP_VERSION=3.1.1.6.0.99.0-147
 export IMPALA_HBASE_VERSION=2.1.0-cdh6.x-SNAPSHOT
-export IMPALA_HIVE_VERSION=2.1.1-cdh6.x-SNAPSHOT
-export IMPALA_SENTRY_VERSION=2.0.0-cdh6.x-SNAPSHOT
+export IMPALA_SENTRY_VERSION=2.1.0-cdh6.x-SNAPSHOT
+export IMPALA_RANGER_VERSION=1.2.0.6.0.99.0-147
 export IMPALA_PARQUET_VERSION=1.9.0-cdh6.x-SNAPSHOT
 export IMPALA_AVRO_JAVA_VERSION=1.8.2-cdh6.x-SNAPSHOT
 export IMPALA_LLAMA_MINIKDC_VERSION=1.0.0
 export IMPALA_KITE_VERSION=1.0.0-cdh6.x-SNAPSHOT
-export KUDU_JAVA_VERSION=1.8.0-cdh6.x-SNAPSHOT
+export KUDU_JAVA_VERSION=1.10.0-cdh6.x-SNAPSHOT
+export CDH_HIVE_VERSION=2.1.1-cdh6.x-SNAPSHOT
+export CDP_HIVE_VERSION=3.1.0.6.0.99.0-147
 
 # When IMPALA_(CDH_COMPONENT)_URL are overridden, they may contain '$(platform_label)'
 # which will be substituted for the CDH platform label in bootstrap_toolchain.py
@@ -186,6 +192,29 @@ unset IMPALA_LLAMA_MINIKDC_URL
 if [ -f "$IMPALA_HOME/bin/impala-config-local.sh" ]; then
   . "$IMPALA_HOME/bin/impala-config-local.sh"
 fi
+
+export CDH_COMPONENTS_HOME="$IMPALA_TOOLCHAIN/cdh_components-$CDH_BUILD_NUMBER"
+export CDP_COMPONENTS_HOME="$IMPALA_TOOLCHAIN/cdp_components-$CDP_BUILD_NUMBER"
+export USE_CDP_HIVE=${USE_CDP_HIVE-false}
+if $USE_CDP_HIVE; then
+  # When USE_CDP_HIVE is set we use the CDP hive version to build as well as deploy in
+  # the minicluster
+  export IMPALA_HIVE_VERSION=${CDP_HIVE_VERSION}
+  export IMPALA_TEZ_VERSION=0.9.1.6.0.99.0-147
+  export IMPALA_HADOOP_VERSION=${CDP_HADOOP_VERSION}
+  export HADOOP_HOME="$CDP_COMPONENTS_HOME/hadoop-${CDP_HADOOP_VERSION}/"
+else
+  # CDH hive version is used to build and deploy in minicluster when USE_CDP_HIVE is
+  # false
+  export IMPALA_HIVE_VERSION=${CDH_HIVE_VERSION}
+  export IMPALA_HADOOP_VERSION=${CDH_HADOOP_VERSION}
+  export HADOOP_HOME="$CDH_COMPONENTS_HOME/hadoop-${IMPALA_HADOOP_VERSION}/"
+fi
+# Extract the first component of the hive version.
+# Allow overriding of Hive source location in case we want to build Impala without
+# a complete Hive build. This is used by fe/pom.xml to activate compatibility shims
+# for Hive-2 or Hive-3
+export IMPALA_HIVE_MAJOR_VERSION=$(echo "$IMPALA_HIVE_VERSION" | cut -d . -f 1)
 
 # It is important to have a coherent view of the JAVA_HOME and JAVA executable.
 # The JAVA_HOME should be determined first, then the JAVA executable should be
@@ -241,14 +270,10 @@ export IMPALA_MAVEN_OPTIONS=${IMPALA_MAVEN_OPTIONS-}
 # If enabled, debug symbols are added to cross-compiled IR.
 export ENABLE_IMPALA_IR_DEBUG_INFO=${ENABLE_IMPALA_IR_DEBUG_INFO-false}
 
-if [ -d "$IMPALA_HOME/thirdparty" ]; then
-  NO_THIRDPARTY=false
-else
-  NO_THIRDPARTY=true
-fi
-# If true, download and use the CDH components from S3 instead of the ones
-# in $IMPALA_HOME/thirdparty.
-export DOWNLOAD_CDH_COMPONENTS=${DOWNLOAD_CDH_COMPONENTS-"$NO_THIRDPARTY"}
+# Download and use the CDH components from S3. It can be useful to set this to false if
+# building against a custom local build using HIVE_SRC_DIR_OVERRIDE,
+# HADOOP_INCLUDE_DIR_OVERRIDE, and HADOOP_LIB_DIR_OVERRIDE.
+export DOWNLOAD_CDH_COMPONENTS=${DOWNLOAD_CDH_COMPONENTS-true}
 
 export IS_OSX="$(if [[ "$OSTYPE" == "darwin"* ]]; then echo true; else echo false; fi)"
 
@@ -263,14 +288,53 @@ export azure_tenant_id="${azure_tenant_id-DummyAdlsTenantId}"
 export azure_client_id="${azure_client_id-DummyAdlsClientId}"
 export azure_client_secret="${azure_client_secret-DummyAdlsClientSecret}"
 export azure_data_lake_store_name="${azure_data_lake_store_name-}"
+export azure_storage_account_name="${azure_storage_account_name-}"
+export azure_storage_container_name="${azure_storage_container_name-}"
 export HDFS_REPLICATION="${HDFS_REPLICATION-3}"
 export ISILON_NAMENODE="${ISILON_NAMENODE-}"
-export DEFAULT_FS="${DEFAULT_FS-hdfs://localhost:20500}"
+# Internal and external interfaces that test cluster services will listen on. The
+# internal interface is used for ports that should not be accessed from outside the
+# host that the cluster is running on. The external interface is used for ports
+# that may need to be accessed from outside, e.g. web UIs.
+export INTERNAL_LISTEN_HOST="${INTERNAL_LISTEN_HOST-localhost}"
+export EXTERNAL_LISTEN_HOST="${EXTERNAL_LISTEN_HOST-0.0.0.0}"
+export DEFAULT_FS="${DEFAULT_FS-hdfs://${INTERNAL_LISTEN_HOST}:20500}"
 export WAREHOUSE_LOCATION_PREFIX="${WAREHOUSE_LOCATION_PREFIX-}"
 export LOCAL_FS="file:${WAREHOUSE_LOCATION_PREFIX}"
+
 ESCAPED_IMPALA_HOME=$(sed "s/[^0-9a-zA-Z]/_/g" <<< "$IMPALA_HOME")
-export METASTORE_DB=${METASTORE_DB-$(cut -c-63 <<< HMS$ESCAPED_IMPALA_HOME)}
+if $USE_CDP_HIVE; then
+  export HIVE_HOME="$CDP_COMPONENTS_HOME/apache-hive-${IMPALA_HIVE_VERSION}-bin"
+  export HIVE_SRC_DIR=${HIVE_SRC_DIR_OVERRIDE:-"${CDP_COMPONENTS_HOME}/hive-\
+${IMPALA_HIVE_VERSION}"}
+  # Set the path to the hive_metastore.thrift which is used to build thrift code
+  export HIVE_METASTORE_THRIFT_DIR=$HIVE_SRC_DIR/standalone-metastore/src/main/thrift
+  # It is likely that devs will want to work with both the versions of metastore
+  # if cdp hive is being used change the metastore db name, so we don't have to
+  # format the metastore db everytime we switch between hive versions
+  export METASTORE_DB=${METASTORE_DB-"$(cut -c-59 <<< HMS$ESCAPED_IMPALA_HOME)_cdp"}
+  export TEZ_HOME="$CDP_COMPONENTS_HOME/tez-${IMPALA_TEZ_VERSION}-minimal"
+else
+  export HIVE_HOME="$CDH_COMPONENTS_HOME/hive-${IMPALA_HIVE_VERSION}"
+  # Allow overriding of Hive source location in case we want to build Impala without
+# a complete Hive build.
+  export HIVE_SRC_DIR=${HIVE_SRC_DIR_OVERRIDE:-"${HIVE_HOME}/src"}
+  export HIVE_METASTORE_THRIFT_DIR=$HIVE_SRC_DIR/metastore/if
+  export METASTORE_DB=${METASTORE_DB-$(cut -c-63 <<< HMS$ESCAPED_IMPALA_HOME)}
+fi
+# Set the Hive binaries in the path
+export PATH="$HIVE_HOME/bin:$PATH"
+
 export SENTRY_POLICY_DB=${SENTRY_POLICY_DB-$(cut -c-63 <<< SP$ESCAPED_IMPALA_HOME)}
+if [[ "${TARGET_FILESYSTEM}" == "s3" ]]; then
+    # On S3, disable Sentry HDFS sync plugin.
+    export SENTRY_PROCESSOR_FACTORIES="org.apache.sentry.api.service.thrift.SentryPolicyStoreProcessorFactory"
+else
+    export SENTRY_PROCESSOR_FACTORIES="org.apache.sentry.api.service.thrift.SentryPolicyStoreProcessorFactory,org.apache.sentry.hdfs.SentryHDFSServiceProcessorFactory"
+fi
+RANGER_POLICY_DB=${RANGER_POLICY_DB-$(cut -c-63 <<< ranger$ESCAPED_IMPALA_HOME)}
+# The DB script in Ranger expects the database name to be in lower case.
+export RANGER_POLICY_DB=$(echo ${RANGER_POLICY_DB} | tr '[:upper:]' '[:lower:]')
 
 # Environment variables carrying AWS security credentials are prepared
 # according to the following rules:
@@ -326,6 +390,7 @@ fi
 if [ "${TARGET_FILESYSTEM}" = "s3" ]; then
   # We guard the S3 access check with a variable. This check hits a rate-limited endpoint
   # on AWS and multiple inclusions of S3 can exceed the limit, causing the check to fail.
+  S3_ACCESS_VALIDATED="${S3_ACCESS_VALIDATED-0}"
   if [[ "${S3_ACCESS_VALIDATED}" -ne 1 ]]; then
     if ${IMPALA_HOME}/bin/check-s3-access.sh; then
       export S3_ACCESS_VALIDATED=1
@@ -351,6 +416,28 @@ elif [ "${TARGET_FILESYSTEM}" = "adls" ]; then
     return 1
   fi
   DEFAULT_FS="adl://${azure_data_lake_store_name}.azuredatalakestore.net"
+  export DEFAULT_FS
+elif [ "${TARGET_FILESYSTEM}" = "abfs" ]; then
+  # ABFS is also known as ADLS Gen2, and they can share credentials
+  # Basic error checking
+  if [[ "${azure_client_id}" = "DummyAdlsClientId" ||\
+        "${azure_tenant_id}" = "DummyAdlsTenantId" ||\
+        "${azure_client_secret}" = "DummyAdlsClientSecret" ]]; then
+    echo "All 3 of the following need to be assigned valid values and belong
+      to the owner of the Azure storage account in order to access the
+      filesystem: azure_client_id, azure_tenant_id, azure_client_secret."
+    return 1
+  fi
+  if [[ "${azure_storage_account_name}" = "" ]]; then
+    echo "azure_storage_account_name cannot be an empty string for ABFS"
+    return 1
+  fi
+  if [[ "${azure_storage_container_name}" = "" ]]; then
+    echo "azure_storage_container_name cannot be an empty string for ABFS"
+    return 1
+  fi
+  domain="${azure_storage_account_name}.dfs.core.windows.net"
+  DEFAULT_FS="abfss://${azure_storage_container_name}@${domain}"
   export DEFAULT_FS
 elif [ "${TARGET_FILESYSTEM}" = "isilon" ]; then
   if [ "${ISILON_NAMENODE}" = "" ]; then
@@ -401,19 +488,22 @@ export IMPALA_BE_TEST_LOGS_DIR="${IMPALA_LOGS_DIR}/be_tests"
 export IMPALA_EE_TEST_LOGS_DIR="${IMPALA_LOGS_DIR}/ee_tests"
 export IMPALA_CUSTOM_CLUSTER_TEST_LOGS_DIR="${IMPALA_LOGS_DIR}/custom_cluster_tests"
 export IMPALA_MVN_LOGS_DIR="${IMPALA_LOGS_DIR}/mvn"
+export IMPALA_TIMEOUT_LOGS_DIR="${IMPALA_LOGS_DIR}/timeout_stacktrace"
 # List of all Impala log dirs so they can be created by buildall.sh
 export IMPALA_ALL_LOGS_DIRS="${IMPALA_CLUSTER_LOGS_DIR}
   ${IMPALA_DATA_LOADING_LOGS_DIR} ${IMPALA_DATA_LOADING_SQL_DIR}
   ${IMPALA_FE_TEST_LOGS_DIR} ${IMPALA_FE_TEST_COVERAGE_DIR}
   ${IMPALA_BE_TEST_LOGS_DIR} ${IMPALA_EE_TEST_LOGS_DIR}
-  ${IMPALA_CUSTOM_CLUSTER_TEST_LOGS_DIR} ${IMPALA_MVN_LOGS_DIR}"
+  ${IMPALA_CUSTOM_CLUSTER_TEST_LOGS_DIR} ${IMPALA_MVN_LOGS_DIR}
+  ${IMPALA_TIMEOUT_LOGS_DIR}"
 
 # Reduce the concurrency for local tests to half the number of cores in the system.
 CORES=$(($(getconf _NPROCESSORS_ONLN) / 2))
 export NUM_CONCURRENT_TESTS="${NUM_CONCURRENT_TESTS-${CORES}}"
 
-export KUDU_MASTER_HOSTS="${KUDU_MASTER_HOSTS:-127.0.0.1}"
+export KUDU_MASTER_HOSTS="${KUDU_MASTER_HOSTS:-${INTERNAL_LISTEN_HOST}}"
 export KUDU_MASTER_PORT="${KUDU_MASTER_PORT:-7051}"
+export KUDU_MASTER_WEBUI_PORT="${KUDU_MASTER_WEBUI_PORT:-8051}"
 
 export IMPALA_FE_DIR="$IMPALA_HOME/fe"
 export IMPALA_BE_DIR="$IMPALA_HOME/be"
@@ -425,16 +515,6 @@ export IMPALA_COMMON_DIR="$IMPALA_HOME/common"
 export PATH="$IMPALA_TOOLCHAIN/gdb-$IMPALA_GDB_VERSION/bin:$PATH"
 export PATH="$IMPALA_HOME/bin:$IMPALA_TOOLCHAIN/cmake-$IMPALA_CMAKE_VERSION/bin/:$PATH"
 
-# The directory in which all the thirdparty CDH components live.
-if [ "${DOWNLOAD_CDH_COMPONENTS}" = true ]; then
-  export CDH_COMPONENTS_HOME="$IMPALA_TOOLCHAIN/cdh_components-$CDH_BUILD_NUMBER"
-else
-  export CDH_COMPONENTS_HOME="$IMPALA_HOME/thirdparty"
-fi
-
-# Typically we build against a snapshot build of Hadoop that includes everything we need
-# for building Impala and running a minicluster.
-export HADOOP_HOME="$CDH_COMPONENTS_HOME/hadoop-${IMPALA_HADOOP_VERSION}/"
 export HADOOP_CONF_DIR="$IMPALA_FE_DIR/src/test/resources"
 # The include and lib paths are needed to pick up hdfs.h and libhdfs.*
 # Allow overriding in case we want to point to a package/install with a different layout.
@@ -462,13 +542,9 @@ export MINIKDC_HOME="$CDH_COMPONENTS_HOME/llama-minikdc-${IMPALA_LLAMA_MINIKDC_V
 export SENTRY_HOME="$CDH_COMPONENTS_HOME/sentry-${IMPALA_SENTRY_VERSION}"
 export SENTRY_CONF_DIR="$IMPALA_HOME/fe/src/test/resources"
 
-# Extract the first component of the hive version.
-export IMPALA_HIVE_MAJOR_VERSION=$(echo "$IMPALA_HIVE_VERSION" | cut -d . -f 1)
-export HIVE_HOME="$CDH_COMPONENTS_HOME/hive-${IMPALA_HIVE_VERSION}/"
-export PATH="$HIVE_HOME/bin:$PATH"
-# Allow overriding of Hive source location in case we want to build Impala without
-# a complete Hive build.
-export HIVE_SRC_DIR=${HIVE_SRC_DIR_OVERRIDE:-"${HIVE_HOME}/src"}
+export RANGER_HOME="${CDP_COMPONENTS_HOME}/ranger-${IMPALA_RANGER_VERSION}-admin"
+export RANGER_CONF_DIR="$IMPALA_HOME/fe/src/test/resources"
+
 # To configure Hive logging, there's a hive-log4j2.properties[.template]
 # file in fe/src/test/resources. To get it into the classpath earlier
 # than the hive-log4j2.properties file included in some Hive jars,
@@ -489,7 +565,7 @@ export HIVE_CONF_DIR="$IMPALA_FE_DIR/./src/test/resources"
 # any jars in AUX_CLASSPATH. (Or a list of jars in HIVE_AUX_JARS_PATH.)
 # The Postgres JDBC driver is downloaded by maven when building the frontend.
 # Export the location of Postgres JDBC driver so Sentry can pick it up.
-export POSTGRES_JDBC_DRIVER="${IMPALA_FE_DIR}/target/dependency/postgresql-${IMPALA_POSTGRES_JDBC_DRIVER_VERSION}.jdbc4.jar"
+export POSTGRES_JDBC_DRIVER="${IMPALA_FE_DIR}/target/dependency/postgresql-${IMPALA_POSTGRES_JDBC_DRIVER_VERSION}.jar"
 
 export HIVE_AUX_JARS_PATH="$POSTGRES_JDBC_DRIVER"
 export AUX_CLASSPATH="${LZO_JAR_PATH}"
@@ -559,7 +635,7 @@ if [[ -z "${KUDU_IS_SUPPORTED-}" ]]; then
       # Remove spaces, trim minor versions, and convert to lowercase.
       DISTRO_VERSION="$(tr -d ' \n' <<< "$DISTRO_VERSION" | cut -d. -f1 | tr "A-Z" "a-z")"
       case "$DISTRO_VERSION" in
-        centos6 | centos7 | debian8 | suselinux12 | suse12 | ubuntu16 )
+        centos6 | centos7 | debian8 | suselinux12 | suse12 | ubuntu16 | ubuntu18)
           USE_CDH_KUDU=true
           KUDU_IS_SUPPORTED=true;;
         ubuntu14 )
@@ -572,10 +648,10 @@ fi
 export KUDU_IS_SUPPORTED
 
 if $USE_CDH_KUDU; then
-  export IMPALA_KUDU_VERSION=${IMPALA_KUDU_VERSION-"1.8.0-cdh6.x-SNAPSHOT"}
+  export IMPALA_KUDU_VERSION=${IMPALA_KUDU_VERSION-"1.10.0-cdh6.x-SNAPSHOT"}
   export IMPALA_KUDU_HOME=${CDH_COMPONENTS_HOME}/kudu-$IMPALA_KUDU_VERSION
 else
-  export IMPALA_KUDU_VERSION=${IMPALA_KUDU_VERSION-"5211897"}
+  export IMPALA_KUDU_VERSION=${IMPALA_KUDU_VERSION-"9ba901a"}
   export IMPALA_KUDU_HOME=${IMPALA_TOOLCHAIN}/kudu-$IMPALA_KUDU_VERSION
 fi
 
@@ -654,6 +730,10 @@ echo "HIVE_CONF_DIR           = $HIVE_CONF_DIR"
 echo "HIVE_SRC_DIR            = $HIVE_SRC_DIR"
 echo "HBASE_HOME              = $HBASE_HOME"
 echo "HBASE_CONF_DIR          = $HBASE_CONF_DIR"
+echo "SENTRY_HOME             = $SENTRY_HOME"
+echo "SENTRY_CONF_DIR         = $SENTRY_CONF_DIR"
+echo "RANGER_HOME             = $RANGER_HOME"
+echo "RANGER_CONF_DIR         = $RANGER_CONF_DIR "
 echo "MINIKDC_HOME            = $MINIKDC_HOME"
 echo "THRIFT_HOME             = $THRIFT_HOME"
 echo "HADOOP_LZO              = $HADOOP_LZO"
@@ -666,10 +746,20 @@ echo "LD_LIBRARY_PATH         = $LD_LIBRARY_PATH"
 echo "LD_PRELOAD              = $LD_PRELOAD"
 echo "POSTGRES_JDBC_DRIVER    = $POSTGRES_JDBC_DRIVER"
 echo "IMPALA_TOOLCHAIN        = $IMPALA_TOOLCHAIN"
+echo "METASTORE_DB            = $METASTORE_DB"
 echo "DOWNLOAD_CDH_COMPONENTS = $DOWNLOAD_CDH_COMPONENTS"
 echo "IMPALA_MAVEN_OPTIONS    = $IMPALA_MAVEN_OPTIONS"
-echo "CDH_DOWNLOAD_HOST       = $CDH_DOWNLOAD_HOST"
+echo "IMPALA_TOOLCHAIN_HOST   = $IMPALA_TOOLCHAIN_HOST"
 echo "CDH_BUILD_NUMBER        = $CDH_BUILD_NUMBER"
+echo "CDH_COMPONENTS_HOME     = $CDH_COMPONENTS_HOME"
+echo "CDP_BUILD_NUMBER        = $CDP_BUILD_NUMBER"
+echo "CDP_COMPONENTS_HOME     = $CDP_COMPONENTS_HOME"
+echo "IMPALA_HADOOP_VERSION   = $IMPALA_HADOOP_VERSION"
+echo "IMPALA_HIVE_VERSION     = $IMPALA_HIVE_VERSION"
+echo "IMPALA_HBASE_VERSION    = $IMPALA_HBASE_VERSION"
+echo "IMPALA_SENTRY_VERSION   = $IMPALA_SENTRY_VERSION"
+echo "IMPALA_KUDU_VERSION     = $IMPALA_KUDU_VERSION"
+echo "IMPALA_RANGER_VERSION   = $IMPALA_RANGER_VERSION"
 
 # Kerberos things.  If the cluster exists and is kerberized, source
 # the required environment.  This is required for any hadoop tool to

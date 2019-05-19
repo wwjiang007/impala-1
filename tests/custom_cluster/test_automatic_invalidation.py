@@ -19,7 +19,7 @@ import os
 import pytest
 import time
 from subprocess import call
-from tests.common.environ import IMPALAD_BUILD
+from tests.common.environ import IMPALA_TEST_CLUSTER_PROPERTIES
 from tests.util.filesystem_utils import IS_HDFS, IS_LOCAL
 
 
@@ -37,7 +37,8 @@ class TestAutomaticCatalogInvalidation(CustomClusterTestSuite):
 
   # The test will run a query and assumes the table is loaded when the query finishes.
   # The timeout should be larger than the time of the query.
-  timeout = 20 if IMPALAD_BUILD.runs_slowly() or (not IS_HDFS and not IS_LOCAL) else 10
+  timeout = 20 if IMPALA_TEST_CLUSTER_PROPERTIES.runs_slowly() or\
+               (not IS_HDFS and not IS_LOCAL) else 10
   timeout_flag = "--invalidate_tables_timeout_s=" + str(timeout)
 
   @classmethod
@@ -54,8 +55,8 @@ class TestAutomaticCatalogInvalidation(CustomClusterTestSuite):
     cursor.fetchall()
     # The table is cached after usage.
     assert self.metadata_cache_string in self._get_catalog_object()
-    # Wait 2 * table TTL for the invalidation to take effect.
-    max_wait_time = time.time() + self.timeout * 2
+    # Wait 5 * table TTL for the invalidation to take effect.
+    max_wait_time = time.time() + self.timeout * 5
     while True:
       time.sleep(1)
       # The table is eventually evicted.

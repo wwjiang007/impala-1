@@ -17,10 +17,8 @@
 
 package org.apache.impala.planner;
 
+import java.util.ArrayList;
 import java.util.List;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.Expr;
@@ -59,7 +57,7 @@ public class DataPartition {
     Preconditions.checkState(type == TPartitionType.UNPARTITIONED
         || type == TPartitionType.RANDOM);
     type_ = type;
-    partitionExprs_ = Lists.newArrayList();
+    partitionExprs_ = new ArrayList<>();
   }
 
   public final static DataPartition UNPARTITIONED =
@@ -113,7 +111,7 @@ public class DataPartition {
     StringBuilder str = new StringBuilder();
     str.append(getPartitionShortName(type_));
     if (!partitionExprs_.isEmpty()) {
-      List<String> strings = Lists.newArrayList();
+      List<String> strings = new ArrayList<>();
       for (Expr expr: partitionExprs_) {
         strings.add(expr.toSql());
       }

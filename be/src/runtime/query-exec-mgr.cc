@@ -47,7 +47,8 @@ Status QueryExecMgr::StartQuery(const TExecQueryFInstancesParams& params) {
           << " coord=" << TNetworkAddressToString(params.query_ctx.coord_address);
 
   bool dummy;
-  QueryState* qs = GetOrCreateQueryState(params.query_ctx, &dummy);
+  QueryState* qs =
+      GetOrCreateQueryState(params.query_ctx, params.per_backend_mem_limit, &dummy);
   Status status = qs->Init(params);
   if (!status.ok()) {
     qs->ReleaseBackendResourceRefcount(); // Release refcnt acquired in Init().
@@ -58,8 +59,8 @@ Status QueryExecMgr::StartQuery(const TExecQueryFInstancesParams& params) {
   // query startup (which takes ownership of the QueryState reference)
   unique_ptr<Thread> t;
   status = Thread::Create("query-exec-mgr",
-      Substitute("start-query-finstances-$0", PrintId(query_id)),
-          &QueryExecMgr::StartQueryHelper, this, qs, &t, true);
+      Substitute("query-state-$0", PrintId(query_id)),
+          &QueryExecMgr::ExecuteQueryHelper, this, qs, &t, true);
   if (!status.ok()) {
     // decrement refcount taken in QueryState::Init()
     qs->ReleaseBackendResourceRefcount();
@@ -71,9 +72,10 @@ Status QueryExecMgr::StartQuery(const TExecQueryFInstancesParams& params) {
   return Status::OK();
 }
 
-QueryState* QueryExecMgr::CreateQueryState(const TQueryCtx& query_ctx) {
+QueryState* QueryExecMgr::CreateQueryState(
+    const TQueryCtx& query_ctx, int64_t mem_limit) {
   bool created;
-  QueryState* qs = GetOrCreateQueryState(query_ctx, &created);
+  QueryState* qs = GetOrCreateQueryState(query_ctx, mem_limit, &created);
   DCHECK(created);
   return qs;
 }
@@ -97,7 +99,7 @@ QueryState* QueryExecMgr::GetQueryState(const TUniqueId& query_id) {
 }
 
 QueryState* QueryExecMgr::GetOrCreateQueryState(
-    const TQueryCtx& query_ctx, bool* created) {
+    const TQueryCtx& query_ctx, int64_t mem_limit, bool* created) {
   QueryState* qs = nullptr;
   int refcnt;
   {
@@ -107,8 +109,11 @@ QueryState* QueryExecMgr::GetOrCreateQueryState(
 
     auto it = map_ref->find(query_ctx.query_id);
     if (it == map_ref->end()) {
-      // register new QueryState
-      qs = new QueryState(query_ctx);
+      // Register new QueryState. This marks when the query first starts executing on
+      // this backend.
+      ImpaladMetrics::BACKEND_NUM_QUERIES_EXECUTED->Increment(1);
+      ImpaladMetrics::BACKEND_NUM_QUERIES_EXECUTING->Increment(1);
+      qs = new QueryState(query_ctx, mem_limit);
       map_ref->insert(make_pair(query_ctx.query_id, qs));
       *created = true;
     } else {
@@ -123,8 +128,9 @@ QueryState* QueryExecMgr::GetOrCreateQueryState(
 }
 
 
-void QueryExecMgr::StartQueryHelper(QueryState* qs) {
-  qs->StartFInstances();
+void QueryExecMgr::ExecuteQueryHelper(QueryState* qs) {
+  // Start the query fragment instances and wait for completion or errors.
+  if (LIKELY(qs->StartFInstances())) qs->MonitorFInstances();
 
 #if !defined(ADDRESS_SANITIZER) && !defined(THREAD_SANITIZER)
   // tcmalloc and address or thread sanitizer cannot be used together
@@ -174,7 +180,9 @@ void QueryExecMgr::ReleaseQueryState(QueryState* qs) {
     if (cnt > 0) return;
     map_ref->erase(it);
   }
-  // TODO: send final status report during gc, but do this from a different thread
   delete qs_from_map;
   VLOG(1) << "ReleaseQueryState(): deleted query_id=" << PrintId(query_id);
+  // BACKEND_NUM_QUERIES_EXECUTING is used to detect the backend being quiesced, so we
+  // decrement it after we're completely done with the query.
+  ImpaladMetrics::BACKEND_NUM_QUERIES_EXECUTING->Increment(-1);
 }

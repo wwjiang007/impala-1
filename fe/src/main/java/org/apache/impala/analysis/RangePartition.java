@@ -17,6 +17,8 @@
 
 package org.apache.impala.analysis;
 
+import static org.apache.impala.analysis.ToSqlOptions.DEFAULT;
+
 import java.math.BigInteger;
 import java.util.List;
 
@@ -24,10 +26,10 @@ import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.common.Pair;
+import org.apache.impala.service.FeSupport;
 import org.apache.impala.thrift.TRangePartition;
 import org.apache.impala.util.KuduUtil;
 
-import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
@@ -53,7 +55,7 @@ import com.google.common.collect.Lists;
  * where l_bound_type, u_bound_type are boolean values indicating if the associated bounds
  * are inclusive (true) or exclusive (false).
  */
-public class RangePartition implements ParseNode {
+public class RangePartition extends StmtNode {
 
   // Upper and lower bound exprs contain literals of the target column type post-analysis.
   // For TIMESTAMPs those are Kudu UNIXTIME_MICROS, i.e. int64s.
@@ -163,12 +165,13 @@ public class RangePartition implements ParseNode {
       throw new AnalysisException(String.format("Only constant values are allowed " +
           "for range-partition bounds: %s", value.toSql()));
     }
-    LiteralExpr literal = LiteralExpr.create(value, analyzer.getQueryCtx());
+    LiteralExpr literal = LiteralExpr.createBounded(value, analyzer.getQueryCtx(),
+        StringLiteral.MAX_STRING_LEN);
     if (literal == null) {
       throw new AnalysisException(String.format("Only constant values are allowed " +
           "for range-partition bounds: %s", value.toSql()));
     }
-    if (literal.getType().isNull()) {
+    if (Expr.IS_NULL_VALUE.apply(literal)) {
       throw new AnalysisException(String.format("Range partition values cannot be " +
           "NULL. Range partition: '%s'", toSql()));
     }
@@ -180,9 +183,10 @@ public class RangePartition implements ParseNode {
       // Add an explicit cast to TIMESTAMP
       Expr e = new CastExpr(new TypeDef(Type.TIMESTAMP), literal);
       e.analyze(analyzer);
-      literal = LiteralExpr.create(e, analyzer.getQueryCtx());
+      literal = LiteralExpr.createBounded(e, analyzer.getQueryCtx(),
+        StringLiteral.MAX_STRING_LEN);
       Preconditions.checkNotNull(literal);
-      if (literal.isNullLiteral()) {
+      if (Expr.IS_NULL_VALUE.apply(literal)) {
         throw new AnalysisException(String.format("Range partition value %s cannot be " +
             "cast to target TIMESTAMP partitioning column.", value.toSql()));
       }
@@ -198,7 +202,8 @@ public class RangePartition implements ParseNode {
     if (!literalType.equals(colType)) {
       Expr castLiteral = literal.uncheckedCastTo(colType);
       Preconditions.checkNotNull(castLiteral);
-      literal = LiteralExpr.create(castLiteral, analyzer.getQueryCtx());
+      literal = LiteralExpr.createBounded(castLiteral, analyzer.getQueryCtx(),
+        StringLiteral.MAX_STRING_LEN);
     }
     Preconditions.checkNotNull(literal);
 
@@ -216,18 +221,23 @@ public class RangePartition implements ParseNode {
   }
 
   @Override
-  public String toSql() {
+  public final String toSql() {
+    return toSql(DEFAULT);
+  }
+
+  @Override
+  public String toSql(ToSqlOptions options) {
     StringBuilder output = new StringBuilder();
     output.append("PARTITION ");
     if (isSingletonRange_) {
       output.append("VALUE = ");
       if (lowerBound_.size() > 1) output.append("(");
-      output.append(Expr.toSql(lowerBound_));
+      output.append(Expr.toSql(lowerBound_, options));
       if (lowerBound_.size() > 1) output.append(")");
     } else {
       if (!lowerBound_.isEmpty()) {
         if (lowerBound_.size() > 1) output.append("(");
-        output.append(Expr.toSql(lowerBound_));
+        output.append(Expr.toSql(lowerBound_, options));
         if (lowerBound_.size() > 1) output.append(")");
         output.append(lowerBoundInclusive_ ? " <= " : " < ");
       }
@@ -235,7 +245,7 @@ public class RangePartition implements ParseNode {
       if (!upperBound_.isEmpty()) {
         output.append(upperBoundInclusive_ ? " <= " : " < ");
         if (upperBound_.size() > 1) output.append("(");
-        output.append(Expr.toSql(upperBound_));
+        output.append(Expr.toSql(upperBound_, options));
         if (upperBound_.size() > 1) output.append(")");
       }
     }

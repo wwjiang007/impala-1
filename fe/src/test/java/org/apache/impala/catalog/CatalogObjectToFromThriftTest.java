@@ -19,13 +19,15 @@ package org.apache.impala.catalog;
 
 import static org.junit.Assert.fail;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Map;
 
 import org.apache.impala.analysis.LiteralExpr;
-import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.ImpalaException;
+import org.apache.impala.common.SqlCastException;
 import org.apache.impala.testutil.CatalogServiceTestCatalog;
+import org.apache.impala.testutil.TestUtils;
 import org.apache.impala.thrift.CatalogObjectsConstants;
 import org.apache.impala.thrift.TAccessLevel;
 import org.apache.impala.thrift.THBaseTable;
@@ -35,6 +37,7 @@ import org.apache.impala.thrift.TTable;
 import org.apache.impala.thrift.TTableType;
 import org.junit.AfterClass;
 import org.junit.Assert;
+import org.junit.Assume;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
@@ -208,13 +211,22 @@ public class CatalogObjectToFromThriftTest {
   }
 
   @Test
-  public void TestTableLoadingErrors() throws ImpalaException {
+  public void TestTableLoadingErrorsForHive2() throws ImpalaException {
+    // run the test only when it is running against Hive-2 since index tables are
+    // skipped during data-load against Hive-3
+    Assume.assumeTrue(
+        "Skipping this test since it is only supported when running against Hive-2",
+        TestUtils.getHiveMajorVersion() == 2);
     Table table = catalog_.getOrLoadTable("functional", "hive_index_tbl");
+    Assert.assertNotNull(table);
     TTable thriftTable = getThriftTable(table);
     Assert.assertEquals(thriftTable.tbl_name, "hive_index_tbl");
     Assert.assertEquals(thriftTable.db_name, "functional");
+  }
 
-    table = catalog_.getOrLoadTable("functional", "alltypes");
+  @Test
+  public void TestTableLoadingErrors() throws ImpalaException {
+    Table table = catalog_.getOrLoadTable("functional", "alltypes");
     HdfsTable hdfsTable = (HdfsTable) table;
     // Get any partition with valid HMS parameters to create a
     // dummy partition.
@@ -224,14 +236,15 @@ public class CatalogObjectToFromThriftTest {
     Assert.assertNotNull(part);;
     // Create a dummy partition with an invalid decimal type.
     try {
-      HdfsPartition dummyPart = new HdfsPartition(hdfsTable, part.toHmsPartition(),
-        Lists.newArrayList(LiteralExpr.create("1.1", ScalarType.createDecimalType(1, 0)),
-            LiteralExpr.create("1.1", ScalarType.createDecimalType(1, 0))),
-        null, Lists.<HdfsPartition.FileDescriptor>newArrayList(),
+      new HdfsPartition(hdfsTable, part.toHmsPartition(),
+        Lists.newArrayList(LiteralExpr.create("11.1", ScalarType.createDecimalType(1, 0)),
+            LiteralExpr.create("11.1", ScalarType.createDecimalType(1, 0))),
+        null, new ArrayList<>(),
         TAccessLevel.READ_WRITE);
       fail("Expected metadata to be malformed.");
-    } catch (AnalysisException e) {
-      Assert.assertTrue(e.getMessage().contains("invalid DECIMAL(1,0) value: 1.1"));
+    } catch (SqlCastException e) {
+      Assert.assertTrue(e.getMessage().contains(
+          "Value 11.1 cannot be cast to type DECIMAL(1,0)"));
     }
   }
 

@@ -27,7 +27,8 @@ import logging
 import os
 import pytest
 
-from tests.common.environ import specific_build_type_timeout
+import tests.common
+from tests.common.environ import build_flavor_timeout
 from common.test_result_verifier import QueryTestResult
 from tests.common.patterns import is_valid_impala_identifier
 from tests.comparison.db_connection import ImpalaConnection
@@ -52,7 +53,7 @@ if FILESYSTEM == 'isilon':
 
 # Timeout each individual test case after 2 hours, or 4 hours for slow builds
 PYTEST_TIMEOUT_S = \
-    specific_build_type_timeout(2 * 60 * 60, slow_build_timeout=4 * 60 * 60)
+    build_flavor_timeout(2 * 60 * 60, slow_build_timeout=4 * 60 * 60)
 
 def pytest_configure(config):
   """ Hook startup of pytest. Sets up log format and per-test timeout. """
@@ -78,9 +79,9 @@ def pytest_addoption(parser):
                    "format: workload:exploration_strategy. Ex: tpch:core,tpcds:pairwise.")
 
   parser.addoption("--impalad", default=DEFAULT_IMPALADS,
-                   help="A comma-separated list of impalad host:ports to target. Note: "
-                   "Not all tests make use of all impalad, some tests target just the "
-                   "first item in the list (it is considered the 'default'")
+                   help="A comma-separated list of impalad Beeswax host:ports to target. "
+                   "Note: Not all tests make use of all impalad, some tests target just "
+                   "the first item in the list (it is considered the 'default'")
 
   parser.addoption("--impalad_hs2_port", default=DEFAULT_IMPALAD_HS2_PORT,
                    help="The impalad HiveServer2 port.")
@@ -173,7 +174,9 @@ def pytest_assertrepr_compare(op, left, right):
   if isinstance(left, set) and isinstance(right, set) and op == '<=':
     # If expected is not a subset of actual, print out the set difference.
     result = ['Items in expected results not found in actual results:']
-    result.append(('').join(list(left - right)))
+    result.extend(list(left - right))
+    result.append('Items in actual results:')
+    result.extend(list(right))
     LOG.error('\n'.join(result))
     return result
 
@@ -195,8 +198,10 @@ def pytest_generate_tests(metafunc):
     metafunc.cls.add_test_dimensions()
     vectors = metafunc.cls.ImpalaTestMatrix.generate_test_vectors(
         metafunc.config.option.exploration_strategy)
+
     if len(vectors) == 0:
-      LOG.warning('No test vectors generated. Check constraints and input vectors')
+      LOG.warning("No test vectors generated for test '%s'. Check constraints and "
+          "input vectors" % metafunc.function.func_name)
 
     vector_names = map(str, vectors)
     # In the case this is a test result update or sanity run, select a single test vector
@@ -327,6 +332,29 @@ def unique_database(request, testid_checksum):
     LOG.info('Created database "{0}" for test ID "{1}"'.format(db_name,
                                                                str(request.node.nodeid)))
   return first_db_name
+
+
+@pytest.fixture
+def unique_role(request, testid_checksum):
+  """Returns a unique role to any test using the fixture. The fixture does not create
+  a role."""
+  role_name_prefix = request.function.__name__
+  fixture_params = getattr(request, 'param', None)
+  if fixture_params is not None:
+    if 'name_prefix' in fixture_params:
+      role_name_prefix = fixture_params['name_prefix']
+  return '{0}_{1}_role'.format(role_name_prefix, testid_checksum)
+
+
+@pytest.fixture
+def unique_name(request, testid_checksum):
+  """Returns a unique name to any test using the fixture."""
+  name_prefix = request.function.__name__
+  fixture_params = getattr(request, 'param', None)
+  if fixture_params is not None:
+    if 'name_prefix' in fixture_params:
+      name_prefix = fixture_params['name_prefix']
+  return '{0}_{1}'.format(name_prefix, testid_checksum)
 
 
 @pytest.yield_fixture
@@ -578,3 +606,13 @@ def pytest_collection_modifyitems(items, config, session):
 
   logging.info("pytest shard selection enabled %s. Of %d items, selected %d items by hash.",
       config.option.shard_tests, num_items, len(items))
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_runtest_logstart(nodeid, location):
+  # Beeswax doesn't support commas or equals in configuration, so they are replaced.
+  # Spaces are removed to make the string a little bit shorter.
+  # The string is shortened so that it is entirely spit out by ThriftDebugString, rather
+  # than being elided.
+  tests.common.current_node = \
+      nodeid.replace(",", ";").replace(" ", "").replace("=", "-")[0:255]

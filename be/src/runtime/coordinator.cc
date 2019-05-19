@@ -17,6 +17,8 @@
 
 #include "runtime/coordinator.h"
 
+#include <unordered_set>
+
 #include <thrift/protocol/TDebugProtocol.h>
 #include <boost/algorithm/string/join.hpp>
 #include <boost/filesystem.hpp>
@@ -41,8 +43,8 @@
 #include "scheduling/admission-controller.h"
 #include "scheduling/scheduler.h"
 #include "scheduling/query-schedule.h"
+#include "service/client-request-state.h"
 #include "util/bloom-filter.h"
-#include "util/counting-barrier.h"
 #include "util/hdfs-bulk-ops.h"
 #include "util/hdfs-util.h"
 #include "util/histogram-metric.h"
@@ -67,12 +69,14 @@ using namespace impala;
 // Maximum number of fragment instances that can publish each broadcast filter.
 static const int MAX_BROADCAST_FILTER_PRODUCERS = 3;
 
-Coordinator::Coordinator(
-    const QuerySchedule& schedule, RuntimeProfile::EventSequence* events)
-  : schedule_(schedule),
+Coordinator::Coordinator(ClientRequestState* parent, const QuerySchedule& schedule,
+    RuntimeProfile::EventSequence* events)
+  : parent_request_state_(parent),
+    schedule_(schedule),
     filter_mode_(schedule.query_options().runtime_filter_mode),
     obj_pool_(new ObjectPool()),
-    query_events_(events) {}
+    query_events_(events),
+    exec_rpcs_complete_barrier_(schedule_.per_backend_exec_params().size()) {}
 
 Coordinator::~Coordinator() {
   // Must have entered a terminal exec state guaranteeing resources were released.
@@ -97,17 +101,17 @@ Status Coordinator::Exec() {
   finalization_timer_ = ADD_TIMER(query_profile_, "FinalizationTimer");
   filter_updates_received_ = ADD_COUNTER(query_profile_, "FiltersReceived", TUnit::UNIT);
 
+  host_profiles_ = RuntimeProfile::Create(obj_pool(), "Per Node Profiles");
+  query_profile_->AddChild(host_profiles_);
+
   SCOPED_TIMER(query_profile_->total_time_counter());
 
   // initialize progress updater
   const string& str = Substitute("Query $0", PrintId(query_id()));
   progress_.Init(str, schedule_.num_scan_ranges());
 
-  // runtime filters not yet supported for mt execution
-  bool is_mt_execution = request.query_ctx.client_request.query_options.mt_dop > 0;
-  if (is_mt_execution) filter_mode_ = TRuntimeFilterMode::OFF;
-
-  query_state_ = ExecEnv::GetInstance()->query_exec_mgr()->CreateQueryState(query_ctx());
+  query_state_ = ExecEnv::GetInstance()->query_exec_mgr()->CreateQueryState(
+      query_ctx(), schedule_.per_backend_mem_limit());
   filter_mem_tracker_ = query_state_->obj_pool()->Add(new MemTracker(
       -1, "Runtime Filter (Coordinator)", query_state_->query_mem_tracker(), false));
 
@@ -204,7 +208,7 @@ void Coordinator::InitBackendStates() {
   for (const auto& entry: schedule_.per_backend_exec_params()) {
     BackendState* backend_state = obj_pool()->Add(
         new BackendState(*this, backend_idx, filter_mode_));
-    backend_state->Init(entry.second, fragment_stats_, obj_pool());
+    backend_state->Init(entry.second, fragment_stats_, host_profiles_, obj_pool());
     backend_states_[backend_idx++] = backend_state;
   }
 }
@@ -222,9 +226,34 @@ void Coordinator::ExecSummary::Init(const QuerySchedule& schedule) {
       int root_node_idx = thrift_exec_summary.nodes.size();
 
       const TPlan& plan = fragment.plan;
+      const TDataSink& output_sink = fragment.output_sink;
       int num_instances =
           schedule.GetFragmentExecParams(fragment.idx).instance_exec_params.size();
-      for (const TPlanNode& node: plan.nodes) {
+
+      // Add the data sink at the root of the fragment.
+      data_sink_id_to_idx_map[fragment.idx] = thrift_exec_summary.nodes.size();
+      thrift_exec_summary.nodes.emplace_back();
+      // Note that some clients like impala-shell depend on many of these fields being
+      // set, even if they are optional in the thrift.
+      TPlanNodeExecSummary& node_summary = thrift_exec_summary.nodes.back();
+      node_summary.__set_node_id(-1);
+      node_summary.__set_fragment_idx(fragment.idx);
+      node_summary.__set_label(output_sink.label);
+      node_summary.__set_label_detail("");
+      node_summary.__set_num_children(1);
+      DCHECK(output_sink.__isset.estimated_stats);
+      node_summary.__set_estimated_stats(output_sink.estimated_stats);
+      node_summary.exec_stats.resize(num_instances);
+
+      // We don't track rows returned from sinks, but some clients like impala-shell
+      // expect it to be set in the thrift struct. Set it to -1 for compatibility
+      // with those tools.
+      node_summary.estimated_stats.__set_cardinality(-1);
+      for (TExecStats& instance_stats : node_summary.exec_stats) {
+        instance_stats.__set_cardinality(-1);
+      }
+
+      for (const TPlanNode& node : plan.nodes) {
         node_id_to_idx_map[node.node_id] = thrift_exec_summary.nodes.size();
         thrift_exec_summary.nodes.emplace_back();
         TPlanNodeExecSummary& node_summary = thrift_exec_summary.nodes.back();
@@ -233,9 +262,8 @@ void Coordinator::ExecSummary::Init(const QuerySchedule& schedule) {
         node_summary.__set_label(node.label);
         node_summary.__set_label_detail(node.label_detail);
         node_summary.__set_num_children(node.num_children);
-        if (node.__isset.estimated_stats) {
-          node_summary.__set_estimated_stats(node.estimated_stats);
-        }
+        DCHECK(node.__isset.estimated_stats);
+        node_summary.__set_estimated_stats(node.estimated_stats);
         node_summary.exec_stats.resize(num_instances);
       }
 
@@ -254,7 +282,6 @@ void Coordinator::ExecSummary::Init(const QuerySchedule& schedule) {
 }
 
 void Coordinator::InitFilterRoutingTable() {
-  DCHECK(schedule_.request().query_ctx.client_request.query_options.mt_dop == 0);
   DCHECK_NE(filter_mode_, TRuntimeFilterMode::OFF)
       << "InitFilterRoutingTable() called although runtime filters are disabled";
   DCHECK(!filter_routing_table_complete_)
@@ -321,7 +348,6 @@ void Coordinator::InitFilterRoutingTable() {
 
 void Coordinator::StartBackendExec() {
   int num_backends = backend_states_.size();
-  exec_rpcs_complete_barrier_.reset(new CountingBarrier(num_backends));
   backend_exec_complete_barrier_.reset(new CountingBarrier(num_backends));
 
   DebugOptions debug_options(schedule_.query_options());
@@ -334,11 +360,11 @@ void Coordinator::StartBackendExec() {
     ExecEnv::GetInstance()->exec_rpc_thread_pool()->Offer(
         [backend_state, this, &debug_options]() {
           DebugActionNoFail(schedule_.query_options(), "COORD_BEFORE_EXEC_RPC");
-          backend_state->Exec(debug_options, filter_routing_table_,
-              exec_rpcs_complete_barrier_.get());
+          backend_state->Exec(
+              debug_options, filter_routing_table_, &exec_rpcs_complete_barrier_);
         });
   }
-  exec_rpcs_complete_barrier_->Wait();
+  exec_rpcs_complete_barrier_.Wait();
 
   VLOG_QUERY << "started execution on " << num_backends << " backends for query_id="
              << PrintId(query_id());
@@ -520,8 +546,7 @@ void Coordinator::HandleExecStateTransition(
   // Can't transition until the exec RPCs are no longer in progress. Otherwise, a
   // cancel RPC could be missed, and resources freed before a backend has had a chance
   // to take a resource reference.
-  DCHECK(exec_rpcs_complete_barrier_ != nullptr &&
-      exec_rpcs_complete_barrier_->pending() <= 0) << "exec rpcs not completed";
+  DCHECK_LE(exec_rpcs_complete_barrier_.pending(), 0) << "exec rpcs not completed";
 
   query_events_->MarkEvent(exec_state_to_event.at(new_state));
   // This thread won the race to transitioning into a terminal state - terminate
@@ -534,6 +559,8 @@ void Coordinator::HandleExecStateTransition(
     CancelBackends();
   }
   ReleaseAdmissionControlResources();
+  // Once the query has released its admission control resources, update its end time.
+  parent_request_state_->UpdateEndTime();
   // Can compute summary only after we stop accepting reports from the backends. Both
   // WaitForBackends() and CancelBackends() ensures that.
   // TODO: should move this off of the query execution path?
@@ -634,8 +661,7 @@ Status Coordinator::GetNext(QueryResultSet* results, int max_rows, bool* eos) {
 void Coordinator::Cancel() {
   // Illegal to call Cancel() before Exec() returns, so there's no danger of the cancel
   // RPC passing the exec RPC.
-  DCHECK(exec_rpcs_complete_barrier_ != nullptr &&
-      exec_rpcs_complete_barrier_->pending() <= 0) << "Exec() must be called first";
+  DCHECK_LE(exec_rpcs_complete_barrier_.pending(), 0) << "Exec() must be called first";
   discard_result(SetNonErrorTerminalState(ExecState::CANCELLED));
   // CancelBackends() is called for all transitions into a terminal state except
   // for RETURNED_RESULTS. We need to call it now because after Cancel() is called
@@ -659,23 +685,25 @@ void Coordinator::CancelBackends() {
       PrintId(query_id()), num_cancelled);
 }
 
-Status Coordinator::UpdateBackendExecStatus(const TReportExecStatusParams& params) {
+Status Coordinator::UpdateBackendExecStatus(const ReportExecStatusRequestPB& request,
+    const TRuntimeProfileForest& thrift_profiles) {
+  const int32_t coord_state_idx = request.coord_state_idx();
   VLOG_FILE << "UpdateBackendExecStatus() query_id=" << PrintId(query_id())
-            << " backend_idx=" << params.coord_state_idx;
-  if (params.coord_state_idx >= backend_states_.size()) {
+            << " backend_idx=" << coord_state_idx;
+
+  if (coord_state_idx >= backend_states_.size()) {
     return Status(TErrorCode::INTERNAL_ERROR,
         Substitute("Unknown backend index $0 (max known: $1)",
-            params.coord_state_idx, backend_states_.size() - 1));
+            coord_state_idx, backend_states_.size() - 1));
   }
-  BackendState* backend_state = backend_states_[params.coord_state_idx];
+  BackendState* backend_state = backend_states_[coord_state_idx];
 
-  // TODO: only do this when the sink is done; probably missing a done field
-  // in TReportExecStatus for that
-  if (params.__isset.insert_exec_status) {
-    dml_exec_state_.Update(params.insert_exec_status);
+  if (thrift_profiles.__isset.host_profile) {
+    backend_state->UpdateHostProfile(thrift_profiles.host_profile);
   }
 
-  if (backend_state->ApplyExecStatusReport(params, &exec_summary_, &progress_)) {
+  if (backend_state->ApplyExecStatusReport(request, thrift_profiles, &exec_summary_,
+          &progress_, &dml_exec_state_)) {
     // This backend execution has completed.
     if (VLOG_QUERY_IS_ON) {
       // Don't log backend completion if the query has already been cancelled.
@@ -694,7 +722,7 @@ Status Coordinator::UpdateBackendExecStatus(const TReportExecStatusParams& param
     if (!status.ok()) {
       // We may start receiving status reports before all exec rpcs are complete.
       // Can't apply state transition until no more exec rpcs will be sent.
-      exec_rpcs_complete_barrier_->Wait();
+      exec_rpcs_complete_barrier_.Wait();
       // Transition the status if we're not already in a terminal state. This won't block
       // because either this transitions to an ERROR state or the query is already in
       // a terminal state.
@@ -708,6 +736,30 @@ Status Coordinator::UpdateBackendExecStatus(const TReportExecStatusParams& param
   // If query execution has terminated, return a cancelled status to force the fragment
   // instance to stop executing.
   return IsExecuting() ? Status::OK() : Status::CANCELLED;
+}
+
+int64_t Coordinator::GetMaxBackendStateLagMs(TNetworkAddress* address) {
+  if (exec_rpcs_complete_barrier_.pending() > 0) {
+    // Exec() hadn't completed for all the backends, so we can't rely on
+    // 'last_report_time_ms_' being set yet.
+    return 0;
+  }
+  DCHECK_GT(backend_states_.size(), 0);
+  int64_t current_time = BackendState::GenerateReportTimestamp();
+  int64_t min_last_report_time_ms = current_time;
+  BackendState* min_state = nullptr;
+  for (BackendState* backend_state : backend_states_) {
+    if (backend_state->IsDone()) continue;
+    int64_t last_report_time_ms = backend_state->last_report_time_ms();
+    DCHECK_GT(last_report_time_ms, 0);
+    if (last_report_time_ms < min_last_report_time_ms) {
+      min_last_report_time_ms = last_report_time_ms;
+      min_state = backend_state;
+    }
+  }
+  if (min_state == nullptr) return 0;
+  *address = min_state->krpc_impalad_address();
+  return current_time - min_last_report_time_ms;
 }
 
 // TODO: add histogram/percentile
@@ -749,11 +801,49 @@ void Coordinator::ComputeQuerySummary() {
                     << ") ";
   }
 
+  // The total number of bytes read by this query.
   COUNTER_SET(ADD_COUNTER(query_profile_, "TotalBytesRead", TUnit::BYTES),
       total_utilization.bytes_read);
+  // The total number of bytes sent by this query in exchange nodes. Does not include
+  // remote reads, data written to disk, or data sent to the client.
+  COUNTER_SET(ADD_COUNTER(query_profile_, "TotalBytesSent", TUnit::BYTES),
+      total_utilization.scan_bytes_sent + total_utilization.exchange_bytes_sent);
+  // The total number of bytes sent by fragment instances that had a scan node in their
+  // plan.
+  COUNTER_SET(ADD_COUNTER(query_profile_, "TotalScanBytesSent", TUnit::BYTES),
+      total_utilization.scan_bytes_sent);
+  // The total number of bytes sent by fragment instances that did not have a scan node in
+  // their plan, i.e. that received their input data from other instances through exchange
+  // node.
+  COUNTER_SET(ADD_COUNTER(query_profile_, "TotalInnerBytesSent", TUnit::BYTES),
+      total_utilization.exchange_bytes_sent);
+
+  double xchg_scan_ratio = 0;
+  if (total_utilization.bytes_read > 0) {
+    xchg_scan_ratio =
+        (double)total_utilization.scan_bytes_sent / total_utilization.bytes_read;
+  }
+  // The ratio between TotalScanBytesSent and TotalBytesRead, i.e. the selectivity over
+  // all fragment instances that had a scan node in their plan.
+  COUNTER_SET(ADD_COUNTER(query_profile_, "ExchangeScanRatio", TUnit::DOUBLE_VALUE),
+      xchg_scan_ratio);
+
+  double inner_node_ratio = 0;
+  if (total_utilization.scan_bytes_sent > 0) {
+    inner_node_ratio =
+        (double)total_utilization.exchange_bytes_sent / total_utilization.scan_bytes_sent;
+  }
+  // The ratio between bytes sent by instances with a scan node in their plan and
+  // instances without a scan node in their plan. This indicates how well the inner nodes
+  // of the execution plan reduced the data volume.
+  COUNTER_SET(
+      ADD_COUNTER(query_profile_, "InnerNodeSelectivityRatio", TUnit::DOUBLE_VALUE),
+      inner_node_ratio);
+
   COUNTER_SET(ADD_COUNTER(query_profile_, "TotalCpuTime", TUnit::TIME_NS),
       total_utilization.cpu_user_ns + total_utilization.cpu_sys_ns);
 
+  // TODO(IMPALA-8126): Move to host profiles
   query_profile_->AddInfoString("Per Node Peak Memory Usage", mem_info.str());
   query_profile_->AddInfoString("Per Node Bytes Read", bytes_read_info.str());
   query_profile_->AddInfoString("Per Node User Time", cpu_user_info.str());
@@ -790,7 +880,8 @@ void Coordinator::ReleaseAdmissionControlResources() {
   AdmissionController* admission_controller =
       ExecEnv::GetInstance()->admission_controller();
   DCHECK(admission_controller != nullptr);
-  admission_controller->ReleaseQuery(schedule_);
+  admission_controller->ReleaseQuery(
+      schedule_, ComputeQueryResourceUtilization().peak_per_host_mem_consumption);
   query_events_->MarkEvent("Released admission control resources");
 }
 
@@ -802,14 +893,29 @@ Coordinator::ResourceUtilization Coordinator::ComputeQueryResourceUtilization() 
   return query_resource_utilization;
 }
 
+vector<TNetworkAddress> Coordinator::GetActiveBackends(
+    const vector<TNetworkAddress>& candidates) {
+  // Build set from vector so that runtime of this function is O(backend_states.size()).
+  unordered_set<TNetworkAddress> candidate_set(candidates.begin(), candidates.end());
+  vector<TNetworkAddress> result;
+  lock_guard<SpinLock> l(backend_states_init_lock_);
+  for (BackendState* backend_state : backend_states_) {
+    if (candidate_set.find(backend_state->impalad_address()) != candidate_set.end()
+        && !backend_state->IsDone()) {
+      result.push_back(backend_state->impalad_address());
+    }
+  }
+  return result;
+}
+
 void Coordinator::UpdateFilter(const TUpdateFilterParams& params) {
   shared_lock<shared_mutex> lock(filter_lock_);
   DCHECK_NE(filter_mode_, TRuntimeFilterMode::OFF)
       << "UpdateFilter() called although runtime filters are disabled";
-  DCHECK(exec_rpcs_complete_barrier_.get() != nullptr)
+  DCHECK(backend_exec_complete_barrier_.get() != nullptr)
       << "Filters received before fragments started!";
 
-  exec_rpcs_complete_barrier_->Wait();
+  exec_rpcs_complete_barrier_.Wait();
   DCHECK(filter_routing_table_complete_)
       << "Filter received before routing table complete";
 
@@ -943,7 +1049,8 @@ void Coordinator::FilterState::ApplyUpdate(const TUpdateFilterParams& params,
     } else if (min_max_filter_.always_false) {
       MinMaxFilter::Copy(params.min_max_filter, &min_max_filter_);
     } else {
-      MinMaxFilter::Or(params.min_max_filter, &min_max_filter_);
+      MinMaxFilter::Or(params.min_max_filter, &min_max_filter_,
+          ColumnType::FromThrift(desc_.src_expr.nodes[0].type));
     }
   }
 

@@ -20,16 +20,22 @@
 #include <limits>
 #include <memory>
 
+#include "gutil/strings/substitute.h"
+#include "rpc/rpc-mgr.h"
 #include "runtime/query-exec-mgr.h"
-#include "runtime/tmp-file-mgr.h"
 #include "runtime/query-state.h"
+#include "runtime/tmp-file-mgr.h"
+#include "service/control-service.h"
 #include "util/disk-info.h"
 #include "util/impalad-metrics.h"
-#include "gutil/strings/substitute.h"
+#include "util/memory-metrics.h"
+
 #include "common/names.h"
 
 using boost::scoped_ptr;
 using std::numeric_limits;
+
+DECLARE_string(hostname);
 
 namespace impala {
 
@@ -44,13 +50,12 @@ Status TestEnv::Init() {
   if (static_metrics_ == NULL) {
     static_metrics_.reset(new MetricGroup("test-env-static-metrics"));
     ImpaladMetrics::CreateMetrics(static_metrics_.get());
+    RETURN_IF_ERROR(RegisterMemoryMetrics(static_metrics_.get(), true, nullptr, nullptr));
   }
 
   exec_env_.reset(new ExecEnv);
   // Populate the ExecEnv state that the backend tests need.
-  exec_env_->mem_tracker_.reset(new MemTracker(-1, "Process"));
   RETURN_IF_ERROR(exec_env_->disk_io_mgr()->Init());
-  exec_env_->metrics_.reset(new MetricGroup("test-env-metrics"));
   exec_env_->tmp_file_mgr_.reset(new TmpFileMgr);
   if (have_tmp_file_mgr_args_) {
     RETURN_IF_ERROR(
@@ -58,8 +63,24 @@ Status TestEnv::Init() {
   } else {
     RETURN_IF_ERROR(tmp_file_mgr()->Init(metrics()));
   }
-  exec_env_->InitBufferPool(buffer_pool_min_buffer_len_, buffer_pool_capacity_,
-      static_cast<int64_t>(0.1 * buffer_pool_capacity_));
+  if (enable_buffer_pool_) {
+    exec_env_->InitBufferPool(buffer_pool_min_buffer_len_, buffer_pool_capacity_,
+        static_cast<int64_t>(0.1 * buffer_pool_capacity_));
+  }
+  if (process_mem_tracker_use_metrics_) {
+    exec_env_->InitMemTracker(process_mem_limit_);
+  } else {
+    exec_env_->mem_tracker_.reset(new MemTracker(process_mem_limit_, "Process"));
+  }
+
+  // Initialize RpcMgr and control service.
+  IpAddr ip_address;
+  RETURN_IF_ERROR(HostnameToIpAddr(FLAGS_hostname, &ip_address));
+  exec_env_->krpc_address_.__set_hostname(ip_address);
+  RETURN_IF_ERROR(exec_env_->rpc_mgr_->Init());
+  exec_env_->control_svc_.reset(new ControlService(exec_env_->rpc_metrics_));
+  RETURN_IF_ERROR(exec_env_->control_svc_->Init());
+
   return Status::OK();
 }
 
@@ -73,6 +94,11 @@ void TestEnv::SetTmpFileMgrArgs(
 void TestEnv::SetBufferPoolArgs(int64_t min_buffer_len, int64_t capacity) {
   buffer_pool_min_buffer_len_ = min_buffer_len;
   buffer_pool_capacity_ = capacity;
+}
+
+void TestEnv::SetProcessMemTrackerArgs(int64_t bytes_limit, bool use_metrics) {
+  process_mem_limit_ = bytes_limit;
+  process_mem_tracker_use_metrics_ = use_metrics;
 }
 
 TestEnv::~TestEnv() {
@@ -113,9 +139,16 @@ Status TestEnv::CreateQueryState(
   query_ctx.query_id.hi = 0;
   query_ctx.query_id.lo = query_id;
   query_ctx.request_pool = "test-pool";
+  query_ctx.coord_address = exec_env_->configured_backend_address_;
+  query_ctx.coord_krpc_address = exec_env_->krpc_address_;
+  TQueryOptions* query_options_to_use = &query_ctx.client_request.query_options;
+  int64_t mem_limit =
+      query_options_to_use->__isset.mem_limit && query_options_to_use->mem_limit > 0 ?
+      query_options_to_use->mem_limit :
+      -1;
 
   // CreateQueryState() enforces the invariant that 'query_id' must be unique.
-  QueryState* qs = exec_env_->query_exec_mgr()->CreateQueryState(query_ctx);
+  QueryState* qs = exec_env_->query_exec_mgr()->CreateQueryState(query_ctx, mem_limit);
   query_states_.push_back(qs);
   // make sure to initialize data structures unrelated to the TExecQueryFInstancesParams
   // param
@@ -128,7 +161,8 @@ Status TestEnv::CreateQueryState(
       vector<TPlanFragmentInstanceCtx>({TPlanFragmentInstanceCtx()}));
   RETURN_IF_ERROR(qs->Init(rpc_params));
   FragmentInstanceState* fis = qs->obj_pool()->Add(
-      new FragmentInstanceState(qs, qs->rpc_params().fragment_ctxs[0], qs->rpc_params().fragment_instance_ctxs[0]));
+      new FragmentInstanceState(qs, qs->exec_rpc_params().fragment_ctxs[0],
+          qs->exec_rpc_params().fragment_instance_ctxs[0]));
   RuntimeState* rs = qs->obj_pool()->Add(
       new RuntimeState(qs, fis->fragment_ctx(), fis->instance_ctx(), exec_env_.get()));
   runtime_states_.push_back(rs);

@@ -24,9 +24,14 @@ import static org.apache.impala.common.ByteUnits.PETABYTE;
 import static org.apache.impala.common.ByteUnits.TERABYTE;
 
 import java.text.DecimalFormat;
+import java.util.Iterator;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.apache.commons.lang3.StringUtils;
-import org.apache.impala.planner.PlanFragmentId;
+import org.apache.commons.lang3.text.WordUtils;
+
+import com.google.common.base.Joiner;
 
 /**
  * Utility functions for pretty printing.
@@ -49,6 +54,73 @@ public class PrintUtils {
     return bytes + "B";
   }
 
+  public static final long KILO = 1000;
+  public static final long MEGA = KILO * 1000;
+  public static final long GIGA = MEGA * 1000;
+  public static final long TERA = GIGA * 1000;
+
+  /**
+   * Print a value using simple metric (power of 1000) units. Units are
+   * (none), K, M, G or T. Value has two digits past the decimal point.
+   */
+  public static String printMetric(long value) {
+    double result = value;
+    if (value >= TERA) return new DecimalFormat(".00T").format(result / TERA);
+    if (value >= GIGA) return new DecimalFormat(".00G").format(result / GIGA);
+    if (value >= MEGA) return new DecimalFormat(".00M").format(result / MEGA);
+    if (value >= KILO) return new DecimalFormat(".00K").format(result / KILO);
+    return Long.toString(value);
+  }
+
+  /**
+   * Pattern to use when searching for a metric-encoded value.
+   */
+  public static final String METRIC_REGEX = "(\\d+(?:.\\d+)?)([TGMK]?)";
+
+  /**
+   * Pattern to use when searching for or parsing a metric-encoded value.
+   */
+  public static final Pattern METRIC_PATTERN =
+      Pattern.compile(METRIC_REGEX, Pattern.CASE_INSENSITIVE);
+
+  /**
+   * Decode a value metric-encoded using {@link #printMetric(long)}.
+   * @param value metric-encoded string
+   * @return approximate numeric value, or -1 if the value is invalid
+   * (metric encoded strings can never be negative normally)
+   */
+  public static double decodeMetric(String value) {
+    Matcher m = METRIC_PATTERN.matcher(value);
+    if (! m.matches()) return -1;
+    return decodeMetric(m.group(1), m.group(2));
+  }
+
+  /**
+   * Decode a metric-encoded string already parsed into parts.
+   * @param valueStr numeric part of the value
+   * @param units units part of the value
+   * @return approximate numeric value
+   */
+  // Yes, "PrintUtils" is an odd place for a parse function, but
+  // best to keep the formatter and parser together.
+  public static double decodeMetric(String valueStr, String units) {
+    double value = Double.parseDouble(valueStr);
+    switch (units.toUpperCase()) {
+    case "":
+      return value;
+    case "K":
+      return value * KILO;
+    case "M":
+      return value * MEGA;
+    case "G":
+      return value * GIGA;
+    case "T":
+      return value * TERA;
+    default:
+      return -1;
+    }
+  }
+
   /**
    * Same as printBytes() except 0 decimal points are shown for MB and KB.
    */
@@ -65,9 +137,26 @@ public class PrintUtils {
     return bytes + "B";
   }
 
-  public static String printCardinality(String prefix, long cardinality) {
-    return prefix + "cardinality=" +
-        ((cardinality != -1) ? String.valueOf(cardinality) : "unavailable");
+  /**
+   * Print an estimated cardinality. No need to print the exact value
+   * because estimates are not super-precise.
+   */
+  public static String printEstCardinality(long cardinality) {
+    return (cardinality != -1) ? printMetric(cardinality) : "unavailable";
+  }
+
+  /**
+   * Print an exact cardinality (such as a row count) as one of three formats:
+   *
+   * * "unavailable" (if value < 0)
+   * * number (if value is small)
+   * * xx.xxU (dd,ddd) (if the value is large)
+   */
+  public static String printExactCardinality(long value) {
+    if (value == -1) return "unavailable";
+    String result = printMetric(value);
+    if (value < KILO) return result;
+    return String.format("%s (%,d)", result, value);
   }
 
   public static String printNumHosts(String prefix, long numHosts) {
@@ -100,5 +189,26 @@ public class PrintUtils {
       }
       matrixStr.append("\n");
     }
+  }
+
+  /**
+   * Wrap a string by inserting newlines so that no line exceeds a given length.
+   * Any newlines in the input are maintained.
+   */
+  public static String wrapString(String s, int wrapLength) {
+    String wrapped = WordUtils.wrap(s, wrapLength, null, true);
+    // Remove any trailing blanks from a line.
+    wrapped = wrapped.replaceAll(" +$", "");
+    return wrapped;
+  }
+
+  /**
+   * Join the objects in 'objects' in a human-readable form, such as
+   * "'obj 1', 'obj 2', 'obj 3'". No escaping of quotes is performed.
+   */
+  public static String joinQuoted(Iterable<?> objs) {
+    Iterator<?> it = objs.iterator();
+    if (!it.hasNext()) return "";
+    return "'" + Joiner.on("', '").join(it) + "'";
   }
 }

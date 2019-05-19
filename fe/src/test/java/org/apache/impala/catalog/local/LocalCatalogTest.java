@@ -22,7 +22,10 @@ import static org.junit.Assert.*;
 import java.util.List;
 import java.util.Set;
 
+import org.apache.hive.service.rpc.thrift.TGetTablesReq;
+import org.apache.impala.analysis.Expr;
 import org.apache.impala.analysis.ToSqlUtils;
+import org.apache.impala.authorization.NoopAuthorizationFactory;
 import org.apache.impala.catalog.CatalogTest;
 import org.apache.impala.catalog.ColumnStats;
 import org.apache.impala.catalog.FeCatalogUtils;
@@ -35,7 +38,11 @@ import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.service.BackendConfig;
 import org.apache.impala.service.FeSupport;
+import org.apache.impala.service.Frontend;
 import org.apache.impala.thrift.TCatalogObjectType;
+import org.apache.impala.thrift.TMetadataOpRequest;
+import org.apache.impala.thrift.TMetadataOpcode;
+import org.apache.impala.thrift.TResultRow;
 import org.apache.impala.thrift.TResultSet;
 import org.apache.impala.util.MetaStoreUtil;
 import org.apache.impala.util.PatternMatcher;
@@ -51,12 +58,14 @@ import com.google.common.collect.Iterables;
 public class LocalCatalogTest {
   private CatalogdMetaProvider provider_;
   private LocalCatalog catalog_;
+  private Frontend fe_;
 
   @Before
-  public void setupCatalog() {
+  public void setupCatalog() throws Exception {
     FeSupport.loadLibrary();
     provider_ = new CatalogdMetaProvider(BackendConfig.INSTANCE.getBackendCfg());
     catalog_ = new LocalCatalog(provider_, /*defaultKuduMasterHosts=*/null);
+    fe_ = new Frontend(new NoopAuthorizationFactory(), catalog_);
   }
 
   @Test
@@ -122,6 +131,25 @@ public class LocalCatalogTest {
   }
 
   @Test
+  public void testLoadDateTableBasics() throws Exception {
+    FeDb functionalDb = catalog_.getDb("functional");
+    CatalogTest.checkTableCols(functionalDb, "date_tbl", 1,
+        new String[] {"date_part", "id_col", "date_col"},
+        new Type[] {Type.DATE, Type.INT, Type.DATE});
+    FeTable t = functionalDb.getTable("date_tbl");
+    assertEquals(22, t.getNumRows());
+
+    assertTrue(t instanceof LocalFsTable);
+    FeFsTable fsTable = (FeFsTable) t;
+    assertEquals(MetaStoreUtil.DEFAULT_NULL_PARTITION_KEY_VALUE,
+        fsTable.getNullPartitionKeyValue());
+
+    // Stats should have one row per partition, plus a "total" row.
+    TResultSet stats = fsTable.getTableStats();
+    assertEquals(5, stats.getRowsSize());
+  }
+
+  @Test
   public void testPartitioning() throws Exception {
     FeFsTable t = (FeFsTable) catalog_.getTable("functional",  "alltypes");
     // TODO(todd): once we support file descriptors in LocalCatalog,
@@ -142,7 +170,7 @@ public class LocalCatalogTest {
     assertEquals(1,  ids.size());
     FeFsPartition partition = FeCatalogUtils.loadPartition(
         t, Iterables.getOnlyElement(ids));
-    assertTrue(partition.getPartitionValue(dayCol).isNullLiteral());
+    assertTrue(Expr.IS_NULL_VALUE.apply(partition.getPartitionValue(dayCol)));
   }
 
   @Test
@@ -191,7 +219,22 @@ public class LocalCatalogTest {
     // Verify expected stats for timestamp.
     stats = t.getColumn("timestamp_col").getStats();
     assertEquals(10210, stats.getNumDistinctValues());
-    assertEquals(-1, stats.getNumNulls());
+    assertEquals(0, stats.getNumNulls());
+  }
+
+  @Test
+  public void testDateColumnStats() throws Exception {
+    FeFsTable t = (FeFsTable) catalog_.getTable("functional",  "date_tbl");
+    // Verify expected stats for a partitioning column.
+    // 'date_part' has 4 non-NULL partitions
+    ColumnStats stats = t.getColumn("date_part").getStats();
+    assertEquals(4, stats.getNumDistinctValues());
+    assertEquals(0, stats.getNumNulls());
+
+    // Verify expected stats for date_col.
+    stats = t.getColumn("date_col").getStats();
+    assertEquals(16, stats.getNumDistinctValues());
+    assertEquals(2, stats.getNumNulls());
   }
 
   @Test
@@ -258,6 +301,18 @@ public class LocalCatalogTest {
         "d:date_string_col,d:string_col,d:timestamp_col,d:year,d:month', " +
         "'serialization.format'='1')"
     ));
+
+    t = (LocalHbaseTable) catalog_.getTable("functional_hbase", "date_tbl");
+    Assert.assertThat(ToSqlUtils.getCreateTableSql(t), CoreMatchers.startsWith(
+        "CREATE EXTERNAL TABLE functional_hbase.date_tbl (\n" +
+        "  id_col INT,\n" +
+        "  date_col DATE,\n" +
+        "  date_part DATE\n" +
+        ")\n" +
+        "STORED BY 'org.apache.hadoop.hive.hbase.HBaseStorageHandler'\n" +
+        "WITH SERDEPROPERTIES ('hbase.columns.mapping'=':key,d:date_col,d:date_part', " +
+        "'serialization.format'='1')"
+    ));
   }
 
   /**
@@ -282,5 +337,38 @@ public class LocalCatalogTest {
     // The tinyint column should get promoted to INT to be Avro-compatible.
     assertEquals(t.getColumn("tinyint_col").getType(), Type.INT);
     assertTrue(t.usesAvroSchemaOverride());
+  }
+
+  /**
+   * Test handling of skip.header.line.count property for text tables.
+   */
+  @Test
+  public void testSkipHeaderLine() throws Exception {
+    // Table without header.
+    FeFsTable alltypes = (FeFsTable)catalog_.getTable("functional", "alltypes");
+    StringBuilder error = new StringBuilder();
+    assertEquals(alltypes.parseSkipHeaderLineCount(error), 0);
+    assertEquals(error.length(), 0);
+
+    // Table with header.
+    FeFsTable table_with_header =
+        (FeFsTable)catalog_.getTable("functional", "table_with_header");
+    assertEquals(table_with_header.parseSkipHeaderLineCount(error), 1);
+    assertEquals(error.length(), 0);
+  }
+
+  /**
+   * Test GET_TABLES request on an Impala incompatible table. It should be silently
+   * ignored.
+   */
+  @Test
+  public void testGetTables() throws Exception {
+    TMetadataOpRequest req = new TMetadataOpRequest();
+    req.opcode = TMetadataOpcode.GET_TABLES;
+    req.get_tables_req = new TGetTablesReq();
+    req.get_tables_req.setSchemaName("functional");
+    req.get_tables_req.setTableName("bad_serde");
+    TResultSet resp = fe_.execHiveServer2MetadataOp(req);
+    assertEquals(0, resp.rows.size());
   }
 }

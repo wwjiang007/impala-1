@@ -16,7 +16,8 @@
 # under the License.
 
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfS3, SkipIfADLS, SkipIfLocal
+from tests.common.skip import (SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfLocal,
+                               SkipIfCatalogV2)
 from tests.common.test_dimensions import (
     create_single_exec_option_dimension,
     create_uncompressed_text_dimension)
@@ -28,6 +29,7 @@ TBL_LOC = '%s/%s' % (WAREHOUSE, TEST_TBL)
 
 
 @SkipIfS3.hdfs_acls
+@SkipIfABFS.hdfs_acls
 @SkipIfADLS.hdfs_acls
 @SkipIfLocal.hdfs_client
 class TestHdfsPermissions(ImpalaTestSuite):
@@ -52,6 +54,7 @@ class TestHdfsPermissions(ImpalaTestSuite):
     self.client.execute('drop table if exists %s' % TEST_TBL)
     self.hdfs_client.delete_file_dir('test-warehouse/%s' % TEST_TBL, recursive=True)
 
+  @SkipIfCatalogV2.impala_7539()
   def test_insert_into_read_only_table(self, vector):
     permission = 444
     if IS_ISILON:

@@ -19,6 +19,7 @@
 
 #include <boost/scoped_ptr.hpp>
 
+#include "exec/exec-node-util.h"
 #include "exprs/scalar-expr.h"
 #include "runtime/exec-env.h"
 #include "runtime/krpc-data-stream-mgr.h"
@@ -88,7 +89,7 @@ Status ExchangeNode::Prepare(RuntimeState* state) {
   // TODO: figure out appropriate buffer size
   DCHECK_GT(num_senders_, 0);
   stream_recvr_ = ExecEnv::GetInstance()->stream_mgr()->CreateRecvr(
-      &input_row_desc_, state->fragment_instance_id(), id_, num_senders_,
+      &input_row_desc_, *state, state->fragment_instance_id(), id_, num_senders_,
       FLAGS_exchg_node_buffer_size_bytes, is_merging_, runtime_profile(), mem_tracker(),
       &recvr_buffer_pool_client_);
 
@@ -113,6 +114,7 @@ void ExchangeNode::Codegen(RuntimeState* state) {
 
 Status ExchangeNode::Open(RuntimeState* state) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedOpenEventAdder ea(this);
   RETURN_IF_ERROR(ExecNode::Open(state));
   RETURN_IF_CANCELLED(state);
   if (is_merging_) {
@@ -127,7 +129,7 @@ Status ExchangeNode::Open(RuntimeState* state) {
   return Status::OK();
 }
 
-Status ExchangeNode::Reset(RuntimeState* state) {
+Status ExchangeNode::Reset(RuntimeState* state, RowBatch* row_batch) {
   DCHECK(false) << "NYI";
   return Status("NYI");
 }
@@ -156,8 +158,9 @@ Status ExchangeNode::FillInputRowBatch(RuntimeState* state) {
 }
 
 Status ExchangeNode::GetNext(RuntimeState* state, RowBatch* output_batch, bool* eos) {
-  RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::GETNEXT, state));
   SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedGetNextEventAdder ea(this, eos);
+  RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::GETNEXT, state));
   if (ReachedLimit()) {
     stream_recvr_->TransferAllResources(output_batch);
     *eos = true;
@@ -175,7 +178,7 @@ Status ExchangeNode::GetNext(RuntimeState* state, RowBatch* output_batch, bool* 
       RETURN_IF_ERROR(QueryMaintenance(state));
       // copy rows until we hit the limit/capacity or until we exhaust input_batch_
       while (!ReachedLimit() && !output_batch->AtCapacity()
-          && input_batch_ != NULL && next_row_idx_ < input_batch_->capacity()) {
+          && input_batch_ != NULL && next_row_idx_ < input_batch_->num_rows()) {
         TupleRow* src = input_batch_->GetRow(next_row_idx_);
         ++next_row_idx_;
         int j = output_batch->AddRow();
@@ -187,9 +190,9 @@ Status ExchangeNode::GetNext(RuntimeState* state, RowBatch* output_batch, bool* 
         // rows in output_batch
         input_batch_->CopyRow(src, dest);
         output_batch->CommitLastRow();
-        ++num_rows_returned_;
+        IncrementNumRowsReturned(1);
       }
-      COUNTER_SET(rows_returned_counter_, num_rows_returned_);
+      COUNTER_SET(rows_returned_counter_, rows_returned());
 
       if (ReachedLimit()) {
         stream_recvr_->TransferAllResources(output_batch);
@@ -221,7 +224,7 @@ Status ExchangeNode::GetNextMerging(RuntimeState* state, RowBatch* output_batch,
   while (num_rows_skipped_ < offset_) {
     num_rows_skipped_ += output_batch->num_rows();
     // Throw away rows in the output batch until the offset is skipped.
-    int rows_to_keep = num_rows_skipped_ - offset_;
+    int64_t rows_to_keep = num_rows_skipped_ - offset_;
     if (rows_to_keep > 0) {
       output_batch->CopyRows(0, output_batch->num_rows() - rows_to_keep, rows_to_keep);
       output_batch->set_num_rows(rows_to_keep);
@@ -232,18 +235,13 @@ Status ExchangeNode::GetNextMerging(RuntimeState* state, RowBatch* output_batch,
     RETURN_IF_ERROR(stream_recvr_->GetNext(output_batch, eos));
   }
 
-  num_rows_returned_ += output_batch->num_rows();
-  if (ReachedLimit()) {
-    output_batch->set_num_rows(output_batch->num_rows() - (num_rows_returned_ - limit_));
-    num_rows_returned_ = limit_;
-    *eos = true;
-  }
+  CheckLimitAndTruncateRowBatchIfNeeded(output_batch, eos);
 
   // On eos, transfer all remaining resources from the input batches maintained
   // by the merger to the output batch.
   if (*eos) stream_recvr_->TransferAllResources(output_batch);
 
-  COUNTER_SET(rows_returned_counter_, num_rows_returned_);
+  COUNTER_SET(rows_returned_counter_, rows_returned());
   return Status::OK();
 }
 

@@ -154,13 +154,13 @@ struct TGetDataSrcsResult {
 enum TDescribeOutputStyle {
   // The default output style if no options are specified for
   // DESCRIBE DATABASE <db> and DESCRIBE <table>.
-  MINIMAL,
+  MINIMAL = 0
 
   // Output additional information on the database or table.
   // Set for both DESCRIBE DATABASE FORMATTED|EXTENDED <db>
   // and DESCRIBE FORMATTED|EXTENDED <table> statements.
-  EXTENDED,
-  FORMATTED
+  EXTENDED = 1
+  FORMATTED = 2
 }
 
 // Arguments to DescribeDb, which returns a list of properties for a given database.
@@ -213,10 +213,10 @@ struct TShowDbsParams {
 
 // Used by SHOW STATS and SHOW PARTITIONS to control what information is returned.
 enum TShowStatsOp {
-  TABLE_STATS,
-  COLUMN_STATS,
-  PARTITIONS,
-  RANGE_PARTITIONS
+  TABLE_STATS = 0
+  COLUMN_STATS = 1
+  PARTITIONS = 2
+  RANGE_PARTITIONS = 3
 }
 
 // Parameters for SHOW TABLE/COLUMN STATS and SHOW PARTITIONS commands
@@ -264,7 +264,7 @@ struct TShowRolesParams {
   // True if this opertion requires admin privileges on the Sentry Service. This is
   // needed to check for the case where an operation is_user_scope, but the user does
   // not belong to the specified grant_group.
-  2: required bool is_admin_op
+  // REMOVED: 2: required bool is_admin_op
 
   // True if the statement is "SHOW CURRENT ROLES".
   3: required bool is_show_current_roles
@@ -292,7 +292,7 @@ struct TShowGrantPrincipalParams {
 
   // True if this operation requires admin privileges on the Sentry Service (when
   // the requesting user has not been granted the target role name).
-  4: required bool is_admin_op
+  // REMOVED: 4: required bool is_admin_op
 
   // An optional filter to show grants that match a specific privilege spec.
   5: optional CatalogObjects.TPrivilege privilege
@@ -441,21 +441,21 @@ struct TQueryExecRequest {
 }
 
 enum TCatalogOpType {
-  SHOW_TABLES,
-  SHOW_DBS,
-  SHOW_STATS,
-  USE,
-  DESCRIBE_TABLE,
-  DESCRIBE_DB,
-  SHOW_FUNCTIONS,
-  RESET_METADATA,
-  DDL,
-  SHOW_CREATE_TABLE,
-  SHOW_DATA_SRCS,
-  SHOW_ROLES,
-  SHOW_GRANT_PRINCIPAL,
-  SHOW_FILES,
-  SHOW_CREATE_FUNCTION
+  SHOW_TABLES = 0
+  SHOW_DBS = 1
+  SHOW_STATS = 2
+  USE = 3
+  DESCRIBE_TABLE = 4
+  DESCRIBE_DB = 5
+  SHOW_FUNCTIONS = 6
+  RESET_METADATA = 7
+  DDL = 8
+  SHOW_CREATE_TABLE = 9
+  SHOW_DATA_SRCS = 10
+  SHOW_ROLES = 11
+  SHOW_GRANT_PRINCIPAL = 12
+  SHOW_FILES = 13
+  SHOW_CREATE_FUNCTION = 14
 }
 
 // TODO: Combine SHOW requests with a single struct that contains a field
@@ -540,7 +540,7 @@ struct TShutdownParams {
 
 // The type of administrative function to be executed.
 enum TAdminRequestType {
-  SHUTDOWN
+  SHUTDOWN = 0
 }
 
 // Parameters for administrative function statement. This is essentially a tagged union
@@ -554,13 +554,13 @@ struct TAdminRequest {
 
 // HiveServer2 Metadata operations (JniFrontend.hiveServer2MetadataOperation)
 enum TMetadataOpcode {
-  GET_TYPE_INFO,
-  GET_CATALOGS,
-  GET_SCHEMAS,
-  GET_TABLES,
-  GET_TABLE_TYPES,
-  GET_COLUMNS,
-  GET_FUNCTIONS
+  GET_TYPE_INFO = 0
+  GET_CATALOGS = 1
+  GET_SCHEMAS = 2
+  GET_TABLES = 3
+  GET_TABLE_TYPES = 4
+  GET_COLUMNS = 5
+  GET_FUNCTIONS = 6
 }
 
 // Input parameter to JniFrontend.hiveServer2MetadataOperation
@@ -634,6 +634,7 @@ struct TExecRequest {
   10: optional TSetQueryOptionRequest set_query_option_request
 
   // Timeline of planner's operation, for profiling
+  // TODO(todd): should integrate this with the 'profile' member instead.
   11: optional RuntimeProfile.TEventSequence timeline
 
   // If false, the user that runs this statement doesn't have access to the runtime
@@ -643,6 +644,12 @@ struct TExecRequest {
 
   // Set iff stmt_type is ADMIN_FN.
   13: optional TAdminRequest admin_request
+
+  // Profile information from the planning process.
+  14: optional RuntimeProfile.TRuntimeProfileNode profile
+
+  // Set iff stmt_type is TESTCASE
+  15: optional string testcase_data_path
 }
 
 // Parameters to FeSupport.cacheJar().
@@ -662,9 +669,9 @@ struct TCacheJarResult {
 // A UDF may include optional prepare and close functions in addition the main evaluation
 // function. This enum distinguishes between these when doing a symbol lookup.
 enum TSymbolType {
-  UDF_EVALUATE,
-  UDF_PREPARE,
-  UDF_CLOSE,
+  UDF_EVALUATE = 0
+  UDF_PREPARE = 1
+  UDF_CLOSE = 2
 }
 
 // Parameters to pass to validate that the binary contains the symbol. If the
@@ -703,9 +710,9 @@ struct TSymbolLookupParams {
 }
 
 enum TSymbolLookupResultCode {
-  SYMBOL_FOUND,
-  BINARY_NOT_FOUND,
-  SYMBOL_NOT_FOUND,
+  SYMBOL_FOUND = 0
+  BINARY_NOT_FOUND = 1
+  SYMBOL_NOT_FOUND = 2
 }
 
 struct TSymbolLookupResult {
@@ -900,4 +907,28 @@ struct TGetHadoopGroupsResponse {
 struct TBuildTestDescriptorTableParams {
   // Every entry describes the slot types of one tuple.
   1: required list<list<Types.TColumnType>> slot_types
+}
+
+// Output format for generating a testcase for a given query_stmt. The resulting bytes
+// are compressed before writing to a file.
+// TODO: Add the EXPLAIN string from the source cluster on which the testcase was
+// collected.
+struct TTestCaseData {
+  // Query statemnt for which this test case data is generated.
+  1: required string query_stmt
+
+  // All referenced table and view defs.
+  2: optional list<CatalogObjects.TTable> tables_and_views
+
+  // All databases referenced in the query.
+  3: optional list<CatalogObjects.TDatabase> dbs
+
+  // Output path
+  4: required string testcase_data_path
+
+  // Impala version that was used to generate this testcase.
+  // TODO: How to deal with version incompatibilities? E.g: A testcase collected on
+  // Impala version v1 may or may not be compatible to Impala version v2 if the
+  // underlying thrift layout changes.
+  5: required string impala_version
 }

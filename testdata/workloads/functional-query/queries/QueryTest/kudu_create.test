@@ -32,11 +32,17 @@ NonRecoverableException: key column may not have type of BOOL, FLOAT, or DOUBLE
 ====
 ---- QUERY
 # Primary keys should be declared first
-# TODO: See KUDU-1709 for improving Kudu error messages.
 create table tab (x int, y int, primary key(y))
   partition by hash (y) partitions 3 stored as kudu
 ---- CATCH
-NonRecoverableException: Got out-of-order key column: name: "y" type: INT32 is_key: true is_nullable: false cfile_block_size: 0
+ImpalaRuntimeException: Kudu PRIMARY KEY columns must be specified as the first columns in the table (expected leading columns ('y') but found ('x'))
+====
+---- QUERY
+# Primary keys should be be listed in the same order
+create table tab (x int, y int, z int, primary key(y,x))
+  partition by hash (y) partitions 3 stored as kudu
+---- CATCH
+ImpalaRuntimeException: Kudu PRIMARY KEY columns must be specified as the first columns in the table (expected leading columns ('y', 'x') but found ('x', 'y'))
 ====
 ---- QUERY
 # Small number of hash partitions
@@ -106,7 +112,7 @@ Couldn't resolve this master's address bogus.host.name:7051
 ---- QUERY
 # Valid host with whitespace
 create table tdata_master_addresses_whitespace (id int primary key) stored as kudu
-  tblproperties('kudu.master_addresses' = '  localhost  ')
+  tblproperties('kudu.master_addresses' = '  $INTERNAL_LISTEN_HOST  ')
 ---- RESULTS
 'Table has been created.'
 ====

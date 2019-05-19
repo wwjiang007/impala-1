@@ -22,12 +22,15 @@ set(LIBRARY_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/service")
 set(EXECUTABLE_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/service")
 
 # Mark the protobuf file as generated
-set_source_files_properties(${DATA_STREAM_SVC_PROTO_SRCS} PROPERTIES GENERATED TRUE)
+set_source_files_properties(${CONTROL_SERVICE_PROTO_SRCS} PROPERTIES GENERATED TRUE)
+set_source_files_properties(${DATA_STREAM_SERVICE_PROTO_SRCS} PROPERTIES GENERATED TRUE)
 
 add_library(Service
   child-query.cc
   client-request-state.cc
-  ${DATA_STREAM_SVC_PROTO_SRCS}
+  ${CONTROL_SERVICE_PROTO_SRCS}
+  control-service.cc
+  ${DATA_STREAM_SERVICE_PROTO_SRCS}
   data-stream-service.cc
   frontend.cc
   fe-support.cc
@@ -55,16 +58,29 @@ add_executable(impalad
   daemon-main.cc
 )
 
+add_executable(unifiedbetests
+  unified-betest-main.cc
+)
+
 # All Impala daemons run from the same binary. The code that is run is determined by the
 # name (i.e. argv[0]) of the command that executes the binary, so we create symlinks for
-# statestored and catalogd.
-ADD_CUSTOM_TARGET(statestored ALL
-  ${CMAKE_COMMAND} -E create_symlink ${EXECUTABLE_OUTPUT_PATH}/impalad
-  ${BUILD_OUTPUT_ROOT_DIRECTORY}/statestore/statestored DEPENDS impalad)
+# statestored and catalogd. The symlinks are relative so they can be installed along with
+# the impalad binary.
+set (STATESTORED_SYMLINK ${EXECUTABLE_OUTPUT_PATH}/statestored)
+set (CATALOGD_SYMLINK ${EXECUTABLE_OUTPUT_PATH}/catalogd)
 
-ADD_CUSTOM_TARGET(catalogd ALL
-  ${CMAKE_COMMAND} -E create_symlink ${EXECUTABLE_OUTPUT_PATH}/impalad
-  ${BUILD_OUTPUT_ROOT_DIRECTORY}/catalog/catalogd DEPENDS impalad)
+ADD_CUSTOM_COMMAND(
+  OUTPUT ${STATESTORED_SYMLINK}
+  COMMAND ${CMAKE_COMMAND} -E create_symlink impalad ${STATESTORED_SYMLINK}
+  DEPENDS impalad)
+ADD_CUSTOM_COMMAND(
+  OUTPUT ${CATALOGD_SYMLINK}
+  COMMAND ${CMAKE_COMMAND} -E create_symlink impalad ${CATALOGD_SYMLINK}
+  DEPENDS impalad)
+ADD_CUSTOM_TARGET(statestored ALL DEPENDS ${STATESTORED_SYMLINK})
+ADD_CUSTOM_TARGET(catalogd ALL DEPENDS ${CATALOGD_SYMLINK})
+
+ADD_CUSTOM_TARGET(daemons DEPENDS impalad statestored catalogd fesupport)
 
 # This permits libraries loaded by dlopen to link to the symbols in the program.
 set_target_properties(impalad PROPERTIES LINK_FLAGS -rdynamic)
@@ -73,6 +89,10 @@ target_link_libraries(impalad
   ${JAVA_JSIG_LIBRARY}
   ${IMPALA_LINK_LIBS}
 )
+
+target_link_libraries(unifiedbetests
+  ${JAVA_JSIG_LIBRARY} ${UNIFIED_TEST_LINK_LIBS})
+ADD_DEPENDENCIES(unified-be-test-executable unifiedbetests)
 
 ADD_BE_TEST(session-expiry-test session-expiry-test.cc) # TODO: this leaks thrift server
 ADD_BE_LSAN_TEST(hs2-util-test hs2-util-test.cc)

@@ -119,6 +119,7 @@ void DiskIoMgrStress::ClientThread(int client_id) {
 
     while (!eos) {
       ScanRange* range;
+      int64_t scan_range_offset = 0;
       bool needs_buffers;
       Status status = client->reader->GetNextUnstartedRange(&range, &needs_buffers);
       CHECK(status.ok() || status.IsCancelled());
@@ -135,7 +136,6 @@ void DiskIoMgrStress::ClientThread(int client_id) {
         CHECK(status.ok() || status.IsCancelled());
         if (buffer == NULL) break;
 
-        int64_t scan_range_offset = buffer->scan_range_offset();
         int len = buffer->len();
         CHECK_GE(scan_range_offset, 0);
         CHECK_LT(scan_range_offset, expected.size());
@@ -154,6 +154,7 @@ void DiskIoMgrStress::ClientThread(int client_id) {
         memcpy(read_buffer + file_offset, buffer->buffer(), buffer->len());
         range->ReturnBuffer(move(buffer));
         bytes_read += len;
+        scan_range_offset += len;
 
         CHECK_GE(bytes_read, 0);
         CHECK_LE(bytes_read, expected.size());
@@ -261,7 +262,7 @@ void DiskIoMgrStress::NewClient(int i) {
 
     ScanRange* range = client.obj_pool.Add(new ScanRange);
     range->Reset(NULL, files_[client.file_idx].filename.c_str(), range_len, assigned_len,
-        0, false, BufferOpts::Uncached());
+        0, false, false, BufferOpts::Uncached());
     client.scan_ranges.push_back(range);
     assigned_len += range_len;
   }
@@ -282,6 +283,6 @@ void DiskIoMgrStress::NewClient(int i) {
       << exec_env->buffer_reservation()->DebugString();
 
   client.reader = io_mgr_->RegisterContext();
-  status = client.reader->AddScanRanges(client.scan_ranges);
+  status = client.reader->AddScanRanges(client.scan_ranges, EnqueueLocation::TAIL);
   CHECK(status.ok());
 }

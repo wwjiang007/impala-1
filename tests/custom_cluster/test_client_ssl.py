@@ -19,6 +19,7 @@
 import logging
 import os
 import pytest
+import requests
 import signal
 import ssl
 import socket
@@ -27,6 +28,7 @@ import time
 
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
 from tests.common.impala_service import ImpaladService
+from tests.common.test_dimensions import create_beeswax_dimension
 from tests.shell.util import run_impala_shell_cmd, run_impala_shell_cmd_no_expect, \
     ImpalaShell
 
@@ -52,6 +54,11 @@ class TestClientSsl(CustomClusterTestSuite):
   SAN_UNSUPPORTED_ERROR = ("Certificate error with remote host: hostname "
                           "'localhost' doesn't match u'badCN'")
 
+  # Deprecation warnings that should not be seen.
+  DEPRECATED_POSITIONAL_WARNING = "positional argument is deprecated"
+  DEPRECATED_VALIDATE_WARNING = "validate is deprecated"
+  # TODO(IMPALA-8333) check for "DeprecationWarning"
+
   SSL_WILDCARD_ARGS = ("--ssl_client_ca_certificate=%s/wildcardCA.pem "
                       "--ssl_server_certificate=%s/wildcard-cert.pem "
                       "--ssl_private_key=%s/wildcard-cert.key"
@@ -73,21 +80,21 @@ class TestClientSsl(CustomClusterTestSuite):
                                     catalogd_args=SSL_ARGS)
   def test_ssl(self, vector):
 
-    self._verify_negative_cases()
+    self._verify_negative_cases(vector)
     # TODO: This is really two different tests, but the custom cluster takes too long to
     # start. Make it so that custom clusters can be specified across test suites.
-    self._validate_positive_cases("%s/server-cert.pem" % self.CERT_DIR)
+    self._validate_positive_cases(vector, "%s/server-cert.pem" % self.CERT_DIR)
 
     # No certificate checking: will accept any cert.
-    self._validate_positive_cases()
+    self._validate_positive_cases(vector, )
 
     # Test cancelling a query
     impalad = ImpaladService(socket.getfqdn())
-    impalad.wait_for_num_in_flight_queries(0)
-    p = ImpalaShell(args="--ssl")
+    assert impalad.wait_for_num_in_flight_queries(0)
+    p = ImpalaShell(vector, args=["--ssl"])
     p.send_cmd("SET DEBUG_ACTION=0:OPEN:WAIT")
     p.send_cmd("select count(*) from functional.alltypes")
-    impalad.wait_for_num_in_flight_queries(1)
+    assert impalad.wait_for_num_in_flight_queries(1)
 
     LOG = logging.getLogger('test_client_ssl')
     LOG.info("Cancelling query")
@@ -106,17 +113,35 @@ class TestClientSsl(CustomClusterTestSuite):
     result = p.get_result()
 
     print result.stderr
-    assert result.rc == 0
     assert "Query Status: Cancelled" in result.stdout
     assert impalad.wait_for_num_in_flight_queries(0)
 
+  WEBSERVER_SSL_ARGS = ("--webserver_certificate_file=%(cert_dir)s/server-cert.pem "
+                        "--webserver_private_key_file=%(cert_dir)s/server-key.pem "
+                        "--hostname=localhost"  # Must match hostname in certificate
+                        % {'cert_dir': CERT_DIR})
+
+  @classmethod
+  def add_test_dimensions(cls):
+    cls.ImpalaTestMatrix.add_dimension(create_beeswax_dimension())
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(impalad_args=WEBSERVER_SSL_ARGS,
+                                    statestored_args=WEBSERVER_SSL_ARGS,
+                                    catalogd_args=WEBSERVER_SSL_ARGS)
+  def test_webserver_ssl(self):
+    "Tests that the debug web pages are reachable when run with ssl."
+    self._verify_ssl_webserver()
+
   # Test that the shell can connect to a ECDH only cluster.
-  TLS_ECDH_ARGS = ("--ssl_client_ca_certificate=%s/server-cert.pem "
-                  "--ssl_server_certificate=%s/server-cert.pem "
-                  "--ssl_private_key=%s/server-key.pem "
-                  "--hostname=localhost "  # Required to match hostname in certificate"
-                  "--ssl_cipher_list=ECDHE-RSA-AES128-GCM-SHA256 "
-                  % (CERT_DIR, CERT_DIR, CERT_DIR))
+  TLS_ECDH_ARGS = ("--ssl_client_ca_certificate=%(cert_dir)s/server-cert.pem "
+                   "--ssl_server_certificate=%(cert_dir)s/server-cert.pem "
+                   "--ssl_private_key=%(cert_dir)s/server-key.pem "
+                   "--hostname=localhost "  # Must match hostname in certificate
+                   "--ssl_cipher_list=ECDHE-RSA-AES128-GCM-SHA256 "
+                   "--webserver_certificate_file=%(cert_dir)s/server-cert.pem "
+                   "--webserver_private_key_file=%(cert_dir)s/server-key.pem "
+                   % {'cert_dir': CERT_DIR})
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(impalad_args=TLS_ECDH_ARGS,
@@ -126,8 +151,9 @@ class TestClientSsl(CustomClusterTestSuite):
   @pytest.mark.skipif(sys.version_info < REQUIRED_MIN_PYTHON_VERSION_FOR_TLSV12,
       reason="Working around IMPALA-7628. TODO: is the right workaround?")
   def test_tls_ecdh(self, vector):
-    self._verify_negative_cases()
-    self._validate_positive_cases("%s/server-cert.pem" % self.CERT_DIR)
+    self._verify_negative_cases(vector)
+    self._validate_positive_cases(vector, "%s/server-cert.pem" % self.CERT_DIR)
+    self._verify_ssl_webserver()
 
   # Test that the shell can connect to a TLS1.2 only cluster, and for good measure
   # restrict the cipher suite to just one choice.
@@ -144,10 +170,14 @@ class TestClientSsl(CustomClusterTestSuite):
                                     statestored_args=TLS_V12_ARGS,
                                     catalogd_args=TLS_V12_ARGS)
   @pytest.mark.skipif(SKIP_SSL_MSG is not None, reason=SKIP_SSL_MSG)
-  @pytest.mark.skipif(sys.version_info < REQUIRED_MIN_PYTHON_VERSION_FOR_TLSV12, \
-      reason="Python version too old to allow Thrift client to use TLSv1.2")
   def test_tls_v12(self, vector):
-    self._validate_positive_cases("%s/server-cert.pem" % self.CERT_DIR)
+    if sys.version_info < REQUIRED_MIN_PYTHON_VERSION_FOR_TLSV12:
+      result = run_impala_shell_cmd_no_expect(
+          vector, ["--ssl", "-q", "select 1 + 2"], wait_until_connected=False)
+      assert "Warning: TLSv1.2 is not supported for Python < 2.7.9" in result.stderr, \
+          result.stderr
+    else:
+      self._validate_positive_cases(vector, "%s/server-cert.pem" % self.CERT_DIR)
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(impalad_args=SSL_WILDCARD_ARGS,
@@ -159,9 +189,9 @@ class TestClientSsl(CustomClusterTestSuite):
     """ Test for IMPALA-3159: Test with a certificate which has a wildcard for the
     CommonName.
     """
-    self._verify_negative_cases()
+    self._verify_negative_cases(vector)
 
-    self._validate_positive_cases("%s/wildcardCA.pem" % self.CERT_DIR)
+    self._validate_positive_cases(vector, "%s/wildcardCA.pem" % self.CERT_DIR)
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(impalad_args=SSL_WILDCARD_SAN_ARGS,
@@ -174,38 +204,47 @@ class TestClientSsl(CustomClusterTestSuite):
 
     # This block of code is the same as _validate_positive_cases() but we want to check
     # if retrieving the SAN is supported first.
-    args = "--ssl -q 'select 1 + 2' --ca_cert=%s/wildcardCA.pem" \
-        % self.CERT_DIR
-    result = run_impala_shell_cmd_no_expect(args)
+    args = ["--ssl", "-q", "select 1 + 2", "--ca_cert=%s/wildcardCA.pem" % self.CERT_DIR]
+    result = run_impala_shell_cmd_no_expect(vector, args)
     if self.SAN_UNSUPPORTED_ERROR in result.stderr:
       pytest.xfail("Running with a RHEL/Python combination that has a bug where Python "
           "cannot retrieve SAN from certificate: "
           "https://bugzilla.redhat.com/show_bug.cgi?id=928390")
 
-    self._verify_negative_cases()
+    self._verify_negative_cases(vector)
 
-    self._validate_positive_cases("%s/wildcardCA.pem" % self.CERT_DIR)
+    self._validate_positive_cases(vector, "%s/wildcardCA.pem" % self.CERT_DIR)
 
-  def _verify_negative_cases(self):
+  def _verify_negative_cases(self, vector):
     # Expect the shell to not start successfully if we point --ca_cert to an incorrect
     # certificate.
-    args = "--ssl -q 'select 1 + 2' --ca_cert=%s/incorrect-commonname-cert.pem" \
-        % self.CERT_DIR
-    run_impala_shell_cmd(args, expect_success=False)
+    args = ["--ssl", "-q", "select 1 + 2",
+            "--ca_cert=%s/incorrect-commonname-cert.pem" % self.CERT_DIR]
+    run_impala_shell_cmd(vector, args, expect_success=False)
 
     # Expect the shell to not start successfully if we don't specify the --ssl option
-    args = "-q 'select 1 + 2'"
-    run_impala_shell_cmd(args, expect_success=False)
+    args = ["-q", "select 1 + 2"]
+    run_impala_shell_cmd(vector, args, expect_success=False)
 
-  def _validate_positive_cases(self, ca_cert=""):
-    shell_options = "--ssl -q 'select 1 + 2'"
-
-    result = run_impala_shell_cmd(shell_options)
+  def _validate_positive_cases(self, vector, ca_cert=""):
+    shell_options = ["--ssl", "-q", "select 1 + 2"]
+    result = run_impala_shell_cmd(vector, shell_options, wait_until_connected=False)
     for msg in [self.SSL_ENABLED, self.CONNECTED, self.FETCHED]:
       assert msg in result.stderr
+    for warning in [self.DEPRECATED_POSITIONAL_WARNING, self.DEPRECATED_VALIDATE_WARNING]:
+      assert warning not in result.stderr
 
     if ca_cert != "":
-      shell_options = shell_options + (" --ca_cert=%s" % ca_cert)
-      result = run_impala_shell_cmd(shell_options)
+      shell_options = shell_options + ["--ca_cert=%s" % ca_cert]
+      result = run_impala_shell_cmd(vector, shell_options, wait_until_connected=False)
       for msg in [self.SSL_ENABLED, self.CONNECTED, self.FETCHED]:
         assert msg in result.stderr
+      for warning in [self.DEPRECATED_POSITIONAL_WARNING,
+                      self.DEPRECATED_VALIDATE_WARNING]:
+        assert warning not in result.stderr
+
+  def _verify_ssl_webserver(self):
+    for port in ["25000", "25010", "25020"]:
+      url = "https://localhost:%s" % port
+      response = requests.get(url, verify="%s/server-cert.pem" % self.CERT_DIR)
+      assert response.status_code == requests.codes.ok, url

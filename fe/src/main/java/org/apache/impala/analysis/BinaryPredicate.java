@@ -36,8 +36,6 @@ import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Predicates;
 import com.google.common.collect.Lists;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * Most predicates with two operands.
@@ -137,9 +135,14 @@ public class BinaryPredicate extends Predicate {
   public boolean isInferred() { return isInferred_; }
   public void setIsInferred() { isInferred_ = true; }
 
+  public boolean hasIdenticalOperands() {
+    return getChild(0) != null && getChild(0).equals(getChild(1));
+  }
+
   @Override
-  public String toSqlImpl() {
-    return getChild(0).toSql() + " " + op_.toString() + " " + getChild(1).toSql();
+  public String toSqlImpl(ToSqlOptions options) {
+    return getChild(0).toSql(options) + " " + op_.toString() + " "
+        + getChild(1).toSql(options);
   }
 
   @Override
@@ -178,7 +181,7 @@ public class BinaryPredicate extends Predicate {
     }
     Preconditions.checkState(fn_.getReturnType().isBoolean());
 
-    ArrayList<Expr> subqueries = Lists.newArrayList();
+    List<Expr> subqueries = new ArrayList<>();
     collectAll(Predicates.instanceOf(Subquery.class), subqueries);
     if (subqueries.size() > 1) {
       // TODO Remove that restriction when we add support for independent subquery
@@ -191,7 +194,7 @@ public class BinaryPredicate extends Predicate {
           "supported in binary predicates: " + toSql());
     }
 
-    List<InPredicate> inPredicates = Lists.newArrayList();
+    List<InPredicate> inPredicates = new ArrayList<>();
     collect(InPredicate.class, inPredicates);
     for (InPredicate inPredicate: inPredicates) {
       if (inPredicate.contains(Subquery.class)) {

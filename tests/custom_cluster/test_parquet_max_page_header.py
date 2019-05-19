@@ -24,7 +24,7 @@ import string
 import subprocess
 
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
-from tests.common.skip import SkipIfS3, SkipIfADLS, SkipIfIsilon
+from tests.common.skip import SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfIsilon
 
 class TestParquetMaxPageHeader(CustomClusterTestSuite):
   '''This tests large page headers in parquet files. Parquet page header size can
@@ -73,8 +73,7 @@ class TestParquetMaxPageHeader(CustomClusterTestSuite):
         .format(self.PARQUET_TABLE_NAME, self.TEXT_TABLE_NAME)
     # Impala parquet-writer doesn't write/use page statistics. So we use hive
     # to write these files
-    hive_cmd = "hive -e " + insert_cmd
-    subprocess.call(hive_cmd, shell=True)
+    self.run_stmt_in_hive(insert_cmd)
 
   def __generate_test_data(self, dir, file):
     """Creates a file in HDFS containing two MAX_STRING_LENGTH lines."""
@@ -92,6 +91,7 @@ class TestParquetMaxPageHeader(CustomClusterTestSuite):
     put.wait()
 
   @SkipIfS3.hive
+  @SkipIfABFS.hive
   @SkipIfADLS.hive
   @SkipIfIsilon.hive
   @pytest.mark.execute_serially

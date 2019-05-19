@@ -52,6 +52,31 @@ under the License.
 
     <p outputclass="toc inpage"/>
   </conbody>
+  <concept rev="3.1.0" id="concept_vnw_r4v_rgb">
+    <title>Incompatible Changes Introduced in Impala 3.2.x</title>
+    <conbody>
+      <p> For the full list of issues closed in this release, including any that
+        introduce behavior changes or incompatibilities, see the <xref
+          keyref="changelog_32">changelog for <keyword keyref="impala32"
+          /></xref>. </p>
+      <ul>
+        <li>The Port change for the <codeph>SHUTDOWN</codeph> command<p>The
+              <codeph>SHUTDOWN</codeph> command for shutting down a remote
+            server used the backend port in Impala 3.1. Starting in Impala 3.2,
+            the command uses the KRPC port, e.g.<codeph>
+              :shutdown('host100:27000')</codeph>.</p></li>
+      </ul>
+    </conbody>
+  </concept>
+  <concept rev="3.1.0" id="new_features_31">
+    <title>Incompatible Changes Introduced in Impala 3.1.x</title>
+    <conbody>
+      <p> For the full list of issues closed in this release, including any that
+        introduce behavior changes or incompatibilities, see the <xref
+          keyref="changelog_31">changelog for <keyword keyref="impala31"
+          /></xref>. </p>
+    </conbody>
+  </concept>
   <concept rev="3.0.0" id="incompatible_changes_300x">
     <title>Incompatible Changes Introduced in Impala 3.0.x</title>
     <conbody>

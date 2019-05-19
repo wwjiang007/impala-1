@@ -24,11 +24,13 @@
 #include <regex>
 #include <boost/algorithm/string.hpp>
 
+#include "common/compiler-util.h"
 #include "common/logging.h"
 #include "kudu/util/path_util.h"
 #include "gutil/strings/ascii_ctype.h"
 #include "gutil/strings/substitute.h"
 #include "runtime/hdfs-fs-cache.h"
+#include "util/debug-util.h"
 #include "util/filesystem-util.h"
 #include "util/hdfs-util.h"
 #include "util/string-parser.h"
@@ -214,7 +216,7 @@ Status TimezoneDatabase::LoadZoneInfoFromHdfs(const string& hdfs_zone_info_zip,
   Status status = CopyHdfsFile(hdfs_conn, hdfs_zone_info_zip, local_conn,
       local_path.data());
   if (!status.ok()) {
-    (void)FileSystemUtil::RemovePaths({local_path.data()});
+    discard_result(FileSystemUtil::RemovePaths({local_path.data()}));
     return status;
   }
 
@@ -386,7 +388,7 @@ Status TimezoneDatabase::LoadZoneAliasesFromHdfs(const string& hdfs_zone_alias_c
     current_bytes_read = hdfsRead(hdfs_conn, hdfs_file, buffer.data(), buffer.size());
     if (current_bytes_read == 0) break;
     if (current_bytes_read < 0) {
-      status = Status(TErrorCode::DISK_IO_ERROR,
+      status = Status(TErrorCode::DISK_IO_ERROR, GetBackendString(),
           GetHdfsErrorMsg("Error reading from HDFS file: ", hdfs_zone_alias_conf));
       break;
     }

@@ -100,9 +100,17 @@ class Catalog {
   Status GetTableMetrics(const std::string& db, const std::string& tbl,
       std::string* metrics);
 
+  /// Returns the Catalog server metrics in the response object. Refer to
+  /// TGetCatalogServerMetricsResponse definition for details.
+  Status GetCatalogServerMetrics(TGetCatalogServerMetricsResponse* response);
+
   /// Returns the current catalog usage that includes the most frequently accessed
   /// tables as well as the tables with the highest memory requirements.
   Status GetCatalogUsage(TGetCatalogUsageResponse* response);
+
+  /// Returns the metastore event processor summary view. The summary string
+  /// in the response can contain detailed metrics along with status
+  Status GetEventProcessorSummary(TEventProcessorMetricsSummaryResponse* response);
 
   /// Gets all functions in the catalog matching the parameters in the given
   /// TFunctionsRequest.
@@ -118,9 +126,10 @@ class Catalog {
       const TGetPartitionStatsRequest& req, TGetPartitionStatsResponse* resp);
 
   /// Checks whether the requesting user has admin privileges on the Sentry Service and
-  /// returns OK if they do. Returns a bad status if the user is not an admin or if there
-  /// was an error executing the request.
-  Status SentryAdminCheck(const TSentryAdminCheckRequest& req);
+  /// returns OK if they do. Returns a bad status if there was an error executing the
+  /// request.
+  Status SentryAdminCheck(const TSentryAdminCheckRequest& req,
+      TSentryAdminCheckResponse* resp);
 
   /// Update recently used table names and their use counts in an impalad since the last
   /// report.
@@ -139,6 +148,8 @@ class Catalog {
   jmethodID get_catalog_delta_id_;  // JniCatalog.getCatalogDelta()
   jmethodID get_catalog_version_id_;  // JniCatalog.getCatalogVersion()
   jmethodID get_catalog_usage_id_; // JniCatalog.getCatalogUsage()
+  jmethodID get_catalog_server_metrics_; // JniCatalog.getCatalogServerMetrics()
+  jmethodID get_event_processor_summary_; // JniCatalog.getEventProcessorMetrics()
   jmethodID get_dbs_id_; // JniCatalog.getDbs()
   jmethodID get_table_names_id_; // JniCatalog.getTableNames()
   jmethodID get_table_metrics_id_; // JniCatalog.getTableMetrics()

@@ -138,7 +138,7 @@ Status HdfsScanner::ProcessSplit() {
     // data referenced by previously appended batches.
     if (returned_rows) scan_node->AddMaterializedRowBatch(move(batch));
     RETURN_IF_ERROR(status);
-  } while (!eos_ && !scan_node_->ReachedLimit());
+  } while (!eos_ && !scan_node_->ReachedLimitShared());
   return Status::OK();
 }
 
@@ -486,7 +486,7 @@ Status HdfsScanner::CodegenWriteCompleteTuple(const HdfsScanNodeBase* node,
       parse_block = llvm::BasicBlock::Create(context, "parse", fn, eval_fail_block);
       llvm::Function* conjunct_fn;
       Status status =
-          conjuncts[conjunct_idx]->GetCodegendComputeFn(codegen, &conjunct_fn);
+          conjuncts[conjunct_idx]->GetCodegendComputeFn(codegen, false, &conjunct_fn);
       if (!status.ok()) {
         stringstream ss;
         ss << "Failed to codegen conjunct: " << status.GetDetail();
@@ -812,14 +812,14 @@ Status HdfsScanner::IssueFooterRanges(HdfsScanNodeBase* scan_node,
           footer_range = scan_node->AllocateScanRange(files[i]->fs,
               files[i]->filename.c_str(), footer_size, footer_start,
               split_metadata->partition_id, footer_split->disk_id(),
-              footer_split->expected_local(),
+              footer_split->expected_local(), files[i]->is_erasure_coded,
               BufferOpts(footer_split->try_cache(), files[i]->mtime), split);
         } else {
           // If we did not find the last split, we know it is going to be a remote read.
           footer_range =
               scan_node->AllocateScanRange(files[i]->fs, files[i]->filename.c_str(),
                    footer_size, footer_start, split_metadata->partition_id, -1, false,
-                   BufferOpts::Uncached(), split);
+                   files[i]->is_erasure_coded, BufferOpts::Uncached(), split);
         }
 
         footer_ranges.push_back(footer_range);
@@ -828,10 +828,9 @@ Status HdfsScanner::IssueFooterRanges(HdfsScanNodeBase* scan_node,
       }
     }
   }
-  // The threads that process the footer will also do the scan, so we mark all the files
-  // as complete here.
+  // The threads that process the footer will also do the scan.
   if (footer_ranges.size() > 0) {
-    RETURN_IF_ERROR(scan_node->AddDiskIoRanges(footer_ranges, files.size()));
+    RETURN_IF_ERROR(scan_node->AddDiskIoRanges(footer_ranges, EnqueueLocation::TAIL));
   }
   return Status::OK();
 }

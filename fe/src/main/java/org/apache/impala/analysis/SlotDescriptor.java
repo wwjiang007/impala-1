@@ -17,11 +17,13 @@
 
 package org.apache.impala.analysis;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
 import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.ColumnStats;
+import org.apache.impala.catalog.FeKuduTable;
 import org.apache.impala.catalog.KuduColumn;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.thrift.TSlotDescriptor;
@@ -48,7 +50,7 @@ public class SlotDescriptor {
 
   // Expr(s) materialized into this slot; multiple exprs for unions. Should be empty if
   // path_ is set.
-  private List<Expr> sourceExprs_ = Lists.newArrayList();
+  private List<Expr> sourceExprs_ = new ArrayList<>();
 
   // if false, this slot doesn't need to be materialized in parent tuple
   // (and physical layout parameters are invalid)
@@ -182,6 +184,15 @@ public class SlotDescriptor {
   }
 
   /**
+   * Returns true if this slot is of STRING type in a kudu table.
+   */
+  public boolean isKuduStringSlot() {
+    if (getParent() == null) return false;
+    if (!(getParent().getTable() instanceof FeKuduTable)) return false;
+    return getType().isStringType();
+  }
+
+  /**
    * Assembles the absolute materialized path to this slot starting from the schema
    * root. The materialized path points to the first non-struct schema element along the
    * path starting from the parent's tuple path to this slot's path.
@@ -296,4 +307,7 @@ public class SlotDescriptor {
         .add("stats", stats_)
         .toString();
   }
+
+  @Override
+  public String toString() { return debugString(); }
 }

@@ -56,7 +56,7 @@ if (APPLE)
   SET(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -stdlib=libstdc++")
 endif()
 
-SET(CXX_COVERAGE_FLAGS "-fprofile-arcs -ftest-coverage")
+SET(CXX_COVERAGE_FLAGS "-fprofile-arcs -ftest-coverage -DCODE_COVERAGE_ENABLED")
 
 # For any clang builds (currently only ASAN):
 #   -Qunused-arguments: quiet warnings about unused arguments to clang because ccache
@@ -158,6 +158,9 @@ elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "TIDY")
   SET(CMAKE_CXX_FLAGS "${CXX_FLAGS_TIDY}")
 elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "UBSAN")
   SET(CMAKE_CXX_FLAGS "${CXX_FLAGS_UBSAN}")
+elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "UBSAN_FULL")
+  SET(CMAKE_CXX_FLAGS "${CXX_FLAGS_UBSAN}")
+  SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DUNDEFINED_SANITIZER_FULL")
 elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "TSAN")
   SET(CMAKE_CXX_FLAGS "${CXX_FLAGS_TSAN}")
 else()
@@ -184,6 +187,7 @@ if (CCACHE AND NOT DEFINED ENV{DISABLE_CCACHE})
   if ("${CMAKE_BUILD_TYPE}" STREQUAL "ADDRESS_SANITIZER"
       OR "${CMAKE_BUILD_TYPE}" STREQUAL "TIDY"
       OR "${CMAKE_BUILD_TYPE}" STREQUAL "UBSAN"
+      OR "${CMAKE_BUILD_TYPE}" STREQUAL "UBSAN_FULL"
       OR "${CMAKE_BUILD_TYPE}" STREQUAL "TSAN")
     # Need to set CCACHE_CPP so that ccache calls clang with the original source file for
     # both preprocessing and compilation. Otherwise, ccache will use clang to preprocess
@@ -222,18 +226,19 @@ add_definitions(-DKUDU_HEADERS_USE_SHORT_STATUS_MACROS -DKUDU_HEADERS_USE_RICH_S
 #  -Wno-return-type-c-linkage: UDFs return C++ classes but use C linkage to prevent
 #       mangling
 #  -DBOOST_NO_EXCEPTIONS: call a custom error handler for exceptions in codegen'd code.
-set(CLANG_IR_CXX_FLAGS "-emit-llvm" "-c" "-std=c++14" "-DIR_COMPILE" "-DNDEBUG"
-  "-DHAVE_INTTYPES_H" "-DHAVE_NETINET_IN_H" "-DBOOST_DATE_TIME_POSIX_TIME_STD_CONFIG"
-  "-DBOOST_NO_EXCEPTIONS" "-fcolor-diagnostics" "-Wno-deprecated"
-  "-Wno-return-type-c-linkage" "-O1")
+set(CLANG_IR_CXX_FLAGS "-emit-llvm" "-c" "-std=c++14" "-DIR_COMPILE" "-DHAVE_INTTYPES_H"
+  "-DHAVE_NETINET_IN_H" "-DBOOST_DATE_TIME_POSIX_TIME_STD_CONFIG" "-DBOOST_NO_EXCEPTIONS"
+  "-fcolor-diagnostics" "-Wno-deprecated" "-Wno-return-type-c-linkage" "-O1")
 # -Werror: compile warnings should be errors when using the toolchain compiler.
 set(CLANG_IR_CXX_FLAGS "${CLANG_IR_CXX_FLAGS}" "-Werror")
 
 if ("${CMAKE_BUILD_TYPE}" STREQUAL "ADDRESS_SANITIZER")
   SET(CLANG_IR_CXX_FLAGS "${CLANG_IR_CXX_FLAGS}" "-DADDRESS_SANITIZER")
+elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "RELEASE")
+  SET(CLANG_IR_CXX_FLAGS "${CLANG_IR_CXX_FLAGS}" "-DNDEBUG")
 endif()
 
-if (UBSAN_CODEGEN)
+if ("${CMAKE_BUILD_TYPE}" STREQUAL "UBSAN_FULL")
   set(CLANG_IR_CXX_FLAGS "${CLANG_IR_CXX_FLAGS}" "-DUNDEFINED_SANITIZER"
     "-fno-omit-frame-pointer" "-fsanitize=undefined" "-fno-wrapv" "-ggdb3"
     "-fno-sanitize=alignment,function,vptr,float-divide-by-zero,float-cast-overflow"
@@ -250,6 +255,13 @@ endif()
 # Flags to pass to LLVM's opt to further optimize cross-compiled IR.
 #  -inline: inline with low threshold to get rid of trivial accessor functions.
 set(LLVM_OPT_IR_FLAGS "-inline" "-inlinehint-threshold=10" "-inline-threshold=10")
+
+# Additional compile flags that will hide symbols by default, e.g. for building
+# UDFs. We have both a concatenated string version and a list version for convenience,
+# depending on what is needed in the context.
+set(HIDE_SYMBOLS "-fvisibility=hidden -fvisibility-inlines-hidden")
+set(HIDE_SYMBOLS_ARGS "${HIDE_SYMBOLS_STRING}")
+separate_arguments(HIDE_SYMBOLS_ARGS)
 
 # setup doc generation with Doxygen
 find_package(Doxygen)
@@ -304,6 +316,7 @@ set(CLANG_INCLUDE_FLAGS
   "-I${SQUEASEL_INCLUDE_DIR}"
   "-I${GLOG_INCLUDE_DIR}"
   "-I${GFLAGS_INCLUDE_DIR}"
+  "-I${GTEST_INCLUDE_DIR}"
   "-I${RAPIDJSON_INCLUDE_DIR}"
   "-I${AVRO_INCLUDE_DIR}"
   "-I${ORC_INCLUDE_DIR}"
@@ -329,6 +342,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 if ("${CMAKE_BUILD_TYPE}" STREQUAL "DEBUG" OR
     "${CMAKE_BUILD_TYPE}" STREQUAL "ADDRESS_SANITIZER" OR
     "${CMAKE_BUILD_TYPE}" STREQUAL "UBSAN" OR
+    "${CMAKE_BUILD_TYPE}" STREQUAL "UBSAN_FULL" OR
     "${CMAKE_BUILD_TYPE}" STREQUAL "TSAN")
   set(BUILD_OUTPUT_ROOT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/build/debug/")
 else()
@@ -374,12 +388,12 @@ if (NOT APPLE)
   set(WL_START_GROUP "-Wl,--start-group")
   set(WL_END_GROUP "-Wl,--end-group")
 endif()
-set (IMPALA_LINK_LIBS
-  ${WL_START_GROUP}
+set (IMPALA_LIBS
   BufferPool
   Catalog
   CodeGen
   Common
+  Parquet
   Exec
   Exprs
   GlobalFlags
@@ -402,6 +416,39 @@ set (IMPALA_LINK_LIBS
   token_proto
   Udf
   Util
+)
+
+set (IMPALA_LINK_LIBS
+  ${WL_START_GROUP}
+  ${IMPALA_LIBS}
+  ${WL_END_GROUP}
+)
+
+# Backend tests originally produced a single executable for each backend c++ test file.
+# Since these executables linked in all of the libraries, each test is very large
+# (100s of MB) and requires considerable link time. To address this, tests can now
+# be linked into a unified test executable that contains tests from many backend
+# c++ test files. See the ADD_UNIFIED_BE_TEST and ADD_UNIFIED_LSAN_BE_TEST
+# macros below. The original mode of producing a standalone executable is still
+# available via the ADD_BE_TEST and ADD_LSAN_BE_TEST macros.
+#
+# To make a unified test executable, the backend tests need to be in their own libraries.
+# The main function is provided by the unified main c++ file. None of the test c++ files
+# has a main function. Normal dependency resolution would not include any of the tests
+# in any executable, as no function references them. Force the unified test executable
+# to include the tests by using "--whole-archive".
+set(WL_WHOLE_ARCHIVE "-Wl,--whole-archive")
+set(WL_NO_WHOLE_ARCHIVE "-Wl,--no-whole-archive")
+set (UNIFIED_TEST_LIBS
+  GUtilTests
+  UtilTests
+)
+set (UNIFIED_TEST_LINK_LIBS
+  ${WL_START_GROUP}
+  ${WL_WHOLE_ARCHIVE}
+  ${UNIFIED_TEST_LIBS}
+  ${WL_NO_WHOLE_ARCHIVE}
+  ${IMPALA_LIBS}
   ${WL_END_GROUP}
 )
 
@@ -413,6 +460,7 @@ if (BUILD_SHARED_LIBS)
     BufferPool
     Io
     Runtime
+    Parquet
     Exec
     CodeGen
     Exprs
@@ -467,6 +515,18 @@ set (IMPALA_LINK_LIBS ${IMPALA_LINK_LIBS}
   -ldl # Needed for LLVM
 )
 
+# Add external dependencies for backend tests
+set (UNIFIED_TEST_LINK_LIBS ${UNIFIED_TEST_LINK_LIBS}
+  ${IMPALA_DEPENDENCIES}
+  -lrt
+  -ldl # Needed for LLVM
+)
+
+if (ENABLE_CODE_COVERAGE)
+  set(IMPALA_LINK_LIBS ${IMPALA_LINK_LIBS} -lgcov)
+  set(UNIFIED_TEST_LINK_LIBS ${UNIFIED_TEST_LINK_LIBS} -lgcov)
+endif()
+
 # The above link list does not include tcmalloc. This is because the Impala JVM support
 # libraries (libfesupport, libloggingsupport) cannot use tcmalloc in all cases. When they
 # are started up by the FE (for tests) the jvm has already made allocations before
@@ -477,6 +537,7 @@ set (IMPALA_LINK_LIBS_NO_TCMALLOC ${IMPALA_LINK_LIBS})
 if (NOT "${CMAKE_BUILD_TYPE}" STREQUAL "ADDRESS_SANITIZER" AND
     NOT "${CMAKE_BUILD_TYPE}" STREQUAL "TSAN")
   set (IMPALA_LINK_LIBS ${IMPALA_LINK_LIBS} tcmallocstatic)
+  set (UNIFIED_TEST_LINK_LIBS ${UNIFIED_TEST_LINK_LIBS} tcmallocstatic)
 endif()
 
 # When we link statically, we need to replace the static libhdfs.a with the dynamic
@@ -493,6 +554,7 @@ set(IMPALA_LINK_LIBS_DYNAMIC_TARGETS ${IMPALA_LINK_LIBS_DYNAMIC_TARGETS}
 # TODO: build time for tests is no longer small, but our dependencies are now very
 # complicated and hard to isolate
 set (IMPALA_TEST_LINK_LIBS ${IMPALA_LINK_LIBS} gtest)
+set (UNIFIED_TEST_LINK_LIBS ${UNIFIED_TEST_LINK_LIBS} gtest)
 
 MESSAGE(STATUS "Compiler Flags: ${CMAKE_CXX_FLAGS}")
 
@@ -504,9 +566,24 @@ set(LLVM_IR_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/llvm-ir")
 file(MAKE_DIRECTORY ${LLVM_IR_OUTPUT_DIRECTORY})
 
 # Add custom target to only build the backend tests
-add_custom_target(be-test)
+# Note: this specifies "ALL" so it builds if running "make" with no arguments. This is
+# necessary due to the non-executable targets (i.e. generating backend test scripts)
+# that run for the unified backend tests.
+add_custom_target(be-test ALL)
 
-# Utility CMake function to make specifying tests and benchmarks less verbose
+# Add custom target to build unified backend tests
+add_custom_target(unified-be-test)
+
+# Add custom target to build the unified backend test executable
+add_custom_target(unified-be-test-executable)
+
+# Variable to use to aggregate all of the filter patterns, joined by ":"
+set_property(GLOBAL PROPERTY AGG_UNIFIED_FILTER_PATTERN)
+
+# Utility CMake functions for specifying tests and benchmarks
+
+# ADD_BE_TEST: This function adds a backend test with its own executable. The associated
+# c++ file must have its own main() function.
 FUNCTION(ADD_BE_TEST TEST_NAME)
   # This gets the directory where the test is from (e.g. 'exprs' or 'runtime')
   file(RELATIVE_PATH DIR_NAME "${CMAKE_SOURCE_DIR}/be/src/" ${CMAKE_CURRENT_SOURCE_DIR})
@@ -518,6 +595,27 @@ FUNCTION(ADD_BE_TEST TEST_NAME)
   ADD_DEPENDENCIES(be-test ${TEST_NAME})
 ENDFUNCTION()
 
+# ADD_UNIFIED_BE_TEST: This function adds a backend test that is part of the unified
+# backend executable. This creates an executable script that runs the unified executable
+# with appropriate args to run the subset of tests identified by "TEST_FILTER_PATTERN".
+# See the documentation for --gtest_filter for examples of filter patterns.
+FUNCTION(ADD_UNIFIED_BE_TEST TEST_NAME TEST_FILTER_PATTERN)
+  # This gets the directory where the test is from (e.g. 'exprs' or 'runtime')
+  file(RELATIVE_PATH DIR_NAME "${CMAKE_SOURCE_DIR}/be/src/" ${CMAKE_CURRENT_SOURCE_DIR})
+  add_custom_target(${TEST_NAME} "${CMAKE_SOURCE_DIR}/bin/gen-backend-test-script.py"
+    "--test_script_output" "${BUILD_OUTPUT_ROOT_DIRECTORY}/${DIR_NAME}/${TEST_NAME}"
+    "--gtest_filter" ${TEST_FILTER_PATTERN})
+  # Incorporate this TEST_FILTER_PATTERN into the aggregate list of filter patterns
+  get_property(tmp GLOBAL PROPERTY AGG_UNIFIED_FILTER_PATTERN)
+  set(tmp "${TEST_FILTER_PATTERN}:${tmp}")
+  set_property(GLOBAL PROPERTY AGG_UNIFIED_FILTER_PATTERN "${tmp}")
+  ADD_TEST(NAME ${TEST_NAME}
+    COMMAND "${BUILD_OUTPUT_ROOT_DIRECTORY}/${DIR_NAME}/${TEST_NAME}"
+    -log_dir=$ENV{IMPALA_BE_TEST_LOGS_DIR})
+  ADD_DEPENDENCIES(unified-be-test ${TEST_NAME})
+  ADD_DEPENDENCIES(${TEST_NAME} unified-be-test-validated-executable)
+ENDFUNCTION()
+
 FUNCTION(ENABLE_LSAN_FOR_TEST TEST_NAME)
   SET_TESTS_PROPERTIES(${TEST_NAME} PROPERTIES ENVIRONMENT
       "ASAN_OPTIONS=handle_segv=0 detect_leaks=1 allocator_may_return_null=1")
@@ -525,10 +623,17 @@ FUNCTION(ENABLE_LSAN_FOR_TEST TEST_NAME)
       "LSAN_OPTIONS=suppressions=${CMAKE_SOURCE_DIR}/bin/lsan-suppressions.txt")
 ENDFUNCTION()
 
-# Same as ADD_BE_TEST, but also enable LeakSanitizer.
+# ADD_BE_LSAN_TEST: Same as ADD_BE_TEST, but also enable LeakSanitizer.
 # TODO: IMPALA-2746: we should make this the default.
 FUNCTION(ADD_BE_LSAN_TEST TEST_NAME)
   ADD_BE_TEST(${TEST_NAME})
+  ENABLE_LSAN_FOR_TEST(${TEST_NAME})
+ENDFUNCTION()
+
+# ADD_UNIFIED_BE_LSAN_TEST: Same as ADD_UNIFIED_BE_TEST, but also enable LeakSanitizer.
+# TODO: IMPALA_2746: we should make this the default.
+FUNCTION(ADD_UNIFIED_BE_LSAN_TEST TEST_NAME TEST_FILTER_PATTERN)
+  ADD_UNIFIED_BE_TEST(${TEST_NAME} ${TEST_FILTER_PATTERN})
   ENABLE_LSAN_FOR_TEST(${TEST_NAME})
 ENDFUNCTION()
 
@@ -559,7 +664,8 @@ function(COMPILE_TO_IR SRC_FILE)
   set(OUTPUT_FILE "${LIBRARY_OUTPUT_PATH}/${BASE_NAME}.ll")
   add_custom_command(
     OUTPUT ${OUTPUT_FILE}
-    COMMAND ${LLVM_CLANG_EXECUTABLE} ${CLANG_IR_CXX_FLAGS} ${CLANG_INCLUDE_FLAGS} ${SRC_FILE} -o ${OUTPUT_FILE}
+    COMMAND ${LLVM_CLANG_EXECUTABLE} ${CLANG_IR_CXX_FLAGS} ${HIDE_SYMBOLS_ARGS}
+            ${CLANG_INCLUDE_FLAGS} ${SRC_FILE} -o ${OUTPUT_FILE}
     DEPENDS ${SRC_FILE})
   add_custom_target(${BASE_NAME}-ir ALL DEPENDS ${OUTPUT_FILE})
 endfunction(COMPILE_TO_IR)
@@ -597,7 +703,6 @@ SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-variable")
 add_subdirectory(generated-sources/gen-cpp)
 
 link_directories(
-  ${CMAKE_CURRENT_SOURCE_DIR}/build/bufferpool
   ${CMAKE_CURRENT_SOURCE_DIR}/build/catalog
   ${CMAKE_CURRENT_SOURCE_DIR}/build/common
   ${CMAKE_CURRENT_SOURCE_DIR}/build/exec
@@ -610,6 +715,19 @@ link_directories(
   ${CMAKE_CURRENT_SOURCE_DIR}/build/util
   ${CMAKE_CURRENT_SOURCE_DIR}/build/transport
 )
+
+# Add custom target to validate the unified backend test executable and test match
+# patterns. At this point, all filter patterns have been aggregated from the individual
+# ADD_UNIFIED_BE_TEST calls into AGG_UNIFIED_FILTER_PATTERN.
+get_property(TOTAL_UNIFIED_FILTER_PATTERN GLOBAL PROPERTY AGG_UNIFIED_FILTER_PATTERN)
+add_custom_target(unified-be-test-validated-executable
+  "${CMAKE_CURRENT_SOURCE_DIR}/../bin/validate-unified-backend-test-filters.py"
+  "-f" "${TOTAL_UNIFIED_FILTER_PATTERN}"
+  "-b" "${BUILD_OUTPUT_ROOT_DIRECTORY}/service/unifiedbetests")
+
+ADD_DEPENDENCIES(be-test unified-be-test)
+ADD_DEPENDENCIES(unified-be-test unified-be-test-validated-executable)
+ADD_DEPENDENCIES(unified-be-test-validated-executable unified-be-test-executable)
 
 # only generate statically linked libs and executables
 set(BUILD_SHARED_LIBS OFF)

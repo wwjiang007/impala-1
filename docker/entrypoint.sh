@@ -42,6 +42,19 @@
 #      where <suite> is one of: BE_TEST JDBC_TEST CLUSTER_TEST
 #                               EE_TEST_SERIAL EE_TEST_PARALLEL
 
+# Starts or stops postgres
+# The centos:7 Docker image doesn't allow systemctl to start postgresql,
+# so we start it explicitly with pg_ctl.
+function _pg_ctl() {
+  if [ -f /etc/redhat-release ]; then
+    if which systemctl; then
+      sudo -u postgres PGDATA=/var/lib/pgsql/data bash -c "pg_ctl $1 -w --timeout=120 >> /var/lib/pgsql/pg.log 2>&1"
+      return
+    fi
+  fi
+  sudo service postgresql $1
+}
+
 # Boostraps the container by creating a user and adding basic tools like Python and git.
 # Takes a uid as an argument for the user to be created.
 function build() {
@@ -67,12 +80,24 @@ function build() {
     paste <(cut -d : -f3 /etc/passwd) <(cut -d : -f1 /etc/passwd) | sort -n
     exit 1
   fi
-  apt-get update
-  apt-get install -y sudo git lsb-release python
+  if which apt-get > /dev/null; then
+    apt-get update
+    apt-get install -y sudo git lsb-release python
+  else
+    yum -y install sudo git python
+  fi
 
-  adduser --disabled-password --gecos "" --uid $1 impdev
-  echo "impdev ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+  if ! id impdev; then
+    # Adduser is slightly different on CentOS and Ubuntu
+    if which apt-get; then
+      adduser --disabled-password --gecos "" --uid $1 impdev
+    else
+      adduser --uid $1 impdev
+    fi
+    echo "impdev ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+  fi
 
+  ulimit -a
   su impdev -c "$0 build_impdev"
 }
 
@@ -117,10 +142,19 @@ function start_minicluster {
   pushd /home/impdev/Impala
 
   # Required for metastore
-  sudo service postgresql start
+  _pg_ctl start
 
   # Required for starting HBase
-  sudo service ssh start
+  if [ -f /etc/redhat-release ]; then
+    if which systemctl; then
+      # centos7 doesn't support systemd running inside of docker to start daemons
+      sudo /usr/sbin/sshd
+    else
+      sudo service sshd start
+    fi
+  else
+    sudo service ssh start
+  fi
 
   (echo ">>> Copying Kudu Data") 2> /dev/null
   # Move around Kudu's WALs to avoid issue with Docker filesystems (aufs and
@@ -129,16 +163,18 @@ function start_minicluster {
   # presumably because there's only one layer involved. See
   # https://issues.apache.org/jira/browse/KUDU-1419.
   set -x
-  pushd /home/impdev/Impala/testdata
-  for x in cluster/cdh*/node-*/var/lib/kudu/*/wal; do
-    echo $x
-    # This mv takes time, as it's actually copying into the latest layer.
-    mv $x $x-orig
-    mkdir $x
-    mv $x-orig/* $x
-    rmdir $x-orig
-  done
-  popd
+  if [ "true" = $KUDU_IS_SUPPORTED ]; then
+    pushd /home/impdev/Impala/testdata
+    for x in cluster/cdh*/node-*/var/lib/kudu/*/wal; do
+      echo $x
+      # This mv takes time, as it's actually copying into the latest layer.
+      mv $x $x-orig
+      mkdir $x
+      mv $x-orig/* $x
+      rmdir $x-orig
+    done
+    popd
+  fi
 
   # Wait for postgresql to really start; if it doesn't, Hive Metastore will fail to start.
   for i in {1..120}; do
@@ -162,6 +198,11 @@ function build_impdev() {
   # Assert we're impdev now.
   [ "$(id -un)" = impdev ]
 
+  # Bump "Max processes" ulimit to the hard limit; default
+  # on CentOS 6 can be 1024, which isn't enough for minicluster.
+  ulimit -u $(cat /proc/self/limits | grep 'Max processes' | awk '{ print $4 }')
+  ulimit -a
+
   # Link in ccache from host.
   ln -s /ccache /home/impdev/.ccache
 
@@ -173,6 +214,14 @@ function build_impdev() {
   git init
   git fetch /git_common_dir --no-tags "$GIT_HEAD_REV"
   git checkout -b test-with-docker FETCH_HEAD
+
+  # Checkout impala-lzo too
+  mkdir /home/impdev/Impala-lzo
+  pushd /home/impdev/Impala-lzo
+  git init
+  git fetch $IMPALA_LZO_REPO --no-tags "$IMPALA_LZO_REF"
+  git checkout -b test-with-docker FETCH_HEAD
+  popd
 
   # Link in logs. Logs are on the host since that's the most important thing to
   # look at after the tests are run.
@@ -190,14 +239,39 @@ function build_impdev() {
   # and, this is a first build anyway.
   ./buildall.sh -noclean -format -testdata -notests
 
+  # We make one exception to "-notests":
+  # test_insert_parquet.py, which is used in all the end-to-end test
+  # shards, depends on this binary. We build it here once,
+  # instead of building it during the startup of each container running
+  # a subset of E2E tests. Building it here is also a lot faster.
+  make -j$(nproc) --load-average=$(nproc) parquet-reader
+
   # Dump current memory usage to logs, before shutting things down.
   memory_usage
 
   # Shut down things cleanly.
   testdata/bin/kill-all.sh
 
+  # "Compress" HDFS data by de-duplicating blocks. As a result of
+  # having three datanodes, our data load is 3x larger than it needs
+  # to be. To alleviate this (to the tune of ~20GB savings), we
+  # use hardlinks to link together the identical blocks. This is absolutely
+  # taking advantage of an implementation detail of HDFS.
+  echo "Hardlinking duplicate HDFS block data."
+  set +x
+  for x in $(find testdata/cluster/*/node-1/data/dfs/dn/current/ -name 'blk_*[0-9]'); do
+    for n in 2 3; do
+      xn=${x/node-1/node-$n}
+      if [ -f $xn ]; then
+        rm $xn
+        ln $x $xn
+      fi
+    done
+  done
+  set -x
+
   # Shutting down PostgreSQL nicely speeds up it's start time for new containers.
-  sudo service postgresql stop
+  _pg_ctl stop
 
   # Clean up things we don't need to reduce image size
   find be -name '*.o' -execdir rm '{}' + # ~1.6GB
@@ -328,11 +402,6 @@ function test_suite() {
 
   ret=0
 
-  if [[ ${EE_TEST} = true ]]; then
-    # test_insert_parquet.py depends on this binary
-    make -j$(nproc) --load-average=$(nproc) parquet-reader
-  fi
-
   # Run tests.
   (echo ">>> $1: Starting run-all-test") 2> /dev/null
   if ! time -p bash -x bin/run-all-tests.sh; then
@@ -360,10 +429,49 @@ function test_suite() {
 function configure_timezone() {
   if [ -e "${LOCALTIME_LINK_TARGET}" ]; then
     ln -sf "${LOCALTIME_LINK_TARGET}" /etc/localtime
-    date +%Z > /etc/timezone
+    # Only Debian-based distros have this file.
+    if [ -f /etc/timezone ]; then
+      echo "${LOCALTIME_LINK_TARGET}" | sed -e 's,.*zoneinfo/,,' > /etc/timezone
+    fi
   else
     echo '$LOCALTIME_LINK_TARGET not configured.' 1>&2
   fi
+}
+
+# Exposes a shell, with the container booted with
+# a minicluster.
+function shell() {
+  echo "Starting minicluster and Impala."
+  # Logs is typically a symlink; remove it if so.
+  rm logs || true
+  mkdir -p logs
+  boot_container
+  impala_environment
+  # Kudu requires --privileged for the Docker container; see
+  # https://issues.apache.org/jira/browse/KUDU-2000. Because
+  # our goal here is convenience for new developers, we
+  # skip kudu if "ntptime" doesn't work, which is a good
+  # proxy for Kudu won't start.
+  if ! ntptime > /dev/null; then
+    export KUDU_IS_SUPPORTED=false
+    KUDU_MSG="Kudu is not started."
+  fi
+  start_minicluster
+  bin/start-impala-cluster.py
+  cat <<"EOF"
+
+==========================================================
+Welcome to the Impala development environment.
+
+The "minicluster" is running; i.e., HDFS, HBase, Hive,
+etc. are running. $KUDU_MSG
+
+To get started, perhaps run:
+  impala-shell.sh -q 'select count(*) from tpcds.web_page'
+==========================================================
+
+EOF
+  exec bash
 }
 
 function main() {
@@ -373,9 +481,17 @@ function main() {
   CMD="$1"
   shift
 
+  # Treat shell specialy to avoid the extra logging and | cat below.
+  if [[ $CMD = "shell" ]]; then
+    shell
+    # shell shoud have exec'd, so if we get here, it's a failure.
+    exit 1
+  fi
+
   echo ">>> ${CMD} $@ (begin)"
   # Dump environment, for debugging
   env | grep -vE "AWS_(SECRET_)?ACCESS_KEY"
+  ulimit -a
   set -x
   # The "| cat" here avoids "set -e"/errexit from exiting the
   # script right away.

@@ -35,7 +35,7 @@
 #include "kudu/rpc/rpc_sidecar.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/status.h"
-#include "rpc/rpc-mgr.inline.h"
+#include "rpc/rpc-mgr.h"
 #include "runtime/descriptors.h"
 #include "runtime/exec-env.h"
 #include "runtime/mem-tracker.h"
@@ -43,6 +43,7 @@
 #include "runtime/row-batch.h"
 #include "runtime/runtime-state.h"
 #include "runtime/tuple-row.h"
+#include "service/data-stream-service.h"
 #include "util/aligned-new.h"
 #include "util/debug-util.h"
 #include "util/network-util.h"
@@ -66,6 +67,7 @@ namespace impala {
 const char* KrpcDataStreamSender::HASH_ROW_SYMBOL =
     "KrpcDataStreamSender7HashRowEPNS_8TupleRowE";
 const char* KrpcDataStreamSender::LLVM_CLASS_NAME = "class.impala::KrpcDataStreamSender";
+const char* KrpcDataStreamSender::TOTAL_BYTES_SENT_COUNTER = "TotalBytesSent";
 
 // A datastream sender may send row batches to multiple destinations. There is one
 // channel for each destination.
@@ -306,8 +308,7 @@ Status KrpcDataStreamSender::Channel::Init(RuntimeState* state) {
   batch_.reset(new RowBatch(row_desc_, capacity, parent_->mem_tracker()));
 
   // Create a DataStreamService proxy to the destination.
-  RpcMgr* rpc_mgr = ExecEnv::GetInstance()->rpc_mgr();
-  RETURN_IF_ERROR(rpc_mgr->GetProxy(address_, hostname_, &proxy_));
+  RETURN_IF_ERROR(DataStreamService::GetProxy(address_, hostname_, &proxy_));
   return Status::OK();
 }
 
@@ -582,10 +583,11 @@ void KrpcDataStreamSender::Channel::Teardown(RuntimeState* state) {
   batch_.reset();
 }
 
-KrpcDataStreamSender::KrpcDataStreamSender(int sender_id, const RowDescriptor* row_desc,
-    const TDataStreamSink& sink, const vector<TPlanFragmentDestination>& destinations,
-    int per_channel_buffer_size, RuntimeState* state)
-  : DataSink(row_desc,
+KrpcDataStreamSender::KrpcDataStreamSender(TDataSinkId sink_id, int sender_id,
+    const RowDescriptor* row_desc, const TDataStreamSink& sink,
+    const vector<TPlanFragmentDestination>& destinations, int per_channel_buffer_size,
+    RuntimeState* state)
+  : DataSink(sink_id, row_desc,
         Substitute("KrpcDataStreamSender (dst_id=$0)", sink.dest_node_id), state),
     sender_id_(sender_id),
     partition_type_(sink.output_partition.type),
@@ -644,6 +646,7 @@ Status KrpcDataStreamSender::Prepare(
   rpc_retry_counter_ = ADD_COUNTER(profile(), "RpcRetry", TUnit::UNIT);
   rpc_failure_counter_ = ADD_COUNTER(profile(), "RpcFailure", TUnit::UNIT);
   bytes_sent_counter_ = ADD_COUNTER(profile(), "TotalBytesSent", TUnit::BYTES);
+  state->AddBytesSentCounter(bytes_sent_counter_);
   bytes_sent_time_series_counter_ =
       ADD_TIME_SERIES_COUNTER(profile(), "BytesSent", bytes_sent_counter_);
   network_throughput_counter_ =
@@ -719,7 +722,8 @@ Status KrpcDataStreamSender::CodegenHashRow(LlvmCodeGen* codegen, llvm::Function
   // Unroll the loop and codegen each of the partition expressions
   for (int i = 0; i < partition_exprs_.size(); ++i) {
     llvm::Function* compute_fn;
-    RETURN_IF_ERROR(partition_exprs_[i]->GetCodegendComputeFn(codegen, &compute_fn));
+    RETURN_IF_ERROR(
+        partition_exprs_[i]->GetCodegendComputeFn(codegen, false, &compute_fn));
 
     // Load the expression evaluator for the i-th partition expression
     llvm::Function* get_expr_eval_fn =

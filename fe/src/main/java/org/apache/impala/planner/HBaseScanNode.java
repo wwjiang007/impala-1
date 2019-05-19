@@ -21,7 +21,9 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
+import java.util.ListIterator;
 import java.util.Map;
 
 import org.apache.hadoop.hbase.HConstants;
@@ -36,11 +38,13 @@ import org.apache.impala.analysis.SlotDescriptor;
 import org.apache.impala.analysis.StringLiteral;
 import org.apache.impala.analysis.TupleDescriptor;
 import org.apache.impala.catalog.FeHBaseTable;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.HBaseColumn;
 import org.apache.impala.catalog.PrimitiveType;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.Pair;
+import org.apache.impala.service.FeSupport;
 import org.apache.impala.thrift.TExplainLevel;
 import org.apache.impala.thrift.THBaseFilter;
 import org.apache.impala.thrift.THBaseKeyRange;
@@ -61,35 +65,12 @@ import org.slf4j.LoggerFactory;
 import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
 
 /**
  * Full scan of an HBase table.
  * Only families/qualifiers specified in TupleDescriptor will be retrieved in the backend.
  */
 public class HBaseScanNode extends ScanNode {
-  private final static Logger LOG = LoggerFactory.getLogger(HBaseScanNode.class);
-  private final TupleDescriptor desc_;
-
-  // One range per clustering column. The range bounds are expected to be constants.
-  // A null entry means there's no range restriction for that particular key.
-  // If keyRanges is non-null it always contains as many entries as there are clustering
-  // cols.
-  private List<ValueRange> keyRanges_;
-
-  // derived from keyRanges_; empty means unbounded;
-  // initialize start/stopKey_ to be unbounded.
-  private byte[] startKey_ = HConstants.EMPTY_START_ROW;
-  private byte[] stopKey_ = HConstants.EMPTY_END_ROW;
-
-  // True if this scan node is not going to scan anything. If the row key filter
-  // evaluates to null, or if the lower bound > upper bound, then this scan node won't
-  // scan at all.
-  private boolean isEmpty_ = false;
-
-  // List of HBase Filters for generating thrift message. Filled in finalize().
-  private final List<THBaseFilter> filters_ = new ArrayList<THBaseFilter>();
-
   // The suggested value for "hbase.client.scan.setCaching", which batches maxCaching
   // rows per fetch request to the HBase region server. If the value is too high,
   // then the hbase region server will have a hard time (GC pressure and long response
@@ -99,7 +80,6 @@ public class HBaseScanNode extends ScanNode {
   // won't exceed 500MB.
   private final static int MAX_HBASE_FETCH_BATCH_SIZE = 500 * 1024 * 1024;
   private final static int DEFAULT_SUGGESTED_CACHING = 1024;
-  private int suggestedCaching_ = DEFAULT_SUGGESTED_CACHING;
 
   // Used for memory estimation when the column max size stat is missing (happens only
   // in case of string type columns).
@@ -113,18 +93,56 @@ public class HBaseScanNode extends ScanNode {
   // block size that can be allocated by the mem-pool.
   private final static int DEFAULT_MIN_ESTIMATE_BYTES = 4 * 1024;
 
+  private final static Logger LOG = LoggerFactory.getLogger(HBaseScanNode.class);
+  private final TupleDescriptor desc_;
+
+  // One range per clustering column. The range bounds are expected to be constants.
+  // A null entry means there's no range restriction for that particular key.
+  // If keyRanges is non-null it always contains as many entries as there are clustering
+  // cols.
+  private List<ValueRange> keyRanges_ = new ArrayList<>();
+
+  // The list of conjuncts used to create the key ranges. Used if we
+  // must estimate cardinality based on row count stats.
+  private List<Expr> keyConjuncts_ = new ArrayList<>();
+
+  // derived from keyRanges_; empty means unbounded;
+  // initialize start/stopKey_ to be unbounded.
+  private byte[] startKey_ = HConstants.EMPTY_START_ROW;
+  private byte[] stopKey_ = HConstants.EMPTY_END_ROW;
+
+  // True if this scan node is not going to scan anything. If the row key filter
+  // evaluates to null, or if the lower bound > upper bound, then this scan node won't
+  // scan at all.
+  private boolean isEmpty_ = false;
+
+  // List of HBase Filters for generating thrift message. Filled in finalize().
+  private final List<THBaseFilter> filters_ = new ArrayList<>();
+
+  private int suggestedCaching_ = DEFAULT_SUGGESTED_CACHING;
+
   public HBaseScanNode(PlanNodeId id, TupleDescriptor desc) {
     super(id, desc, "SCAN HBASE");
     desc_ = desc;
   }
 
-  public void setKeyRanges(List<ValueRange> keyRanges) {
-    Preconditions.checkNotNull(keyRanges);
-    keyRanges_ = keyRanges;
-  }
-
   @Override
   public void init(Analyzer analyzer) throws ImpalaException {
+    FeTable table = desc_.getTable();
+    // determine scan predicates for clustering cols
+    for (int i = 0; i < table.getNumClusteringCols(); ++i) {
+      SlotDescriptor slotDesc = analyzer.getColumnSlot(
+          desc_, table.getColumns().get(i));
+      if (slotDesc == null || !slotDesc.getType().isStringType()) {
+        // the hbase row key is mapped to a non-string type
+        // (since it's stored in ASCII it will be lexicographically ordered,
+        // and non-string comparisons won't work)
+        keyRanges_.add(null);
+      } else {
+        keyRanges_.add(createHBaseValueRange(slotDesc));
+      }
+    }
+
     checkForSupportedFileFormats();
     assignConjuncts(analyzer);
     conjuncts_ = orderConjunctsByCost(conjuncts_);
@@ -143,13 +161,70 @@ public class HBaseScanNode extends ScanNode {
   }
 
   /**
+   * Transform '=', '<[=]' and '>[=]' comparisons for given slot into
+   * ValueRange. Also removes those predicates which were used for the construction
+   * of ValueRange from 'conjuncts_'. Only looks at comparisons w/ string constants
+   * (ie, the bounds of the result can be evaluated with Expr::GetValue(NULL)).
+   * HBase row key filtering works only if the row key is mapped to a string column and
+   * the expression is a string constant expression.
+   * If there are multiple competing comparison predicates that could be used
+   * to construct a ValueRange, only the first one from each category is chosen.
+   */
+  private ValueRange createHBaseValueRange(SlotDescriptor d) {
+    ListIterator<Expr> i = conjuncts_.listIterator();
+    ValueRange result = null;
+    while (i.hasNext()) {
+      Expr e = i.next();
+      if (!(e instanceof BinaryPredicate)) continue;
+      BinaryPredicate comp = (BinaryPredicate) e;
+      if ((comp.getOp() == BinaryPredicate.Operator.NE)
+          || (comp.getOp() == BinaryPredicate.Operator.DISTINCT_FROM)
+          || (comp.getOp() == BinaryPredicate.Operator.NOT_DISTINCT)) {
+        continue;
+      }
+      Expr slotBinding = comp.getSlotBinding(d.getId());
+      if (slotBinding == null || !slotBinding.isConstant() ||
+          !slotBinding.getType().equals(Type.STRING)) {
+        continue;
+      }
+
+      if (comp.getOp() == BinaryPredicate.Operator.EQ) {
+        i.remove();
+        keyConjuncts_.add(e);
+        return ValueRange.createEqRange(slotBinding);
+      }
+
+      if (result == null) result = new ValueRange();
+
+      // TODO: do we need copies here?
+      if (comp.getOp() == BinaryPredicate.Operator.GT
+          || comp.getOp() == BinaryPredicate.Operator.GE) {
+        if (result.getLowerBound() == null) {
+          result.setLowerBound(slotBinding);
+          result.setLowerBoundInclusive(comp.getOp() == BinaryPredicate.Operator.GE);
+          i.remove();
+          keyConjuncts_.add(e);
+        }
+      } else {
+        if (result.getUpperBound() == null) {
+          result.setUpperBound(slotBinding);
+          result.setUpperBoundInclusive(comp.getOp() == BinaryPredicate.Operator.LE);
+          i.remove();
+          keyConjuncts_.add(e);
+       }
+      }
+    }
+    return result;
+  }
+
+  /**
    * Convert keyRanges_ to startKey_ and stopKey_.
    * If ValueRange is not null, transform it into start/stopKey_ by evaluating the
    * expression. Analysis has checked that the expression is string type. If the
    * expression evaluates to null, then there's nothing to scan because Hbase row key
    * cannot be null.
    * At present, we only do row key filtering for string-mapped keys. String-mapped keys
-   * are always encded as ascii.
+   * are always encoded as ASCII.
    * ValueRange is null if there is no predicate on the row-key.
    */
   private void setStartStopKey(Analyzer analyzer) throws ImpalaException {
@@ -162,11 +237,15 @@ public class HBaseScanNode extends ScanNode {
         Preconditions.checkState(rowRange.getLowerBound().isConstant());
         Preconditions.checkState(
             rowRange.getLowerBound().getType().equals(Type.STRING));
-        LiteralExpr val = LiteralExpr.create(rowRange.getLowerBound(),
-            analyzer.getQueryCtx());
+        LiteralExpr val = LiteralExpr.createBounded(rowRange.getLowerBound(),
+            analyzer.getQueryCtx(), StringLiteral.MAX_STRING_LEN);
+        // TODO: Make this a Preconditions.checkState(). If we get here,
+        // and the value is not a string literal, then we've got a predicate
+        // that we removed from the conjunct list, but which we won't evaluate
+        // as a key. That is, we'll produce wrong query results.
         if (val instanceof StringLiteral) {
           StringLiteral litVal = (StringLiteral) val;
-          startKey_ = convertToBytes(litVal.getStringValue(),
+          startKey_ = convertToBytes(litVal.getUnescapedValue(),
               !rowRange.getLowerBoundInclusive());
         } else {
           // lower bound is null.
@@ -178,11 +257,11 @@ public class HBaseScanNode extends ScanNode {
         Preconditions.checkState(rowRange.getUpperBound().isConstant());
         Preconditions.checkState(
             rowRange.getUpperBound().getType().equals(Type.STRING));
-        LiteralExpr val = LiteralExpr.create(rowRange.getUpperBound(),
-            analyzer.getQueryCtx());
+        LiteralExpr val = LiteralExpr.createBounded(rowRange.getUpperBound(),
+            analyzer.getQueryCtx(), StringLiteral.MAX_STRING_LEN);
         if (val instanceof StringLiteral) {
           StringLiteral litVal = (StringLiteral) val;
-          stopKey_ = convertToBytes(litVal.getStringValue(),
+          stopKey_ = convertToBytes(litVal.getUnescapedValue(),
               rowRange.getUpperBoundInclusive());
         } else {
           // lower bound is null.
@@ -213,20 +292,42 @@ public class HBaseScanNode extends ScanNode {
     } else if (rowRange != null && rowRange.isEqRange()) {
       cardinality_ = 1;
     } else {
-      // Set maxCaching so that each fetch from hbase won't return a batch of more than
-      // MAX_HBASE_FETCH_BATCH_SIZE bytes.
-      Pair<Long, Long> estimate = tbl.getEstimatedRowStats(startKey_, stopKey_);
-      cardinality_ = estimate.first.longValue();
-      if (estimate.second.longValue() > 0) {
-        suggestedCaching_ = (int)
-            Math.max(MAX_HBASE_FETCH_BATCH_SIZE / estimate.second.longValue(), 1);
+      Pair<Long, Long> estimate;
+      if (analyzer.getQueryCtx().isDisable_hbase_row_est()) {
+        estimate = new Pair<>(-1L, -1L);
+      } else {
+        // Set maxCaching so that each fetch from hbase won't return a batch of more than
+        // MAX_HBASE_FETCH_BATCH_SIZE bytes.
+        // May return -1 for the estimate if insufficient data is available.
+        estimate = tbl.getEstimatedRowStats(startKey_, stopKey_);
+      }
+      if (estimate.first == -1) {
+        // No useful estimate. Rely on HMS row count stats.
+        // This works only if HBase stats are available in HMS. This is true
+        // for the Impala tests, and may be true for some applications.
+        cardinality_ = tbl.getTTableStats().getNum_rows();
+        // TODO: What do do if neither HBase nor HMS provide a row count estimate?
+        // Is there some third, ulitimate fallback?
+        // Apply estimated key range selectivity from original key conjuncts
+        if (cardinality_ != -1 && keyConjuncts_ != null) {
+          cardinality_ *= computeCombinedSelectivity(keyConjuncts_);
+        }
+      } else {
+        // Use the HBase sampling scan to estimate cardinality. Note that,
+        // in tests, this estimate has proven to be very rough: off by
+        // 2x or more.
+        cardinality_ = estimate.first;
+        if (estimate.second > 0) {
+          suggestedCaching_ = (int)
+              Math.max(MAX_HBASE_FETCH_BATCH_SIZE / estimate.second.longValue(), 1);
+        }
       }
     }
     inputCardinality_ = cardinality_;
 
     cardinality_ *= computeSelectivity();
     cardinality_ = Math.max(1, cardinality_);
-    cardinality_ = capAtLimit(cardinality_);
+    cardinality_ = capCardinalityAtLimit(cardinality_);
     if (LOG.isTraceEnabled()) {
       LOG.trace("computeStats HbaseScan: cardinality=" + Long.toString(cardinality_));
     }
@@ -280,9 +381,14 @@ public class HBaseScanNode extends ScanNode {
 
         StringLiteral literal = (StringLiteral) bindingExpr;
         HBaseColumn col = (HBaseColumn) slot.getColumn();
-        filters_.add(new THBaseFilter(
-            col.getColumnFamily(), col.getColumnQualifier(),
-            (byte) hbaseOp.ordinal(), literal.getUnescapedValue()));
+        // IMPALA-7929: Since the qualifier can be null (e.g. for the key column of an
+        // HBase table), the qualifier field must be optional in order to express the
+        // null value. Constructors in Thrift do not set optional fields, so the qualifier
+        // must be set separately.
+        THBaseFilter thbf = new THBaseFilter(col.getColumnFamily(),
+            (byte) hbaseOp.ordinal(), literal.getUnescapedValue());
+        thbf.setQualifier(col.getColumnQualifier());
+        filters_.add(thbf);
         analyzer.materializeSlots(Lists.newArrayList(e));
       }
     }
@@ -325,7 +431,7 @@ public class HBaseScanNode extends ScanNode {
     // Convert list of HRegionLocation to Map<hostport, List<HRegionLocation>>.
     // The List<HRegionLocations>'s end up being sorted by start key/end key, because
     // regionsLoc is sorted that way.
-    Map<String, List<HRegionLocation>> locationMap = Maps.newHashMap();
+    Map<String, List<HRegionLocation>> locationMap = new HashMap<>();
     for (HRegionLocation regionLoc: regionsLoc) {
       String locHostPort = regionLoc.getHostnamePort();
       if (locationMap.containsKey(locHostPort)) {
@@ -427,6 +533,10 @@ public class HBaseScanNode extends ScanNode {
     output.append(String.format("%s%s:%s [%s%s]\n", prefix, id_.toString(),
         displayName_, table.getFullName(), aliasStr));
     if (detailLevel.ordinal() >= TExplainLevel.STANDARD.ordinal()) {
+      if (!keyConjuncts_.isEmpty()) {
+        output.append(detailPrefix
+            + "key predicates: " + getExplainString(keyConjuncts_, detailLevel) + "\n");
+      }
       if (!Bytes.equals(startKey_, HConstants.EMPTY_START_ROW)) {
         output.append(detailPrefix + "start key: " + printKey(startKey_) + "\n");
       }
@@ -451,8 +561,8 @@ public class HBaseScanNode extends ScanNode {
         output.append('\n');
       }
       if (!conjuncts_.isEmpty()) {
-        output.append(
-            detailPrefix + "predicates: " + getExplainString(conjuncts_) + "\n");
+        output.append(detailPrefix
+            + "predicates: " + getExplainString(conjuncts_, detailLevel) + "\n");
       }
     }
     if (detailLevel.ordinal() >= TExplainLevel.EXTENDED.ordinal()) {
@@ -513,7 +623,7 @@ public class HBaseScanNode extends ScanNode {
     // The first column in an HBase table is always the key column.
     HBaseColumn keyCol = (HBaseColumn) tbl.getColumns().get(0);
 
-    List<HBaseColumn> colsToFetchFromHBase = new ArrayList<HBaseColumn>();
+    List<HBaseColumn> colsToFetchFromHBase = new ArrayList<>();
     for (SlotDescriptor slot : desc_.getSlots()) {
       HBaseColumn col = (HBaseColumn) tbl.getColumn(slot.getLabel());
       // Will add key column separately, since its always fetched.

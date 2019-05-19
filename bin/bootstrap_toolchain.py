@@ -50,6 +50,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 
 from collections import namedtuple
 
@@ -71,11 +72,13 @@ OS_MAPPING = [
   OsMapping("suselinux11", "ec2-package-sles-11", None),
   OsMapping("suselinux12", "ec2-package-sles-12", "sles12"),
   OsMapping("suse12.2", "ec2-package-sles-12", "sles12"),
+  OsMapping("suse12.3", "ec2-package-sles-12", "sles12"),
   OsMapping("ubuntu12.04", "ec2-package-ubuntu-12-04", None),
   OsMapping("ubuntu14.04", "ec2-package-ubuntu-14-04", None),
   OsMapping("ubuntu15.04", "ec2-package-ubuntu-14-04", None),
   OsMapping("ubuntu15.10", "ec2-package-ubuntu-14-04", None),
-  OsMapping('ubuntu16.04', "ec2-package-ubuntu-16-04", "ubuntu1604")
+  OsMapping('ubuntu16.04', "ec2-package-ubuntu-16-04", "ubuntu1604"),
+  OsMapping('ubuntu18.04', "ec2-package-ubuntu-18-04", "ubuntu1804")
 ]
 
 class Package(object):
@@ -99,6 +102,26 @@ class Package(object):
     if self.url is None:
       url_env_var = "IMPALA_{0}_URL".format(package_env_name)
       self.url = os.environ.get(url_env_var)
+
+
+class CdpComponent(object):
+  def __init__(self, basename, makedir=False, pkg_directory=None):
+    """
+    basename: the name of the file to be downloaded, without its .tar.gz suffix
+    makedir: if false, it is assumed that the downloaded tarball will expand
+             into a directory with the same name as 'basename'. If True, we
+             assume that the tarball doesn't have any top-level directory,
+             and so we need to manually create a directory within which to
+             expand the tarball.
+    """
+    self.basename = basename
+    self.makedir = makedir
+    cdp_components_home = os.environ.get("CDP_COMPONENTS_HOME")
+    if cdp_components_home is None:
+      raise Exception("CDP_COMPONENTS_HOME is not set. Cannot determine the "
+                      "component package directory")
+    self.pkg_directory = "{0}/{1}".format(cdp_components_home,
+                            pkg_directory if pkg_directory else basename)
 
 
 def try_get_platform_release_label():
@@ -382,7 +405,7 @@ def download_cdh_components(toolchain_root, cdh_components, url_prefix):
   cdh_components_home = os.environ.get("CDH_COMPONENTS_HOME")
   if not cdh_components_home:
     logging.error("Impala environment not set up correctly, make sure "
-          "$CDH_COMPONENTS_HOME is present.")
+          "$CDH_COMPONENTS_HOME is set.")
     sys.exit(1)
 
   # Create the directory where CDH components live if necessary.
@@ -390,44 +413,94 @@ def download_cdh_components(toolchain_root, cdh_components, url_prefix):
     os.makedirs(cdh_components_home)
 
   def download(component):
-    pkg_directory = package_directory(cdh_components_home, component.name,
-        component.version)
-    if os.path.isdir(pkg_directory):
-      return
+    try:
+      pkg_directory = package_directory(cdh_components_home, component.name,
+          component.version)
+      if os.path.isdir(pkg_directory):
+        return
 
-    platform_label = ""
-    # Kudu is the only component that's platform dependent.
-    if component.name == "kudu":
-      platform_label = "-%s" % get_platform_release_label().cdh
-    # Download the package if it doesn't exist
-    file_name = "{0}-{1}{2}.tar.gz".format(
-        component.name, component.version, platform_label)
+      platform_label = ""
+      # Kudu is the only component that's platform dependent.
+      if component.name == "kudu":
+        platform_label = "-%s" % get_platform_release_label().cdh
+      # Download the package if it doesn't exist
+      file_name = "{0}-{1}{2}.tar.gz".format(
+          component.name, component.version, platform_label)
 
-    if component.url is None:
-      download_path = url_prefix + file_name
-    else:
-      download_path = component.url
-      if "%(platform_label)" in component.url:
-        download_path = \
-            download_path.replace("%(platform_label)", get_platform_release_label().cdh)
-    wget_and_unpack_package(download_path, file_name, cdh_components_home, False)
+      if component.url is None:
+        download_path = url_prefix + file_name
+      else:
+        download_path = component.url
+        if "%(platform_label)" in component.url:
+          download_path = \
+              download_path.replace("%(platform_label)", get_platform_release_label().cdh)
+      wget_and_unpack_package(download_path, file_name, cdh_components_home, False)
+    except Exception:
+      # IMPALA-8517: print backtrace to help debug flaky failures.
+      traceback.print_exc()
+      raise
 
   execute_many(download, cdh_components)
 
+
+def download_cdp_components(cdp_components, url_prefix):
+  """
+  Downloads and unpacks the CDP components for a given URL prefix into
+  $CDP_COMPONENTS_HOME if not found.
+
+  cdp_components: list of CdpComponent instances
+  """
+  cdp_components_home = os.environ.get("CDP_COMPONENTS_HOME")
+  if not cdp_components_home:
+    logging.error("Impala environment not set up correctly, make sure "
+                  "$CDP_COMPONENTS_HOME is set.")
+    sys.exit(1)
+
+  # Create the directory where CDP components live if necessary.
+  if not os.path.exists(cdp_components_home):
+    os.makedirs(cdp_components_home)
+
+  def download(component):
+
+    if os.path.isdir(component.pkg_directory): return
+    file_name = "{0}.tar.gz".format(component.basename)
+    download_path = "{0}/{1}".format(url_prefix, file_name)
+    dst = cdp_components_home
+    if component.makedir:
+      # Download and unpack in a temp directory, which we'll later move into place
+      dst = tempfile.mkdtemp(dir=cdp_components_home)
+    try:
+      wget_and_unpack_package(download_path, file_name, dst, False)
+    except:  # noqa
+      # Clean up any partially-unpacked result.
+      if os.path.isdir(component.pkg_directory):
+        shutil.rmtree(component.pkg_directory)
+      # Clean up any temp directory if we made one
+      if component.makedir:
+        shutil.rmtree(dst)
+      raise
+    if component.makedir:
+      os.rename(dst, component.pkg_directory)
+
+  execute_many(download, cdp_components)
+
+
 if __name__ == "__main__":
   """Validates the presence of $IMPALA_HOME and $IMPALA_TOOLCHAIN in the environment.-
-  By checking $IMPALA_HOME is present, we assume that IMPALA_{LIB}_VERSION will be present
+  By checking $IMPALA_HOME is set, we assume that IMPALA_{LIB}_VERSION will be set
   as well. Will create the directory specified by $IMPALA_TOOLCHAIN if it doesn't exist
   yet. Each of the packages specified in `packages` is downloaded and extracted into
   $IMPALA_TOOLCHAIN. If $DOWNLOAD_CDH_COMPONENTS is true, the presence of
-  $CDH_DOWNLOAD_HOST and $CDH_BUILD_NUMBER will be checked and this function will also
-  download the following CDH components into the directory specified by
-  $CDH_COMPONENTS_HOME.
-  - hadoop (downloaded from $CDH_DOWNLOAD_HOST for a given $CDH_BUILD_NUMBER)
-  - hbase (downloaded from $CDH_DOWNLOAD_HOST for a given $CDH_BUILD_NUMBER)
-  - hive (downloaded from $CDH_DOWNLOAD_HOST for a given $CDH_BUILD_NUMBER)
-  - sentry (downloaded from $CDH_DOWNLOAD_HOST for a given $CDH_BUILD_NUMBER)
+  $IMPALA_TOOLCHAIN_HOST and $CDH_BUILD_NUMBER will be checked and this function will also
+  download the following CDH/CDP components into the directory specified by
+  $CDH_COMPONENTS_HOME/$CDP_COMPONENTS_HOME.
+  - hadoop (downloaded from $IMPALA_TOOLCHAIN_HOST for a given $CDH_BUILD_NUMBER)
+  - hbase (downloaded from $IMPALA_TOOLCHAIN_HOST for a given $CDH_BUILD_NUMBER)
+  - hive (downloaded from $IMPALA_TOOLCHAIN_HOST for a given $CDH_BUILD_NUMBER)
+  - sentry (downloaded from $IMPALA_TOOLCHAIN_HOST for a given $CDH_BUILD_NUMBER)
   - llama-minikdc (downloaded from $TOOLCHAIN_HOST)
+  - ranger (downloaded from $IMPALA_TOOLCHAIN_HOST for a given $CDP_BUILD_NUMBER)
+  - hive3 (downloaded from $IMPALA_TOOLCHAIN_HOST for a given $CDP_BUILD_NUMBER)
   """
   logging.basicConfig(level=logging.INFO,
       format='%(asctime)s %(threadName)s %(levelname)s: %(message)s')
@@ -443,7 +516,7 @@ if __name__ == "__main__":
   toolchain_root = os.environ.get("IMPALA_TOOLCHAIN")
   if not toolchain_root:
     logging.error("Impala environment not set up correctly, make sure "
-          "$IMPALA_TOOLCHAIN is present.")
+          "$IMPALA_TOOLCHAIN is set.")
     sys.exit(1)
 
   if not os.path.exists(toolchain_root):
@@ -466,28 +539,33 @@ if __name__ == "__main__":
       "libunwind", "lz4", "openldap", "openssl", "orc", "protobuf",
       "rapidjson", "re2", "snappy", "thrift", "tpc-h", "tpc-ds", "zlib"])
   packages.insert(0, Package("llvm", "5.0.1-asserts-p1"))
+  packages.insert(0, Package("thrift", os.environ.get("IMPALA_THRIFT11_VERSION")))
   bootstrap(toolchain_root, packages)
 
   # Download the CDH components if necessary.
   if not os.getenv("DOWNLOAD_CDH_COMPONENTS", "false") == "true": sys.exit(0)
 
-  if "CDH_DOWNLOAD_HOST" not in os.environ or "CDH_BUILD_NUMBER" not in os.environ:
+  if "IMPALA_TOOLCHAIN_HOST" not in os.environ or "CDH_BUILD_NUMBER" not in os.environ:
     logging.error("Impala environment not set up correctly, make sure "
                   "impala-config.sh is sourced.")
     sys.exit(1)
 
-  cdh_host = os.environ.get("CDH_DOWNLOAD_HOST")
-  cdh_build_number = os.environ.get("CDH_BUILD_NUMBER")
+  toolchain_host = os.environ["IMPALA_TOOLCHAIN_HOST"]
+  cdh_build_number = os.environ["CDH_BUILD_NUMBER"]
 
-  cdh_components = map(Package, ["hadoop", "hbase", "hive", "sentry"])
+  cdh_components = map(Package, ["hbase", "sentry"])
+  use_cdp_hive = os.getenv("USE_CDP_HIVE") == "true"
+  if not use_cdp_hive:
+    cdh_components += [Package("hive"), Package("hadoop")]
+
   if use_cdh_kudu:
     if not try_get_platform_release_label() or not try_get_platform_release_label().cdh:
       logging.error("CDH Kudu is not supported on this platform. Set USE_CDH_KUDU=false "
                     "to use the toolchain Kudu.")
       sys.exit(1)
     cdh_components += [Package("kudu")]
-  download_path_prefix= \
-      "https://{0}/build/cdh_components/{1}/tarballs/".format(cdh_host,
+  download_path_prefix = \
+      "https://{0}/build/cdh_components/{1}/tarballs/".format(toolchain_host,
                                                               cdh_build_number)
   download_cdh_components(toolchain_root, cdh_components, download_path_prefix)
 
@@ -497,3 +575,22 @@ if __name__ == "__main__":
   cdh_components = [Package("llama-minikdc")]
   download_path_prefix = "{0}/cdh_components/".format(TOOLCHAIN_HOST)
   download_cdh_components(toolchain_root, cdh_components, download_path_prefix)
+
+  cdp_build_number = os.environ["CDP_BUILD_NUMBER"]
+  cdp_components = [
+    CdpComponent("ranger-{0}-admin".format(os.environ.get("IMPALA_RANGER_VERSION"))),
+  ]
+  if use_cdp_hive:
+    hive_version = os.environ.get("IMPALA_HIVE_VERSION")
+    cdp_components.append(CdpComponent("hive-{0}-source".format(hive_version),
+                          pkg_directory="hive-{0}".format(hive_version))),
+    cdp_components.append(CdpComponent("apache-hive-{0}-bin".format(hive_version))),
+    cdp_components.append(CdpComponent("hadoop-{0}"
+                          .format(os.environ.get("IMPALA_HADOOP_VERSION")))),
+    cdp_components.append(CdpComponent(
+        "tez-{0}-minimal".format(os.environ.get("IMPALA_TEZ_VERSION")),
+        makedir=True))
+  download_path_prefix = \
+    "https://{0}/build/cdp_components/{1}/tarballs".format(toolchain_host,
+                                                           cdp_build_number)
+  download_cdp_components(cdp_components, download_path_prefix)

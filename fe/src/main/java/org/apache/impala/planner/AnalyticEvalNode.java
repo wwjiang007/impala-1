@@ -17,6 +17,7 @@
 
 package org.apache.impala.planner;
 
+import java.util.ArrayList;
 import java.util.List;
 
 import org.slf4j.Logger;
@@ -36,7 +37,6 @@ import org.apache.impala.thrift.TQueryOptions;
 import com.google.common.base.Joiner;
 import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
 
 /**
  * Computation of analytic exprs.
@@ -138,12 +138,12 @@ public class AnalyticEvalNode extends PlanNode {
   protected void computeStats(Analyzer analyzer) {
     super.computeStats(analyzer);
     cardinality_ = getChild(0).cardinality_;
-    cardinality_ = capAtLimit(cardinality_);
+    cardinality_ = capCardinalityAtLimit(cardinality_);
   }
 
   @Override
   protected String debugString() {
-    List<String> orderByElementStrs = Lists.newArrayList();
+    List<String> orderByElementStrs = new ArrayList<>();
     for (OrderByElement element: orderByElements_) {
       orderByElementStrs.add(element.toSql());
     }
@@ -200,7 +200,7 @@ public class AnalyticEvalNode extends PlanNode {
     output.append("\n");
     if (detailLevel.ordinal() >= TExplainLevel.STANDARD.ordinal()) {
       output.append(detailPrefix + "functions: ");
-      List<String> strings = Lists.newArrayList();
+      List<String> strings = new ArrayList<>();
       for (Expr fnCall: analyticFnCalls_) {
         strings.add(fnCall.toSql());
       }
@@ -234,8 +234,8 @@ public class AnalyticEvalNode extends PlanNode {
       }
 
       if (!conjuncts_.isEmpty()) {
-        output.append(
-            detailPrefix + "predicates: " + getExplainString(conjuncts_) + "\n");
+        output.append(detailPrefix
+            + "predicates: " + getExplainString(conjuncts_, detailLevel) + "\n");
       }
     }
     return output.toString();

@@ -24,6 +24,7 @@ import javax.annotation.Nullable;
 import org.apache.hadoop.fs.Path;
 import org.apache.impala.analysis.LiteralExpr;
 import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
+import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.thrift.TAccessLevel;
 import org.apache.impala.thrift.THdfsPartitionLocation;
 import org.apache.impala.thrift.TPartitionStats;
@@ -47,6 +48,11 @@ public interface FeFsPartition {
    * @return the table that contains this partition
    */
   FeFsTable getTable();
+
+  /**
+   * @return the FsType that this partition is stored on
+   */
+  FileSystemUtil.FsType getFsType();
 
   /**
    * @return the files that this partition contains
@@ -161,4 +167,11 @@ public interface FeFsPartition {
    * getPartitionStatsCompressed().
    */
   Map<String, String> getParameters();
+
+  /**
+   * @return the writeId stored in hms for the partition
+   * -1 means write Id is undefined.
+   */
+  long getWriteId();
+
 }

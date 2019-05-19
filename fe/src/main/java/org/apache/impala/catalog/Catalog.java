@@ -17,17 +17,21 @@
 
 package org.apache.impala.catalog;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.apache.impala.analysis.FunctionName;
+import org.apache.impala.authorization.AuthorizationPolicy;
 import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
 import org.apache.impala.thrift.TCatalogObject;
 import org.apache.impala.thrift.TFunction;
 import org.apache.impala.thrift.TPartitionKeyValue;
+import org.apache.impala.thrift.TPrincipalType;
 import org.apache.impala.thrift.TTable;
 import org.apache.impala.thrift.TTableName;
 import org.apache.impala.thrift.TUniqueId;
@@ -35,7 +39,6 @@ import org.apache.impala.util.PatternMatcher;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
 
 /**
  * Thread safe interface for reading and updating metadata stored in the Hive MetaStore.
@@ -55,14 +58,13 @@ import com.google.common.collect.Lists;
  * database that the user cannot modify.
  * Builtins are populated on startup in initBuiltins().
  */
-public abstract class Catalog {
+public abstract class Catalog implements AutoCloseable {
   // Initial catalog version and ID.
   public final static long INITIAL_CATALOG_VERSION = 0L;
   public static final TUniqueId INITIAL_CATALOG_SERVICE_ID = new TUniqueId(0L, 0L);
   public static final String DEFAULT_DB = "default";
 
-  protected final MetaStoreClientPool metaStoreClientPool_ =
-      new MetaStoreClientPool(0, 0);
+  private final MetaStoreClientPool metaStoreClientPool_;
 
   // Cache of authorization policy metadata. Populated from data retried from the
   // Sentry Service, if configured.
@@ -71,9 +73,8 @@ public abstract class Catalog {
   // Thread safe cache of database metadata. Uses an AtomicReference so reset()
   // operations can atomically swap dbCache_ references.
   // TODO: Update this to use a CatalogObjectCache?
-  protected AtomicReference<ConcurrentHashMap<String, Db>> dbCache_ =
-      new AtomicReference<ConcurrentHashMap<String, Db>>(
-          new ConcurrentHashMap<String, Db>());
+  protected AtomicReference<Map<String, Db>> dbCache_ =
+      new AtomicReference<>(new ConcurrentHashMap<String, Db>());
 
   // Cache of data sources.
   protected final CatalogObjectCache<DataSource> dataSources_;
@@ -83,29 +84,32 @@ public abstract class Catalog {
   protected final CatalogObjectCache<HdfsCachePool> hdfsCachePools_ =
       new CatalogObjectCache<HdfsCachePool>(false);
 
-  public Catalog() {
+  // Cache of authorization cache invalidation markers.
+  protected final CatalogObjectCache<AuthzCacheInvalidation> authzCacheInvalidation_ =
+      new CatalogObjectCache<>();
+
+  /**
+   * Creates a new instance of Catalog backed by a given MetaStoreClientPool.
+   */
+  public Catalog(MetaStoreClientPool metaStoreClientPool) {
     dataSources_ = new CatalogObjectCache<DataSource>();
+    metaStoreClientPool_ = Preconditions.checkNotNull(metaStoreClientPool);
   }
 
   /**
-   * Creates a new instance of Catalog. It also adds 'numClients' clients to
-   * 'metastoreClientPool_'.
-   * 'initialCnxnTimeoutSec' specifies the time (in seconds) Catalog will wait to
-   * establish an initial connection to the HMS. Using this setting allows catalogd and
-   * HMS to be started simultaneously.
+   * Creates a Catalog instance with the default MetaStoreClientPool implementation.
+   * Refer to MetaStoreClientPool class for more details.
    */
-  public Catalog(int numClients, int initialCnxnTimeoutSec) {
-    this();
-    metaStoreClientPool_.initClients(numClients, initialCnxnTimeoutSec);
+  public Catalog() {
+    this(new MetaStoreClientPool(0, 0));
   }
 
   /**
    * Adds a new database to the catalog, replacing any existing database with the same
-   * name. Returns the previous database with this name, or null if there was no
-   * previous database.
+   * name.
    */
-  public Db addDb(Db db) {
-    return dbCache_.get().put(db.getName().toLowerCase(), db);
+  public void addDb(Db db) {
+    dbCache_.get().put(db.getName().toLowerCase(), db);
   }
 
   /**
@@ -113,7 +117,7 @@ public abstract class Catalog {
    * Returns null if no matching database is found.
    */
   public Db getDb(String dbName) {
-    Preconditions.checkState(dbName != null && !dbName.isEmpty(),
+    Preconditions.checkArgument(dbName != null && !dbName.isEmpty(),
         "Null or empty database name given as argument to Catalog.getDb");
     return dbCache_.get().get(dbName.toLowerCase());
   }
@@ -268,12 +272,14 @@ public abstract class Catalog {
 
   /**
    * Returns the function that best matches 'desc' that is registered with the
-   * catalog using 'mode' to check for matching. If desc matches multiple functions
-   * in the catalog, it will return the function with the strictest matching mode.
-   * If multiple functions match at the same matching mode, ties are broken by comparing
-   * argument types in lexical order. Argument types are ordered by argument precision
-   * (e.g. double is preferred over float) and then by alphabetical order of argument
-   * type name, to guarantee deterministic results.
+   * catalog using 'mode' to check for matching.
+   * If desc matches multiple functions in the catalog, it will return the function with
+   * the strictest matching mode.
+   * If multiple functions match at the same matching mode, best match is defined as the
+   * one that requires the least number of arguments to be converted.
+   * Ties are broken by comparing argument types in lexical order. Argument types are
+   * ordered by argument precision (e.g. double is preferred over float) and then by
+   * alphabetical order of argument type name, to guarantee deterministic results.
    */
   public Function getFunction(Function desc, Function.CompareMode mode) {
     Db db = getDb(desc.dbName());
@@ -318,11 +324,18 @@ public abstract class Catalog {
   }
 
   /**
+   * Gets the {@link AuthzCacheInvalidation} for a given marker name.
+   */
+  public AuthzCacheInvalidation getAuthzCacheInvalidation(String markerName) {
+    return authzCacheInvalidation_.get(Preconditions.checkNotNull(markerName));
+  }
+
+  /**
    * Release the Hive Meta Store Client resources. Can be called multiple times
    * (additional calls will be no-ops).
    */
+  @Override
   public void close() { metaStoreClientPool_.close(); }
-
 
   /**
    * Returns a managed meta store client from the client connection pool.
@@ -337,7 +350,7 @@ public abstract class Catalog {
   public static List<String> filterStringsByPattern(Iterable<String> candidates,
       PatternMatcher matcher) {
     Preconditions.checkNotNull(matcher);
-    List<String> filtered = Lists.newArrayList();
+    List<String> filtered = new ArrayList<>();
     for (String candidate: candidates) {
       if (matcher.matches(candidate)) filtered.add(candidate);
     }
@@ -362,7 +375,7 @@ public abstract class Catalog {
   public static <T extends HasName> List<T> filterCatalogObjectsByPattern(
       Iterable<? extends T> candidates, PatternMatcher matcher) {
     Preconditions.checkNotNull(matcher);
-    List<T> filtered = Lists.newArrayList();
+    List<T> filtered = new ArrayList<>();
     for (T candidate: candidates) {
       if (matcher.matches(candidate.getName())) filtered.add(candidate);
     }
@@ -372,7 +385,7 @@ public abstract class Catalog {
 
   public HdfsPartition getHdfsPartition(String dbName, String tableName,
       org.apache.hadoop.hive.metastore.api.Partition msPart) throws CatalogException {
-    List<TPartitionKeyValue> partitionSpec = Lists.newArrayList();
+    List<TPartitionKeyValue> partitionSpec = new ArrayList<>();
     Table table = getTable(dbName, tableName);
     if (!(table instanceof HdfsTable)) {
       throw new PartitionNotFoundException(
@@ -512,11 +525,11 @@ public abstract class Catalog {
         break;
       case PRIVILEGE:
         Principal tmpPrincipal = authPolicy_.getPrincipal(
-            objectDesc.getPrincipal().getPrincipal_id(),
-            objectDesc.getPrincipal().getPrincipal_type());
+            objectDesc.getPrivilege().getPrincipal_id(),
+            objectDesc.getPrivilege().getPrincipal_type());
         if (tmpPrincipal == null) {
           throw new CatalogException(String.format("No %s associated with ID: %d",
-              Principal.toString(objectDesc.getPrincipal().getPrincipal_type())
+              Principal.toString(objectDesc.getPrivilege().getPrincipal_type())
                   .toLowerCase(), objectDesc.getPrivilege().getPrincipal_id()));
         }
         String privilegeName = PrincipalPrivilege.buildPrivilegeName(
@@ -531,6 +544,19 @@ public abstract class Catalog {
         throw new CatalogException(String.format("%s '%s' does not contain " +
             "privilege: '%s'", Principal.toString(tmpPrincipal.getPrincipalType()),
             tmpPrincipal.getName(), privilegeName));
+      case AUTHZ_CACHE_INVALIDATION:
+        AuthzCacheInvalidation authzCacheInvalidation = getAuthzCacheInvalidation(
+            objectDesc.getAuthz_cache_invalidation().getMarker_name());
+        if (authzCacheInvalidation == null) {
+          // Authorization cache invalidation requires a single catalog object and it
+          // needs to exist.
+          throw new CatalogException("Authz cache invalidation not found: " +
+              objectDesc.getAuthz_cache_invalidation().getMarker_name());
+        }
+        result.setType(authzCacheInvalidation.getCatalogObjectType());
+        result.setCatalog_version(authzCacheInvalidation.getCatalogVersion());
+        result.setAuthz_cache_invalidation(authzCacheInvalidation.toThrift());
+        break;
       default: throw new IllegalStateException(
           "Unexpected TCatalogObject type: " + objectDesc.getType());
     }
@@ -543,6 +569,13 @@ public abstract class Catalog {
 
   /**
    * Returns a unique string key of a catalog object.
+   *
+   * This method may initially seem counter-intuitive because Catalog::getUniqueName()
+   * uses this method to build a unique name instead of Catalog::getUniqueName()
+   * providing the implementation on how to build a catalog object key. The reason is
+   * building CatalogObject from TCatalogObject in order to call getUniqueName() can
+   * be an expensive operation, especially for constructing a Table catalog object
+   * from TCatalogObject.
    */
   public static String toCatalogObjectKey(TCatalogObject catalogObject) {
     Preconditions.checkNotNull(catalogObject);
@@ -558,19 +591,29 @@ public abstract class Catalog {
         return "FUNCTION:" + catalogObject.getFn().getName() + "(" +
             catalogObject.getFn().getSignature() + ")";
       case PRINCIPAL:
-        return "PRINCIPAL:" + catalogObject.getPrincipal().getPrincipal_name()
-            .toLowerCase();
+        // It is important to make the principal object key unique since it is possible
+        // to have the same name for both role and user.
+        String principalName = catalogObject.getPrincipal().getPrincipal_name();
+        if (catalogObject.getPrincipal().getPrincipal_type() == TPrincipalType.ROLE) {
+          principalName = principalName.toLowerCase();
+        }
+        return "PRINCIPAL:" + principalName + "." +
+            catalogObject.getPrincipal().getPrincipal_type().name();
       case PRIVILEGE:
-        // The combination of privilege name + principal ID is guaranteed to be unique.
+        // The combination of privilege name + principal ID + principal type is
+        // guaranteed to be unique.
         return "PRIVILEGE:" +
-            PrincipalPrivilege.buildPrivilegeName(catalogObject.getPrivilege())
-                .toLowerCase() + "." +
-            Integer.toString(catalogObject.getPrivilege().getPrincipal_id());
+            PrincipalPrivilege.buildPrivilegeName(catalogObject.getPrivilege()) + "." +
+            catalogObject.getPrivilege().getPrincipal_id() + "." +
+            catalogObject.getPrivilege().getPrincipal_type();
       case HDFS_CACHE_POOL:
         return "HDFS_CACHE_POOL:" +
             catalogObject.getCache_pool().getPool_name().toLowerCase();
       case DATA_SOURCE:
         return "DATA_SOURCE:" + catalogObject.getData_source().getName().toLowerCase();
+      case AUTHZ_CACHE_INVALIDATION:
+        return "AUTHZ_CACHE_INVALIDATION:" + catalogObject.getAuthz_cache_invalidation()
+            .getMarker_name().toLowerCase();
       case CATALOG:
         return "CATALOG_SERVICE_ID";
       default:

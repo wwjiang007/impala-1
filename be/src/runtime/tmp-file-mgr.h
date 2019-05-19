@@ -200,6 +200,11 @@ class TmpFileMgr {
     Status RecoverWriteError(
         WriteHandle* handle, const Status& write_status) WARN_UNUSED_RESULT;
 
+    /// Return a SCRATCH_ALLOCATION_FAILED error with the appropriate information,
+    /// including scratch directories, the amount of scratch allocated and previous
+    /// errors that caused this failure. 'lock_' must be held by caller.
+    Status ScratchAllocationFailedStatus();
+
     /// The TmpFileMgr it is associated with.
     TmpFileMgr* const tmp_file_mgr_;
 
@@ -419,6 +424,9 @@ class TmpFileMgr {
   /// Metrics to track active scratch directories.
   IntGauge* num_active_scratch_dirs_metric_;
   SetMetric<std::string>* active_scratch_dirs_metric_;
+
+  /// Metrics to track the scratch space HWM.
+  AtomicHighWaterMarkGauge* scratch_bytes_used_metric_;
 };
 
 }

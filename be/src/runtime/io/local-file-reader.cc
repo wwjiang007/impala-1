@@ -40,7 +40,7 @@ Status LocalFileReader::Open(bool use_file_handle_cache) {
 
   file_ = fopen(scan_range_->file(), "r");
   if (file_ == nullptr) {
-    return Status(TErrorCode::DISK_IO_ERROR,
+    return Status(TErrorCode::DISK_IO_ERROR, GetBackendString(),
         Substitute("Could not open file: $0: $1", *scan_range_->file_string(),
             GetStrErrMsg()));
   }
@@ -49,7 +49,7 @@ Status LocalFileReader::Open(bool use_file_handle_cache) {
 }
 
 Status LocalFileReader::ReadFromPos(int64_t file_offset, uint8_t* buffer,
-    int64_t bytes_to_read, int64_t* bytes_read, bool* eosr) {
+    int64_t bytes_to_read, int64_t* bytes_read, bool* eof) {
   DCHECK(scan_range_->read_in_flight());
   DCHECK_GE(bytes_to_read, 0);
   // Delay before acquiring the lock, to allow triggering IMPALA-6587 race.
@@ -61,14 +61,14 @@ Status LocalFileReader::ReadFromPos(int64_t file_offset, uint8_t* buffer,
   unique_lock<SpinLock> fs_lock(lock_);
   RETURN_IF_ERROR(scan_range_->cancel_status_);
 
-  *eosr = false;
+  *eof = false;
   *bytes_read = 0;
 
   DCHECK(file_ != nullptr);
   if (fseek(file_, file_offset, SEEK_SET) == -1) {
     fclose(file_);
     file_ = nullptr;
-    return Status(TErrorCode::DISK_IO_ERROR,
+    return Status(TErrorCode::DISK_IO_ERROR, GetBackendString(),
         Substitute("Could not seek to $0 "
             "for file: $1: $2", scan_range_->offset(),
             *scan_range_->file_string(), GetStrErrMsg()));
@@ -78,24 +78,21 @@ Status LocalFileReader::ReadFromPos(int64_t file_offset, uint8_t* buffer,
   DCHECK_LE(*bytes_read, bytes_to_read);
   if (*bytes_read < bytes_to_read) {
     if (ferror(file_) != 0) {
-      return Status(TErrorCode::DISK_IO_ERROR,
+      return Status(TErrorCode::DISK_IO_ERROR, GetBackendString(),
           Substitute("Error reading from $0"
               "at byte offset: $1: $2", file_,
               file_offset, GetStrErrMsg()));
     }
     // On Linux, we should only get partial reads from block devices on error or eof.
     DCHECK(feof(file_) != 0);
-    *eosr = true;
+    *eof = true;
   }
-  bytes_read_ += *bytes_read;
-  DCHECK_LE(bytes_read_, scan_range_->len());
-  if (bytes_read_ == scan_range_->len()) *eosr = true;
   return Status::OK();
 }
 
-void* LocalFileReader::CachedFile() {
-  DCHECK(false);
-  return nullptr;
+void LocalFileReader::CachedFile(uint8_t** data, int64_t* length) {
+  *data = nullptr;
+  *length = 0;
 }
 
 void LocalFileReader::Close() {

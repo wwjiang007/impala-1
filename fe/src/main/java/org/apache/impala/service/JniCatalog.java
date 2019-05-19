@@ -18,19 +18,18 @@
 package org.apache.impala.service;
 
 import com.google.common.base.Preconditions;
-import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.UUID;
 
-import org.apache.impala.authorization.SentryConfig;
+import org.apache.impala.authorization.AuthorizationConfig;
+import org.apache.impala.authorization.AuthorizationFactory;
+import org.apache.impala.authorization.AuthorizationManager;
 import org.apache.impala.authorization.User;
+import org.apache.impala.authorization.sentry.SentryCatalogdAuthorizationManager;
 import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.CatalogServiceCatalog;
 import org.apache.impala.catalog.Db;
@@ -46,6 +45,7 @@ import org.apache.impala.thrift.TErrorCode;
 import org.apache.impala.thrift.TFunction;
 import org.apache.impala.thrift.TGetCatalogDeltaResponse;
 import org.apache.impala.thrift.TGetCatalogDeltaRequest;
+import org.apache.impala.thrift.TGetCatalogServerMetricsResponse;
 import org.apache.impala.thrift.TGetDbsParams;
 import org.apache.impala.thrift.TGetDbsResult;
 import org.apache.impala.thrift.TGetFunctionsRequest;
@@ -57,15 +57,16 @@ import org.apache.impala.thrift.TGetTablesParams;
 import org.apache.impala.thrift.TGetTableMetricsParams;
 import org.apache.impala.thrift.TGetTablesResult;
 import org.apache.impala.thrift.TLogLevel;
-import org.apache.impala.thrift.TPartitionStats;
 import org.apache.impala.thrift.TPrioritizeLoadRequest;
 import org.apache.impala.thrift.TResetMetadataRequest;
 import org.apache.impala.thrift.TSentryAdminCheckRequest;
+import org.apache.impala.thrift.TSentryAdminCheckResponse;
 import org.apache.impala.thrift.TStatus;
 import org.apache.impala.thrift.TUniqueId;
 import org.apache.impala.thrift.TUpdateCatalogRequest;
 import org.apache.impala.thrift.TBackendGflags;
 import org.apache.impala.thrift.TUpdateTableUsageRequest;
+import org.apache.impala.util.AuthorizationUtil;
 import org.apache.impala.util.GlogAppender;
 import org.apache.impala.util.PatternMatcher;
 import org.apache.thrift.TException;
@@ -84,6 +85,7 @@ public class JniCatalog {
       new TBinaryProtocol.Factory();
   private final CatalogServiceCatalog catalog_;
   private final CatalogOpExecutor catalogOpExecutor_;
+  private final AuthorizationManager authzManager_;
 
   // A unique identifier for this instance of the Catalog Service.
   private static final TUniqueId catalogServiceId_ = generateId();
@@ -109,23 +111,26 @@ public class JniCatalog {
     GlogAppender.Install(TLogLevel.values()[cfg.impala_log_lvl],
         TLogLevel.values()[cfg.non_impala_java_vlog]);
 
-    // Check if the Sentry Service is configured. If so, create a configuration object.
-    SentryConfig sentryConfig = null;
-    if (!Strings.isNullOrEmpty(cfg.sentry_config)) {
-      sentryConfig = new SentryConfig(cfg.sentry_config);
-      sentryConfig.loadConfig();
-    }
+    // create the appropriate auth factory from backend config
+    // this logic is shared with JniFrontend
+    final AuthorizationFactory authzFactory
+        = AuthorizationUtil.authzFactoryFrom(BackendConfig.INSTANCE);
+
     LOG.info(JniUtil.getJavaVersion());
 
+    final AuthorizationConfig authzConfig = authzFactory.getAuthorizationConfig();
+
     catalog_ = new CatalogServiceCatalog(cfg.load_catalog_in_background,
-        cfg.num_metadata_loading_threads, cfg.initial_hms_cnxn_timeout_s, sentryConfig,
-        getServiceId(), cfg.principal, cfg.local_library_path);
+        cfg.num_metadata_loading_threads, cfg.initial_hms_cnxn_timeout_s, getServiceId(),
+        cfg.local_library_path);
+    authzManager_ = authzFactory.newAuthorizationManager(catalog_);
+    catalog_.setAuthzManager(authzManager_);
     try {
       catalog_.reset();
     } catch (CatalogException e) {
       LOG.error("Error initializing Catalog. Please run 'invalidate metadata'", e);
     }
-    catalogOpExecutor_ = new CatalogOpExecutor(catalog_);
+    catalogOpExecutor_ = new CatalogOpExecutor(catalog_, authzConfig, authzManager_);
   }
 
   public static TUniqueId getServiceId() { return catalogServiceId_; }
@@ -283,16 +288,21 @@ public class JniCatalog {
   }
 
   /**
-   * Verifies whether the user is configured as an admin on the Sentry Service. Throws
-   * an AuthorizationException if the user does not have admin privileges or if there
-   * were errors communicating with the Sentry Service.
+   * Verifies whether the user is configured as a Sentry admin.
    */
-  public void checkUserSentryAdmin(byte[] thriftReq) throws ImpalaException,
-      TException  {
+  public byte[] checkUserSentryAdmin(byte[] thriftReq)
+      throws ImpalaException, TException {
     TSentryAdminCheckRequest request = new TSentryAdminCheckRequest();
     JniUtil.deserializeThrift(protocolFactory_, request, thriftReq);
-    catalog_.getSentryProxy().checkUserSentryAdmin(
-        new User(request.getHeader().getRequesting_user()));
+    TSerializer serializer = new TSerializer(protocolFactory_);
+    User user = new User(request.getHeader().getRequesting_user());
+    Preconditions.checkState(catalogOpExecutor_.getAuthzManager() instanceof
+        SentryCatalogdAuthorizationManager);
+
+    TSentryAdminCheckResponse response = new TSentryAdminCheckResponse();
+    response.setIs_admin(((SentryCatalogdAuthorizationManager)
+        catalogOpExecutor_.getAuthzManager()).isSentryAdmin(user));
+    return serializer.serialize(response);
   }
 
   /**
@@ -315,9 +325,23 @@ public class JniCatalog {
     return serializer.serialize(catalog_.getCatalogUsage());
   }
 
+  public byte[] getEventProcessorSummary() throws TException {
+    TSerializer serializer = new TSerializer(protocolFactory_);
+    return serializer.serialize(catalog_.getEventProcessorSummary());
+  }
+
   public void updateTableUsage(byte[] req) throws ImpalaException {
     TUpdateTableUsageRequest thriftReq = new TUpdateTableUsageRequest();
     JniUtil.deserializeThrift(protocolFactory_, thriftReq, req);
     catalog_.updateTableUsage(thriftReq);
+  }
+
+  public byte[] getCatalogServerMetrics() throws ImpalaException, TException {
+    TGetCatalogServerMetricsResponse response = new TGetCatalogServerMetricsResponse();
+    response.setCatalog_partial_fetch_rpc_queue_len(
+        catalog_.getPartialFetchRpcQueueLength());
+    response.setEvent_metrics(catalog_.getEventProcessorMetrics());
+    TSerializer serializer = new TSerializer(protocolFactory_);
+    return serializer.serialize(response);
   }
 }

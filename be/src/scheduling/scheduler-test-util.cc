@@ -221,6 +221,10 @@ void Plan::SetReplicaPreference(TReplicaPreference::type p) {
   query_options_.replica_preference = p;
 }
 
+void Plan::SetNumRemoteExecutorCandidates(int32_t num) {
+  query_options_.num_remote_executor_candidates = num;
+}
+
 const vector<TNetworkAddress>& Plan::referenced_datanodes() const {
   return referenced_datanodes_;
 }
@@ -269,7 +273,7 @@ void Plan::BuildScanRange(const TableName& table_name, const Block& block, int b
   // 'length' is the only member considered by the scheduler.
   file_split.length = block.length;
   // Encoding the table name and block index in the file helps debugging.
-  file_split.file_name = table_name + "_block_" + std::to_string(block_idx);
+  file_split.relative_path = table_name + "_block_" + std::to_string(block_idx);
   file_split.offset = 0;
   file_split.partition_id = 0;
   // For now, we model each file by a single block.
@@ -285,9 +289,9 @@ void Plan::BuildScanRangeSpec(const TableName& table_name,
   THdfsFileDesc thrift_file;
 
   flatbuffers::FlatBufferBuilder fb_builder;
-  auto file_name =
+  auto rel_path =
       fb_builder.CreateString(table_name + "_spec_" + std::to_string(spec_idx));
-  auto fb_file_desc = CreateFbFileDesc(fb_builder, file_name, spec.length);
+  auto fb_file_desc = CreateFbFileDesc(fb_builder, rel_path, spec.length);
   fb_builder.Finish(fb_file_desc);
 
   string buffer(
@@ -576,7 +580,7 @@ void SchedulerWrapper::InitializeScheduler() {
   scheduler_.reset(new Scheduler(nullptr, scheduler_backend_id,
       &metrics_, nullptr, nullptr));
   const Status status = scheduler_->Init(scheduler_backend_address,
-      scheduler_krpc_address, scheduler_host.ip);
+      scheduler_krpc_address, scheduler_host.ip, /* admit_mem_limit */ 0L);
   DCHECK(status.ok()) << "Scheduler init failed in test";
   // Initialize the scheduler backend maps.
   SendFullMembershipMap();
@@ -597,7 +601,7 @@ void SchedulerWrapper::AddHostToTopicDelta(const Host& host, TTopicDelta* delta)
   TTopicItem item;
   item.key = host.ip;
   ThriftSerializer serializer(false);
-  Status status = serializer.Serialize(&be_desc, &item.value);
+  Status status = serializer.SerializeToString(&be_desc, &item.value);
   DCHECK(status.ok());
 
   // Add to topic delta.

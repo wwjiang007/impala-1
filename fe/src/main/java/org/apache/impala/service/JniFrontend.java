@@ -23,7 +23,6 @@ import java.util.Collections;
 import java.util.Enumeration;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 import com.google.common.annotations.VisibleForTesting;
 import org.apache.hadoop.conf.Configuration;
@@ -32,6 +31,8 @@ import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.s3a.S3AFileSystem;
+import org.apache.hadoop.fs.azurebfs.AzureBlobFileSystem;
+import org.apache.hadoop.fs.azurebfs.SecureAzureBlobFileSystem;
 import org.apache.hadoop.fs.adl.AdlFileSystem;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
@@ -43,19 +44,21 @@ import org.apache.hadoop.security.ShellBasedUnixGroupsNetgroupMapping;
 import org.apache.impala.analysis.DescriptorTable;
 import org.apache.impala.analysis.ToSqlUtils;
 import org.apache.impala.authorization.AuthorizationConfig;
+import org.apache.impala.authorization.AuthorizationFactory;
+import org.apache.impala.authorization.AuthorizationProvider;
 import org.apache.impala.authorization.ImpalaInternalAdminUser;
+import org.apache.impala.authorization.NoopAuthorizationFactory;
 import org.apache.impala.authorization.User;
 import org.apache.impala.catalog.FeDataSource;
 import org.apache.impala.catalog.FeDb;
 import org.apache.impala.catalog.Function;
-import org.apache.impala.catalog.Role;
 import org.apache.impala.catalog.StructType;
 import org.apache.impala.catalog.Type;
-import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.common.JniUtil;
+import org.apache.impala.service.Frontend.PlanCtx;
 import org.apache.impala.thrift.TBackendGflags;
 import org.apache.impala.thrift.TBuildTestDescriptorTableParams;
 import org.apache.impala.thrift.TCatalogObject;
@@ -85,18 +88,17 @@ import org.apache.impala.thrift.TLoadDataReq;
 import org.apache.impala.thrift.TLoadDataResp;
 import org.apache.impala.thrift.TLogLevel;
 import org.apache.impala.thrift.TMetadataOpRequest;
-import org.apache.impala.thrift.TPrincipalType;
 import org.apache.impala.thrift.TQueryCtx;
 import org.apache.impala.thrift.TResultSet;
 import org.apache.impala.thrift.TShowFilesParams;
 import org.apache.impala.thrift.TShowGrantPrincipalParams;
 import org.apache.impala.thrift.TShowRolesParams;
-import org.apache.impala.thrift.TShowRolesResult;
 import org.apache.impala.thrift.TShowStatsOp;
 import org.apache.impala.thrift.TShowStatsParams;
 import org.apache.impala.thrift.TTableName;
 import org.apache.impala.thrift.TUpdateCatalogCacheRequest;
 import org.apache.impala.thrift.TUpdateExecutorMembershipRequest;
+import org.apache.impala.util.AuthorizationUtil;
 import org.apache.impala.util.GlogAppender;
 import org.apache.impala.util.PatternMatcher;
 import org.apache.impala.util.TSessionStateUtil;
@@ -111,7 +113,6 @@ import org.slf4j.LoggerFactory;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import com.google.common.collect.Sets;
 
 /**
  * JNI-callable interface onto a wrapped Frontend instance. The main point is to serialise
@@ -135,22 +136,10 @@ public class JniFrontend {
     GlogAppender.Install(TLogLevel.values()[cfg.impala_log_lvl],
         TLogLevel.values()[cfg.non_impala_java_vlog]);
 
-    // Validate the authorization configuration before initializing the Frontend.
-    // If there are any configuration problems Impala startup will fail.
-    AuthorizationConfig authConfig = new AuthorizationConfig(cfg.server_name,
-        cfg.authorization_policy_file, cfg.sentry_config,
-        cfg.authorization_policy_provider_class);
-    authConfig.validateConfig();
-    if (authConfig.isEnabled()) {
-      LOG.info(String.format("Authorization is 'ENABLED' using %s",
-          authConfig.isFileBasedPolicy() ? " file based policy from: " +
-          authConfig.getPolicyFile() : " using Sentry Policy Service."));
-    } else {
-      LOG.info("Authorization is 'DISABLED'.");
-    }
+    final AuthorizationFactory authzFactory =
+        AuthorizationUtil.authzFactoryFrom(BackendConfig.INSTANCE);
     LOG.info(JniUtil.getJavaVersion());
-
-    frontend_ = new Frontend(authConfig);
+    frontend_ = new Frontend(authzFactory);
   }
 
   /**
@@ -162,10 +151,11 @@ public class JniFrontend {
     TQueryCtx queryCtx = new TQueryCtx();
     JniUtil.deserializeThrift(protocolFactory_, queryCtx, thriftQueryContext);
 
-    StringBuilder explainString = new StringBuilder();
-    TExecRequest result = frontend_.createExecRequest(queryCtx, explainString);
-    if (explainString.length() > 0 && LOG.isTraceEnabled()) {
-      LOG.trace(explainString.toString());
+    PlanCtx planCtx = new PlanCtx(queryCtx);
+    TExecRequest result = frontend_.createExecRequest(planCtx);
+    if (LOG.isTraceEnabled()) {
+      String explainStr = planCtx.getExplainString();
+      if (!explainStr.isEmpty()) LOG.trace(explainStr);
     }
 
     // TODO: avoid creating serializer for each query?
@@ -514,40 +504,14 @@ public class JniFrontend {
   }
 
   /**
-   * Gets all roles
+   * Gets all roles.
    */
   public byte[] getRoles(byte[] showRolesParams) throws ImpalaException {
     TShowRolesParams params = new TShowRolesParams();
     JniUtil.deserializeThrift(protocolFactory_, params, showRolesParams);
-    TShowRolesResult result = new TShowRolesResult();
-
-    List<Role> roles = Lists.newArrayList();
-    if (params.isIs_show_current_roles() || params.isSetGrant_group()) {
-      User user = new User(params.getRequesting_user());
-      Set<String> groupNames;
-      if (params.isIs_show_current_roles()) {
-        groupNames = frontend_.getAuthzChecker().getUserGroups(user);
-      } else {
-        Preconditions.checkState(params.isSetGrant_group());
-        groupNames = Sets.newHashSet(params.getGrant_group());
-      }
-      for (String groupName: groupNames) {
-        roles.addAll(frontend_.getCatalog().getAuthPolicy().getGrantedRoles(groupName));
-      }
-    } else {
-      Preconditions.checkState(!params.isIs_show_current_roles());
-      roles = frontend_.getCatalog().getAuthPolicy().getAllRoles();
-    }
-
-    result.setRole_names(Lists.<String>newArrayListWithExpectedSize(roles.size()));
-    for (Role role: roles) {
-      result.getRole_names().add(role.getName());
-    }
-
-    Collections.sort(result.getRole_names());
     TSerializer serializer = new TSerializer(protocolFactory_);
     try {
-      return serializer.serialize(result);
+      return serializer.serialize(frontend_.getAuthzManager().getRoles(params));
     } catch (TException e) {
       throw new InternalException(e.getMessage());
     }
@@ -560,23 +524,9 @@ public class JniFrontend {
       throws ImpalaException {
     TShowGrantPrincipalParams params = new TShowGrantPrincipalParams();
     JniUtil.deserializeThrift(protocolFactory_, params, showGrantPrincipalParams);
-    TResultSet result;
-    switch (params.getPrincipal_type()) {
-      case USER:
-        result = frontend_.getCatalog().getAuthPolicy().getUserPrivileges(
-            params.getName(), params.getPrivilege(), frontend_);
-        break;
-      case ROLE:
-        result = frontend_.getCatalog().getAuthPolicy().getRolePrivileges(
-            params.getName(), params.getPrivilege());
-        break;
-      default:
-        throw new AnalysisException("Unexpected TPrincipalType: " +
-            params.getPrincipal_type());
-    }
     TSerializer serializer = new TSerializer(protocolFactory_);
     try {
-      return serializer.serialize(result);
+      return serializer.serialize(frontend_.getAuthzManager().getPrivileges(params));
     } catch (TException e) {
       throw new InternalException(e.getMessage());
     }
@@ -709,10 +659,6 @@ public class JniFrontend {
     if (BackendConfig.INSTANCE.isAuthorizedProxyGroupEnabled()) {
       output.append(checkGroupsMappingProvider(CONF));
     }
-    if (BackendConfig.INSTANCE.isAuthorizationFileSet()) {
-      LOG.warn("authorization_policy_file flag is deprecated. Object Ownership feature" +
-          " is not supported with authorization_policy_file.");
-    }
     return output.toString();
   }
 
@@ -799,6 +745,8 @@ public class JniFrontend {
       FileSystem fs = FileSystem.get(CONF);
       if (!(fs instanceof DistributedFileSystem ||
             fs instanceof S3AFileSystem ||
+            fs instanceof AzureBlobFileSystem ||
+            fs instanceof SecureAzureBlobFileSystem ||
             fs instanceof AdlFileSystem)) {
         return "Currently configured default filesystem: " +
             fs.getClass().getSimpleName() + ". " +

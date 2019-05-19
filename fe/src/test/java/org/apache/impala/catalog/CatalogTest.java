@@ -23,11 +23,13 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.fail;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
@@ -38,45 +40,42 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-import org.apache.commons.codec.binary.Base64;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.GlobalStorageStatistics;
 import org.apache.hadoop.fs.StorageStatistics;
 import org.apache.hadoop.hdfs.DFSOpsCountStatistics;
+import org.apache.hadoop.hdfs.DFSOpsCountStatistics.OpType;
 import org.apache.hadoop.hive.metastore.TableType;
 import org.apache.hadoop.hive.metastore.api.ColumnStatisticsData;
 import org.apache.impala.analysis.FunctionName;
 import org.apache.impala.analysis.LiteralExpr;
 import org.apache.impala.analysis.NumericLiteral;
-import org.apache.impala.analysis.TableName;
+import org.apache.impala.authorization.AuthorizationPolicy;
 import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
-import org.apache.impala.common.FrontendTestBase;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.Reference;
 import org.apache.impala.service.BackendConfig;
 import org.apache.impala.testutil.CatalogServiceTestCatalog;
-import org.apache.impala.thrift.CatalogObjectsConstants;
+import org.apache.impala.testutil.TestUtils;
 import org.apache.impala.thrift.TBackendGflags;
 import org.apache.impala.thrift.TFunctionBinaryType;
 import org.apache.impala.thrift.TGetPartitionStatsRequest;
-import org.apache.impala.thrift.TGetPartitionStatsResponse;
+import org.apache.impala.thrift.TPartitionKeyValue;
 import org.apache.impala.thrift.TPartitionStats;
 import org.apache.impala.thrift.TPrincipalType;
 import org.apache.impala.thrift.TPrivilege;
 import org.apache.impala.thrift.TPrivilegeLevel;
 import org.apache.impala.thrift.TPrivilegeScope;
 import org.apache.impala.thrift.TTableName;
-import org.apache.impala.thrift.TUniqueId;
+import org.junit.After;
+import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Test;
 
-import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
-
-import junit.framework.AssertionFailedError;
 
 public class CatalogTest {
   private CatalogServiceCatalog catalog_;
@@ -85,6 +84,9 @@ public class CatalogTest {
   public void init() {
     catalog_ = CatalogServiceTestCatalog.create();
   }
+
+  @After
+  public void cleanUp() { catalog_.close(); }
 
   public static void checkTableCols(FeDb db, String tblName, int numClusteringCols,
       String[] colNames, Type[] colTypes) throws TableLoadingException {
@@ -147,6 +149,7 @@ public class CatalogTest {
     assertNotNull(catalog_.getOrLoadTable("functional", "rankingssmall"));
     assertNotNull(catalog_.getOrLoadTable("functional", "uservisitssmall"));
     assertNotNull(catalog_.getOrLoadTable("functional", "view_view"));
+    assertNotNull(catalog_.getOrLoadTable("functional", "date_tbl"));
     // IMP-163 - table with string partition column does not load if there are partitions
     assertNotNull(catalog_.getOrLoadTable("functional", "StringPartitionKey"));
     // Test non-existent table
@@ -315,14 +318,29 @@ public class CatalogTest {
            Type.FLOAT, Type.STRING, Type.STRING,
            Type.STRING, Type.STRING, Type.INT});
 
+    checkTableCols(functionalDb, "date_tbl", 1,
+        new String[] {"date_part", "id_col", "date_col"},
+        new Type[] {Type.DATE, Type.INT, Type.DATE});
+
     // case-insensitive lookup
     assertEquals(catalog_.getOrLoadTable("functional", "alltypes"),
         catalog_.getOrLoadTable("functional", "AllTypes"));
   }
 
+  // Count of listFiles (list status + blocks) calls
+  private static final String LIST_LOCATED_STATUS =
+      OpType.LIST_LOCATED_STATUS.getSymbol();
+  // Count of listStatus calls
+  private static final String LIST_STATUS = OpType.LIST_STATUS.getSymbol();
+  // Count of getStatus calls
+  private static final String GET_FILE_STATUS = OpType.GET_FILE_STATUS.getSymbol();
+  // Count of getFileBlockLocations() calls
+  private static final String GET_FILE_BLOCK_LOCS =
+      OpType.GET_FILE_BLOCK_LOCATIONS.getSymbol();
+
   /**
-   * Regression test for IMPALA-7320: we should use batch APIs to fetch
-   * file permissions for partitions.
+   * Regression test for IMPALA-7320 and IMPALA-7047: we should use batch APIs to fetch
+   * file permissions for partitions when loading or reloading.
    */
   @Test
   public void testNumberOfGetFileStatusCalls() throws CatalogException, IOException {
@@ -345,25 +363,66 @@ public class CatalogTest {
     // Due to HDFS-13747, the listStatus calls are incorrectly accounted as
     // op_list_located_status. So, we'll just add up the two to make our
     // assertion resilient to this bug.
-    long seenCalls = opsCounts.getLong("op_list_located_status") +
-        opsCounts.getLong("op_list_status");
+    long seenCalls = opsCounts.getLong(LIST_LOCATED_STATUS) +
+        opsCounts.getLong(LIST_STATUS);
     assertEquals(expectedCalls, seenCalls);
 
     // We expect only one getFileStatus call, for the top-level directory.
-    assertEquals(1L, (long)opsCounts.getLong("op_get_file_status"));
+    assertEquals(1L, (long)opsCounts.getLong(GET_FILE_STATUS));
+
+    // None of the underlying files changed so we should not do any ops for the files.
+    assertEquals(0L, (long)opsCounts.getLong(GET_FILE_BLOCK_LOCS));
 
     // Now test REFRESH on the table...
     stats.reset();
     catalog_.reloadTable(table);
 
     // Again, we expect only one getFileStatus call, for the top-level directory.
-    assertEquals(1L, (long)opsCounts.getLong("op_get_file_status"));
+    assertEquals(1L, (long)opsCounts.getLong(GET_FILE_STATUS));
     // REFRESH calls listStatus on each of the partitions, but doesn't re-check
     // the permissions of the partition directories themselves.
-    assertEquals(table.getPartitionIds().size(),
-        (long)opsCounts.getLong("op_list_status"));
-  }
+    seenCalls = opsCounts.getLong(LIST_LOCATED_STATUS) +
+        opsCounts.getLong(LIST_STATUS);
+    assertEquals(table.getPartitionIds().size(), seenCalls);
+    // None of the underlying files changed so we should not do any ops for the files.
+    assertEquals(0L, (long)opsCounts.getLong(GET_FILE_BLOCK_LOCS));
 
+    // Reloading a specific partition should not make an RPC per file
+    // (regression test for IMPALA-7047).
+    stats.reset();
+    List<TPartitionKeyValue> partitionSpec = ImmutableList.of(
+        new TPartitionKeyValue("year", "2010"),
+        new TPartitionKeyValue("month", "10"));
+    catalog_.reloadPartition(table, partitionSpec);
+    assertEquals(0L, (long)opsCounts.getLong(GET_FILE_BLOCK_LOCS));
+
+    // Loading or reloading an unpartitioned table with some files in it should not make
+    // an RPC per file.
+    stats.reset();
+    HdfsTable unpartTable = (HdfsTable)catalog_.getOrLoadTable(
+        "functional", "alltypesaggmultifilesnopart");
+    assertEquals(0L, (long)opsCounts.getLong(GET_FILE_BLOCK_LOCS));
+    stats.reset();
+    catalog_.reloadTable(unpartTable);
+    assertEquals(0L, (long)opsCounts.getLong(GET_FILE_BLOCK_LOCS));
+
+    // Simulate an empty partition, which will trigger the full
+    // reload path. Since we can't modify HDFS itself via these tests, we
+    // do the next best thing: modify the metadata to revise history as
+    // though the partition used above were actually empty.
+    HdfsPartition hdfsPartition = table
+        .getPartitionFromThriftPartitionSpec(partitionSpec);
+    hdfsPartition.setFileDescriptors(new ArrayList<>());
+    stats.reset();
+    catalog_.reloadPartition(table, partitionSpec);
+
+    // Should not scan the directory file-by-file, should use a single
+    // listLocatedStatus() to get the whole directory (partition)
+    assertEquals(0L, (long)opsCounts.getLong(GET_FILE_BLOCK_LOCS));
+    seenCalls = opsCounts.getLong(LIST_LOCATED_STATUS) +
+        opsCounts.getLong(LIST_STATUS);
+    assertEquals(1, seenCalls);
+  }
 
   @Test
   public void TestPartitions() throws CatalogException {
@@ -384,7 +443,7 @@ public class CatalogTest {
     assertEquals(24, partitions.size());
     Set<HdfsStorageDescriptor> uniqueSds = Collections.newSetFromMap(
         new IdentityHashMap<HdfsStorageDescriptor, Boolean>());
-    Set<Long> months = Sets.newHashSet();
+    Set<Long> months = new HashSet<>();
     for (FeFsPartition p: partitions) {
       assertEquals(2, p.getPartitionValues().size());
 
@@ -415,89 +474,71 @@ public class CatalogTest {
     assertEquals(1, uniqueSds.size());
   }
 
-  // TODO: All Hive-stats related tests are temporarily disabled because of an unknown,
-  // sporadic issue causing stats of some columns to be absent in Jenkins runs.
-  // Investigate this issue further.
-  //@Test
-  public void testStats() throws TableLoadingException {
+  @Test
+  public void testStats() throws CatalogException {
     // make sure the stats for functional.alltypesagg look correct
-    HdfsTable table =
-        (HdfsTable) catalog_.getDb("functional").getTable("AllTypesAgg");
+    HdfsTable table = (HdfsTable) catalog_.getOrLoadTable("functional", "AllTypesAgg");
 
     Column idCol = table.getColumn("id");
-    assertEquals(idCol.getStats().getAvgSerializedSize() -
-        PrimitiveType.INT.getSlotSize(),
+    assertEquals(idCol.getStats().getAvgSerializedSize(),
         PrimitiveType.INT.getSlotSize(), 0.0001);
     assertEquals(idCol.getStats().getMaxSize(), PrimitiveType.INT.getSlotSize());
-    assertTrue(!idCol.getStats().hasNulls());
+    assertFalse(idCol.getStats().hasNulls());
 
     Column boolCol = table.getColumn("bool_col");
-    assertEquals(boolCol.getStats().getAvgSerializedSize() -
-        PrimitiveType.BOOLEAN.getSlotSize(),
+    assertEquals(boolCol.getStats().getAvgSerializedSize(),
         PrimitiveType.BOOLEAN.getSlotSize(), 0.0001);
     assertEquals(boolCol.getStats().getMaxSize(), PrimitiveType.BOOLEAN.getSlotSize());
-    assertTrue(!boolCol.getStats().hasNulls());
+    assertFalse(boolCol.getStats().hasNulls());
 
     Column tinyintCol = table.getColumn("tinyint_col");
-    assertEquals(tinyintCol.getStats().getAvgSerializedSize() -
-        PrimitiveType.TINYINT.getSlotSize(),
+    assertEquals(tinyintCol.getStats().getAvgSerializedSize(),
         PrimitiveType.TINYINT.getSlotSize(), 0.0001);
-    assertEquals(tinyintCol.getStats().getMaxSize(),
-        PrimitiveType.TINYINT.getSlotSize());
+    assertEquals(tinyintCol.getStats().getMaxSize(), PrimitiveType.TINYINT.getSlotSize());
     assertTrue(tinyintCol.getStats().hasNulls());
 
     Column smallintCol = table.getColumn("smallint_col");
-    assertEquals(smallintCol.getStats().getAvgSerializedSize() -
-        PrimitiveType.SMALLINT.getSlotSize(),
+    assertEquals(smallintCol.getStats().getAvgSerializedSize(),
         PrimitiveType.SMALLINT.getSlotSize(), 0.0001);
     assertEquals(smallintCol.getStats().getMaxSize(),
         PrimitiveType.SMALLINT.getSlotSize());
     assertTrue(smallintCol.getStats().hasNulls());
 
     Column intCol = table.getColumn("int_col");
-    assertEquals(intCol.getStats().getAvgSerializedSize() -
-        PrimitiveType.INT.getSlotSize(),
+    assertEquals(intCol.getStats().getAvgSerializedSize(),
         PrimitiveType.INT.getSlotSize(), 0.0001);
     assertEquals(intCol.getStats().getMaxSize(), PrimitiveType.INT.getSlotSize());
     assertTrue(intCol.getStats().hasNulls());
 
     Column bigintCol = table.getColumn("bigint_col");
-    assertEquals(bigintCol.getStats().getAvgSerializedSize() -
-        PrimitiveType.BIGINT.getSlotSize(),
+    assertEquals(bigintCol.getStats().getAvgSerializedSize(),
         PrimitiveType.BIGINT.getSlotSize(), 0.0001);
     assertEquals(bigintCol.getStats().getMaxSize(), PrimitiveType.BIGINT.getSlotSize());
     assertTrue(bigintCol.getStats().hasNulls());
 
     Column floatCol = table.getColumn("float_col");
-    assertEquals(floatCol.getStats().getAvgSerializedSize() -
-        PrimitiveType.FLOAT.getSlotSize(),
+    assertEquals(floatCol.getStats().getAvgSerializedSize(),
         PrimitiveType.FLOAT.getSlotSize(), 0.0001);
     assertEquals(floatCol.getStats().getMaxSize(), PrimitiveType.FLOAT.getSlotSize());
     assertTrue(floatCol.getStats().hasNulls());
 
     Column doubleCol = table.getColumn("double_col");
-    assertEquals(doubleCol.getStats().getAvgSerializedSize() -
-        PrimitiveType.DOUBLE.getSlotSize(),
+    assertEquals(doubleCol.getStats().getAvgSerializedSize(),
         PrimitiveType.DOUBLE.getSlotSize(), 0.0001);
     assertEquals(doubleCol.getStats().getMaxSize(), PrimitiveType.DOUBLE.getSlotSize());
     assertTrue(doubleCol.getStats().hasNulls());
 
     Column timestampCol = table.getColumn("timestamp_col");
-    assertEquals(timestampCol.getStats().getAvgSerializedSize() -
-        PrimitiveType.TIMESTAMP.getSlotSize(),
+    assertEquals(timestampCol.getStats().getAvgSerializedSize(),
         PrimitiveType.TIMESTAMP.getSlotSize(), 0.0001);
     assertEquals(timestampCol.getStats().getMaxSize(),
         PrimitiveType.TIMESTAMP.getSlotSize());
-    // this does not have nulls, it's not clear why this passes
-    // TODO: investigate and re-enable
-    //assertTrue(timestampCol.getStats().hasNulls());
+    assertFalse(timestampCol.getStats().hasNulls());
 
     Column stringCol = table.getColumn("string_col");
-    assertTrue(stringCol.getStats().getAvgSerializedSize() >=
-        PrimitiveType.STRING.getSlotSize());
     assertTrue(stringCol.getStats().getAvgSerializedSize() > 0);
     assertTrue(stringCol.getStats().getMaxSize() > 0);
-    assertTrue(!stringCol.getStats().hasNulls());
+    assertFalse(stringCol.getStats().hasNulls());
   }
 
   /**
@@ -505,10 +546,7 @@ public class CatalogTest {
    * the column type results in the stats being set to "unknown". This is a regression
    * test for IMPALA-588, where this used to result in a Preconditions failure.
    */
-  // TODO: All Hive-stats related tests are temporarily disabled because of an unknown,
-  // sporadic issue causing stats of some columns to be absent in Jenkins runs.
-  // Investigate this issue further.
-  //@Test
+  @Test
   public void testColStatsColTypeMismatch() throws Exception {
     // First load a table that has column stats.
     //catalog_.refreshTable("functional", "alltypesagg", false);
@@ -541,7 +579,7 @@ public class CatalogTest {
 
       // Now try to apply a matching column stats data and ensure it succeeds.
       assertTrue(table.getColumn("string_col").updateStats(stringColStatsData));
-      assertEquals(1178, table.getColumn("string_col").getStats().getNumDistinctValues());
+      assertEquals(963, table.getColumn("string_col").getStats().getNumDistinctValues());
     }
   }
 
@@ -550,7 +588,6 @@ public class CatalogTest {
     assertEquals(-1, column.getStats().getNumNulls());
     double expectedSize = column.getType().isFixedLengthType() ?
         column.getType().getSlotSize() : -1;
-
     assertEquals(expectedSize, column.getStats().getAvgSerializedSize(), 0.0001);
     assertEquals(expectedSize, column.getStats().getMaxSize(), 0.0001);
   }
@@ -664,18 +701,26 @@ public class CatalogTest {
   }
 
   @Test
-  public void testLoadingUnsupportedTableTypes() throws CatalogException {
+  public void testLoadingUnsupportedTblTypesOnHive2() throws CatalogException {
+    // run the test only when it is running against Hive-2 since index tables are
+    // skipped during data-load against Hive-3
+    Assume.assumeTrue(
+        "Skipping this test since it is only supported when running against Hive-2",
+        TestUtils.getHiveMajorVersion() == 2);
     Table table = catalog_.getOrLoadTable("functional", "hive_index_tbl");
     assertTrue(table instanceof IncompleteTable);
     IncompleteTable incompleteTable = (IncompleteTable) table;
     assertTrue(incompleteTable.getCause() instanceof TableLoadingException);
     assertEquals("Unsupported table type 'INDEX_TABLE' for: functional.hive_index_tbl",
         incompleteTable.getCause().getMessage());
+  }
 
+  @Test
+  public void testLoadingUnsupportedTableTypes() throws CatalogException {
     // Table with unsupported SerDe library.
-    table = catalog_.getOrLoadTable("functional", "bad_serde");
+    Table table = catalog_.getOrLoadTable("functional", "bad_serde");
     assertTrue(table instanceof IncompleteTable);
-    incompleteTable = (IncompleteTable) table;
+    IncompleteTable incompleteTable = (IncompleteTable) table;
     assertTrue(incompleteTable.getCause() instanceof TableLoadingException);
     assertEquals("Impala does not support tables of this type. REASON: SerDe" +
         " library 'org.apache.hadoop.hive.serde2.binarysortable.BinarySortableSerDe' " +
@@ -694,7 +739,7 @@ public class CatalogTest {
 
   private List<String> getFunctionSignatures(String db) throws DatabaseNotFoundException {
     List<Function> fns = catalog_.getFunctions(db);
-    List<String> names = Lists.newArrayList();
+    List<String> names = new ArrayList<>();
     for (Function fn: fns) {
       names.add(fn.signatureString());
     }
@@ -706,9 +751,9 @@ public class CatalogTest {
     List<String> fnNames = getFunctionSignatures("default");
     assertEquals(fnNames.size(), 0);
 
-    ArrayList<Type> args1 = Lists.newArrayList();
-    ArrayList<Type> args2 = Lists.<Type>newArrayList(Type.INT);
-    ArrayList<Type> args3 = Lists.<Type>newArrayList(Type.TINYINT);
+    List<Type> args1 = new ArrayList<>();
+    List<Type> args2 = Lists.<Type>newArrayList(Type.INT);
+    List<Type> args3 = Lists.<Type>newArrayList(Type.TINYINT);
 
     catalog_.removeFunction(
         new Function(new FunctionName("default", "Foo"), args1,
@@ -791,9 +836,9 @@ public class CatalogTest {
     assertEquals(fnNames.size(), 0);
 
     // Test to check if catalog can handle loading corrupt udfs
-    HashMap<String, String> dbParams = Maps.newHashMap();
+    Map<String, String> dbParams = new HashMap<>();
     String badFnKey = "impala_registered_function_badFn";
-    String badFnVal = Base64.encodeBase64String("badFn".getBytes());
+    String badFnVal = Base64.getEncoder().encodeToString("badFn".getBytes());
     String dbName = "corrupt_udf_test";
     dbParams.put(badFnKey, badFnVal);
     Db db = catalog_.getDb(dbName);
@@ -853,7 +898,7 @@ public class CatalogTest {
     assertNull(catalog_.getAuthPolicy().getPrincipal("role1", TPrincipalType.USER));
     assertNull(catalog_.getAuthPolicy().getPrincipal("role2", TPrincipalType.ROLE));
     // Add the same role, the old role will be deleted.
-    role = catalog_.addRole("role1", new HashSet<String>());
+    role = catalog_.addRole("role1", new HashSet<>());
     assertSame(role, authPolicy.getPrincipal("role1", TPrincipalType.ROLE));
     // Delete the role.
     assertSame(role, catalog_.removeRole("role1"));
@@ -866,7 +911,7 @@ public class CatalogTest {
     for (int i = 0; i < size; i++) {
       String name = prefix + i;
       catalog_.addUser(name);
-      catalog_.addRole(name, new HashSet<String>());
+      catalog_.addRole(name, new HashSet<>());
     }
 
     for (int i = 0; i < size; i++) {

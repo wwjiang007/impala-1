@@ -306,8 +306,9 @@ error_codes = (
   # TODO: IMPALA-4697: the merged errors do not show up in the query error log,
   # so we must point users to the impalad error log.
   ("SCRATCH_ALLOCATION_FAILED", 101, "Could not create files in any configured scratch "
-   "directories (--scratch_dirs=$0) on backend '$1'. See logs for previous errors that may "
-   "have prevented creating or writing scratch files."),
+   "directories (--scratch_dirs=$0) on backend '$1'. $2 of scratch is currently in "
+   "use by this Impala Daemon ($3 by this query). See logs for previous errors that "
+   "may have prevented creating or writing scratch files."),
 
   ("SCRATCH_READ_TRUNCATED", 102, "Error reading $0 bytes from scratch file '$1' "
    "on backend $2 at offset $3: could only read $4 bytes"),
@@ -334,7 +335,7 @@ error_codes = (
 
   ("THREAD_CREATION_FAILED", 109, "Failed to create thread $0 in category $1: $2"),
 
-  ("DISK_IO_ERROR", 110, "Disk I/O error: $0"),
+  ("DISK_IO_ERROR", 110, "Disk I/O error on $0: $1"),
 
   ("DATASTREAM_RECVR_CLOSED", 111,
    "DataStreamRecvr for fragment=$0, node=$1 is closed already"),
@@ -370,6 +371,43 @@ error_codes = (
   ("PARQUET_TIMESTAMP_INVALID_TIME_OF_DAY", 121,
    "Parquet file '$0' column '$1' contains a timestamp with invalid time of day. "
    "The time of day should be 0 <= and < 24 hour (in nanoseconds)."),
+
+  ("PARQUET_CORRUPT_BOOL_VALUE", 122, "File '$0' is corrupt: error decoding BOOLEAN "
+   "value with encoding $1 at offset $2"),
+
+  ("THREAD_POOL_SUBMIT_FAILED", 123,
+   "Failed to submit $0 to thread pool after waiting $1 seconds"),
+
+  ("THREAD_POOL_TASK_TIMED_OUT", 124,
+   "$0 failed to finish before the $1 second timeout"),
+
+  ("UNREACHABLE_IMPALADS", 125, "Failed due to unreachable impalad(s): $0"),
+
+  ("INACTIVE_SESSION_EXPIRED", 126, "Session expired due to inactivity"),
+
+  ("INACTIVE_QUERY_EXPIRED", 127,
+   "Query $0 expired due to client inactivity (timeout is $1)"),
+
+  ("EXEC_TIME_LIMIT_EXCEEDED", 128, "Query $0 expired due to execution time limit of $1"),
+
+  ("CPU_LIMIT_EXCEEDED", 129, "Query $0 terminated due to CPU limit of $1"),
+
+  ("SCAN_BYTES_LIMIT_EXCEEDED", 130, "Query $0 terminated due to scan bytes limit of $1"),
+
+  ("ROWS_PRODUCED_LIMIT_EXCEEDED", 131,
+   "Query $0 terminated due to rows produced limit of $1. "
+   "Unset or increase NUM_ROWS_PRODUCED_LIMIT query option to produce more rows."),
+
+  ("EXPR_REWRITE_RESULT_LIMIT_EXCEEDED", 132,
+   "Expression rewrite rejected due to result size ($0) exceeding the limit ($1)."),
+
+  ("UNRESPONSIVE_BACKEND", 133,
+   "Query $0 cancelled due to unresponsive backend: $1 has not sent a report in $2ms "
+   "(max allowed lag is $3ms)"),
+
+  ("PARQUET_DATE_OUT_OF_RANGE", 134,
+   "Parquet file '$0' column '$1' contains an out of range date. "
+   "The valid date range is 0000-01-01..9999-12-31."),
 )
 
 import sys

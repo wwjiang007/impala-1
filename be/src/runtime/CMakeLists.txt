@@ -30,6 +30,7 @@ set_source_files_properties(${ROW_BATCH_PROTO_SRCS} PROPERTIES GENERATED TRUE)
 add_library(Runtime
   buffered-tuple-stream.cc
   client-cache.cc
+  collection-value.cc
   coordinator.cc
   coordinator-backend-state.cc
   datetime-parse-util.cc
@@ -69,6 +70,7 @@ add_library(Runtime
   scanner-mem-limiter.cc
   sorted-run-merger.cc
   sorter.cc
+  sorter-ir.cc
   string-value.cc
   thread-resource-mgr.cc
   timestamp-parse-util.cc
@@ -100,3 +102,4 @@ ADD_BE_LSAN_TEST(tmp-file-mgr-test)
 ADD_BE_LSAN_TEST(row-batch-serialize-test)
 ADD_BE_LSAN_TEST(row-batch-test)
 ADD_BE_LSAN_TEST(collection-value-builder-test)
+ADD_BE_LSAN_TEST(runtime-state-test)

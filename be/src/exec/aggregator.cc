@@ -322,7 +322,7 @@ Status Aggregator::CodegenUpdateSlot(LlvmCodeGen* codegen, int agg_fn_idx,
   for (int i = 0; i < num_inputs; ++i) {
     ScalarExpr* input_expr = agg_fn->GetChild(i);
     llvm::Function* input_expr_fn;
-    RETURN_IF_ERROR(input_expr->GetCodegendComputeFn(codegen, &input_expr_fn));
+    RETURN_IF_ERROR(input_expr->GetCodegendComputeFn(codegen, false, &input_expr_fn));
     DCHECK(input_expr_fn != nullptr);
 
     // Call input expr function with the matching evaluator to get src slot value.
@@ -339,7 +339,8 @@ Status Aggregator::CodegenUpdateSlot(LlvmCodeGen* codegen, int agg_fn_idx,
   const ColumnType& dst_type = agg_fn->intermediate_type();
   bool dst_is_int_or_float_or_bool = dst_type.IsIntegerType()
       || dst_type.IsFloatingPointType() || dst_type.IsBooleanType();
-  bool dst_is_numeric_or_bool = dst_is_int_or_float_or_bool || dst_type.IsDecimalType();
+  bool dst_is_numeric_or_bool = dst_is_int_or_float_or_bool || dst_type.IsDecimalType()
+      || dst_type.IsDateType();
 
   llvm::BasicBlock* ret_block = llvm::BasicBlock::Create(codegen->context(), "ret", *fn);
 

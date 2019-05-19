@@ -19,9 +19,11 @@ package org.apache.impala.catalog;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
-import java.util.Iterator;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -31,7 +33,6 @@ import javax.annotation.Nonnull;
 
 import org.apache.hadoop.fs.BlockLocation;
 import org.apache.hadoop.fs.FileStatus;
-import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.impala.analysis.Expr;
 import org.apache.impala.analysis.LiteralExpr;
@@ -40,6 +41,7 @@ import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.Pair;
 import org.apache.impala.common.Reference;
+import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.fb.FbCompression;
 import org.apache.impala.fb.FbFileBlock;
 import org.apache.impala.fb.FbFileDesc;
@@ -134,12 +136,23 @@ public class HdfsPartition implements FeFsPartition, PrunablePartition {
      * file resides and 'hostIndex' stores the network addresses of the hosts that store
      * blocks of the parent HdfsTable. 'isEc' indicates whether the file is erasure-coded.
      * Populates 'numUnknownDiskIds' with the number of unknown disk ids.
+     *
+     *
      */
-    public static FileDescriptor create(FileStatus fileStatus,
-        BlockLocation[] blockLocations, FileSystem fileSystem,
-        ListMap<TNetworkAddress> hostIndex, boolean isEc,
+    /**
+     * Creates a FileDescriptor with block locations.
+     *
+     * @param fileStatus the status returned from file listing
+     * @param relPath the path of the file relative to the partition directory
+     * @param blockLocations the block locations for the file
+     * @param hostIndex the host index to use for encoding the hosts
+     * @param isEc true if the file is known to be erasure-coded
+     * @param numUnknownDiskIds reference which will be set to the number of blocks
+     *                          for which no disk ID could be determined
+     */
+    public static FileDescriptor create(FileStatus fileStatus, String relPath,
+        BlockLocation[] blockLocations, ListMap<TNetworkAddress> hostIndex, boolean isEc,
         Reference<Long> numUnknownDiskIds) throws IOException {
-      Preconditions.checkState(FileSystemUtil.supportsStorageIds(fileSystem));
       FlatBufferBuilder fbb = new FlatBufferBuilder(1);
       int[] fbFileBlockOffsets = new int[blockLocations.length];
       int blockIdx = 0;
@@ -153,17 +166,18 @@ public class HdfsPartition implements FeFsPartition, PrunablePartition {
               FileBlock.createFbFileBlock(fbb, loc, hostIndex, numUnknownDiskIds);
         }
       }
-      return new FileDescriptor(createFbFileDesc(fbb, fileStatus, fbFileBlockOffsets,
-          isEc));
+      return new FileDescriptor(createFbFileDesc(fbb, fileStatus, relPath,
+          fbFileBlockOffsets, isEc));
     }
 
     /**
      * Creates the file descriptor of a file represented by 'fileStatus' that
      * resides in a filesystem that doesn't support the BlockLocation API (e.g. S3).
      */
-    public static FileDescriptor createWithNoBlocks(FileStatus fileStatus) {
+    public static FileDescriptor createWithNoBlocks(FileStatus fileStatus,
+        String relPath) {
       FlatBufferBuilder fbb = new FlatBufferBuilder(1);
-      return new FileDescriptor(createFbFileDesc(fbb, fileStatus, null, false));
+      return new FileDescriptor(createFbFileDesc(fbb, fileStatus, relPath, null, false));
     }
 
     /**
@@ -173,15 +187,16 @@ public class HdfsPartition implements FeFsPartition, PrunablePartition {
      * in the underlying buffer. Can be null if there are no blocks.
      */
     private static FbFileDesc createFbFileDesc(FlatBufferBuilder fbb,
-        FileStatus fileStatus, int[] fbFileBlockOffets, boolean isEc) {
-      int fileNameOffset = fbb.createString(fileStatus.getPath().getName());
+        FileStatus fileStatus, String relPath, int[] fbFileBlockOffets, boolean isEc) {
+      int relPathOffset = fbb.createString(relPath);
       // A negative block vector offset is used when no block offsets are specified.
       int blockVectorOffset = -1;
       if (fbFileBlockOffets != null) {
         blockVectorOffset = FbFileDesc.createFileBlocksVector(fbb, fbFileBlockOffets);
       }
       FbFileDesc.startFbFileDesc(fbb);
-      FbFileDesc.addFileName(fbb, fileNameOffset);
+      // TODO(todd) rename to RelativePathin the FBS
+      FbFileDesc.addRelativePath(fbb, relPathOffset);
       FbFileDesc.addLength(fbb, fileStatus.getLen());
       FbFileDesc.addLastModificationTime(fbb, fileStatus.getModificationTime());
       FbFileDesc.addIsEc(fbb, isEc);
@@ -197,7 +212,7 @@ public class HdfsPartition implements FeFsPartition, PrunablePartition {
       return FbFileDesc.getRootAsFbFileDesc((ByteBuffer)compressedBb.flip());
     }
 
-    public String getFileName() { return fbFileDescriptor_.fileName(); }
+    public String getRelativePath() { return fbFileDescriptor_.relativePath(); }
     public long getFileLength() { return fbFileDescriptor_.length(); }
 
     /** Compute the total length of files in fileDescs */
@@ -236,7 +251,7 @@ public class HdfsPartition implements FeFsPartition, PrunablePartition {
         blocks.add(FileBlock.debugString(getFbFileBlock(i)));
       }
       return Objects.toStringHelper(this)
-          .add("FileName", getFileName())
+          .add("RelativePath", getRelativePath())
           .add("Length", getFileLength())
           .add("Compression", getFileCompression())
           .add("ModificationTime", getModificationTime())
@@ -245,7 +260,7 @@ public class HdfsPartition implements FeFsPartition, PrunablePartition {
 
     @Override
     public int compareTo(FileDescriptor otherFd) {
-      return getFileName().compareTo(otherFd.getFileName());
+      return getRelativePath().compareTo(otherFd.getRelativePath());
     }
 
     /**
@@ -304,7 +319,8 @@ public class HdfsPartition implements FeFsPartition, PrunablePartition {
       String[] ip_port = location.split(":");
       if (ip_port.length != 2) return null;
       try {
-        return new TNetworkAddress(ip_port[0], Integer.parseInt(ip_port[1]));
+        return CatalogInterners.internNetworkAddress(
+            new TNetworkAddress(ip_port[0], Integer.parseInt(ip_port[1])));
       } catch (NumberFormatException e) {
         return null;
       }
@@ -479,6 +495,76 @@ public class HdfsPartition implements FeFsPartition, PrunablePartition {
     }
   }
 
+  // Struct-style class for caching all the information we need to reconstruct an
+  // HMS-compatible Partition object, for use in RPCs to the metastore. We do this rather
+  // than cache the Thrift partition object itself as the latter can be large - thanks
+  // mostly to the inclusion of the full FieldSchema list. This class is read-only - if
+  // any field can be mutated by Impala it should belong to HdfsPartition itself (see
+  // HdfsPartition.location_ for an example).
+  //
+  // TODO: Cache this descriptor in HdfsTable so that identical descriptors are shared
+  // between HdfsPartition instances.
+  // TODO: sdInputFormat and sdOutputFormat can be mutated by Impala when the file format
+  // of a partition changes; move these fields to HdfsPartition.
+  private static class CachedHmsPartitionDescriptor {
+    public String sdInputFormat;
+    public String sdOutputFormat;
+    public final boolean sdCompressed;
+    public final int sdNumBuckets;
+    public final org.apache.hadoop.hive.metastore.api.SerDeInfo sdSerdeInfo;
+    public final List<String> sdBucketCols;
+    public final List<org.apache.hadoop.hive.metastore.api.Order> sdSortCols;
+    public final Map<String, String> sdParameters;
+    public final int msCreateTime;
+    public final int msLastAccessTime;
+
+    public CachedHmsPartitionDescriptor(
+        org.apache.hadoop.hive.metastore.api.Partition msPartition) {
+      org.apache.hadoop.hive.metastore.api.StorageDescriptor sd = null;
+      if (msPartition != null) {
+        sd = msPartition.getSd();
+        CatalogInterners.internFieldsInPlace(sd);
+        msCreateTime = msPartition.getCreateTime();
+        msLastAccessTime = msPartition.getLastAccessTime();
+      } else {
+        msCreateTime = msLastAccessTime = 0;
+      }
+      if (sd != null) {
+        sdInputFormat = sd.getInputFormat();
+        sdOutputFormat = sd.getOutputFormat();
+        sdCompressed = sd.isCompressed();
+        sdNumBuckets = sd.getNumBuckets();
+        sdSerdeInfo = sd.getSerdeInfo();
+        sdBucketCols = ImmutableList.copyOf(sd.getBucketCols());
+        sdSortCols = ImmutableList.copyOf(sd.getSortCols());
+        sdParameters = ImmutableMap.copyOf(CatalogInterners.internParameters(
+            sd.getParameters()));
+      } else {
+        sdInputFormat = "";
+        sdOutputFormat = "";
+        sdCompressed = false;
+        sdNumBuckets = 0;
+        sdSerdeInfo = null;
+        sdBucketCols = ImmutableList.of();
+        sdSortCols = ImmutableList.of();
+        sdParameters = ImmutableMap.of();
+      }
+    }
+  }
+
+  private final static Logger LOG = LoggerFactory.getLogger(HdfsPartition.class);
+
+  // A predicate for checking if a given string is a key used for serializing
+  // TPartitionStats to HMS parameters.
+  private static Predicate<String> IS_INCREMENTAL_STATS_KEY =
+      new Predicate<String>() {
+        @Override
+        public boolean apply(String key) {
+          return key.startsWith(PartitionStatsUtil.INCREMENTAL_STATS_NUM_CHUNKS)
+              || key.startsWith(PartitionStatsUtil.INCREMENTAL_STATS_CHUNK_PREFIX);
+        }
+      };
+
   private final HdfsTable table_;
   private final List<LiteralExpr> partitionKeyValues_;
   // estimated number of rows in partition; -1: unknown
@@ -512,11 +598,10 @@ public class HdfsPartition implements FeFsPartition, PrunablePartition {
   @Nonnull
   private ImmutableList<byte[]> encodedFileDescriptors_;
   private HdfsPartitionLocationCompressor.Location location_;
-  private final static Logger LOG = LoggerFactory.getLogger(HdfsPartition.class);
-  private boolean isDirty_ = false;
+  private boolean isDirty_;
   // True if this partition is marked as cached. Does not necessarily mean the data is
   // cached.
-  private boolean isMarkedCached_ = false;
+  private boolean isMarkedCached_;
   private final TAccessLevel accessLevel_;
 
   // (k,v) pairs of parameters for this partition, stored in the HMS.
@@ -524,21 +609,61 @@ public class HdfsPartition implements FeFsPartition, PrunablePartition {
 
   // Binary representation of the TPartitionStats for this partition. Populated
   // when the partition is loaded and updated using setPartitionStatsBytes().
-  private byte[] partitionStats_ = null;
+  private byte[] partitionStats_;
 
   // True if partitionStats_ has intermediate_col_stats populated.
-  private boolean hasIncrementalStats_ = false;
+  private boolean hasIncrementalStats_ ;
 
-  // A predicate for checking if a given string is a key used for serializing
-  // TPartitionStats to HMS parameters.
-  private static Predicate<String> IS_INCREMENTAL_STATS_KEY =
-      new Predicate<String>() {
-        @Override
-        public boolean apply(String key) {
-          return key.startsWith(PartitionStatsUtil.INCREMENTAL_STATS_NUM_CHUNKS)
-              || key.startsWith(PartitionStatsUtil.INCREMENTAL_STATS_CHUNK_PREFIX);
-        }
-      };
+  // The last committed write ID which modified this partition.
+  // -1 means writeId_ is irrelevant(not supported).
+  private long writeId_ = -1L;
+
+  private HdfsPartition(HdfsTable table,
+      org.apache.hadoop.hive.metastore.api.Partition msPartition,
+      List<LiteralExpr> partitionKeyValues,
+      HdfsStorageDescriptor fileFormatDescriptor,
+      List<HdfsPartition.FileDescriptor> fileDescriptors, long id,
+      HdfsPartitionLocationCompressor.Location location, TAccessLevel accessLevel) {
+    table_ = table;
+    if (msPartition == null) {
+      cachedMsPartitionDescriptor_ = null;
+    } else {
+      cachedMsPartitionDescriptor_ = new CachedHmsPartitionDescriptor(msPartition);
+    }
+    location_ = location;
+    partitionKeyValues_ = ImmutableList.copyOf(partitionKeyValues);
+    setFileDescriptors(fileDescriptors);
+    fileFormatDescriptor_ = fileFormatDescriptor;
+    id_ = id;
+    accessLevel_ = accessLevel;
+    if (msPartition != null && msPartition.getParameters() != null) {
+      isMarkedCached_ = HdfsCachingUtil.getCacheDirectiveId(
+          msPartition.getParameters()) != null;
+      hmsParameters_ = msPartition.getParameters();
+    } else {
+      hmsParameters_ = new HashMap<>();
+    }
+    extractAndCompressPartStats();
+    // Intern parameters after removing the incremental stats
+    hmsParameters_ = CatalogInterners.internParameters(hmsParameters_);
+    if (MetastoreShim.getMajorVersion() > 2 && msPartition != null) {
+      writeId_ = MetastoreShim.getWriteIdFromMSPartition(msPartition);
+    }
+  }
+
+  public HdfsPartition(HdfsTable table,
+      org.apache.hadoop.hive.metastore.api.Partition msPartition,
+      List<LiteralExpr> partitionKeyValues,
+      HdfsStorageDescriptor fileFormatDescriptor,
+      List<HdfsPartition.FileDescriptor> fileDescriptors,
+      TAccessLevel accessLevel) {
+    this(table, msPartition, partitionKeyValues, fileFormatDescriptor, fileDescriptors,
+        partitionIdCounter_.getAndIncrement(),
+        table.getPartitionLocationCompressor().new Location(msPartition != null
+                ? msPartition.getSd().getLocation()
+                : table.getLocation()),
+        accessLevel);
+  }
 
   @Override // FeFsPartition
   public HdfsStorageDescriptor getInputFormatDescriptor() {
@@ -600,16 +725,31 @@ public class HdfsPartition implements FeFsPartition, PrunablePartition {
   }
 
   @Override // FeFsPartition
-  public Path getLocationPath() { return new Path(getLocation()); }
+  public Path getLocationPath() {
+    Preconditions.checkNotNull(getLocation(), "HdfsPartition location is null");
+    return new Path(getLocation());
+  }
+
   @Override // FeFsPartition
   public long getId() { return id_; }
+
   @Override // FeFsPartition
   public HdfsTable getTable() { return table_; }
+
+  @Override
+  public FileSystemUtil.FsType getFsType() {
+    Preconditions.checkNotNull(getLocationPath().toUri().getScheme(),
+        "Cannot get scheme from path " + getLocationPath());
+    return FileSystemUtil.FsType.getFsType(getLocationPath().toUri().getScheme());
+  }
+
   public void setNumRows(long numRows) { numRows_ = numRows; }
   @Override // FeFsPartition
   public long getNumRows() { return numRows_; }
+  @Override
   public boolean isMarkedCached() { return isMarkedCached_; }
   void markCached() { isMarkedCached_ = true; }
+  private CachedHmsPartitionDescriptor cachedMsPartitionDescriptor_;
 
   /**
    * Updates the file format of this partition and sets the corresponding input/output
@@ -642,6 +782,7 @@ public class HdfsPartition implements FeFsPartition, PrunablePartition {
     return PartitionStatsUtil.getPartStatsOrWarn(this);
   }
 
+  @Override
   public byte[] getPartitionStatsCompressed() {
     return partitionStats_;
   }
@@ -661,7 +802,7 @@ public class HdfsPartition implements FeFsPartition, PrunablePartition {
       // Convert the stats stored in the hmsParams map to a deflate-compressed in-memory
       // byte array format. After conversion, delete the entries in the hmsParams map
       // as they are not needed anymore.
-      Reference<Boolean> hasIncrStats = new Reference(false);
+      Reference<Boolean> hasIncrStats = new Reference<Boolean>(false);
       byte[] partitionStats =
           PartitionStatsUtil.partStatsBytesFromParameters(hmsParameters_, hasIncrStats);
       setPartitionStatsBytes(partitionStats, hasIncrStats.getRef());
@@ -699,6 +840,7 @@ public class HdfsPartition implements FeFsPartition, PrunablePartition {
     Preconditions.checkArgument(!IS_INCREMENTAL_STATS_KEY.apply(k));
     hmsParameters_.put(k, v);
   }
+
   public void putToParameters(Pair<String, String> kv) {
     putToParameters(kv.first, kv.second);
   }
@@ -715,80 +857,41 @@ public class HdfsPartition implements FeFsPartition, PrunablePartition {
   public List<LiteralExpr> getPartitionValues() { return partitionKeyValues_; }
   @Override // FeFsPartition
   public LiteralExpr getPartitionValue(int i) { return partitionKeyValues_.get(i); }
+
   @Override // FeFsPartition
   public List<HdfsPartition.FileDescriptor> getFileDescriptors() {
     // Return a lazily transformed list from our internal bytes storage.
     return Lists.transform(encodedFileDescriptors_, FileDescriptor.FROM_BYTES);
   }
+
+  /**
+   * Returns a set of fully qualified file names in the partition.
+   */
+  public Set<String> getFileNames() {
+    List<FileDescriptor> fdList = getFileDescriptors();
+    Set<String> fileNames = new HashSet<>(fdList.size());
+    // Fully qualified file names.
+    String location = getLocation();
+    for (FileDescriptor fd : fdList) {
+      fileNames.add(location + Path.SEPARATOR + fd.getRelativePath());
+    }
+    return fileNames;
+  }
+
   public void setFileDescriptors(List<FileDescriptor> descriptors) {
     // Store an eagerly transformed-and-copied list so that we drop the memory usage
     // of the flatbuffer wrapper.
     encodedFileDescriptors_ = ImmutableList.copyOf(Lists.transform(
         descriptors, FileDescriptor.TO_BYTES));
   }
+
   @Override // FeFsPartition
   public int getNumFileDescriptors() {
     return encodedFileDescriptors_.size();
   }
 
+  @Override
   public boolean hasFileDescriptors() { return !encodedFileDescriptors_.isEmpty(); }
-
-  // Struct-style class for caching all the information we need to reconstruct an
-  // HMS-compatible Partition object, for use in RPCs to the metastore. We do this rather
-  // than cache the Thrift partition object itself as the latter can be large - thanks
-  // mostly to the inclusion of the full FieldSchema list. This class is read-only - if
-  // any field can be mutated by Impala it should belong to HdfsPartition itself (see
-  // HdfsPartition.location_ for an example).
-  //
-  // TODO: Cache this descriptor in HdfsTable so that identical descriptors are shared
-  // between HdfsPartition instances.
-  // TODO: sdInputFormat and sdOutputFormat can be mutated by Impala when the file format
-  // of a partition changes; move these fields to HdfsPartition.
-  private static class CachedHmsPartitionDescriptor {
-    public String sdInputFormat;
-    public String sdOutputFormat;
-    public final boolean sdCompressed;
-    public final int sdNumBuckets;
-    public final org.apache.hadoop.hive.metastore.api.SerDeInfo sdSerdeInfo;
-    public final List<String> sdBucketCols;
-    public final List<org.apache.hadoop.hive.metastore.api.Order> sdSortCols;
-    public final Map<String, String> sdParameters;
-    public final int msCreateTime;
-    public final int msLastAccessTime;
-
-    public CachedHmsPartitionDescriptor(
-        org.apache.hadoop.hive.metastore.api.Partition msPartition) {
-      org.apache.hadoop.hive.metastore.api.StorageDescriptor sd = null;
-      if (msPartition != null) {
-        sd = msPartition.getSd();
-        msCreateTime = msPartition.getCreateTime();
-        msLastAccessTime = msPartition.getLastAccessTime();
-      } else {
-        msCreateTime = msLastAccessTime = 0;
-      }
-      if (sd != null) {
-        sdInputFormat = sd.getInputFormat();
-        sdOutputFormat = sd.getOutputFormat();
-        sdCompressed = sd.isCompressed();
-        sdNumBuckets = sd.getNumBuckets();
-        sdSerdeInfo = sd.getSerdeInfo();
-        sdBucketCols = ImmutableList.copyOf(sd.getBucketCols());
-        sdSortCols = ImmutableList.copyOf(sd.getSortCols());
-        sdParameters = ImmutableMap.copyOf(sd.getParameters());
-      } else {
-        sdInputFormat = "";
-        sdOutputFormat = "";
-        sdCompressed = false;
-        sdNumBuckets = 0;
-        sdSerdeInfo = null;
-        sdBucketCols = ImmutableList.of();
-        sdSortCols = ImmutableList.of();
-        sdParameters = ImmutableMap.of();
-      }
-    }
-  }
-
-  private CachedHmsPartitionDescriptor cachedMsPartitionDescriptor_;
 
   public CachedHmsPartitionDescriptor getCachedMsPartitionDescriptor() {
     return cachedMsPartitionDescriptor_;
@@ -804,7 +907,10 @@ public class HdfsPartition implements FeFsPartition, PrunablePartition {
     // Update the serde library class based on the currently used file format.
     org.apache.hadoop.hive.metastore.api.StorageDescriptor storageDescriptor =
         new org.apache.hadoop.hive.metastore.api.StorageDescriptor(
-            table_.getNonPartitionFieldSchemas(),
+          // Make a shallow copy of the field schemas instead of passing a reference to
+          // the source list since it could potentially be modified once the current
+          // thread is out of table lock scope.
+            new ArrayList<>(table_.getNonPartitionFieldSchemas()),
             getLocation(),
             cachedMsPartitionDescriptor_.sdInputFormat,
             cachedMsPartitionDescriptor_.sdOutputFormat,
@@ -827,52 +933,10 @@ public class HdfsPartition implements FeFsPartition, PrunablePartition {
     return partition;
   }
 
-  private HdfsPartition(HdfsTable table,
-      org.apache.hadoop.hive.metastore.api.Partition msPartition,
-      List<LiteralExpr> partitionKeyValues,
-      HdfsStorageDescriptor fileFormatDescriptor,
-      List<HdfsPartition.FileDescriptor> fileDescriptors, long id,
-      HdfsPartitionLocationCompressor.Location location, TAccessLevel accessLevel) {
-    table_ = table;
-    if (msPartition == null) {
-      cachedMsPartitionDescriptor_ = null;
-    } else {
-      cachedMsPartitionDescriptor_ = new CachedHmsPartitionDescriptor(msPartition);
-    }
-    location_ = location;
-    partitionKeyValues_ = ImmutableList.copyOf(partitionKeyValues);
-    setFileDescriptors(fileDescriptors);
-    fileFormatDescriptor_ = fileFormatDescriptor;
-    id_ = id;
-    accessLevel_ = accessLevel;
-    if (msPartition != null && msPartition.getParameters() != null) {
-      isMarkedCached_ = HdfsCachingUtil.getCacheDirectiveId(
-          msPartition.getParameters()) != null;
-      hmsParameters_ = msPartition.getParameters();
-    } else {
-      hmsParameters_ = Maps.newHashMap();
-    }
-    extractAndCompressPartStats();
-  }
-
-  public HdfsPartition(HdfsTable table,
-      org.apache.hadoop.hive.metastore.api.Partition msPartition,
-      List<LiteralExpr> partitionKeyValues,
-      HdfsStorageDescriptor fileFormatDescriptor,
-      List<HdfsPartition.FileDescriptor> fileDescriptors,
-      TAccessLevel accessLevel) {
-    this(table, msPartition, partitionKeyValues, fileFormatDescriptor, fileDescriptors,
-        partitionIdCounter_.getAndIncrement(),
-        table.getPartitionLocationCompressor().new Location(msPartition != null
-                ? msPartition.getSd().getLocation()
-                : table.getLocation()),
-        accessLevel);
-  }
-
   public static HdfsPartition prototypePartition(
       HdfsTable table, HdfsStorageDescriptor storageDescriptor) {
-    List<LiteralExpr> emptyExprList = Lists.newArrayList();
-    List<FileDescriptor> emptyFileDescriptorList = Lists.newArrayList();
+    List<LiteralExpr> emptyExprList = new ArrayList<>();
+    List<FileDescriptor> emptyFileDescriptorList = new ArrayList<>();
     return new HdfsPartition(table, null, emptyExprList,
         storageDescriptor, emptyFileDescriptorList,
         CatalogObjectsConstants.PROTOTYPE_PARTITION_ID, null,
@@ -900,14 +964,14 @@ public class HdfsPartition implements FeFsPartition, PrunablePartition {
     HdfsStorageDescriptor storageDesc = HdfsStorageDescriptor.fromThriftPartition(
         thriftPartition, table.getName());
 
-    List<LiteralExpr> literalExpr = Lists.newArrayList();
+    List<LiteralExpr> literalExpr = new ArrayList<>();
     if (id != CatalogObjectsConstants.PROTOTYPE_PARTITION_ID) {
-      List<Column> clusterCols = Lists.newArrayList();
+      List<Column> clusterCols = new ArrayList<>();
       for (int i = 0; i < table.getNumClusteringCols(); ++i) {
         clusterCols.add(table.getColumns().get(i));
       }
 
-      List<TExprNode> exprNodes = Lists.newArrayList();
+      List<TExprNode> exprNodes = new ArrayList<>();
       for (TExpr expr: thriftPartition.getPartitionKeyExprs()) {
         for (TExprNode node: expr.getNodes()) {
           exprNodes.add(node);
@@ -924,7 +988,7 @@ public class HdfsPartition implements FeFsPartition, PrunablePartition {
       }
     }
 
-    List<HdfsPartition.FileDescriptor> fileDescriptors = Lists.newArrayList();
+    List<HdfsPartition.FileDescriptor> fileDescriptors = new ArrayList<>();
     if (thriftPartition.isSetFile_desc()) {
       for (THdfsFileDesc desc: thriftPartition.getFile_desc()) {
         fileDescriptors.add(HdfsPartition.FileDescriptor.fromThrift(desc));
@@ -947,15 +1011,19 @@ public class HdfsPartition implements FeFsPartition, PrunablePartition {
     }
 
     if (thriftPartition.isSetHms_parameters()) {
-      partition.hmsParameters_ = thriftPartition.getHms_parameters();
+      partition.hmsParameters_ = CatalogInterners.internParameters(
+          thriftPartition.getHms_parameters());
     } else {
-      partition.hmsParameters_ = Maps.newHashMap();
+      partition.hmsParameters_ = new HashMap<>();
     }
 
     partition.hasIncrementalStats_ = thriftPartition.has_incremental_stats;
     if (thriftPartition.isSetPartition_stats()) {
       partition.partitionStats_ = thriftPartition.getPartition_stats();
     }
+
+    partition.writeId_ = thriftPartition.isSetWrite_id() ?
+        thriftPartition.getWrite_id() : -1L;
 
     return partition;
   }
@@ -996,5 +1064,10 @@ public class HdfsPartition implements FeFsPartition, PrunablePartition {
       if (cmp != 0) return cmp;
     }
     return 0;
+  }
+
+  @Override
+  public long getWriteId() {
+    return writeId_;
   }
 }

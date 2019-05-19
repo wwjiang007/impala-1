@@ -19,15 +19,14 @@ package org.apache.impala.analysis;
 
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
-import com.google.common.collect.Sets;
 import org.apache.impala.catalog.Principal;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.thrift.TPrincipalType;
 import org.apache.impala.thrift.TShowGrantPrincipalParams;
 
+import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 
 /**
  * Represents "SHOW GRANT ROLE <role>" [ON <privilegeSpec>]" and
@@ -37,9 +36,6 @@ public class ShowGrantPrincipalStmt extends AuthorizationStmt {
   private final PrivilegeSpec privilegeSpec_;
   private final String name_;
   private final TPrincipalType principalType_;
-
-  // Set/modified during analysis.
-  private Principal principal_;
 
   public ShowGrantPrincipalStmt(String name, TPrincipalType principalType,
       PrivilegeSpec privilegeSpec) {
@@ -58,38 +54,34 @@ public class ShowGrantPrincipalStmt extends AuthorizationStmt {
           "empty.", Principal.toString(principalType_),
           Principal.toString(principalType_).toUpperCase()));
     }
-    principal_ = analyzer.getCatalog().getAuthPolicy().getPrincipal(name_,
-        principalType_);
 
-    // If it's a role, we can determine if it doesn't exist here. For a user
-    // it's considered non-existent if it doesn't have any groups, but we cannot
-    // access the group information from analysis. The group check for a user
-    // is done in AuthorizationPolicy.getPrincipalPrivileges
-    if (principal_ == null) {
-      switch (principalType_) {
-        case ROLE:
-          throw new AnalysisException(String.format("%s '%s' does not exist.",
-              Principal.toString(principalType_), name_));
-        case USER:
-          // Create a user object here because it's possible the user does not exist in
-          // Sentry, but still exists according to the OS, or Hadoop, or other custom
-          // group mapping provider.
-          principal_ = Principal.newInstance(name_, principalType_, Sets.newHashSet());
-          break;
-        default:
-          throw new AnalysisException(String.format("Unexpected TPrincipalType: %s",
-              Principal.toString(principalType_)));
-      }
-    }
     if (privilegeSpec_ != null) privilegeSpec_.analyze(analyzer);
   }
 
   @Override
-  public String toSql() {
+  public String toSql(ToSqlOptions options) {
     StringBuilder sb = new StringBuilder(String.format("SHOW GRANT %s ",
         Principal.toString(principalType_).toUpperCase()));
     sb.append(name_);
-    if (privilegeSpec_ != null) sb.append(" " + privilegeSpec_.toSql());
+    if (privilegeSpec_ != null) {
+      sb.append(String.format(" ON %s", privilegeSpec_.getScope().name()));
+      switch (privilegeSpec_.getScope()) {
+        case SERVER:
+          break;
+        case DATABASE:
+          sb.append(String.format(" %s", privilegeSpec_.getDbName()));
+          break;
+        case TABLE:
+          sb.append(String.format(" %s", privilegeSpec_.getTableName()));
+          break;
+        case URI:
+          sb.append(String.format(" '%s'", privilegeSpec_.getUri()));
+          break;
+        default:
+          throw new IllegalStateException("Unexpected privilege spec scope: " +
+              privilegeSpec_.getScope());
+      }
+    }
     return sb.toString();
   }
 
@@ -105,10 +97,7 @@ public class ShowGrantPrincipalStmt extends AuthorizationStmt {
     params.setRequesting_user(requestingUser_.getShortName());
     if (privilegeSpec_ != null) {
       params.setPrivilege(privilegeSpec_.toThrift().get(0));
-      params.getPrivilege().setPrincipal_id(principal_.getId());
     }
     return params;
   }
-
-  public Principal getPrincipal() { return principal_; }
 }

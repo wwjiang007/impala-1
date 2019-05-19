@@ -29,6 +29,7 @@ import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TExpr;
 import org.apache.impala.thrift.TExprNode;
 import org.apache.impala.thrift.TExprNodeType;
+
 import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
@@ -42,6 +43,9 @@ public class CastExpr extends Expr {
 
   // True if this cast does not change the type.
   private boolean noOp_ = false;
+
+  // Prefix for naming cast functions.
+  protected final static String CAST_FUNCTION_PREFIX = "castto";
 
   /**
    * C'tor for "pre-analyzed" implicit casts.
@@ -96,7 +100,7 @@ public class CastExpr extends Expr {
   }
 
   private static String getFnName(Type targetType) {
-    return "castTo" + targetType.getPrimitiveType().toString();
+    return CAST_FUNCTION_PREFIX + targetType.getPrimitiveType().toString();
   }
 
   public static void initBuiltins(Db db) {
@@ -106,8 +110,16 @@ public class CastExpr extends Expr {
         if (toType.isNull()) continue;
         // Disable casting from string to boolean
         if (fromType.isStringType() && toType.isBoolean()) continue;
-        // Disable casting from boolean/timestamp to decimal
-        if ((fromType.isBoolean() || fromType.isDateType()) && toType.isDecimal()) {
+        // Casting from date is only allowed when to-type is timestamp or string.
+        if (fromType.isDate() && !toType.isTimestamp() && !toType.isStringType()) {
+          continue;
+        }
+        // Casting to date is only allowed when from-type is timestamp or string.
+        if (toType.isDate() && !fromType.isTimestamp() && !fromType.isStringType()) {
+          continue;
+        }
+        // Disable casting from boolean/timestamp/date to decimal
+        if ((fromType.isBoolean() || fromType.isDateOrTimeType()) && toType.isDecimal()) {
           continue;
         }
         if (fromType.getPrimitiveType() == PrimitiveType.STRING
@@ -168,9 +180,17 @@ public class CastExpr extends Expr {
   }
 
   @Override
-  public String toSqlImpl() {
-    if (isImplicit_) return getChild(0).toSql();
-    return "CAST(" + getChild(0).toSql() + " AS " + targetTypeDef_.toString() + ")";
+  public String toSqlImpl(ToSqlOptions options) {
+    if (isImplicit_) {
+      if (options.showImplictCasts()) {
+        // for implicit casts, targetTypeDef_ is null
+        return "CAST(" + getChild(0).toSql(options) + " AS " + type_.toSql() + ")";
+      } else {
+        return getChild(0).toSql(options);
+      }
+    }
+    return "CAST(" + getChild(0).toSql(options) + " AS " + targetTypeDef_.toString()
+        + ")";
   }
 
   @Override
@@ -245,7 +265,7 @@ public class CastExpr extends Expr {
 
     // Ensure child has non-null type (even if it's a null literal). This is required
     // for the UDF interface.
-    if (children_.get(0) instanceof NullLiteral) {
+    if (Expr.IS_NULL_LITERAL.apply(children_.get(0))) {
       NullLiteral nullChild = (NullLiteral)(children_.get(0));
       nullChild.uncheckedCastTo(type_);
     }
@@ -296,6 +316,11 @@ public class CastExpr extends Expr {
     } else {
       return this;
     }
+  }
+
+  @Override
+  public boolean isImplicitCast() {
+    return isImplicit();
   }
 
   @Override

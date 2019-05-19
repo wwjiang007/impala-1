@@ -17,18 +17,19 @@
 
 # Targeted Impala insert tests
 
+import os
 import pytest
 
 from testdata.common import widetable
 from tests.common.impala_cluster import ImpalaCluster
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfEC, SkipIfLocal, SkipIfNotHdfsMinicluster
+from tests.common.parametrize import UniqueDatabase
+from tests.common.skip import SkipIfABFS, SkipIfEC, SkipIfLocal, \
+    SkipIfNotHdfsMinicluster, SkipIfS3, SkipIfDockerizedCluster
 from tests.common.test_dimensions import (
     create_exec_option_dimension,
     create_uncompressed_text_dimension)
 from tests.common.test_result_verifier import (
-    parse_column_types,
-    parse_column_labels,
     QueryTestResult,
     parse_result_rows)
 from tests.common.test_vector import ImpalaTestDimension
@@ -78,9 +79,11 @@ class TestInsertQueries(ImpalaTestSuite):
             (v.get_value('table_format').file_format == 'parquet' and \
             v.get_value('compression_codec') == 'none'))
 
+  @pytest.mark.execute_serially
   def test_insert_large_string(self, vector, unique_database):
     """Test handling of large strings in inserter and scanner."""
-    table_format = vector.get_value('table_format')
+    if "-Xcheck:jni" in os.environ.get("LIBHDFS_OPTS", ""):
+      pytest.skip("Test unreasonably slow with JNI checking.")
     table_name = unique_database + ".insert_largestring"
 
     file_format = vector.get_value('table_format').file_format
@@ -107,6 +110,16 @@ class TestInsertQueries(ImpalaTestSuite):
         "select substr(s, 200 * 1024 * 1024, 5) from {0}".format(table_name))
     assert result.data == ["ZAZAZ"]
 
+    # IMPALA-7648: test that we gracefully fail when there is not enough memory
+    # to fit the scanned string in memory.
+    self.client.set_configuration_option("mem_limit", "50M")
+    try:
+      self.client.execute("select s from {0}".format(table_name))
+      assert False, "Expected query to fail"
+    except Exception, e:
+      assert "Memory limit exceeded" in str(e)
+
+
   @classmethod
   def setup_class(cls):
     super(TestInsertQueries, cls).setup_class()
@@ -114,6 +127,8 @@ class TestInsertQueries(ImpalaTestSuite):
   @pytest.mark.execute_serially
   # Erasure coding doesn't respect memory limit
   @SkipIfEC.fix_later
+  # ABFS partition names cannot end in periods
+  @SkipIfABFS.jira(reason="HADOOP-15860")
   def test_insert(self, vector):
     if (vector.get_value('table_format').file_format == 'parquet'):
       vector.get_value('exec_option')['COMPRESSION_CODEC'] = \
@@ -132,11 +147,13 @@ class TestInsertQueries(ImpalaTestSuite):
     # IMPALA-7023: These queries can linger and use up memory, causing subsequent
     # tests to hit memory limits. Wait for some time to allow the query to
     # be reclaimed.
-    verifiers = [ MetricVerifier(i.service) for i in ImpalaCluster().impalads ]
+    verifiers = [MetricVerifier(i.service)
+                 for i in ImpalaCluster.get_e2e_test_cluster().impalads]
     for v in verifiers:
-      v.wait_for_metric("impala-server.num-fragments-in-flight", 0, timeout=60)
+      v.wait_for_metric("impala-server.num-fragments-in-flight", 0, timeout=180)
 
   @pytest.mark.execute_serially
+  @SkipIfS3.eventually_consistent
   def test_insert_overwrite(self, vector):
     self.run_test_case('QueryTest/insert_overwrite', vector,
         multiple_impalad=vector.get_value('exec_option')['sync_ddl'] == 1)
@@ -148,6 +165,13 @@ class TestInsertQueries(ImpalaTestSuite):
     if vector.get_value('exec_option')['disable_codegen']:
       self.run_test_case('QueryTest/insert_bad_expr', vector,
           multiple_impalad=vector.get_value('exec_option')['sync_ddl'] == 1)
+
+  @UniqueDatabase.parametrize(sync_ddl=True)
+  def test_insert_random_partition(self, vector, unique_database):
+    """Regression test for IMPALA-402: partitioning by rand() leads to strange behaviour
+    or crashes."""
+    self.run_test_case('QueryTest/insert-random-partition', vector, unique_database,
+        multiple_impalad=vector.get_value('exec_option')['sync_ddl'] == 1)
 
 class TestInsertWideTable(ImpalaTestSuite):
   @classmethod
@@ -201,8 +225,8 @@ class TestInsertWideTable(ImpalaTestSuite):
     assert result.data == ["1"]
 
     result = self.client.execute("select * from " + table_name)
-    types = parse_column_types(result.schema)
-    labels = parse_column_labels(result.schema)
+    types = result.column_types
+    labels = result.column_labels
     expected = QueryTestResult([col_vals], types, labels, order_matters=False)
     actual = QueryTestResult(parse_result_rows(result), types, labels, order_matters=False)
     assert expected == actual

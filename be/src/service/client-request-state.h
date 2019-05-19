@@ -38,14 +38,16 @@
 
 namespace impala {
 
-class ExecEnv;
-class Coordinator;
-class RuntimeState;
-class RowBatch;
-class Expr;
-class TupleRow;
-class Frontend;
 class ClientRequestStateCleaner;
+class Coordinator;
+class ExecEnv;
+class Expr;
+class Frontend;
+class ReportExecStatusRequestPB;
+class RowBatch;
+class RuntimeState;
+class TRuntimeProfileTree;
+class TupleRow;
 enum class AdmissionOutcome;
 
 /// Execution state of the client-facing side a query. This captures everything
@@ -65,6 +67,11 @@ class ClientRequestState {
       ImpalaServer* server, std::shared_ptr<ImpalaServer::SessionState> session);
 
   ~ClientRequestState();
+
+  /// Sets the profile that is produced by the frontend. The frontend creates the
+  /// profile during planning and returns it to the backend via TExecRequest,
+  /// which then sets the frontend profile.
+  void SetFrontendProfile(TRuntimeProfileNode profile);
 
   /// Based on query type, this either initiates execution of a exec_request or submits
   /// the query to the Admission controller for asynchronous admission control. When this
@@ -153,7 +160,8 @@ class ClientRequestState {
   /// coordinator even before it becomes accessible through GetCoordinator(). These
   /// methods should be used instead of calling them directly using the coordinator
   /// object.
-  Status UpdateBackendExecStatus(const TReportExecStatusParams& params);
+  Status UpdateBackendExecStatus(const ReportExecStatusRequestPB& request,
+      const TRuntimeProfileForest& thrift_profiles) WARN_UNUSED_RESULT;
   void UpdateFilter(const TUpdateFilterParams& params);
 
   ImpalaServer::SessionState* session() const { return session_.get(); }
@@ -215,7 +223,7 @@ class ClientRequestState {
   const RuntimeProfile* profile() const { return profile_; }
   const RuntimeProfile* summary_profile() const { return summary_profile_; }
   int64_t start_time_us() const { return start_time_us_; }
-  int64_t end_time_us() const { return end_time_us_; }
+  int64_t end_time_us() const { return end_time_us_.Load(); }
   const std::string& sql_stmt() const { return query_ctx_.client_request.stmt; }
   const TQueryOptions& query_options() const {
     return query_ctx_.client_request.query_options;
@@ -251,7 +259,17 @@ class ClientRequestState {
   RuntimeProfile::EventSequence* query_events() const { return query_events_; }
   RuntimeProfile* summary_profile() { return summary_profile_; }
 
+ protected:
+  /// Updates the end_time_us_ of this query if it isn't set. The end time is determined
+  /// when this function is called for the first time, calling it multiple times does not
+  /// change the end time.
+  void UpdateEndTime();
+
  private:
+  /// The coordinator is a friend class because it needs to be able to call
+  /// UpdateEndTime() when a query's admission control resources are released.
+  friend class Coordinator;
+
   const TQueryCtx query_ctx_;
 
   /// Ensures single-threaded execution of FetchRows(). Callers of FetchRows() are
@@ -352,6 +370,9 @@ class ClientRequestState {
   /// The ClientRequestState builds three separate profiles.
   /// * profile_ is the top-level profile which houses the other
   ///   profiles, plus the query timeline
+  /// * frontend_profile_ is the profile emitted by the frontend
+  ///   during planning. Added to summary_profile_ so as to avoid
+  ///   breaking other tools that depend on the profile_ layout.
   /// * summary_profile_ contains mostly static information about the
   ///   query, including the query statement, the plan and the user who submitted it.
   /// * server_profile_ tracks time spent inside the ImpalaServer,
@@ -370,6 +391,7 @@ class ClientRequestState {
   /// - Query Status
   /// - Error logs
   RuntimeProfile* const profile_;
+  RuntimeProfile* const frontend_profile_;
   RuntimeProfile* const server_profile_;
   RuntimeProfile* const summary_profile_;
   RuntimeProfile::Counter* row_materialization_timer_;
@@ -412,10 +434,11 @@ class ClientRequestState {
   ImpalaServer* parent_server_;
 
   /// Start/end time of the query, in Unix microseconds.
+  int64_t start_time_us_;
   /// end_time_us_ is initialized to 0, which is used to indicate that the query is not
-  /// yet done. It is assinged the final value in
-  /// ClientRequestState::Done().
-  int64_t start_time_us_, end_time_us_ = 0;
+  /// yet done. It is assinged the final value in ClientRequestState::Done() or when the
+  /// coordinator relases its admission control resources.
+  AtomicInt64 end_time_us_{0};
 
   /// Executes a local catalog operation (an operation that does not need to execute
   /// against the catalog service). Includes USE, SHOW, DESCRIBE, and EXPLAIN statements.

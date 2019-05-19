@@ -41,6 +41,8 @@ namespace impala {
 class AdmissionController;
 class BufferPool;
 class CallableThreadPool;
+class ControlService;
+class DataStreamMgr;
 class DataStreamService;
 class QueryExecMgr;
 class Frontend;
@@ -59,6 +61,7 @@ class ReservationTracker;
 class RpcMgr;
 class Scheduler;
 class StatestoreSubscriber;
+class SystemStateInfo;
 class ThreadResourceMgr;
 class TmpFileMgr;
 class Webserver;
@@ -101,7 +104,9 @@ class ExecEnv {
   Status StartKrpcService() WARN_UNUSED_RESULT;
 
   /// TODO: Should ExecEnv own the ImpalaServer as well?
-  void SetImpalaServer(ImpalaServer* server) { impala_server_ = server; }
+  /// Registers the ImpalaServer 'server' with this ExecEnv instance. May only be called
+  /// once.
+  void SetImpalaServer(ImpalaServer* server);
 
   /// Get the address of the thrift backend service. Only valid to call if
   /// StartServices() was successful.
@@ -131,10 +136,10 @@ class ExecEnv {
   CallableThreadPool* rpc_pool() { return async_rpc_pool_.get(); }
   QueryExecMgr* query_exec_mgr() { return query_exec_mgr_.get(); }
   RpcMgr* rpc_mgr() const { return rpc_mgr_.get(); }
-  DataStreamService* data_svc() const { return data_svc_.get(); }
   PoolMemTrackerRegistry* pool_mem_trackers() { return pool_mem_trackers_.get(); }
   ReservationTracker* buffer_reservation() { return buffer_reservation_.get(); }
   BufferPool* buffer_pool() { return buffer_pool_.get(); }
+  SystemStateInfo* system_state_info() { return system_state_info_.get(); }
 
   void set_enable_webserver(bool enable) { enable_webserver_ = enable; }
 
@@ -163,6 +168,8 @@ class ExecEnv {
   /// interface are owned by the ExecEnv. Thread safe.
   Status GetKuduClient(const std::vector<std::string>& master_addrs,
       kudu::client::KuduClient** client) WARN_UNUSED_RESULT;
+
+  int64_t admit_mem_limit() const { return admit_mem_limit_; }
 
  private:
   boost::scoped_ptr<ObjectPool> obj_pool_;
@@ -195,6 +202,7 @@ class ExecEnv {
   boost::scoped_ptr<CallableThreadPool> async_rpc_pool_;
   boost::scoped_ptr<QueryExecMgr> query_exec_mgr_;
   boost::scoped_ptr<RpcMgr> rpc_mgr_;
+  boost::scoped_ptr<ControlService> control_svc_;
   boost::scoped_ptr<DataStreamService> data_svc_;
 
   /// Query-wide buffer pool and the root reservation tracker for the pool. The
@@ -202,6 +210,9 @@ class ExecEnv {
   /// InitBufferPool();
   boost::scoped_ptr<ReservationTracker> buffer_reservation_;
   boost::scoped_ptr<BufferPool> buffer_pool_;
+
+  /// Tracks system resource usage which we then include in profiles.
+  boost::scoped_ptr<SystemStateInfo> system_state_info_;
 
   /// Not owned by this class
   ImpalaServer* impala_server_ = nullptr;
@@ -244,8 +255,26 @@ class ExecEnv {
   /// address lists be identical in order to share a KuduClient.
   KuduClientMap kudu_client_map_;
 
+  /// Return the bytes of memory available for queries to execute with - i.e.
+  /// mem_tracker()->limit() with any overhead that can't be used subtracted out,
+  /// such as the JVM if --mem_limit_includes_jvm=true. Set in Init().
+  int64_t admit_mem_limit_;
+
+  /// Choose a memory limit (returned in *bytes_limit) based on the --mem_limit flag and
+  /// the memory available to the daemon process. Returns an error if the memory limit is
+  /// invalid or another error is encountered that should prevent starting up the daemon.
+  /// Logs the memory limit chosen and any relevant diagnostics related to that choice.
+  Status ChooseProcessMemLimit(int64_t* bytes_limit);
+
   /// Initialise 'buffer_pool_' and 'buffer_reservation_' with given capacity.
   void InitBufferPool(int64_t min_page_len, int64_t capacity, int64_t clean_pages_limit);
+
+  /// Initialise 'mem_tracker_' with a limit of 'bytes_limit'. Must be called after
+  /// InitBufferPool() and RegisterMemoryMetrics().
+  void InitMemTracker(int64_t bytes_limit);
+
+  /// Initialize 'system_state_info_' to track system resource usage.
+  void InitSystemStateInfo();
 };
 
 } // namespace impala

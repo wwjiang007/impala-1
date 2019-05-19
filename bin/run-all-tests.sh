@@ -31,6 +31,7 @@ setup_report_build_error
 : ${EXPLORATION_STRATEGY:=core}
 : ${NUM_TEST_ITERATIONS:=1}
 : ${MAX_PYTEST_FAILURES:=10}
+: ${TIMEOUT_FOR_RUN_ALL_TESTS_MINS:=1200}
 KERB_ARGS=""
 
 . "${IMPALA_HOME}/bin/impala-config.sh" > /dev/null 2>&1
@@ -58,6 +59,10 @@ fi
 : ${RUN_TESTS_ARGS:=}
 # Extra args to pass to run-custom-cluster-tests.sh
 : ${RUN_CUSTOM_CLUSTER_TESTS_ARGS:=}
+# Data cache root directory location.
+: ${DATA_CACHE_DIR:=}
+# Data cache size.
+: ${DATA_CACHE_SIZE:=}
 if [[ "${TARGET_FILESYSTEM}" == "local" ]]; then
   # TODO: Remove abort_on_config_error flag from here and create-load-data.sh once
   # checkConfiguration() accepts the local filesystem (see IMPALA-1850).
@@ -66,6 +71,17 @@ if [[ "${TARGET_FILESYSTEM}" == "local" ]]; then
   FE_TEST=false
 else
   TEST_START_CLUSTER_ARGS="${TEST_START_CLUSTER_ARGS} --cluster_size=3"
+fi
+
+# Enable data cache if configured.
+if [[ -n "${DATA_CACHE_DIR}" && -n "${DATA_CACHE_SIZE}" ]]; then
+   TEST_START_CLUSTER_ARGS="${TEST_START_CLUSTER_ARGS} "`
+       `"--data_cache_dir=${DATA_CACHE_DIR} --data_cache_size=${DATA_CACHE_SIZE}"
+   # Force use of data cache for HDFS. Data cache is only enabled for remote reads.
+   if [[ "${TARGET_FILESYSTEM}" == "hdfs" ]]; then
+      TEST_START_CLUSTER_ARGS="${TEST_START_CLUSTER_ARGS} "`
+          `"--impalad_args=--always_use_data_cache=true"
+   fi
 fi
 
 if [[ "${ERASURE_CODING}" = true ]]; then
@@ -80,7 +96,8 @@ fi
 : ${CODE_COVERAGE:=false}
 
 # parse command line options
-while getopts "e:n:c" OPTION
+# Note: The ":"'s indicate that an option needs an argument.
+while getopts "e:n:ct:" OPTION
 do
   case "$OPTION" in
     e)
@@ -92,15 +109,22 @@ do
     c)
       CODE_COVERAGE=true
       ;;
+    t)
+      TIMEOUT_FOR_RUN_ALL_TESTS_MINS="$OPTARG"
+      ;;
     ?)
       echo "run-all-tests.sh [-e <exploration_strategy>] [-n <num_iters>]"
       echo "[-e] The exploration strategy to use. Default exploration is 'core'."
       echo "[-n] The number of times to run the tests. Default is 1."
       echo "[-c] Set this option to generate code coverage reports."
+      echo "[-t] The timeout in minutes for running all tests."
       exit 1;
       ;;
   esac
 done
+
+"${IMPALA_HOME}/bin/run-all-tests-timeout-check.sh" $TIMEOUT_FOR_RUN_ALL_TESTS_MINS &
+TIMEOUT_PID=$!
 
 # IMPALA-3947: "Exhaustive" tests are actually based on workload. This
 # means what we colloquially call "exhaustive" tests are actually
@@ -220,10 +244,16 @@ do
     export IMPALA_MAX_LOG_FILES="${IMPALA_MAX_LOG_FILES_SAVE}"
   fi
 
-  # Finally, run the process failure tests.
+  # Run the process failure tests.
   # Disabled temporarily until we figure out the proper timeouts required to make the test
   # succeed.
   # ${IMPALA_HOME}/tests/run-process-failure-tests.sh
+
+  # Finally, kill the spawned timeout process and its child sleep process.
+  # There may not be a sleep process, so ignore failure.
+  pkill -P $TIMEOUT_PID || true
+  kill $TIMEOUT_PID
+
   if [[ $TEST_RET_CODE == 1 ]]; then
     exit $TEST_RET_CODE
   fi

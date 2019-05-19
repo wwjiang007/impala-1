@@ -307,6 +307,14 @@ public class ScalarType extends Type {
     return isValid() && !getUnsupportedTypes().contains(this);
   }
 
+  /**
+   *  Returns true if this type is internal and not exposed externally in SQL.
+   */
+  public boolean isInternalType() {
+    return type_ == PrimitiveType.FIXED_UDA_INTERMEDIATE
+        || type_ == PrimitiveType.NULL_TYPE;
+  }
+
   @Override
   public boolean supportsTablePartitioning() {
     if (!isSupported() || isComplexType() || type_ == PrimitiveType.TIMESTAMP) {
@@ -368,7 +376,8 @@ public class ScalarType extends Type {
   }
 
   public Type getMaxResolutionType() {
-    if (isIntegerType()) {
+    // Dates got summed as BIGINT for AVG.
+    if (isIntegerType() || type_ == PrimitiveType.DATE) {
       return ScalarType.BIGINT;
     // Timestamps get summed as DOUBLE for AVG.
     } else if (isFloatingPointType() || type_ == PrimitiveType.TIMESTAMP) {
@@ -525,5 +534,13 @@ public class ScalarType extends Type {
   public static boolean isImplicitlyCastable(ScalarType t1, ScalarType t2,
       boolean strict, boolean strictDecimal) {
     return getAssignmentCompatibleType(t1, t2, strict, strictDecimal).matchesType(t2);
+  }
+
+  /**
+   * @return true if dest = source is valid (if source is at least as
+   * wide as dest.)
+   */
+  public static boolean isAssignable(ScalarType dest, ScalarType source) {
+    return isImplicitlyCastable(source, dest, false, false);
   }
 }

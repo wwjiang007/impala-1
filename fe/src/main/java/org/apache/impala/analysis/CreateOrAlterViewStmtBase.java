@@ -18,19 +18,19 @@
 package org.apache.impala.analysis;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
+import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TCreateOrAlterViewParams;
 import org.apache.impala.thrift.TTableName;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Sets;
 import com.google.common.base.Joiner;
+import com.google.common.base.Preconditions;
 
 /**
  * Base class for CREATE VIEW and ALTER VIEW AS SELECT statements.
@@ -119,7 +119,7 @@ public abstract class CreateOrAlterViewStmtBase extends StatementBase {
       }
     } else {
       // Create list of column definitions from the view-definition statement.
-      finalColDefs_ = Lists.newArrayList();
+      finalColDefs_ = new ArrayList<>();
       List<Expr> exprs = viewDefStmt_.getBaseTblResultExprs();
       List<String> labels = viewDefStmt_.getColLabels();
       Preconditions.checkState(exprs.size() == labels.size());
@@ -132,8 +132,13 @@ public abstract class CreateOrAlterViewStmtBase extends StatementBase {
 
     // Check that the column definitions have valid names, and that there are no
     // duplicate column names.
-    Set<String> distinctColNames = Sets.newHashSet();
+    Set<String> distinctColNames = new HashSet<>();
     for (ColumnDef colDesc: finalColDefs_) {
+      if (colDesc.getType() == Type.NULL) {
+        throw new AnalysisException(String.format("Unable to infer the column type " +
+            "for column '%s'. Use cast() to explicitly specify the column type for " +
+            "column '%s'.", colDesc.getColName(), colDesc.getColName()));
+      }
       colDesc.analyze(null);
       if (!distinctColNames.add(colDesc.getColName().toLowerCase())) {
         throw new AnalysisException("Duplicate column name: " + colDesc.getColName());
@@ -170,7 +175,7 @@ public abstract class CreateOrAlterViewStmtBase extends StatementBase {
    */
   protected void computeLineageGraph(Analyzer analyzer) {
     ColumnLineageGraph graph = analyzer.getColumnLineageGraph();
-    List<String> colDefs = Lists.newArrayList();
+    List<String> colDefs = new ArrayList<>();
     for (ColumnDef colDef: finalColDefs_) {
       colDefs.add(dbName_ + "." + getTbl() + "." + colDef.getColName());
     }
@@ -217,7 +222,7 @@ public abstract class CreateOrAlterViewStmtBase extends StatementBase {
    */
   protected String getColumnNames() {
     Preconditions.checkNotNull(columnDefs_);
-    List<String> columnNames = Lists.newArrayList();
+    List<String> columnNames = new ArrayList<>();
     for (ColumnDef colDef : columnDefs_) {
       columnNames.add(colDef.getColName());
     }

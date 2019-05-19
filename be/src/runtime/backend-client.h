@@ -55,26 +55,6 @@ class ImpalaBackendClient : public ImpalaInternalServiceClient {
     ImpalaInternalServiceClient::recv_ExecQueryFInstances(_return);
   }
 
-  void ReportExecStatus(TReportExecStatusResult& _return,
-      const TReportExecStatusParams& params, bool* send_done) {
-    DCHECK(!*send_done);
-    FAULT_INJECTION_SEND_RPC_EXCEPTION(16);
-    ImpalaInternalServiceClient::send_ReportExecStatus(params);
-    *send_done = true;
-    FAULT_INJECTION_RECV_RPC_EXCEPTION(16);
-    ImpalaInternalServiceClient::recv_ReportExecStatus(_return);
-  }
-
-  void CancelQueryFInstances(TCancelQueryFInstancesResult& _return,
-      const TCancelQueryFInstancesParams& params, bool* send_done) {
-    DCHECK(!*send_done);
-    FAULT_INJECTION_SEND_RPC_EXCEPTION(16);
-    ImpalaInternalServiceClient::send_CancelQueryFInstances(params);
-    *send_done = true;
-    FAULT_INJECTION_RECV_RPC_EXCEPTION(16);
-    ImpalaInternalServiceClient::recv_CancelQueryFInstances(_return);
-  }
-
   /// Callers of TransmitData() should provide their own counter to measure the data
   /// transmission time.
   void SetTransmitDataCounter(RuntimeProfile::ConcurrentTimerCounter* csw) {
@@ -102,14 +82,6 @@ class ImpalaBackendClient : public ImpalaInternalServiceClient {
     ImpalaInternalServiceClient::send_PublishFilter(params);
     *send_done = true;
     ImpalaInternalServiceClient::recv_PublishFilter(_return);
-  }
-
-  void RemoteShutdown(TRemoteShutdownResult& _return, const TRemoteShutdownParams& params,
-      bool* send_done) {
-    DCHECK(!*send_done);
-    ImpalaInternalServiceClient::send_RemoteShutdown(params);
-    *send_done = true;
-    ImpalaInternalServiceClient::recv_RemoteShutdown(_return);
   }
 
 #pragma clang diagnostic pop

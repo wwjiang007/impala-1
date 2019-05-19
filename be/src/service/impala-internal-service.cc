@@ -32,6 +32,8 @@
 
 using namespace impala;
 
+DECLARE_string(debug_actions);
+
 ImpalaInternalService::ImpalaInternalService() {
   impala_server_ = ExecEnv::GetInstance()->impala_server();
   DCHECK(impala_server_ != nullptr);
@@ -41,11 +43,12 @@ ImpalaInternalService::ImpalaInternalService() {
 
 void ImpalaInternalService::ExecQueryFInstances(TExecQueryFInstancesResult& return_val,
     const TExecQueryFInstancesParams& params) {
-  FAULT_INJECTION_RPC_DELAY(RPC_EXECQUERYFINSTANCES);
+  DebugActionNoFail(FLAGS_debug_actions, "EXEC_QUERY_FINSTANCES_DELAY");
   DCHECK(params.__isset.coord_state_idx);
   DCHECK(params.__isset.query_ctx);
   DCHECK(params.__isset.fragment_ctxs);
   DCHECK(params.__isset.fragment_instance_ctxs);
+  ScopedThreadContext scoped_tdi(GetThreadDebugInfo(), params.query_ctx.query_id);
   VLOG_QUERY << "ExecQueryFInstances():" << " query_id="
              << PrintId(params.query_ctx.query_id)
              << " coord=" << TNetworkAddressToString(params.query_ctx.coord_address)
@@ -65,31 +68,9 @@ template <typename T> void SetUnknownIdError(
   status.SetTStatus(status_container);
 }
 
-void ImpalaInternalService::CancelQueryFInstances(
-    TCancelQueryFInstancesResult& return_val,
-    const TCancelQueryFInstancesParams& params) {
-  VLOG_QUERY << "CancelQueryFInstances(): query_id=" << PrintId(params.query_id);
-  FAULT_INJECTION_RPC_DELAY(RPC_CANCELQUERYFINSTANCES);
-  DCHECK(params.__isset.query_id);
-  QueryState::ScopedRef qs(params.query_id);
-  if (qs.get() == nullptr) {
-    SetUnknownIdError("query", params.query_id, &return_val);
-    return;
-  }
-  qs->Cancel();
-}
-
-void ImpalaInternalService::ReportExecStatus(TReportExecStatusResult& return_val,
-    const TReportExecStatusParams& params) {
-  FAULT_INJECTION_RPC_DELAY(RPC_REPORTEXECSTATUS);
-  DCHECK(params.__isset.query_id);
-  DCHECK(params.__isset.coord_state_idx);
-  impala_server_->ReportExecStatus(return_val, params);
-}
-
 void ImpalaInternalService::UpdateFilter(TUpdateFilterResult& return_val,
     const TUpdateFilterParams& params) {
-  FAULT_INJECTION_RPC_DELAY(RPC_UPDATEFILTER);
+  DebugActionNoFail(FLAGS_debug_actions, "UPDATE_FILTER_DELAY");
   DCHECK(params.__isset.filter_id);
   DCHECK(params.__isset.query_id);
   DCHECK(params.__isset.bloom_filter || params.__isset.min_max_filter);
@@ -98,7 +79,7 @@ void ImpalaInternalService::UpdateFilter(TUpdateFilterResult& return_val,
 
 void ImpalaInternalService::PublishFilter(TPublishFilterResult& return_val,
     const TPublishFilterParams& params) {
-  FAULT_INJECTION_RPC_DELAY(RPC_PUBLISHFILTER);
+  DebugActionNoFail(FLAGS_debug_actions, "PUBLISH_FILTER_DELAY");
   DCHECK(params.__isset.filter_id);
   DCHECK(params.__isset.dst_query_id);
   DCHECK(params.__isset.dst_fragment_idx);
@@ -106,12 +87,4 @@ void ImpalaInternalService::PublishFilter(TPublishFilterResult& return_val,
   QueryState::ScopedRef qs(params.dst_query_id);
   if (qs.get() == nullptr) return;
   qs->PublishFilter(params);
-}
-
-void ImpalaInternalService::RemoteShutdown(TRemoteShutdownResult& return_val,
-    const TRemoteShutdownParams& params) {
-  FAULT_INJECTION_RPC_DELAY(RPC_REMOTESHUTDOWN);
-  Status status = impala_server_->StartShutdown(
-      params.__isset.deadline_s ? params.deadline_s : -1, &return_val.shutdown_status);
-  status.ToThrift(&return_val.status);
 }

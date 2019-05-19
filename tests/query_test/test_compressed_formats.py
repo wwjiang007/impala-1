@@ -23,7 +23,7 @@ from os.path import join
 from subprocess import call
 
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfS3, SkipIfADLS, SkipIfIsilon, SkipIfLocal
+from tests.common.skip import SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfIsilon, SkipIfLocal
 from tests.common.test_dimensions import create_single_exec_option_dimension
 from tests.common.test_vector import ImpalaTestDimension
 from tests.util.filesystem_utils import get_fs_path
@@ -40,6 +40,7 @@ compression_formats = [
 # Missing Coverage: Compressed data written by Hive is queriable by Impala on a non-hdfs
 # filesystem.
 @SkipIfS3.hive
+@SkipIfABFS.hive
 @SkipIfADLS.hive
 @SkipIfIsilon.hive
 @SkipIfLocal.hive
@@ -110,7 +111,7 @@ class TestCompressedFormats(ImpalaTestSuite):
     hive_cmd = drop_cmd + 'CREATE TABLE %s LIKE %s;' % (dest_table, src_table)
 
     # Create the table
-    call(["hive", "-e", hive_cmd]);
+    self.run_stmt_in_hive(hive_cmd)
     call(["hadoop", "fs", "-cp", src_file, dest_file])
     # Try to read the compressed file with extension
     query = 'select count(*) from %s' % dest_table
@@ -127,7 +128,7 @@ class TestCompressedFormats(ImpalaTestSuite):
         print "Unexpected error:\n%s", error_msg
         raise
     finally:
-      call(["hive", "-e", drop_cmd]);
+      self.run_stmt_in_hive(drop_cmd)
 
 class TestUnsupportedTableWriters(ImpalaTestSuite):
   @classmethod

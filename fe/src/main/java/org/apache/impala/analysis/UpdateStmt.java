@@ -19,6 +19,7 @@ package org.apache.impala.analysis;
 
 import static java.lang.String.format;
 
+import java.util.ArrayList;
 import java.util.List;
 
 import org.apache.impala.common.Pair;
@@ -27,7 +28,6 @@ import org.apache.impala.planner.TableSink;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.Lists;
 
 /**
  * Representation of an Update statement.
@@ -54,7 +54,7 @@ public class UpdateStmt extends ModifyStmt {
 
   public UpdateStmt(UpdateStmt other) {
     super(other.targetTablePath_, other.fromClause_.clone(),
-        Lists.<Pair<SlotRef, Expr>>newArrayList(), other.wherePredicate_);
+        new ArrayList<>(), other.wherePredicate_);
   }
 
   /**
@@ -77,19 +77,19 @@ public class UpdateStmt extends ModifyStmt {
   }
 
   @Override
-  public String toSql(boolean rewritten) {
-    if (!rewritten && sqlString_ != null) return sqlString_;
+  public String toSql(ToSqlOptions options) {
+    if (!options.showRewritten() && sqlString_ != null) return sqlString_;
 
     StringBuilder b = new StringBuilder();
     b.append("UPDATE ");
 
     if (fromClause_ == null) {
-      b.append(targetTableRef_.toSql(rewritten));
+      b.append(targetTableRef_.toSql(options));
     } else {
       if (targetTableRef_.hasExplicitAlias()) {
         b.append(targetTableRef_.getExplicitAlias());
       } else {
-        b.append(targetTableRef_.toSql(rewritten));
+        b.append(targetTableRef_.toSql(options));
       }
     }
     b.append(" SET");
@@ -101,16 +101,14 @@ public class UpdateStmt extends ModifyStmt {
       } else {
         first = false;
       }
-      b.append(format(" %s = %s",
-          i.first.toSql(),
-          i.second.toSql()));
+      b.append(format(" %s = %s", i.first.toSql(options), i.second.toSql(options)));
     }
 
-    b.append(fromClause_.toSql(rewritten));
+    b.append(fromClause_.toSql(options));
 
     if (wherePredicate_ != null) {
       b.append(" WHERE ");
-      b.append(wherePredicate_.toSql());
+      b.append(wherePredicate_.toSql(options));
     }
     return b.toString();
   }

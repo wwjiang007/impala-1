@@ -32,8 +32,8 @@ from tests.util.filesystem_utils import IS_LOCAL
 from time import sleep
 
 IMPALA_HOME = os.environ['IMPALA_HOME']
-CLUSTER_SIZE = 3
-NUM_COORDINATORS = CLUSTER_SIZE
+DEFAULT_CLUSTER_SIZE = 3
+NUM_COORDINATORS = DEFAULT_CLUSTER_SIZE
 
 # Additional args passed to respective daemon command line.
 IMPALAD_ARGS = 'impalad_args'
@@ -42,10 +42,13 @@ CATALOGD_ARGS = 'catalogd_args'
 # Additional args passed to the start-impala-cluster script.
 START_ARGS = 'start_args'
 SENTRY_CONFIG = 'sentry_config'
+SENTRY_LOG_DIR = 'sentry_log_dir'
+CLUSTER_SIZE = "cluster_size"
 # Default query options passed to the impala daemon command line. Handled separately from
 # other impala daemon arguments to allow merging multiple defaults into a single list.
 DEFAULT_QUERY_OPTIONS = 'default_query_options'
-LOG_DIR = 'log_dir'
+IMPALA_LOG_DIR = 'impala_log_dir'
+NUM_EXCLUSIVE_COORDINATORS = 'num_exclusive_coordinators'
 
 # Run with fast topic updates by default to reduce time to first query running.
 DEFAULT_STATESTORE_ARGS = '--statestore_update_frequency_ms=50 \
@@ -96,7 +99,9 @@ class CustomClusterTestSuite(ImpalaTestSuite):
 
   @staticmethod
   def with_args(impalad_args=None, statestored_args=None, catalogd_args=None,
-      start_args=None, sentry_config=None, default_query_options=None, log_dir=None):
+      start_args=None, sentry_config=None, default_query_options=None,
+      impala_log_dir=None, sentry_log_dir=None, cluster_size=None,
+      num_exclusive_coordinators=None):
     """Records arguments to be passed to a cluster by adding them to the decorated
     method's func_dict"""
     def decorate(func):
@@ -110,13 +115,19 @@ class CustomClusterTestSuite(ImpalaTestSuite):
       if catalogd_args is not None:
         func.func_dict[CATALOGD_ARGS] = catalogd_args
       if start_args is not None:
-        func.func_dict[START_ARGS] = start_args
+        func.func_dict[START_ARGS] = start_args.split()
       if sentry_config is not None:
         func.func_dict[SENTRY_CONFIG] = sentry_config
+      if sentry_log_dir is not None:
+        func.func_dict[SENTRY_LOG_DIR] = sentry_log_dir
       if default_query_options is not None:
         func.func_dict[DEFAULT_QUERY_OPTIONS] = default_query_options
-      if log_dir is not None:
-        func.func_dict[LOG_DIR] = log_dir
+      if impala_log_dir is not None:
+        func.func_dict[IMPALA_LOG_DIR] = impala_log_dir
+      if cluster_size is not None:
+        func.func_dict[CLUSTER_SIZE] = cluster_size
+      if num_exclusive_coordinators is not None:
+        func.func_dict[NUM_EXCLUSIVE_COORDINATORS] = num_exclusive_coordinators
       return func
     return decorate
 
@@ -124,20 +135,35 @@ class CustomClusterTestSuite(ImpalaTestSuite):
     cluster_args = list()
     for arg in [IMPALAD_ARGS, STATESTORED_ARGS, CATALOGD_ARGS]:
       if arg in method.func_dict:
-        cluster_args.append("--%s=\"%s\" " % (arg, method.func_dict[arg]))
+        cluster_args.append("--%s=%s " % (arg, method.func_dict[arg]))
     if START_ARGS in method.func_dict:
-      cluster_args.append(method.func_dict[START_ARGS])
+      cluster_args.extend(method.func_dict[START_ARGS])
 
     if SENTRY_CONFIG in method.func_dict:
-      self._start_sentry_service(method.func_dict[SENTRY_CONFIG])
+      self._start_sentry_service(method.func_dict[SENTRY_CONFIG],
+          method.func_dict.get(SENTRY_LOG_DIR))
+
+    cluster_size = DEFAULT_CLUSTER_SIZE
+    if CLUSTER_SIZE in method.func_dict:
+      cluster_size = method.func_dict[CLUSTER_SIZE]
+
+    use_exclusive_coordinators = False
+    num_coordinators = cluster_size
+    if NUM_EXCLUSIVE_COORDINATORS in method.func_dict:
+      num_coordinators = method.func_dict[NUM_EXCLUSIVE_COORDINATORS]
+      use_exclusive_coordinators = True
+
     # Start a clean new cluster before each test
-    if LOG_DIR in method.func_dict:
-      self._start_impala_cluster(cluster_args,
-          default_query_options=method.func_dict.get(DEFAULT_QUERY_OPTIONS),
-          log_dir=method.func_dict[LOG_DIR])
-    else:
-      self._start_impala_cluster(cluster_args,
-          default_query_options=method.func_dict.get(DEFAULT_QUERY_OPTIONS))
+    kwargs = {
+      "cluster_size": cluster_size,
+      "num_coordinators": num_coordinators,
+      "expected_num_executors": cluster_size,
+      "default_query_options": method.func_dict.get(DEFAULT_QUERY_OPTIONS),
+      "use_exclusive_coordinators": use_exclusive_coordinators
+    }
+    if IMPALA_LOG_DIR in method.func_dict:
+      kwargs["impala_log_dir"] = method.func_dict[IMPALA_LOG_DIR]
+    self._start_impala_cluster(cluster_args, **kwargs)
     super(CustomClusterTestSuite, self).setup_class()
 
   def teardown_method(self, method):
@@ -152,30 +178,38 @@ class CustomClusterTestSuite(ImpalaTestSuite):
     sleep(2)
 
   @classmethod
-  def _start_sentry_service(cls, sentry_service_config):
+  def _start_sentry_service(cls, sentry_service_config, sentry_log_dir=None):
     sentry_env = dict(os.environ)
+    if sentry_log_dir is not None:
+        sentry_env['SENTRY_LOG_DIR'] = sentry_log_dir
     sentry_env['SENTRY_SERVICE_CONFIG'] = sentry_service_config
     call = subprocess.Popen(
         ['/bin/bash', '-c', os.path.join(IMPALA_HOME,
-        'testdata/bin/run-sentry-service.sh')],
+                                         'testdata/bin/run-sentry-service.sh')],
         env=sentry_env)
     call.wait()
     if call.returncode != 0:
-      raise RuntimeError("unable to start sentry")
+      raise RuntimeError("Unable to start Sentry")
 
   @classmethod
-  def _start_impala_cluster(cls, options, log_dir=os.getenv('LOG_DIR', "/tmp/"),
-      cluster_size=CLUSTER_SIZE, num_coordinators=NUM_COORDINATORS,
-      use_exclusive_coordinators=False, log_level=1, expected_num_executors=CLUSTER_SIZE,
-      default_query_options=None):
-    cls.impala_log_dir = log_dir
+  def _stop_sentry_service(cls):
+    subprocess.check_call([os.path.join(os.environ["IMPALA_HOME"],
+                                        "testdata/bin/kill-sentry-service.sh")],
+                          close_fds=True)
+
+  @classmethod
+  def _start_impala_cluster(cls, options, impala_log_dir=os.getenv('LOG_DIR', "/tmp/"),
+      cluster_size=DEFAULT_CLUSTER_SIZE, num_coordinators=NUM_COORDINATORS,
+      use_exclusive_coordinators=False, log_level=1,
+      expected_num_executors=DEFAULT_CLUSTER_SIZE, default_query_options=None):
+    cls.impala_log_dir = impala_log_dir
     # We ignore TEST_START_CLUSTER_ARGS here. Custom cluster tests specifically test that
     # certain custom startup arguments work and we want to keep them independent of dev
     # environments.
     cmd = [os.path.join(IMPALA_HOME, 'bin/start-impala-cluster.py'),
            '--cluster_size=%d' % cluster_size,
            '--num_coordinators=%d' % num_coordinators,
-           '--log_dir=%s' % log_dir,
+           '--log_dir=%s' % impala_log_dir,
            '--log_level=%s' % log_level]
 
     if use_exclusive_coordinators:
@@ -187,7 +221,7 @@ class CustomClusterTestSuite(ImpalaTestSuite):
 
     if pytest.config.option.pull_incremental_statistics:
       cmd.append("--impalad_args=%s --catalogd_args=%s" %
-                 ("--pull_incremental_statistcs", "--pull_incremental_statistics"))
+                 ("--pull_incremental_statistics", "--pull_incremental_statistics"))
 
     default_query_option_kvs = []
     # Put any defaults first, then any arguments after that so they can override defaults.
@@ -207,7 +241,7 @@ class CustomClusterTestSuite(ImpalaTestSuite):
       check_call(cmd + options, close_fds=True)
     finally:
       # Failure tests expect cluster to be initialised even if start-impala-cluster fails.
-      cls.cluster = ImpalaCluster()
+      cls.cluster = ImpalaCluster.get_e2e_test_cluster()
     statestored = cls.cluster.statestored
     if statestored is None:
       raise Exception("statestored was not found")
@@ -219,41 +253,3 @@ class CustomClusterTestSuite(ImpalaTestSuite):
     statestored.service.wait_for_live_subscribers(expected_subscribers, timeout=60)
     for impalad in cls.cluster.impalads:
       impalad.service.wait_for_num_known_live_backends(expected_num_executors, timeout=60)
-
-  def assert_impalad_log_contains(self, level, line_regex, expected_count=1):
-    """
-    Convenience wrapper around assert_log_contains for impalad logs.
-    """
-    self.assert_log_contains("impalad", level, line_regex, expected_count)
-
-  def assert_catalogd_log_contains(self, level, line_regex, expected_count=1):
-    """
-    Convenience wrapper around assert_log_contains for catalogd logs.
-    """
-    self.assert_log_contains("catalogd", level, line_regex, expected_count)
-
-  def assert_log_contains(self, daemon, level, line_regex, expected_count=1):
-    """
-    Assert that the daemon log with specified level (e.g. ERROR, WARNING, INFO) contains
-    expected_count lines with a substring matching the regex. When expected_count is -1,
-    at least one match is expected.
-    When using this method to check log files of running processes, the caller should
-    make sure that log buffering has been disabled, for example by adding
-    '-logbuflevel=-1' to the daemon startup options.
-    """
-    pattern = re.compile(line_regex)
-    found = 0
-    log_file_path = os.path.join(self.impala_log_dir, daemon + "." + level)
-    # Resolve symlinks to make finding the file easier.
-    log_file_path = os.path.realpath(log_file_path)
-    with open(log_file_path) as log_file:
-      for line in log_file:
-        if pattern.search(line):
-          found += 1
-    if expected_count == -1:
-      assert found > 0, "Expected at least one line in file %s matching regex '%s'"\
-        ", but found none." % (log_file_path, line_regex)
-    else:
-      assert found == expected_count, "Expected %d lines in file %s matching regex '%s'"\
-        ", but found %d lines. Last line was: \n%s" %\
-        (expected_count, log_file_path, line_regex, found, line)

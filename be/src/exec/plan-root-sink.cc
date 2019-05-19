@@ -32,8 +32,10 @@ using boost::mutex;
 
 namespace impala {
 
-PlanRootSink::PlanRootSink(const RowDescriptor* row_desc, RuntimeState* state)
-  : DataSink(row_desc, "PLAN_ROOT_SINK", state) {}
+PlanRootSink::PlanRootSink(
+    TDataSinkId sink_id, const RowDescriptor* row_desc, RuntimeState* state)
+  : DataSink(sink_id, row_desc, "PLAN_ROOT_SINK", state),
+    num_rows_produced_limit_(state->query_options().num_rows_produced_limit) {}
 
 namespace {
 
@@ -61,11 +63,24 @@ void ValidateCollectionSlots(const RowDescriptor& row_desc, RowBatch* batch) {
   }
 #endif
 }
-}
+} // namespace
 
 Status PlanRootSink::Send(RuntimeState* state, RowBatch* batch) {
+  SCOPED_TIMER(profile()->total_time_counter());
   ValidateCollectionSlots(*row_desc_, batch);
   int current_batch_row = 0;
+
+  // Check to ensure that the number of rows produced by query execution does not exceed
+  // rows_returned_limit_. Since the PlanRootSink has a single producer, the
+  // num_rows_returned_ value can be verified without acquiring the lock_.
+  num_rows_produced_ += batch->num_rows();
+  if (num_rows_produced_limit_ > 0 && num_rows_produced_ > num_rows_produced_limit_) {
+    Status err = Status::Expected(TErrorCode::ROWS_PRODUCED_LIMIT_EXCEEDED,
+        PrintId(state->query_id()),
+        PrettyPrinter::Print(num_rows_produced_limit_, TUnit::NONE));
+    VLOG_QUERY << err.msg().msg();
+    return err;
+  }
 
   // Don't enter the loop if batch->num_rows() == 0; no point triggering the consumer with
   // 0 rows to return. Be wary of ever returning 0-row batches to the client; some poorly
@@ -74,27 +89,19 @@ Status PlanRootSink::Send(RuntimeState* state, RowBatch* batch) {
     unique_lock<mutex> l(lock_);
     // Wait until the consumer gives us a result set to fill in, or the fragment
     // instance has been cancelled.
-    while (results_ == nullptr && !state->is_cancelled()) sender_cv_.Wait(l);
+    while (results_ == nullptr && !state->is_cancelled()) {
+      SCOPED_TIMER(profile_->inactive_timer());
+      sender_cv_.Wait(l);
+    }
     RETURN_IF_CANCELLED(state);
 
     // Otherwise the consumer is ready. Fill out the rows.
     DCHECK(results_ != nullptr);
-    // List of expr values to hold evaluated rows from the query
-    vector<void*> result_row;
-    result_row.resize(output_exprs_.size());
-
-    // List of scales for floating point values in result_row
-    vector<int> scales;
-    scales.resize(result_row.size());
-
     int num_to_fetch = batch->num_rows() - current_batch_row;
     if (num_rows_requested_ > 0) num_to_fetch = min(num_to_fetch, num_rows_requested_);
-    for (int i = 0; i < num_to_fetch; ++i) {
-      TupleRow* row = batch->GetRow(current_batch_row);
-      GetRowValue(row, &result_row, &scales);
-      RETURN_IF_ERROR(results_->AddOneRow(result_row, scales));
-      ++current_batch_row;
-    }
+    RETURN_IF_ERROR(
+        results_->AddRows(output_expr_evals_, batch, current_batch_row, num_to_fetch));
+    current_batch_row += num_to_fetch;
     // Prevent expr result allocations from accumulating.
     expr_results_pool_->Clear();
     // Signal the consumer.
@@ -105,6 +112,7 @@ Status PlanRootSink::Send(RuntimeState* state, RowBatch* batch) {
 }
 
 Status PlanRootSink::FlushFinal(RuntimeState* state) {
+  SCOPED_TIMER(profile()->total_time_counter());
   unique_lock<mutex> l(lock_);
   sender_state_ = SenderState::EOS;
   consumer_cv_.NotifyAll();
@@ -112,6 +120,7 @@ Status PlanRootSink::FlushFinal(RuntimeState* state) {
 }
 
 void PlanRootSink::Close(RuntimeState* state) {
+  SCOPED_TIMER(profile()->total_time_counter());
   unique_lock<mutex> l(lock_);
   // FlushFinal() won't have been called when the fragment instance encounters an error
   // before sending all rows.
@@ -145,14 +154,5 @@ Status PlanRootSink::GetNext(
 
   *eos = sender_state_ == SenderState::EOS;
   return state->GetQueryStatus();
-}
-
-void PlanRootSink::GetRowValue(
-    TupleRow* row, vector<void*>* result, vector<int>* scales) {
-  DCHECK_GE(result->size(), output_expr_evals_.size());
-  for (int i = 0; i < output_expr_evals_.size(); ++i) {
-    (*result)[i] = output_expr_evals_[i]->GetValue(row);
-    (*scales)[i] = output_expr_evals_[i]->output_scale();
-  }
 }
 }

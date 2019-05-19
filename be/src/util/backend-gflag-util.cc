@@ -17,6 +17,7 @@
 
 #include "common/global-flags.h"
 
+#include "common/version.h"
 #include "gen-cpp/BackendGflags_types.h"
 #include "rpc/jni-thrift-util.h"
 #include "util/backend-gflag-util.h"
@@ -44,7 +45,6 @@ DECLARE_string(lineage_event_log_dir);
 DECLARE_string(principal);
 DECLARE_string(local_library_dir);
 DECLARE_string(server_name);
-DECLARE_string(authorization_policy_file);
 DECLARE_string(authorization_policy_provider_class);
 DECLARE_string(authorized_proxy_user_config);
 DECLARE_string(authorized_proxy_user_config_delimiter);
@@ -63,11 +63,25 @@ DECLARE_bool(invalidate_tables_on_memory_pressure);
 DECLARE_double(invalidate_tables_gc_old_gen_full_threshold);
 DECLARE_double(invalidate_tables_fraction_on_memory_pressure);
 DECLARE_int32(local_catalog_max_fetch_retries);
+DECLARE_int64(kudu_scanner_thread_estimated_bytes_per_column);
+DECLARE_int64(kudu_scanner_thread_max_estimated_bytes);
+DECLARE_int32(catalog_max_parallel_partial_fetch_rpc);
+DECLARE_int64(catalog_partial_fetch_rpc_queue_timeout_s);
+DECLARE_int64(exchg_node_buffer_size_bytes);
+DECLARE_int32(kudu_mutation_buffer_size);
+DECLARE_int32(kudu_error_buffer_size);
+DECLARE_int32(hms_event_polling_interval_s);
+DECLARE_string(authorization_factory_class);
+DECLARE_bool(unlock_mt_dop);
+DECLARE_string(ranger_service_type);
+DECLARE_string(ranger_app_id);
+DECLARE_string(authorization_provider);
+DECLARE_bool(recursively_list_partitions);
+
 namespace impala {
 
 Status GetThriftBackendGflags(JNIEnv* jni_env, jbyteArray* cfg_bytes) {
   TBackendGflags cfg;
-  cfg.__set_authorization_policy_file(FLAGS_authorization_policy_file);
   cfg.__set_load_catalog_in_background(FLAGS_load_catalog_in_background);
   cfg.__set_enable_orc_scanner(FLAGS_enable_orc_scanner);
   cfg.__set_use_local_catalog(FLAGS_use_local_catalog);
@@ -119,6 +133,26 @@ Status GetThriftBackendGflags(JNIEnv* jni_env, jbyteArray* cfg_bytes) {
   cfg.__set_invalidate_tables_fraction_on_memory_pressure(
       FLAGS_invalidate_tables_fraction_on_memory_pressure);
   cfg.__set_local_catalog_max_fetch_retries(FLAGS_local_catalog_max_fetch_retries);
+  cfg.__set_kudu_scanner_thread_estimated_bytes_per_column(
+      FLAGS_kudu_scanner_thread_estimated_bytes_per_column);
+  cfg.__set_kudu_scanner_thread_max_estimated_bytes(
+      FLAGS_kudu_scanner_thread_max_estimated_bytes);
+  cfg.__set_catalog_max_parallel_partial_fetch_rpc(
+      FLAGS_catalog_max_parallel_partial_fetch_rpc);
+  cfg.__set_catalog_partial_fetch_rpc_queue_timeout_s(
+      FLAGS_catalog_partial_fetch_rpc_queue_timeout_s);
+  cfg.__set_exchg_node_buffer_size_bytes(
+      FLAGS_exchg_node_buffer_size_bytes);
+  cfg.__set_kudu_mutation_buffer_size(FLAGS_kudu_mutation_buffer_size);
+  cfg.__set_kudu_error_buffer_size(FLAGS_kudu_error_buffer_size);
+  cfg.__set_hms_event_polling_interval_s(FLAGS_hms_event_polling_interval_s);
+  cfg.__set_impala_build_version(::GetDaemonBuildVersion());
+  cfg.__set_authorization_factory_class(FLAGS_authorization_factory_class);
+  cfg.__set_unlock_mt_dop(FLAGS_unlock_mt_dop);
+  cfg.__set_ranger_service_type(FLAGS_ranger_service_type);
+  cfg.__set_ranger_app_id(FLAGS_ranger_app_id);
+  cfg.__set_authorization_provider(FLAGS_authorization_provider);
+  cfg.__set_recursively_list_partitions(FLAGS_recursively_list_partitions);
   RETURN_IF_ERROR(SerializeThriftMsg(jni_env, &cfg, cfg_bytes));
   return Status::OK();
 }

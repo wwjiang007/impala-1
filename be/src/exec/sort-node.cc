@@ -16,6 +16,8 @@
 // under the License.
 
 #include "exec/sort-node.h"
+
+#include "exec/exec-node-util.h"
 #include "runtime/row-batch.h"
 #include "runtime/runtime-state.h"
 #include "runtime/sorted-run-merger.h"
@@ -71,6 +73,7 @@ void SortNode::Codegen(RuntimeState* state) {
 
 Status SortNode::Open(RuntimeState* state) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedOpenEventAdder ea(this);
   RETURN_IF_ERROR(ExecNode::Open(state));
   RETURN_IF_ERROR(child(0)->Open(state));
   // Claim reservation after the child has been opened to reduce the peak reservation
@@ -90,6 +93,7 @@ Status SortNode::Open(RuntimeState* state) {
 
 Status SortNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedGetNextEventAdder ea(this, eos);
   RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::GETNEXT, state));
   RETURN_IF_CANCELLED(state);
   RETURN_IF_ERROR(QueryMaintenance(state));
@@ -131,21 +135,17 @@ Status SortNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
   }
 
   returned_buffer_ = row_batch->num_buffers() > 0;
-  num_rows_returned_ += row_batch->num_rows();
-  if (ReachedLimit()) {
-    row_batch->set_num_rows(row_batch->num_rows() - (num_rows_returned_ - limit_));
-    *eos = true;
-  }
+  CheckLimitAndTruncateRowBatchIfNeeded(row_batch, eos);
 
-  COUNTER_SET(rows_returned_counter_, num_rows_returned_);
+  COUNTER_SET(rows_returned_counter_, rows_returned());
 
   return Status::OK();
 }
 
-Status SortNode::Reset(RuntimeState* state) {
+Status SortNode::Reset(RuntimeState* state, RowBatch* row_batch) {
   num_rows_skipped_ = 0;
   if (sorter_.get() != NULL) sorter_->Reset();
-  return ExecNode::Reset(state);
+  return ExecNode::Reset(state, row_batch);
 }
 
 void SortNode::Close(RuntimeState* state) {

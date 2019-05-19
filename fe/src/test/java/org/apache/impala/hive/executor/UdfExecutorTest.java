@@ -37,7 +37,6 @@ import org.apache.hadoop.hive.ql.udf.UDFE;
 import org.apache.hadoop.hive.ql.udf.UDFExp;
 import org.apache.hadoop.hive.ql.udf.UDFFindInSet;
 import org.apache.hadoop.hive.ql.udf.UDFHex;
-import org.apache.hadoop.hive.ql.udf.UDFLength;
 import org.apache.hadoop.hive.ql.udf.UDFLn;
 import org.apache.hadoop.hive.ql.udf.UDFLog;
 import org.apache.hadoop.hive.ql.udf.UDFLog10;
@@ -71,7 +70,6 @@ import org.apache.thrift.protocol.TBinaryProtocol;
 import org.junit.Assert;
 import org.junit.Test;
 
-import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
@@ -451,7 +449,7 @@ public class UdfExecutorTest {
       throws ImpalaException, MalformedURLException, TException {
     TestHiveUdf(UDFAscii.class, createInt('1'), "123");
     TestHiveUdf(UDFFindInSet.class, createInt(2), "31", "12,31,23");
-    TestHiveUdf(UDFLength.class, createInt(5), "Hello");
+    // UDFLength was moved to GenericUDFLength in Hive 2.3 (HIVE-15979)
     TestHiveUdf(UDFRepeat.class, createText("abcabc"), "abc", createInt(2));
     TestHiveUdf(UDFReverse.class, createText("cba"), "abc");
     TestHiveUdf(UDFSpace.class, createText("    "), createInt(4));

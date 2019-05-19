@@ -205,6 +205,17 @@ void Tuple::ConvertOffsetsToPointers(const TupleDescriptor& desc, uint8_t* tuple
   }
 }
 
+void Tuple::SetNullIndicators(NullIndicatorOffset offset, int64_t num_tuples,
+    int64_t tuple_stride, uint8_t* tuple_mem) {
+  // 'offset' is passed by value instead of const reference so that the compiler knows
+  // that it doesn't alias 'tuple_mem' and keep the offset values in registers in the
+  // below loop.
+  for (int64_t i = 0; i < num_tuples; ++i) {
+    reinterpret_cast<Tuple*>(tuple_mem)->SetNull(offset);
+    tuple_mem += tuple_stride;
+  }
+}
+
 template <bool COLLECT_STRING_VALS, bool NO_POOL>
 void Tuple::MaterializeExprs(TupleRow* row, const TupleDescriptor& desc,
     ScalarExprEvaluator* const* evals, MemPool* pool,
@@ -317,7 +328,7 @@ Status Tuple::CodegenMaterializeExprs(LlvmCodeGen* codegen, bool collect_string_
   llvm::Function* materialize_expr_fns[slot_materialize_exprs.size()];
   for (int i = 0; i < slot_materialize_exprs.size(); ++i) {
     Status status = slot_materialize_exprs[i]->GetCodegendComputeFn(
-        codegen, &materialize_expr_fns[i]);
+        codegen, false, &materialize_expr_fns[i]);
     if (!status.ok()) {
       return Status::Expected(Substitute("Could not codegen CodegenMaterializeExprs: $0",
             status.GetDetail()));

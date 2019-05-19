@@ -20,11 +20,13 @@ import pytest
 import re
 import time
 
-from tests.common.environ import specific_build_type_timeout
+from tests.common.environ import build_flavor_timeout
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.skip import SkipIfLocal, SkipIfIsilon
 
-WAIT_TIME_MS = specific_build_type_timeout(60000, slow_build_timeout=100000)
+# slow_build_timeout is set to 200000 to avoid failures like IMPALA-8064 where the
+# runtime filters don't arrive in time.
+WAIT_TIME_MS = build_flavor_timeout(60000, slow_build_timeout=200000)
 
 # Some of the queries in runtime_filters consume a lot of memory, leading to
 # significant memory reservations in parallel tests.
@@ -56,7 +58,8 @@ class TestRuntimeFilters(ImpalaTestSuite):
     self.run_test_case('QueryTest/runtime_filters_wait', vector)
     duration_s = time.time() - now
     assert duration_s < (WAIT_TIME_MS / 1000), \
-        "Query took too long (%ss, possibly waiting for missing filters?)" % str(duration)
+        "Query took too long (%ss, possibly waiting for missing filters?)" \
+        % str(duration_s)
 
   def test_file_filtering(self, vector):
     if 'kudu' in str(vector.get_value('table_format')):
@@ -93,7 +96,8 @@ class TestBloomFilters(ImpalaTestSuite):
     self.run_test_case('QueryTest/bloom_filters_wait', vector)
     duration_s = time.time() - now
     assert duration_s < (WAIT_TIME_MS / 1000), \
-        "Query took too long (%ss, possibly waiting for missing filters?)" % str(duration)
+        "Query took too long (%ss, possibly waiting for missing filters?)" \
+        % str(duration_s)
 
 
 @SkipIfLocal.multiple_impalad
@@ -110,7 +114,14 @@ class TestMinMaxFilters(ImpalaTestSuite):
         lambda v: v.get_value('table_format').file_format in ['kudu'])
 
   def test_min_max_filters(self, vector):
-    self.run_test_case('QueryTest/min_max_filters', vector)
+    self.run_test_case('QueryTest/min_max_filters', vector,
+        test_file_vars={'$RUNTIME_FILTER_WAIT_TIME_MS': str(WAIT_TIME_MS)})
+
+  def test_decimal_min_max_filters(self, vector):
+    if self.exploration_strategy() != 'exhaustive':
+      pytest.skip("skip decimal min max filter test with various joins")
+    self.run_test_case('QueryTest/decimal_min_max_filters', vector,
+        test_file_vars={'$RUNTIME_FILTER_WAIT_TIME_MS': str(WAIT_TIME_MS)})
 
   def test_large_strings(self, cursor, unique_database):
     """Tests that truncation of large strings by min-max filters still gives correct

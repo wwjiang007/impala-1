@@ -17,14 +17,14 @@
 
 package org.apache.impala.analysis;
 
-import java.util.HashMap;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
 import org.apache.avro.SchemaParseException;
 import org.apache.hadoop.hive.metastore.api.hive_metastoreConstants;
 import org.apache.hadoop.hive.serde2.avro.AvroSerdeUtils;
-import org.apache.impala.authorization.PrivilegeRequestBuilder;
+import org.apache.impala.authorization.AuthorizationConfig;
 import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.FeFsTable;
 import org.apache.impala.catalog.FeHBaseTable;
@@ -53,10 +53,10 @@ import com.google.common.collect.Lists;
 */
 public class AlterTableSetTblProperties extends AlterTableSetStmt {
   private final TTablePropertyType targetProperty_;
-  private final HashMap<String, String> tblProperties_;
+  private final Map<String, String> tblProperties_;
 
   public AlterTableSetTblProperties(TableName tableName, PartitionSet partitionSet,
-      TTablePropertyType targetProperty, HashMap<String, String> tblProperties) {
+      TTablePropertyType targetProperty, Map<String, String> tblProperties) {
     super(tableName, partitionSet);
     Preconditions.checkNotNull(tblProperties);
     Preconditions.checkNotNull(targetProperty);
@@ -65,7 +65,7 @@ public class AlterTableSetTblProperties extends AlterTableSetStmt {
     CreateTableStmt.unescapeProperties(tblProperties_);
   }
 
-  public HashMap<String, String> getTblProperties() { return tblProperties_; }
+  public Map<String, String> getTblProperties() { return tblProperties_; }
 
   @Override
   public TAlterTableParams toThrift() {
@@ -127,13 +127,13 @@ public class AlterTableSetTblProperties extends AlterTableSetStmt {
           String.format("Not allowed to set '%s' manually for managed Kudu tables .",
               KuduTable.KEY_TABLE_NAME));
     }
-    if (analyzer.getAuthzConfig().isEnabled()) {
+    AuthorizationConfig authzConfig = analyzer.getAuthzConfig();
+    if (authzConfig.isEnabled()) {
       if (keyForExternalProperty != null ||
           tblProperties_.containsKey(KuduTable.KEY_MASTER_HOSTS)) {
-        String authzServer = analyzer.getAuthzConfig().getServerName();
+        String authzServer = authzConfig.getServerName();
         Preconditions.checkNotNull(authzServer);
-        analyzer.registerPrivReq(new PrivilegeRequestBuilder().onServer(
-            authzServer).all().toRequest());
+        analyzer.registerPrivReq(builder -> builder.onServer(authzServer).all().build());
       }
     }
   }
@@ -145,7 +145,7 @@ public class AlterTableSetTblProperties extends AlterTableSetStmt {
    */
   private void analyzeAvroSchema(Analyzer analyzer)
       throws AnalysisException {
-    List<Map<String, String>> schemaSearchLocations = Lists.newArrayList();
+    List<Map<String, String>> schemaSearchLocations = new ArrayList<>();
     schemaSearchLocations.add(tblProperties_);
 
     String avroSchema = AvroSchemaUtils.getAvroSchema(schemaSearchLocations);
@@ -182,13 +182,13 @@ public class AlterTableSetTblProperties extends AlterTableSetStmt {
    */
   public static void analyzeSkipHeaderLineCount(FeTable table,
       Map<String, String> tblProperties) throws AnalysisException {
-    if (tblProperties.containsKey(HdfsTable.TBL_PROP_SKIP_HEADER_LINE_COUNT)) {
+    if (tblProperties.containsKey(FeFsTable.Utils.TBL_PROP_SKIP_HEADER_LINE_COUNT)) {
       if (table != null && !(table instanceof FeFsTable)) {
         throw new AnalysisException(String.format("Table property " +
             "'skip.header.line.count' is only supported for HDFS tables."));
       }
       StringBuilder error = new StringBuilder();
-      HdfsTable.parseSkipHeaderLineCount(tblProperties, error);
+      FeFsTable.Utils.parseSkipHeaderLineCount(tblProperties, error);
       if (error.length() > 0) throw new AnalysisException(error.toString());
     }
   }
@@ -205,7 +205,7 @@ public class AlterTableSetTblProperties extends AlterTableSetStmt {
       Map<String, String> tblProperties) throws AnalysisException {
     if (!tblProperties.containsKey(
         AlterTableSortByStmt.TBL_PROP_SORT_COLUMNS)) {
-      return Lists.newArrayList();
+      return new ArrayList<>();
     }
 
     // ALTER TABLE SET is not supported on HBase tables at all, see

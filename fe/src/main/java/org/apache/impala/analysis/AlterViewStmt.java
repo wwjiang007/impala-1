@@ -17,6 +17,7 @@
 
 package org.apache.impala.analysis;
 
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
@@ -30,7 +31,6 @@ import org.apache.impala.thrift.TCatalogObjectType;
 import org.apache.impala.service.BackendConfig;
 
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Sets;
 
 /**
  * Represents an ALTER VIEW AS statement.
@@ -64,7 +64,7 @@ public class AlterViewStmt extends CreateOrAlterViewStmtBase {
         TCatalogObjectType.VIEW, Privilege.ALTER.toString()));
 
     // viewDefStmt_ should not contain any references to the view being altered.
-    Set<FeView> inlineViews = Sets.newHashSet();
+    Set<FeView> inlineViews = new HashSet<>();
     viewDefStmt_.collectInlineViews(inlineViews);
     TableRef tblRef = analyzer.resolveTableRef(new TableRef(tableName_.toPath(), null));
     if (inlineViews.contains(((InlineViewRef) tblRef).getView())) {
@@ -79,7 +79,7 @@ public class AlterViewStmt extends CreateOrAlterViewStmtBase {
   }
 
   @Override
-  public String toSql() {
+  public String toSql(ToSqlOptions options) {
     StringBuilder sb = new StringBuilder();
     sb.append("ALTER VIEW ");
     if (tableName_.getDb() != null) {
@@ -87,7 +87,7 @@ public class AlterViewStmt extends CreateOrAlterViewStmtBase {
     }
     sb.append(tableName_.getTbl());
     if (columnDefs_ != null) sb.append("(" + getColumnNames() + ")");
-    sb.append(" AS " + viewDefStmt_.toSql());
+    sb.append(" AS " + viewDefStmt_.toSql(options));
     return sb.toString();
   }
 }

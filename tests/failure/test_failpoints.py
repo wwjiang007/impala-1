@@ -26,12 +26,16 @@ from time import sleep
 
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.impala_test_suite import ImpalaTestSuite, LOG
-from tests.common.skip import SkipIf, SkipIfS3, SkipIfADLS, SkipIfIsilon, SkipIfLocal
+from tests.common.skip import SkipIf, SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfIsilon, \
+    SkipIfLocal
 from tests.common.test_dimensions import create_exec_option_dimension
 from tests.common.test_vector import ImpalaTestDimension
 
 FAILPOINT_ACTIONS = ['FAIL', 'CANCEL', 'MEM_LIMIT_EXCEEDED']
-FAILPOINT_LOCATIONS = ['PREPARE', 'PREPARE_SCANNER', 'OPEN', 'GETNEXT', 'GETNEXT_SCANNER', 'CLOSE']
+# Not included:
+# - SCANNER_ERROR, because it only fires if the query already hit an error.
+FAILPOINT_LOCATIONS = ['PREPARE', 'PREPARE_SCANNER', 'OPEN', 'GETNEXT', 'GETNEXT_SCANNER',
+                       'CLOSE']
 # Map debug actions to their corresponding query options' values.
 FAILPOINT_ACTION_MAP = {'FAIL': 'FAIL', 'CANCEL': 'WAIT',
                         'MEM_LIMIT_EXCEEDED': 'MEM_LIMIT_EXCEEDED'}
@@ -53,6 +57,7 @@ QUERIES = [
 
 @SkipIf.skip_hbase # -skip_hbase argument specified
 @SkipIfS3.hbase # S3: missing coverage: failures
+@SkipIfABFS.hbase
 @SkipIfADLS.hbase
 @SkipIfIsilon.hbase # ISILON: missing coverage: failures.
 @SkipIfLocal.hbase
@@ -168,7 +173,7 @@ class TestFailpoints(ImpalaTestSuite):
         self.execute_query(query,
             query_options={'debug_action': debug_action})
       except ImpalaBeeswaxException as e:
-        assert 'Query aborted:Debug Action: FIS_FAIL_THREAD_CREATION:FAIL@0.5' \
+        assert 'Debug Action: FIS_FAIL_THREAD_CREATION:FAIL@0.5' \
             in str(e), str(e)
         break
 

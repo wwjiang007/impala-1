@@ -55,6 +55,8 @@ import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
+import static org.apache.impala.analysis.ToSqlOptions.SHOW_IMPLICIT_CASTS;
+
 /**
  * Creates an executable plan from an analyzed parse tree and query options.
  */
@@ -95,12 +97,12 @@ public class Planner {
    *    that such an expr substitution during plan generation never fails. If it does,
    *    that typically means there is a bug in analysis, or a broken/missing smap.
    */
-  public ArrayList<PlanFragment> createPlan() throws ImpalaException {
+  public List<PlanFragment> createPlan() throws ImpalaException {
     SingleNodePlanner singleNodePlanner = new SingleNodePlanner(ctx_);
     DistributedPlanner distributedPlanner = new DistributedPlanner(ctx_);
     PlanNode singleNodePlan = singleNodePlanner.createSingleNodePlan();
     ctx_.getTimeline().markEvent("Single node plan created");
-    ArrayList<PlanFragment> fragments = null;
+    List<PlanFragment> fragments = null;
 
     checkForSmallQueryOptimization(singleNodePlan);
 
@@ -181,7 +183,7 @@ public class Planner {
       // Compute the column lineage graph
       if (ctx_.isInsertOrCtas()) {
         InsertStmt insertStmt = ctx_.getAnalysisResult().getInsertStmt();
-        List<Expr> exprs = Lists.newArrayList();
+        List<Expr> exprs = new ArrayList<>();
         FeTable targetTable = insertStmt.getTargetTable();
         Preconditions.checkNotNull(targetTable);
         if (targetTable instanceof FeKuduTable) {
@@ -190,7 +192,7 @@ public class Planner {
             // the labels of columns mentioned in the column list.
             List<String> mentionedColumns = insertStmt.getMentionedColumns();
             Preconditions.checkState(!mentionedColumns.isEmpty());
-            List<String> targetColLabels = Lists.newArrayList();
+            List<String> targetColLabels = new ArrayList<>();
             String tblFullName = targetTable.getFullName();
             for (String column: mentionedColumns) {
               targetColLabels.add(tblFullName + "." + column);
@@ -227,10 +229,16 @@ public class Planner {
    */
   public List<PlanFragment> createParallelPlans() throws ImpalaException {
     Preconditions.checkState(ctx_.getQueryOptions().mt_dop > 0);
-    ArrayList<PlanFragment> distrPlan = createPlan();
+    List<PlanFragment> distrPlan = createPlan();
     Preconditions.checkNotNull(distrPlan);
-    ParallelPlanner planner = new ParallelPlanner(ctx_);
-    List<PlanFragment> parallelPlans = planner.createPlans(distrPlan.get(0));
+    List<PlanFragment> parallelPlans;
+    // TODO: IMPALA-4224: Parallel plans are not executable
+    if (RuntimeEnv.INSTANCE.isTestEnv()) {
+      ParallelPlanner planner = new ParallelPlanner(ctx_);
+      parallelPlans = planner.createPlans(distrPlan.get(0));
+    } else {
+      parallelPlans = Collections.singletonList(distrPlan.get(0));
+    }
     // Only use one scanner thread per scan-node instance since intra-node
     // parallelism is achieved via multiple fragment instances.
     ctx_.getQueryOptions().setNum_scanner_threads(1);
@@ -244,7 +252,7 @@ public class Planner {
    * Uses a default level of EXTENDED, unless overriden by the
    * 'explain_level' query option.
    */
-  public String getExplainString(ArrayList<PlanFragment> fragments,
+  public String getExplainString(List<PlanFragment> fragments,
       TQueryExecRequest request) {
     // use EXTENDED by default for all non-explain statements
     TExplainLevel explainLevel = TExplainLevel.EXTENDED;
@@ -260,10 +268,11 @@ public class Planner {
    * explicit explain level.
    * Includes the estimated resource requirements from the request if set.
    */
-  public String getExplainString(ArrayList<PlanFragment> fragments,
+  public String getExplainString(List<PlanFragment> fragments,
       TQueryExecRequest request, TExplainLevel explainLevel) {
     StringBuilder str = new StringBuilder();
     boolean hasHeader = false;
+
     // Only some requests (queries, DML, etc) have a resource profile.
     if (request.isSetMax_per_host_min_mem_reservation()) {
       Preconditions.checkState(request.isSetMax_per_host_thread_reservation());
@@ -276,6 +285,12 @@ public class Planner {
           PrintUtils.printBytesRoundedToMb(request.getPer_host_mem_estimate())));
       hasHeader = true;
     }
+    // Warn if the planner is running in DEBUG mode.
+    if (request.query_ctx.client_request.query_options.planner_testcase_mode) {
+      str.append("WARNING: The planner is running in TESTCASE mode. This should only be "
+          + "used by developers for debugging.\nTo disable it, do SET " +
+          "PLANNER_TESTCASE_MODE=false.\n");
+    }
     if (request.query_ctx.disable_codegen_hint) {
       str.append("Codegen disabled by planner\n");
     }
@@ -285,7 +300,7 @@ public class Planner {
     if (!request.query_ctx.isSetParent_query_id() &&
         request.query_ctx.isSetTables_with_corrupt_stats() &&
         !request.query_ctx.getTables_with_corrupt_stats().isEmpty()) {
-      List<String> tableNames = Lists.newArrayList();
+      List<String> tableNames = new ArrayList<>();
       for (TTableName tableName: request.query_ctx.getTables_with_corrupt_stats()) {
         tableNames.add(tableName.db_name + "." + tableName.table_name);
       }
@@ -301,7 +316,7 @@ public class Planner {
     if (!request.query_ctx.isSetParent_query_id() &&
         request.query_ctx.isSetTables_missing_stats() &&
         !request.query_ctx.getTables_missing_stats().isEmpty()) {
-      List<String> tableNames = Lists.newArrayList();
+      List<String> tableNames = new ArrayList<>();
       for (TTableName tableName: request.query_ctx.getTables_missing_stats()) {
         tableNames.add(tableName.db_name + "." + tableName.table_name);
       }
@@ -311,7 +326,7 @@ public class Planner {
     }
 
     if (request.query_ctx.isSetTables_missing_diskids()) {
-      List<String> tableNames = Lists.newArrayList();
+      List<String> tableNames = new ArrayList<>();
       for (TTableName tableName: request.query_ctx.getTables_missing_diskids()) {
         tableNames.add(tableName.db_name + "." + tableName.table_name);
       }
@@ -326,6 +341,18 @@ public class Planner {
           "is missing relevant stats, and no plan hints were given.\n");
       hasHeader = true;
     }
+
+    if (explainLevel.ordinal() >= TExplainLevel.EXTENDED.ordinal()) {
+      // In extended explain include the analyzed query text showing implicit casts
+      String queryText = ctx_.getQueryStmt().toSql(SHOW_IMPLICIT_CASTS);
+      String wrappedText = PrintUtils.wrapString("Analyzed query: " + queryText, 80);
+      str.append(wrappedText).append("\n");
+      hasHeader = true;
+    }
+    // Note that the analyzed query text must be the last thing in the header.
+    // This is to help tests that parse the header.
+
+    // Add the blank line that indicates the end of the header
     if (hasHeader) str.append("\n");
 
     if (explainLevel.ordinal() < TExplainLevel.VERBOSE.ordinal()) {
@@ -618,7 +645,7 @@ public class Planner {
    */
   public void createPreInsertSort(InsertStmt insertStmt, PlanFragment inputFragment,
        Analyzer analyzer) throws ImpalaException {
-    List<Expr> orderingExprs = Lists.newArrayList();
+    List<Expr> orderingExprs = new ArrayList<>();
 
     boolean partialSort = false;
     if (insertStmt.getTargetTable() instanceof FeKuduTable) {

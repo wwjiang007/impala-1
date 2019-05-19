@@ -27,14 +27,13 @@
 #include "codegen/llvm-codegen.h"
 #include "common/object-pool.h"
 #include "common/status.h"
-#include "exprs/scalar-expr.h"
-#include "exprs/scalar-expr-evaluator.h"
 #include "exec/aggregation-node.h"
 #include "exec/analytic-eval-node.h"
 #include "exec/cardinality-check-node.h"
 #include "exec/data-source-scan-node.h"
 #include "exec/empty-set-node.h"
 #include "exec/exchange-node.h"
+#include "exec/exec-node-util.h"
 #include "exec/hbase-scan-node.h"
 #include "exec/hdfs-scan-node-mt.h"
 #include "exec/hdfs-scan-node.h"
@@ -53,6 +52,8 @@
 #include "exec/union-node.h"
 #include "exec/unnest-node.h"
 #include "exprs/expr.h"
+#include "exprs/scalar-expr-evaluator.h"
+#include "exprs/scalar-expr.h"
 #include "gutil/strings/substitute.h"
 #include "runtime/descriptors.h"
 #include "runtime/exec-env.h"
@@ -73,10 +74,6 @@ namespace impala {
 
 const string ExecNode::ROW_THROUGHPUT_COUNTER = "RowsReturnedRate";
 
-int ExecNode::GetNodeIdFromProfile(RuntimeProfile* p) {
-  return p->metadata();
-}
-
 ExecNode::ExecNode(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs)
   : id_(tnode.node_id),
     type_(tnode.node_type),
@@ -84,15 +81,15 @@ ExecNode::ExecNode(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl
     row_descriptor_(descs, tnode.row_tuples, tnode.nullable_tuples),
     resource_profile_(tnode.resource_profile),
     limit_(tnode.limit),
-    num_rows_returned_(0),
-    runtime_profile_(RuntimeProfile::Create(pool_,
-        Substitute("$0 (id=$1)", PrintThriftEnum(tnode.node_type), id_))),
+    runtime_profile_(RuntimeProfile::Create(
+        pool_, Substitute("$0 (id=$1)", PrintThriftEnum(tnode.node_type), id_))),
     rows_returned_counter_(NULL),
     rows_returned_rate_(NULL),
     containing_subplan_(NULL),
     disable_codegen_(tnode.disable_codegen),
+    num_rows_returned_(0),
     is_closed_(false) {
-  runtime_profile_->set_metadata(id_);
+  runtime_profile_->SetPlanNodeId(id_);
   debug_options_.phase = TExecNodePhase::INVALID;
 }
 
@@ -128,6 +125,10 @@ Status ExecNode::Prepare(RuntimeState* state) {
       Substitute("$0 id=$1 ptr=$2", PrintThriftEnum(type_), id_, this), runtime_profile_,
       state->instance_buffer_reservation(), mem_tracker_.get(), resource_profile_,
       debug_options_);
+  if (!IsInSubplan()) {
+    events_ = runtime_profile_->AddEventSequence("Node Lifecycle Event Timeline");
+    events_->Start(state->query_state()->fragment_events_start_time());
+  }
   return Status::OK();
 }
 
@@ -145,10 +146,10 @@ Status ExecNode::Open(RuntimeState* state) {
   return ScalarExprEvaluator::Open(conjunct_evals_, state);
 }
 
-Status ExecNode::Reset(RuntimeState* state) {
+Status ExecNode::Reset(RuntimeState* state, RowBatch* row_batch) {
   num_rows_returned_ = 0;
   for (int i = 0; i < children_.size(); ++i) {
-    RETURN_IF_ERROR(children_[i]->Reset(state));
+    RETURN_IF_ERROR(children_[i]->Reset(state, row_batch));
   }
   return Status::OK();
 }
@@ -180,6 +181,7 @@ void ExecNode::Close(RuntimeState* state) {
     }
     mem_tracker_->Close();
   }
+  if (events_ != nullptr) events_->MarkEvent("Closed");
 }
 
 Status ExecNode::CreateTree(
@@ -392,8 +394,7 @@ Status ExecNode::ExecDebugActionImpl(TExecNodePhase::type phase, RuntimeState* s
     return Status::OK();
   } else if (debug_options_.action == TDebugAction::MEM_LIMIT_EXCEEDED) {
     return mem_tracker()->MemLimitExceeded(state, "Debug Action: MEM_LIMIT_EXCEEDED");
-  } else {
-    DCHECK_EQ(debug_options_.action, TDebugAction::SET_DENY_RESERVATION_PROBABILITY);
+  } else if (debug_options_.action == TDebugAction::SET_DENY_RESERVATION_PROBABILITY) {
     // We can only enable the debug action if the buffer pool client is registered.
     // If the buffer client is not registered at this point (e.g. if phase is PREPARE or
     // OPEN), then we will enable the debug action at the time when the client is
@@ -401,8 +402,43 @@ Status ExecNode::ExecDebugActionImpl(TExecNodePhase::type phase, RuntimeState* s
     if (reservation_manager_.buffer_pool_client()->is_registered()) {
       RETURN_IF_ERROR(reservation_manager_.EnableDenyReservationDebugAction());
     }
+  } else {
+    DCHECK_EQ(debug_options_.action, TDebugAction::DELAY);
+    VLOG(1) << "DEBUG_ACTION: Sleeping";
+    SleepForMs(100);
   }
   return Status::OK();
+}
+
+bool ExecNode::CheckLimitAndTruncateRowBatchIfNeeded(RowBatch* row_batch, bool* eos) {
+  DCHECK(limit_ != 0);
+  const int row_batch_size = row_batch->num_rows();
+  const bool reached_limit =
+      !(limit_ == -1 || (rows_returned() + row_batch_size) < limit_);
+  const int num_rows_to_consume =
+      !reached_limit ? row_batch_size : limit_ - rows_returned();
+  IncrementNumRowsReturned(num_rows_to_consume);
+  if (reached_limit) {
+    row_batch->set_num_rows(num_rows_to_consume);
+    *eos = true;
+  }
+  return reached_limit;
+}
+
+bool ExecNode::CheckLimitAndTruncateRowBatchIfNeededShared(
+    RowBatch* row_batch, bool* eos) {
+  DCHECK(limit_ != 0);
+  const int row_batch_size = row_batch->num_rows();
+  const bool reached_limit =
+      !(limit_ == -1 || (rows_returned_shared() + row_batch_size) < limit_);
+  const int num_rows_to_consume =
+      !reached_limit ? row_batch_size : limit_ - rows_returned_shared();
+  IncrementNumRowsReturnedShared(num_rows_to_consume);
+  if (reached_limit) {
+    row_batch->set_num_rows(num_rows_to_consume);
+    *eos = true;
+  }
+  return reached_limit;
 }
 
 bool ExecNode::EvalConjuncts(
@@ -469,7 +505,7 @@ Status ExecNode::CodegenEvalConjuncts(LlvmCodeGen* codegen,
     const vector<ScalarExpr*>& conjuncts, llvm::Function** fn, const char* name) {
   llvm::Function* conjunct_fns[conjuncts.size()];
   for (int i = 0; i < conjuncts.size(); ++i) {
-    RETURN_IF_ERROR(conjuncts[i]->GetCodegendComputeFn(codegen, &conjunct_fns[i]));
+    RETURN_IF_ERROR(conjuncts[i]->GetCodegendComputeFn(codegen, false, &conjunct_fns[i]));
     if (i >= LlvmCodeGen::CODEGEN_INLINE_EXPRS_THRESHOLD) {
       // Avoid bloating EvalConjuncts by inlining everything into it.
       codegen->SetNoInline(conjunct_fns[i]);

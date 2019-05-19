@@ -20,6 +20,7 @@
 #include "runtime/exec-env.h"
 
 #include "common/names.h"
+#include "common/thread-debug-info.h"
 
 using namespace impala;
 using namespace impala::io;
@@ -351,8 +352,13 @@ void RequestContext::AddRangeToDisk(const unique_lock<mutex>& lock,
     ScanRange* scan_range = static_cast<ScanRange*>(range);
     if (schedule_mode == ScheduleMode::IMMEDIATELY) {
       ScheduleScanRange(lock, scan_range);
-    } else if (schedule_mode == ScheduleMode::UPON_GETNEXT) {
-      disk_state->unstarted_scan_ranges()->Enqueue(scan_range);
+    } else if (schedule_mode != ScheduleMode::BY_CALLER) {
+      if (schedule_mode == ScheduleMode::UPON_GETNEXT_TAIL) {
+        disk_state->unstarted_scan_ranges()->Enqueue(scan_range);
+      } else {
+        DCHECK_ENUM_EQ(schedule_mode, ScheduleMode::UPON_GETNEXT_HEAD);
+        disk_state->unstarted_scan_ranges()->PushFront(scan_range);
+      }
       num_unstarted_scan_ranges_.Add(1);
       // If there's no 'next_scan_range_to_start', schedule this RequestContext so that
       // one of the 'unstarted_scan_ranges' will become the 'next_scan_range_to_start'.
@@ -373,7 +379,8 @@ void RequestContext::AddRangeToDisk(const unique_lock<mutex>& lock,
   ++disk_state->num_remaining_ranges();
 }
 
-Status RequestContext::AddScanRanges(const vector<ScanRange*>& ranges) {
+Status RequestContext::AddScanRanges(
+    const vector<ScanRange*>& ranges, EnqueueLocation enqueue_location) {
   DCHECK_GT(ranges.size(), 0);
   // Validate and initialize all ranges
   for (int i = 0; i < ranges.size(); ++i) {
@@ -394,7 +401,9 @@ Status RequestContext::AddScanRanges(const vector<ScanRange*>& ranges) {
     if (range->try_cache()) {
       cached_ranges_.Enqueue(range);
     } else {
-      AddRangeToDisk(lock, range, ScheduleMode::UPON_GETNEXT);
+      AddRangeToDisk(lock, range, (enqueue_location == EnqueueLocation::HEAD) ?
+              ScheduleMode::UPON_GETNEXT_HEAD :
+              ScheduleMode::UPON_GETNEXT_TAIL);
     }
   }
   DCHECK(Validate()) << endl << DebugString();
@@ -425,11 +434,12 @@ Status RequestContext::GetNextUnstartedRange(ScanRange** range, bool* needs_buff
       *range = cached_ranges_.Dequeue();
       DCHECK((*range)->try_cache());
       bool cached_read_succeeded;
-      RETURN_IF_ERROR((*range)->ReadFromCache(lock, &cached_read_succeeded));
+      RETURN_IF_ERROR(TryReadFromCache(lock, *range, &cached_read_succeeded,
+          needs_buffers));
       if (cached_read_succeeded) return Status::OK();
 
       // This range ended up not being cached. Loop again and pick up a new range.
-      AddRangeToDisk(lock, *range, ScheduleMode::UPON_GETNEXT);
+      AddRangeToDisk(lock, *range, ScheduleMode::UPON_GETNEXT_TAIL);
       DCHECK(Validate()) << endl << DebugString();
       *range = nullptr;
       continue;
@@ -472,12 +482,9 @@ Status RequestContext::StartScanRange(ScanRange* range, bool* needs_buffers) {
   DCHECK_NE(range->len(), 0);
   if (range->try_cache()) {
     bool cached_read_succeeded;
-    RETURN_IF_ERROR(range->ReadFromCache(lock, &cached_read_succeeded));
-    if (cached_read_succeeded) {
-      DCHECK(Validate()) << endl << DebugString();
-      *needs_buffers = false;
-      return Status::OK();
-    }
+    RETURN_IF_ERROR(TryReadFromCache(lock, range, &cached_read_succeeded,
+        needs_buffers));
+    if (cached_read_succeeded) return Status::OK();
     // Cached read failed, fall back to normal read path.
   }
   // If we don't have a buffer yet, the caller must allocate buffers for the range.
@@ -488,6 +495,35 @@ Status RequestContext::StartScanRange(ScanRange* range, bool* needs_buffers) {
   AddRangeToDisk(lock, range,
       *needs_buffers ? ScheduleMode::BY_CALLER : ScheduleMode::IMMEDIATELY);
   DCHECK(Validate()) << endl << DebugString();
+  return Status::OK();
+}
+
+Status RequestContext::TryReadFromCache(const unique_lock<mutex>& lock,
+    ScanRange* range, bool* read_succeeded, bool* needs_buffers) {
+  DCHECK(lock.mutex() == &lock_ && lock.owns_lock());
+  RETURN_IF_ERROR(range->ReadFromCache(lock, read_succeeded));
+  if (!*read_succeeded) return Status::OK();
+
+  DCHECK(Validate()) << endl << DebugString();
+  ScanRange::ExternalBufferTag buffer_tag = range->external_buffer_tag();
+  // The following cases are possible at this point:
+  // * The scan range doesn't have sub-ranges:
+  // ** buffer_tag is CACHED_BUFFER and the buffer is already available to the reader.
+  //    (there is nothing to do)
+  //
+  // * The scan range has sub-ranges, and buffer_tag is:
+  // ** NO_BUFFER: the client needs to add buffers to the scan range
+  // ** CLIENT_BUFFER: the client already provided a buffer to copy data into it
+  *needs_buffers = buffer_tag == ScanRange::ExternalBufferTag::NO_BUFFER;
+  if (*needs_buffers) {
+    DCHECK(range->HasSubRanges());
+    range->SetBlockedOnBuffer();
+    // The range will be scheduled when buffers are added to it.
+    AddRangeToDisk(lock, range, ScheduleMode::BY_CALLER);
+  } else if (buffer_tag == ScanRange::ExternalBufferTag::CLIENT_BUFFER) {
+    DCHECK(range->HasSubRanges());
+    AddRangeToDisk(lock, range, ScheduleMode::IMMEDIATELY);
+  }
   return Status::OK();
 }
 
@@ -592,6 +628,11 @@ RequestContext::RequestContext(
   // PerDiskState is not movable, so we need to initialize the vector in this awkward way.
   for (int i = 0; i < disk_queues.size(); ++i) {
     disk_states_[i].set_disk_queue(disk_queues[i]);
+  }
+  ThreadDebugInfo* tdi = GetThreadDebugInfo();
+  if (tdi != nullptr) {
+    set_query_id(tdi->GetQueryId());
+    set_instance_id(tdi->GetInstanceId());
   }
 }
 

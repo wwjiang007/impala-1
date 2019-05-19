@@ -64,7 +64,7 @@ DEFAULT</value>
   <!-- Location of the KMS key provider -->
   <property>
     <name>hadoop.security.key.provider.path</name>
-    <value>kms://http@127.0.0.1:9600/kms</value>
+    <value>kms://http@${INTERNAL_LISTEN_HOST}:9600/kms</value>
   </property>
 
   <!-- BEGIN Kerberos settings -->
@@ -108,6 +108,31 @@ DEFAULT</value>
   <property>
     <name>dfs.adls.oauth2.refresh.url</name>
     <value>https://login.windows.net/${azure_tenant_id}/oauth2/token</value>
+  </property>
+
+  <property>
+    <name>fs.azure.account.auth.type</name>
+    <value>OAuth</value>
+  </property>
+
+  <property>
+    <name>fs.azure.account.oauth.provider.type</name>
+    <value>org.apache.hadoop.fs.azurebfs.oauth2.ClientCredsTokenProvider</value>
+  </property>
+
+  <property>
+    <name>fs.azure.account.oauth2.client.id</name>
+    <value>${azure_client_id}</value>
+  </property>
+
+  <property>
+    <name>fs.azure.account.oauth2.client.secret</name>
+    <value>${azure_client_secret}</value>
+  </property>
+
+  <property>
+    <name>fs.azure.account.oauth2.client.endpoint</name>
+    <value>https://login.microsoftonline.com/${azure_tenant_id}/oauth2/token</value>
   </property>
 
   <!-- This property can be used in tests to ascertain that this core-site.xml from

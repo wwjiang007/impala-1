@@ -114,7 +114,9 @@ Status GroupingAggregator::Init(const TAggregator& taggregator, RuntimeState* st
         pool_->Add(desc->type().type != TYPE_NULL ? new SlotRef(desc) :
                                                     new SlotRef(desc, TYPE_BOOLEAN));
     build_exprs_.push_back(build_expr);
-    RETURN_IF_ERROR(build_expr->Init(intermediate_row_desc_, state));
+    // Not an entry point because all hash table callers support codegen.
+    RETURN_IF_ERROR(
+        build_expr->Init(intermediate_row_desc_, /* is_entry_point */ false, state));
     if (build_expr->type().IsVarLenStringType()) string_grouping_exprs_.push_back(i);
   }
 
@@ -280,6 +282,9 @@ Status GroupingAggregator::GetRowsFromPartition(
   COUNTER_SET(rows_returned_counter_, num_rows_returned_);
   partition_eos_ = ReachedLimit();
   if (partition_eos_ || output_iterator_.AtEnd()) {
+    // Clean up the remaining entries of the hash table before releasing the memory.
+    CleanupHashTbl(output_partition_->agg_fn_evals, output_iterator_);
+    output_iterator_.SetAtEnd();
     // Attach all buffers referenced by previously-returned rows. On the next GetNext()
     // call we will close the partition.
     output_partition_->aggregated_row_stream->Close(
@@ -364,12 +369,17 @@ void GroupingAggregator::CleanupHashTbl(
   }
 }
 
-Status GroupingAggregator::Reset(RuntimeState* state) {
+Status GroupingAggregator::Reset(RuntimeState* state, RowBatch* row_batch) {
   DCHECK(!is_streaming_preagg_) << "Cannot reset preaggregation";
   partition_eos_ = false;
   streaming_idx_ = 0;
   // Reset the HT and the partitions for this grouping agg.
   ht_ctx_->set_level(0);
+  if (output_partition_ != nullptr) {
+    // Attach all buffers referenced by previously-returned rows.
+    output_partition_->aggregated_row_stream->Close(
+        row_batch, RowBatch::FlushMode::FLUSH_RESOURCES);
+  }
   ClosePartitions();
   return Status::OK();
 }

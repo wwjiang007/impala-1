@@ -21,7 +21,7 @@
 
 #include "testutil/gtest-util.h"
 #include "testutil/mem-util.h"
-#include "util/bit-packing.inline.h"
+#include "util/bit-packing.h"
 #include "util/bit-stream-utils.inline.h"
 
 #include "common/names.h"
@@ -33,7 +33,7 @@ namespace impala {
 
 namespace {
 uint32_t ComputeMask(int bit_width) {
-  return (1U << bit_width) - 1;
+  return (bit_width < 32) ? ((1U << bit_width) - 1) : ~0U;
 }
 }
 
@@ -156,4 +156,3 @@ TEST(BitPackingTest, RandomUnpack) {
 }
 }
 
-IMPALA_TEST_MAIN();

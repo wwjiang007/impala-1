@@ -24,8 +24,11 @@ import time
 from urllib2 import urlopen
 
 from ImpalaService import ImpalaHiveServer2Service
+from tests.common.environ import IMPALA_TEST_CLUSTER_PROPERTIES
+from tests.common.skip import SkipIfDockerizedCluster
 from tests.hs2.hs2_test_suite import HS2TestSuite, needs_session, operation_id_to_query_id
 from TCLIService import TCLIService
+
 
 SQLSTATE_GENERAL_ERROR = "HY000"
 
@@ -117,6 +120,7 @@ class TestHS2(HS2TestSuite):
     # Removed options should not be returned.
     assert "MAX_IO_BUFFERS" not in vals
 
+  @SkipIfDockerizedCluster.internal_hostname
   def test_open_session_http_addr(self):
     """Check that OpenSession returns the coordinator's http address."""
     open_session_req = TCLIService.TOpenSessionReq()
@@ -399,6 +403,52 @@ class TestHS2(HS2TestSuite):
     assert "Sql Statement: GET_SCHEMAS" in profile_page
     assert "Query Type: DDL" in profile_page
 
+  @pytest.mark.execute_serially
+  @needs_session()
+  def test_get_tables(self):
+    """Basic test for the GetTables() HS2 method. Needs to execute serially because
+    the test depends on controlling whether a table is loaded or not and other
+    concurrent tests loading or invalidating tables could interfere with it."""
+    # TODO: unique_database would be better, but it doesn't work with @needs_session
+    # at the moment.
+    table = "__hs2_column_comments_test"
+    self.execute_query("drop table if exists {0}".format(table))
+    self.execute_query("""
+        create table {0} (a int comment 'column comment')
+        comment 'table comment'""".format(table))
+    try:
+      req = TCLIService.TGetTablesReq()
+      req.sessionHandle = self.session_handle
+      req.schemaName = "default"
+      req.tableName = table
+
+      # Execute the request twice, the first time with the table unloaded and the second
+      # with it loaded.
+      self.execute_query("invalidate metadata {0}".format(table))
+      for i in range(2):
+        get_tables_resp = self.hs2_client.GetTables(req)
+        TestHS2.check_response(get_tables_resp)
+
+        fetch_results_resp = self._fetch_results(get_tables_resp.operationHandle, 100)
+        results = fetch_results_resp.results
+        table_cat = results.columns[0].stringVal.values[0]
+        table_schema = results.columns[1].stringVal.values[0]
+        table_name = results.columns[2].stringVal.values[0]
+        table_type = results.columns[3].stringVal.values[0]
+        table_remarks = results.columns[4].stringVal.values[0]
+        assert table_cat == ''
+        assert table_schema == "default"
+        assert table_name == table
+        assert table_type == "TABLE"
+        if i == 0 and not IMPALA_TEST_CLUSTER_PROPERTIES.is_catalog_v2_cluster():
+          # IMPALA-7587: comments not returned for non-loaded tables with legacy catalog.
+          assert table_remarks == ""
+        else:
+          assert table_remarks == "table comment"
+        # Ensure the table is loaded for the second iteration.
+        self.execute_query("describe {0}".format(table))
+    finally:
+      self.execute_query("drop table {0}".format(table))
 
   @needs_session(conf_overlay={"idle_session_timeout": "5"})
   def test_get_operation_status_session_timeout(self):
@@ -533,3 +583,36 @@ class TestHS2(HS2TestSuite):
     execute_statement_req.statement = "SELECT 1 FROM alltypes LIMIT 1"
     execute_statement_resp = self.hs2_client.ExecuteStatement(execute_statement_req)
     TestHS2.check_response(execute_statement_resp, TCLIService.TStatusCode.ERROR_STATUS)
+
+  @needs_session()
+  def test_get_type_info(self):
+    get_type_info_req = TCLIService.TGetTypeInfoReq()
+    get_type_info_req.sessionHandle = self.session_handle
+    get_type_info_resp = self.hs2_client.GetTypeInfo(get_type_info_req)
+    TestHS2.check_response(get_type_info_resp)
+    fetch_results_req = TCLIService.TFetchResultsReq()
+    fetch_results_req.operationHandle = get_type_info_resp.operationHandle
+    fetch_results_req.maxRows = 100
+    fetch_results_resp = self.hs2_client.FetchResults(fetch_results_req)
+    TestHS2.check_response(fetch_results_resp)
+    results = fetch_results_resp.results
+    types = ['BOOLEAN', 'TINYINT', 'SMALLINT', 'INT', 'BIGINT', 'FLOAT', 'DOUBLE', 'DATE',
+             'TIMESTAMP', 'STRING', 'VARCHAR', 'DECIMAL', 'CHAR', 'ARRAY', 'MAP',
+             'STRUCT']
+    assert self.get_num_rows(results) == len(types)
+    # Validate that each type description (result row) has the required 18 fields as
+    # described in the DatabaseMetaData.getTypeInfo() documentation.
+    assert len(results.columns) == 18
+    typed_col = getattr(results.columns[0], 'stringVal')
+    for colType in types:
+      assert typed_col.values.count(colType) == 1
+
+  def _fetch_results(self, operation_handle, max_rows):
+    """Fetch results from 'operation_handle' with up to 'max_rows' rows using
+    self.hs2_client, returning the TFetchResultsResp object."""
+    fetch_results_req = TCLIService.TFetchResultsReq()
+    fetch_results_req.operationHandle = operation_handle
+    fetch_results_req.maxRows = max_rows
+    fetch_results_resp = self.hs2_client.FetchResults(fetch_results_req)
+    TestHS2.check_response(fetch_results_resp)
+    return fetch_results_resp

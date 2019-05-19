@@ -21,12 +21,16 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
+import java.util.stream.Collectors;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
 import org.apache.impala.analysis.AggregateInfo;
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.BinaryPredicate;
@@ -39,7 +43,6 @@ import org.apache.impala.analysis.FunctionParams;
 import org.apache.impala.analysis.InPredicate;
 import org.apache.impala.analysis.IsNotEmptyPredicate;
 import org.apache.impala.analysis.LiteralExpr;
-import org.apache.impala.analysis.NullLiteral;
 import org.apache.impala.analysis.SlotDescriptor;
 import org.apache.impala.analysis.SlotId;
 import org.apache.impala.analysis.SlotRef;
@@ -49,9 +52,10 @@ import org.apache.impala.analysis.TupleDescriptor;
 import org.apache.impala.analysis.TupleId;
 import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.ColumnStats;
-import org.apache.impala.catalog.HdfsCompression;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.FeFsPartition;
 import org.apache.impala.catalog.FeFsTable;
+import org.apache.impala.catalog.HdfsCompression;
 import org.apache.impala.catalog.HdfsFileFormat;
 import org.apache.impala.catalog.HdfsPartition.FileBlock;
 import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
@@ -68,8 +72,8 @@ import org.apache.impala.fb.FbFileBlock;
 import org.apache.impala.service.BackendConfig;
 import org.apache.impala.thrift.TExplainLevel;
 import org.apache.impala.thrift.TExpr;
-import org.apache.impala.thrift.THdfsFileSplit;
 import org.apache.impala.thrift.TFileSplitGeneratorSpec;
+import org.apache.impala.thrift.THdfsFileSplit;
 import org.apache.impala.thrift.THdfsScanNode;
 import org.apache.impala.thrift.TNetworkAddress;
 import org.apache.impala.thrift.TPlanNode;
@@ -83,6 +87,7 @@ import org.apache.impala.thrift.TScanRangeSpec;
 import org.apache.impala.thrift.TTableStats;
 import org.apache.impala.util.BitUtil;
 import org.apache.impala.util.ExecutorMembershipSnapshot;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -91,7 +96,6 @@ import com.google.common.base.Objects;
 import com.google.common.base.Objects.ToStringHelper;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 
 /**
@@ -140,11 +144,6 @@ public class HdfsScanNode extends ScanNode {
   // threads. Corresponds to the default value of --num_threads_per_core in the backend.
   private static final int MAX_THREAD_TOKENS_PER_CORE = 3;
 
-  // Factor capturing the worst-case deviation from a uniform distribution of scan ranges
-  // among nodes. The factor of 1.2 means that a particular node may have 20% more
-  // scan ranges than would have been estimated assuming a uniform distribution.
-  private static final double SCAN_RANGE_SKEW_FACTOR = 1.2;
-
   // The minimum amount of memory we estimate a scan will use. The number is
   // derived experimentally: running metadata-only Parquet count(*) scans on TPC-H
   // lineitem and TPC-DS store_sales of different sizes resulted in memory consumption
@@ -177,10 +176,13 @@ public class HdfsScanNode extends ScanNode {
   private final AggregateInfo aggInfo_;
 
   // Number of partitions, files and bytes scanned. Set in computeScanRangeLocations().
-  // Might not match 'partitions_' due to table sampling.
-  private int numPartitions_ = 0;
-  private long totalFiles_ = 0;
-  private long totalBytes_ = 0;
+  // Might not match 'partitions_' due to table sampling. Grouped by the FsType, so
+  // each key value pair maps how many partitions / files / bytes are stored on each fs.
+  // Stored as a TreeMap so that iteration order is defined by the order of enums in
+  // FsType.
+  private Map<FileSystemUtil.FsType, Long> numPartitionsPerFs_ = new TreeMap<>();
+  private Map<FileSystemUtil.FsType, Long> totalFilesPerFs_ = new TreeMap<>();
+  private Map<FileSystemUtil.FsType, Long> totalBytesPerFs_ = new TreeMap<>();
 
   // File formats scanned. Set in computeScanRangeLocations().
   private Set<HdfsFileFormat> fileFormats_;
@@ -214,7 +216,7 @@ public class HdfsScanNode extends ScanNode {
   // collection-typed slots. Maps from tuple descriptor to the conjuncts bound by that
   // tuple. Uses a linked hash map for consistent display in explain.
   private final Map<TupleDescriptor, List<Expr>> collectionConjuncts_ =
-      Maps.newLinkedHashMap();
+      new LinkedHashMap<>();
 
   // TupleDescriptors of collection slots that have an IsNotEmptyPredicate. See
   // SelectStmt#registerIsNotEmptyPredicates.
@@ -224,7 +226,7 @@ public class HdfsScanNode extends ScanNode {
   // While correct, they may be conservative. See the tests for parquet collection
   // filtering for examples that could benefit from being more aggressive
   // (yet still correct).
-  private final Set<TupleDescriptor> notEmptyCollections_ = Sets.newHashSet();
+  private final Set<TupleDescriptor> notEmptyCollections_ = new HashSet<>();
 
   // Map from SlotDescriptor to indices in PlanNodes.conjuncts_ and
   // collectionConjuncts_ that are eligible for dictionary filtering. Slots in the
@@ -232,7 +234,7 @@ public class HdfsScanNode extends ScanNode {
   // slots in the TupleDescriptors of nested types map to indices into
   // collectionConjuncts_.
   private final Map<SlotDescriptor, List<Integer>> dictionaryFilterConjuncts_ =
-      Maps.newLinkedHashMap();
+      new LinkedHashMap<>();
 
   // Number of partitions that have the row count statistic.
   private int numPartitionsWithNumRows_ = 0;
@@ -253,12 +255,12 @@ public class HdfsScanNode extends ScanNode {
 
   // List of conjuncts for min/max values of parquet::Statistics, that are used to skip
   // data when scanning Parquet files.
-  private final List<Expr> minMaxConjuncts_ = Lists.newArrayList();
+  private final List<Expr> minMaxConjuncts_ = new ArrayList<>();
 
   // Map from TupleDescriptor to list of PlanNode conjuncts that have been transformed
   // into conjuncts in 'minMaxConjuncts_'.
   private final Map<TupleDescriptor, List<Expr>> minMaxOriginalConjuncts_ =
-      Maps.newLinkedHashMap();
+      new LinkedHashMap<>();
 
   // Tuple that is used to materialize statistics when scanning Parquet files. For each
   // column it can contain 0, 1, or 2 slots, depending on whether the column needs to be
@@ -266,10 +268,13 @@ public class HdfsScanNode extends ScanNode {
   // parquet::Statistics.
   private TupleDescriptor minMaxTuple_;
 
-  // Slot that is used to record the Parquet metatdata for the count(*) aggregation if
+  // Slot that is used to record the Parquet metadata for the count(*) aggregation if
   // this scan node has the count(*) optimization enabled.
   private SlotDescriptor countStarSlot_ = null;
 
+  // Conjuncts used to trim the set of partitions passed to this node.
+  // Used only to display EXPLAIN information.
+  private final List<Expr> partitionConjuncts_;
   /**
    * Construct a node to scan given data files into tuples described by 'desc',
    * with 'conjuncts' being the unevaluated conjuncts bound by the tuple and
@@ -277,12 +282,13 @@ public class HdfsScanNode extends ScanNode {
    * class comments above for details.
    */
   public HdfsScanNode(PlanNodeId id, TupleDescriptor desc, List<Expr> conjuncts,
-      List<? extends FeFsPartition> partitions, TableRef hdfsTblRef, AggregateInfo aggInfo) {
-    super(id, desc, "SCAN HDFS");
-    Preconditions.checkState(desc.getTable() instanceof FeFsTable);
+      List<? extends FeFsPartition> partitions, TableRef hdfsTblRef,
+      AggregateInfo aggInfo, List<Expr> partConjuncts) {
+    super(id, desc, createDisplayName(hdfsTblRef.getTable()));
     tbl_ = (FeFsTable)desc.getTable();
     conjuncts_ = conjuncts;
     partitions_ = partitions;
+    partitionConjuncts_ = partConjuncts;
     sampleParams_ = hdfsTblRef.getSampleParams();
     replicaPreference_ = hdfsTblRef.getReplicaPreference();
     randomReplica_ = hdfsTblRef.getRandomReplica();
@@ -295,6 +301,14 @@ public class HdfsScanNode extends ScanNode {
       // Any errors should already have been caught during analysis.
       throw new IllegalStateException(error.toString());
     }
+  }
+
+  /**
+   * Returns the display name for this scan node. Of the form "SCAN [storage-layer-name]"
+   */
+  private static String createDisplayName(FeTable table) {
+    Preconditions.checkState(table instanceof FeFsTable);
+    return "SCAN " + ((FeFsTable) table).getFsType();
   }
 
   @Override
@@ -323,7 +337,7 @@ public class HdfsScanNode extends ScanNode {
     sd.setIsMaterialized(true);
     sd.setIsNullable(false);
     sd.setLabel("parquet-stats: num_rows");
-    ArrayList<Expr> args = Lists.newArrayList();
+    List<Expr> args = new ArrayList<>();
     args.add(new SlotRef(sd));
     FunctionCallExpr sumFn = new FunctionCallExpr("sum_init_zero", args);
     sumFn.analyzeNoThrow(analyzer);
@@ -403,15 +417,28 @@ public class HdfsScanNode extends ScanNode {
   }
 
   /**
-   * Throws if the table schema contains a complex type and we need to scan
+   * Throws NotImplementedException if we do not support scanning the partition.
+   * Specifically:
+   * 1) if the table schema contains a complex type and we need to scan
    * a partition that has a format for which we do not support complex types,
    * regardless of whether a complex-typed column is actually referenced
    * in the query.
+   * 2) if we are scanning ORC partitions and the ORC scanner is disabled.
    */
   @Override
   protected void checkForSupportedFileFormats() throws NotImplementedException {
     Preconditions.checkNotNull(desc_);
     Preconditions.checkNotNull(desc_.getTable());
+
+    if (!BackendConfig.INSTANCE.isOrcScannerEnabled()) {
+      for (FeFsPartition part: partitions_) {
+        if (part.getInputFormatDescriptor().getFileFormat() == HdfsFileFormat.ORC) {
+          throw new NotImplementedException(
+              "ORC scans are disabled by --enable_orc_scanner flag");
+        }
+      }
+    }
+
     Column firstComplexTypedCol = null;
     for (Column col: desc_.getTable().getColumns()) {
       if (col.getType().isComplexType()) {
@@ -505,7 +532,7 @@ public class HdfsScanNode extends ScanNode {
     // Only constant exprs can be evaluated against parquet::Statistics. This includes
     // LiteralExpr, but can also be an expr like "1 + 2".
     if (!constExpr.isConstant()) return;
-    if (constExpr.isNullLiteral()) return;
+    if (Expr.IS_NULL_VALUE.apply(constExpr)) return;
 
     BinaryPredicate.Operator op = binaryPred.getOp();
     if (op == BinaryPredicate.Operator.LT || op == BinaryPredicate.Operator.LE ||
@@ -530,17 +557,17 @@ public class HdfsScanNode extends ScanNode {
     if (slotRef.getDesc().isArrayPosRef()) return;
     if (inPred.isNotIn()) return;
 
-    ArrayList<Expr> children = inPred.getChildren();
+    List<Expr> children = inPred.getChildren();
     LiteralExpr min = null;
     LiteralExpr max = null;
     for (int i = 1; i < children.size(); ++i) {
       Expr child = children.get(i);
 
       // If any child is not a literal, then nothing can be done
-      if (!child.isLiteral()) return;
+      if (!Expr.IS_LITERAL.apply(child)) return;
       LiteralExpr literalChild = (LiteralExpr) child;
       // If any child is NULL, then there is not a valid min/max. Nothing can be done.
-      if (literalChild instanceof NullLiteral) return;
+      if (Expr.IS_NULL_LITERAL.apply(literalChild)) return;
 
       if (min == null || literalChild.compareTo(min) < 0) min = literalChild;
       if (max == null || literalChild.compareTo(max) > 0) max = literalChild;
@@ -561,7 +588,7 @@ public class HdfsScanNode extends ScanNode {
   private void addMinMaxOriginalConjunct(TupleDescriptor tupleDesc, Expr expr) {
     List<Expr> exprs = minMaxOriginalConjuncts_.get(tupleDesc);
     if (exprs == null) {
-      exprs = new ArrayList<Expr>();
+      exprs = new ArrayList<>();
       minMaxOriginalConjuncts_.put(tupleDesc, exprs);
     }
     exprs.add(expr);
@@ -641,7 +668,7 @@ public class HdfsScanNode extends ScanNode {
       // generating new predicates.
       List<Expr> collectionConjuncts =
           analyzer.getUnassignedConjuncts(Lists.newArrayList(itemTid));
-      ArrayList<Expr> bindingPredicates = analyzer.getBoundPredicates(itemTid);
+      List<Expr> bindingPredicates = analyzer.getBoundPredicates(itemTid);
       for (Expr boundPred: bindingPredicates) {
         if (!collectionConjuncts.contains(boundPred)) collectionConjuncts.add(boundPred);
       }
@@ -674,8 +701,8 @@ public class HdfsScanNode extends ScanNode {
    * collections).
    */
   private void addDictionaryFilter(Analyzer analyzer, Expr conjunct, int conjunctIdx) {
-    List<TupleId> tupleIds = Lists.newArrayList();
-    List<SlotId> slotIds = Lists.newArrayList();
+    List<TupleId> tupleIds = new ArrayList<>();
+    List<SlotId> slotIds = new ArrayList<>();
     conjunct.getIds(tupleIds, slotIds);
     // Only single-slot conjuncts are eligible for dictionary filtering. When pruning
     // a row-group, the conjunct must be evaluated only against a single row-group
@@ -709,7 +736,7 @@ public class HdfsScanNode extends ScanNode {
     SlotDescriptor slotKey = analyzer.getSlotDesc(slotId);
     List<Integer> slotList = dictionaryFilterConjuncts_.get(slotKey);
     if (slotList == null) {
-      slotList = Lists.newArrayList();
+      slotList = new ArrayList<>();
       dictionaryFilterConjuncts_.put(slotKey, slotList);
     }
     slotList.add(conjunctIdx);
@@ -734,17 +761,48 @@ public class HdfsScanNode extends ScanNode {
   }
 
   /**
+   * A collection of metadata associated with a sampled partition. Unlike
+   * {@link FeFsPartition} this class is safe to use in hash-based data structures.
+   */
+  public static final class SampledPartitionMetadata {
+
+    private final long partitionId;
+    private final FileSystemUtil.FsType partitionFsType;
+
+    public SampledPartitionMetadata(
+        long partitionId, FileSystemUtil.FsType partitionFsType) {
+      this.partitionId = partitionId;
+      this.partitionFsType = partitionFsType;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) return true;
+      if (o == null || getClass() != o.getClass()) return false;
+      SampledPartitionMetadata that = (SampledPartitionMetadata) o;
+      return partitionId == that.partitionId && partitionFsType == that.partitionFsType;
+    }
+
+    @Override
+    public int hashCode() {
+      return java.util.Objects.hash(partitionId, partitionFsType);
+    }
+
+    private FileSystemUtil.FsType getPartitionFsType() { return partitionFsType; }
+  }
+
+  /**
    * Computes scan ranges (i.e. hdfs splits) plus their storage locations, including
    * volume ids, based on the given maximum number of bytes each scan range should scan.
    * If 'sampleParams_' is not null, generates a sample and computes the scan ranges
    * based on the sample.
    *
-   * Initializes members with information about files and scan ranges, e.g. totalFiles_,
-   * fileFormats_, etc.
+   * Initializes members with information about files and scan ranges, e.g.
+   * totalFilesPerFs_, fileFormats_, etc.
    */
   private void computeScanRangeLocations(Analyzer analyzer)
       throws ImpalaRuntimeException {
-    Map<Long, List<FileDescriptor>> sampledFiles = null;
+    Map<SampledPartitionMetadata, List<FileDescriptor>> sampledFiles = null;
     if (sampleParams_ != null) {
       long percentBytes = sampleParams_.getPercentBytes();
       long randomSeed;
@@ -763,17 +821,26 @@ public class HdfsScanNode extends ScanNode {
     long scanRangeBytesLimit = analyzer.getQueryCtx().client_request.getQuery_options()
         .getMax_scan_range_length();
     scanRangeSpecs_ = new TScanRangeSpec();
-    numPartitions_ = (sampledFiles != null) ? sampledFiles.size() : partitions_.size();
-    totalFiles_ = 0;
-    totalBytes_ = 0;
+
+    if (sampledFiles != null) {
+      numPartitionsPerFs_ = sampledFiles.keySet().stream().collect(Collectors.groupingBy(
+          SampledPartitionMetadata::getPartitionFsType, Collectors.counting()));
+    } else {
+      numPartitionsPerFs_.putAll(partitions_.stream().collect(
+          Collectors.groupingBy(FeFsPartition::getFsType, Collectors.counting())));
+    }
+
+    totalFilesPerFs_ = new TreeMap<>();
+    totalBytesPerFs_ = new TreeMap<>();
     largestScanRangeBytes_ = 0;
     maxScanRangeNumRows_ = -1;
-    fileFormats_ = Sets.newHashSet();
+    fileFormats_ = new HashSet<>();
     for (FeFsPartition partition: partitions_) {
       List<FileDescriptor> fileDescs = partition.getFileDescriptors();
       if (sampledFiles != null) {
         // If we are sampling, check whether this partition is included in the sample.
-        fileDescs = sampledFiles.get(Long.valueOf(partition.getId()));
+        fileDescs = sampledFiles.get(
+            new SampledPartitionMetadata(partition.getId(), partition.getFsType()));
         if (fileDescs == null) continue;
       }
       long partitionNumRows = partition.getNumRows();
@@ -804,14 +871,14 @@ public class HdfsScanNode extends ScanNode {
       final long partitionBytes = FileDescriptor.computeTotalFileLength(fileDescs);
       long partitionMaxScanRangeBytes = 0;
       boolean partitionMissingDiskIds = false;
-      totalBytes_ += partitionBytes;
-      totalFiles_ += fileDescs.size();
+      totalBytesPerFs_.merge(partition.getFsType(), partitionBytes, Long::sum);
+      totalFilesPerFs_.merge(partition.getFsType(), (long) fileDescs.size(), Long::sum);
       for (FileDescriptor fileDesc: fileDescs) {
         if (!analyzer.getQueryOptions().isAllow_erasure_coded_files() &&
             fileDesc.getIsEc()) {
           throw new ImpalaRuntimeException(String.format(
               "Scanning of HDFS erasure-coded file (%s/%s) is not supported",
-              partition.getLocation(), fileDesc.getFileName()));
+              partition.getLocation(), fileDesc.getRelativePath()));
         }
         if (!fsHasBlocks) {
           Preconditions.checkState(fileDesc.getNumFileBlocks() == 0);
@@ -832,14 +899,15 @@ public class HdfsScanNode extends ScanNode {
             partitionNumRows, partitionBytes, partitionMaxScanRangeBytes);
       }
     }
-    if (totalFiles_ == 0) {
+    if (totalFilesPerFs_.isEmpty() || sumValues(totalFilesPerFs_) == 0) {
       maxScanRangeNumRows_ = 0;
     } else {
       // Also estimate max rows per scan range based on table-level stats, in case some
       // or all partition-level stats were missing.
       long tableNumRows = tbl_.getNumRows();
       if (tableNumRows >= 0) {
-        updateMaxScanRangeNumRows(tableNumRows, totalBytes_, largestScanRangeBytes_);
+        updateMaxScanRangeNumRows(
+            tableNumRows, sumValues(totalBytesPerFs_), largestScanRangeBytes_);
       }
     }
   }
@@ -877,7 +945,7 @@ public class HdfsScanNode extends ScanNode {
     Preconditions.checkArgument(maxBlockSize > 0);
     if (fileDesc.getFileLength() <= 0) return;
     boolean splittable = partition.getFileFormat().isSplittable(
-        HdfsCompression.fromFileName(fileDesc.getFileName()));
+        HdfsCompression.fromFileName(fileDesc.getRelativePath()));
     TFileSplitGeneratorSpec splitSpec = new TFileSplitGeneratorSpec(
         fileDesc.toThrift(), maxBlockSize, splittable, partition.getId());
     scanRangeSpecs_.addToSplit_specs(splitSpec);
@@ -914,7 +982,7 @@ public class HdfsScanNode extends ScanNode {
         continue;
       }
       // Collect the network address and volume ID of all replicas of this block.
-      List<TScanRangeLocation> locations = Lists.newArrayList();
+      List<TScanRangeLocation> locations = new ArrayList<>();
       for (int j = 0; j < replicaHostCount; ++j) {
         TScanRangeLocation location = new TScanRangeLocation();
         // Translate from the host index (local to the HdfsTable) to network address.
@@ -942,9 +1010,10 @@ public class HdfsScanNode extends ScanNode {
           currentLength = scanRangeBytesLimit;
         }
         TScanRange scanRange = new TScanRange();
-        scanRange.setHdfs_file_split(new THdfsFileSplit(fileDesc.getFileName(),
+        scanRange.setHdfs_file_split(new THdfsFileSplit(fileDesc.getRelativePath(),
             currentOffset, currentLength, partition.getId(), fileDesc.getFileLength(),
-            fileDesc.getFileCompression().toThrift(), fileDesc.getModificationTime()));
+            fileDesc.getFileCompression().toThrift(), fileDesc.getModificationTime(),
+            fileDesc.getIsEc()));
         TScanRangeLocationList scanRangeLocations = new TScanRangeLocationList();
         scanRangeLocations.scan_range = scanRange;
         scanRangeLocations.locations = locations;
@@ -998,11 +1067,13 @@ public class HdfsScanNode extends ScanNode {
    */
   private void computeCardinalities() {
     // Choose between the extrapolated row count and the one based on stored stats.
-    extrapolatedNumRows_ = FeFsTable.Utils.getExtrapolatedNumRows(tbl_, totalBytes_);
+    extrapolatedNumRows_ = FeFsTable.Utils.getExtrapolatedNumRows(tbl_,
+            sumValues(totalBytesPerFs_));
     long statsNumRows = getStatsNumRows();
     if (extrapolatedNumRows_ != -1) {
-      // The extrapolated row count is based on the 'totalBytes_' which already accounts
-      // for table sampling, so no additional adjustment for sampling is necessary.
+      // The extrapolated row count is based on the 'totalBytesPerFs_' which already
+      // accounts for table sampling, so no additional adjustment for sampling is
+      // necessary.
       cardinality_ = extrapolatedNumRows_;
     } else {
       // Set the cardinality based on table or partition stats.
@@ -1016,7 +1087,7 @@ public class HdfsScanNode extends ScanNode {
     }
 
     // Checked after the block above to first collect information for the explain output.
-    if (totalBytes_ == 0) {
+    if (sumValues(totalBytesPerFs_) == 0) {
       // Nothing to scan. Definitely a cardinality of 0.
       inputCardinality_ = 0;
       cardinality_ = 0;
@@ -1046,7 +1117,7 @@ public class HdfsScanNode extends ScanNode {
       // IMPALA-2165: Avoid setting the cardinality to 0 after rounding.
       cardinality_ = Math.max(cardinality_, 1);
     }
-    cardinality_ = capAtLimit(cardinality_);
+    cardinality_ = capCardinalityAtLimit(cardinality_);
     if (LOG.isTraceEnabled()) {
       LOG.trace("HdfsScan: cardinality_=" + Long.toString(cardinality_));
     }
@@ -1097,51 +1168,76 @@ public class HdfsScanNode extends ScanNode {
    * ultimately determined by the scheduling done by the backend's Scheduler).
    * Assume that scan ranges that can be scheduled locally will be, and that scan
    * ranges that cannot will be round-robined across the cluster.
+   *
+   * When the planner runs in the debug mode (SET PLANNER_TESTCASE_MODE=true), the
+   * estimation does not take into account the local cluster topology and instead
+   * assumes that every scan range location is local to some datanode. This should only
+   * be set when replaying a testcase from some other cluster.
    */
   protected void computeNumNodes(Analyzer analyzer, long cardinality) {
     Preconditions.checkNotNull(scanRangeSpecs_);
     ExecutorMembershipSnapshot cluster = ExecutorMembershipSnapshot.getCluster();
-    HashSet<TNetworkAddress> localHostSet = Sets.newHashSet();
+    Set<TNetworkAddress> localHostSet = new HashSet<>();
     int totalNodes = 0;
     int numLocalRanges = 0;
     int numRemoteRanges = 0;
     if (scanRangeSpecs_.isSetConcrete_ranges()) {
-      for (TScanRangeLocationList range : scanRangeSpecs_.concrete_ranges) {
-        boolean anyLocal = false;
-        if (range.isSetLocations()) {
-          for (TScanRangeLocation loc : range.locations) {
-            TNetworkAddress dataNode =
-                analyzer.getHostIndex().getEntry(loc.getHost_idx());
-            if (cluster.contains(dataNode)) {
-              anyLocal = true;
-              // Use the full datanode address (including port) to account for the test
-              // minicluster where there are multiple datanodes and impalads on a single
-              // host.  This assumes that when an impalad is colocated with a datanode,
-              // there are the same number of impalads as datanodes on this host in this
-              // cluster.
-              localHostSet.add(dataNode);
-            }
+      if (analyzer.getQueryOptions().planner_testcase_mode) {
+        // TODO: Have a separate scan node implementation that mocks an HDFS scan
+        // node rather than including the logic here.
+
+        // Track the number of unique host indexes across all scan ranges. Assume for
+        // the sake of simplicity that every scan is served from a local datanode.
+        Set<Integer> dummyHostIndex = Sets.newHashSet();
+        for (TScanRangeLocationList range : scanRangeSpecs_.concrete_ranges) {
+          for (TScanRangeLocation loc: range.locations) {
+            dummyHostIndex.add(loc.getHost_idx());
+            ++numLocalRanges;
           }
         }
-        // This range has at least one replica with a colocated impalad, so assume it
-        // will be scheduled on one of those nodes.
-        if (anyLocal) {
-          ++numLocalRanges;
-        } else {
-          ++numRemoteRanges;
+        totalNodes = Math.min(
+            scanRangeSpecs_.concrete_ranges.size(), dummyHostIndex.size());
+        LOG.info(String.format("Planner running in DEBUG mode. ScanNode: %s, " +
+            "TotalNodes %d, Local Ranges %d", tbl_.getFullName(), totalNodes,
+            numLocalRanges));
+      } else {
+        for (TScanRangeLocationList range : scanRangeSpecs_.concrete_ranges) {
+          boolean anyLocal = false;
+          if (range.isSetLocations()) {
+            for (TScanRangeLocation loc : range.locations) {
+              TNetworkAddress dataNode =
+                  analyzer.getHostIndex().getEntry(loc.getHost_idx());
+              if (cluster.contains(dataNode)) {
+                anyLocal = true;
+                // Use the full datanode address (including port) to account for the test
+                // minicluster where there are multiple datanodes and impalads on a single
+                // host.  This assumes that when an impalad is colocated with a datanode,
+                // there are the same number of impalads as datanodes on this host in this
+                // cluster.
+                localHostSet.add(dataNode);
+              }
+            }
+          }
+          // This range has at least one replica with a colocated impalad, so assume it
+          // will be scheduled on one of those nodes.
+          if (anyLocal) {
+            ++numLocalRanges;
+          } else {
+            ++numRemoteRanges;
+          }
+          // Approximate the number of nodes that will execute locally assigned ranges to
+          // be the smaller of the number of locally assigned ranges and the number of
+          // hosts that hold block replica for those ranges.
+          int numLocalNodes = Math.min(numLocalRanges, localHostSet.size());
+          // The remote ranges are round-robined across all the impalads.
+          int numRemoteNodes = Math.min(numRemoteRanges, cluster.numExecutors());
+          // The local and remote assignments may overlap, but we don't know by how much
+          // so conservatively assume no overlap.
+          totalNodes = Math.min(numLocalNodes + numRemoteNodes, cluster.numExecutors());
+          // Exit early if all hosts have a scan range assignment, to avoid extraneous
+          // work in case the number of scan ranges dominates the number of nodes.
+          if (totalNodes == cluster.numExecutors()) break;
         }
-        // Approximate the number of nodes that will execute locally assigned ranges to
-        // be the smaller of the number of locally assigned ranges and the number of
-        // hosts that hold block replica for those ranges.
-        int numLocalNodes = Math.min(numLocalRanges, localHostSet.size());
-        // The remote ranges are round-robined across all the impalads.
-        int numRemoteNodes = Math.min(numRemoteRanges, cluster.numExecutors());
-        // The local and remote assignments may overlap, but we don't know by how much so
-        // conservatively assume no overlap.
-        totalNodes = Math.min(numLocalNodes + numRemoteNodes, cluster.numExecutors());
-        // Exit early if all hosts have a scan range assignment, to avoid extraneous work
-        // in case the number of scan ranges dominates the number of nodes.
-        if (totalNodes == cluster.numExecutors()) break;
       }
     }
     // Handle the generated range specifications.
@@ -1172,7 +1268,7 @@ public class HdfsScanNode extends ScanNode {
     msg.hdfs_scan_node.setRandom_replica(randomReplica_);
     msg.node_type = TPlanNodeType.HDFS_SCAN_NODE;
     if (!collectionConjuncts_.isEmpty()) {
-      Map<Integer, List<TExpr>> tcollectionConjuncts = Maps.newLinkedHashMap();
+      Map<Integer, List<TExpr>> tcollectionConjuncts = new LinkedHashMap<>();
       for (Map.Entry<TupleDescriptor, List<Expr>> entry:
         collectionConjuncts_.entrySet()) {
         tcollectionConjuncts.put(entry.getKey().getId().asInt(),
@@ -1195,7 +1291,7 @@ public class HdfsScanNode extends ScanNode {
       }
       msg.hdfs_scan_node.setMin_max_tuple_id(minMaxTuple_.getId().asInt());
     }
-    Map<Integer, List<Integer>> dictMap = Maps.newLinkedHashMap();
+    Map<Integer, List<Integer>> dictMap = new LinkedHashMap<>();
     for (Map.Entry<SlotDescriptor, List<Integer>> entry :
       dictionaryFilterConjuncts_.entrySet()) {
       dictMap.put(entry.getKey().getId().asInt(), entry.getValue());
@@ -1216,21 +1312,50 @@ public class HdfsScanNode extends ScanNode {
     }
     output.append("]\n");
     if (detailLevel.ordinal() >= TExplainLevel.STANDARD.ordinal()) {
-      if (tbl_.getNumClusteringCols() == 0) numPartitions_ = 1;
-      output.append(String.format("%spartitions=%s/%s files=%s size=%s", detailPrefix,
-          numPartitions_, table.getPartitions().size(), totalFiles_,
-          PrintUtils.printBytes(totalBytes_)));
-      output.append("\n");
+      if (partitionConjuncts_ != null && !partitionConjuncts_.isEmpty()) {
+        output.append(detailPrefix)
+          .append(String.format("partition predicates: %s\n",
+              getExplainString(partitionConjuncts_, detailLevel)));
+      }
+      String partMetaTemplate = "partitions=%d/%d files=%d size=%s\n";
+      if (!numPartitionsPerFs_.isEmpty()) {
+        // The table is partitioned; print a line for each filesystem we are reading
+        // partitions from
+        for (Map.Entry<FileSystemUtil.FsType, Long> partsPerFs :
+            numPartitionsPerFs_.entrySet()) {
+          FileSystemUtil.FsType fsType = partsPerFs.getKey();
+          output.append(detailPrefix);
+          output.append(fsType).append(" ");
+          output.append(String.format(partMetaTemplate, partsPerFs.getValue(),
+              table.getPartitions().size(), totalFilesPerFs_.get(fsType),
+              PrintUtils.printBytes(totalBytesPerFs_.get(fsType))));
+        }
+      } else if (tbl_.getNumClusteringCols() == 0) {
+        // There are no partitions so we use the FsType of the base table
+        output.append(detailPrefix);
+        output.append(table.getFsType()).append(" ");
+        output.append(String.format(partMetaTemplate, 1, table.getPartitions().size(),
+            0, PrintUtils.printBytes(0)));
+      } else {
+        // The table is partitioned, but no partitions are selected; in this case we
+        // exclude the FsType completely
+        output.append(detailPrefix);
+        output.append(String.format(partMetaTemplate, 0, table.getPartitions().size(),
+            0, PrintUtils.printBytes(0)));
+      }
+
       if (!conjuncts_.isEmpty()) {
-        output.append(String.format("%spredicates: %s\n", detailPrefix,
-            getExplainString(conjuncts_)));
+        output.append(detailPrefix)
+          .append(String.format("predicates: %s\n",
+            getExplainString(conjuncts_, detailLevel)));
       }
       if (!collectionConjuncts_.isEmpty()) {
         for (Map.Entry<TupleDescriptor, List<Expr>> entry:
           collectionConjuncts_.entrySet()) {
           String alias = entry.getKey().getAlias();
-          output.append(String.format("%spredicates on %s: %s\n",
-              detailPrefix, alias, getExplainString(entry.getValue())));
+          output.append(detailPrefix)
+            .append(String.format("predicates on %s: %s\n", alias,
+              getExplainString(entry.getValue(), detailLevel)));
         }
       }
       if (!runtimeFilters_.isEmpty()) {
@@ -1239,62 +1364,68 @@ public class HdfsScanNode extends ScanNode {
       }
     }
     if (detailLevel.ordinal() >= TExplainLevel.EXTENDED.ordinal()) {
-      output.append(getStatsExplainString(detailPrefix));
-      output.append("\n");
-      String extrapRows = String.valueOf(extrapolatedNumRows_);
-      if (!FeFsTable.Utils.isStatsExtrapolationEnabled(tbl_)) {
+      output.append(getStatsExplainString(detailPrefix)).append("\n");
+      String extrapRows;
+      if (FeFsTable.Utils.isStatsExtrapolationEnabled(tbl_)) {
+        extrapRows = PrintUtils.printEstCardinality(extrapolatedNumRows_);
+      } else {
         extrapRows = "disabled";
-      } else if (extrapolatedNumRows_ == -1) {
-        extrapRows = "unavailable";
       }
-      output.append(String.format("%sextrapolated-rows=%s", detailPrefix, extrapRows));
-      output.append(String.format(" max-scan-range-rows=%s",
-          maxScanRangeNumRows_ == -1 ? "unavailable" : maxScanRangeNumRows_));
-      output.append("\n");
+      output.append(detailPrefix)
+            .append("extrapolated-rows=")
+            .append(extrapRows)
+            .append(" max-scan-range-rows=")
+            .append(PrintUtils.printEstCardinality(maxScanRangeNumRows_))
+            .append("\n");
       if (numScanRangesNoDiskIds_ > 0) {
-        output.append(String.format("%smissing disk ids: "
+        output.append(detailPrefix)
+          .append(String.format("missing disk ids: "
                 + "partitions=%s/%s files=%s/%s scan ranges %s/%s\n",
-            detailPrefix, numPartitionsNoDiskIds_, numPartitions_, numFilesNoDiskIds_,
-            totalFiles_, numScanRangesNoDiskIds_,
+            numPartitionsNoDiskIds_, sumValues(numPartitionsPerFs_),
+            numFilesNoDiskIds_, sumValues(totalFilesPerFs_), numScanRangesNoDiskIds_,
             scanRangeSpecs_.getConcrete_rangesSize() + generatedScanRangeCount_));
       }
       // Groups the min max original conjuncts by tuple descriptor.
-      output.append(getMinMaxOriginalConjunctsExplainString(detailPrefix));
+      output.append(getMinMaxOriginalConjunctsExplainString(detailPrefix, detailLevel));
       // Groups the dictionary filterable conjuncts by tuple descriptor.
-      output.append(getDictionaryConjunctsExplainString(detailPrefix));
+      output.append(getDictionaryConjunctsExplainString(detailPrefix, detailLevel));
     }
     return output.toString();
   }
 
   // Helper method that prints min max original conjuncts by tuple descriptor.
-  private String getMinMaxOriginalConjunctsExplainString(String prefix) {
+  private String getMinMaxOriginalConjunctsExplainString(
+      String prefix, TExplainLevel detailLevel) {
     StringBuilder output = new StringBuilder();
     for (Map.Entry<TupleDescriptor, List<Expr>> entry :
         minMaxOriginalConjuncts_.entrySet()) {
       TupleDescriptor tupleDesc = entry.getKey();
       List<Expr> exprs = entry.getValue();
       if (tupleDesc == getTupleDesc()) {
-        output.append(String.format("%sparquet statistics predicates: %s\n", prefix,
-            getExplainString(exprs)));
+        output.append(prefix)
+        .append(String.format("parquet statistics predicates: %s\n",
+            getExplainString(exprs, detailLevel)));
       } else {
-        output.append(String.format("%sparquet statistics predicates on %s: %s\n",
-            prefix, tupleDesc.getAlias(), getExplainString(exprs)));
+        output.append(prefix)
+        .append(String.format("parquet statistics predicates on %s: %s\n",
+            tupleDesc.getAlias(), getExplainString(exprs, detailLevel)));
       }
     }
     return output.toString();
   }
 
   // Helper method that prints the dictionary filterable conjuncts by tuple descriptor.
-  private String getDictionaryConjunctsExplainString(String prefix) {
+  private String getDictionaryConjunctsExplainString(
+      String prefix, TExplainLevel detailLevel) {
     StringBuilder output = new StringBuilder();
-    Map<TupleDescriptor, List<Integer>> perTupleConjuncts = Maps.newLinkedHashMap();
+    Map<TupleDescriptor, List<Integer>> perTupleConjuncts = new LinkedHashMap<>();
     for (Map.Entry<SlotDescriptor, List<Integer>> entry :
       dictionaryFilterConjuncts_.entrySet()) {
       SlotDescriptor slotDescriptor = entry.getKey();
       TupleDescriptor tupleDescriptor = slotDescriptor.getParent();
       List<Integer> indexes = perTupleConjuncts.get(tupleDescriptor);
       if (indexes == null) {
-        indexes = Lists.newArrayList();
+        indexes = new ArrayList<>();
         perTupleConjuncts.put(tupleDescriptor, indexes);
       }
       indexes.addAll(entry.getValue());
@@ -1316,13 +1447,13 @@ public class HdfsScanNode extends ScanNode {
         tupleName = " on " + tupleDescriptor.getAlias();
       }
       Preconditions.checkNotNull(conjuncts);
-      List<Expr> exprList = Lists.newArrayList();
+      List<Expr> exprList = new ArrayList<>();
       for (Integer idx : totalIdxList) {
         Preconditions.checkState(idx.intValue() < conjuncts.size());
         exprList.add(conjuncts.get(idx));
       }
-      output.append(String.format("%sparquet dictionary predicates%s: %s\n",
-          prefix, tupleName, getExplainString(exprList)));
+      output.append(String.format("%sparquet dictionary predicates%s: %s\n", prefix,
+          tupleName, getExplainString(exprList, detailLevel)));
     }
     return output.toString();
   }
@@ -1331,18 +1462,17 @@ public class HdfsScanNode extends ScanNode {
   protected String getTableStatsExplainString(String prefix) {
     StringBuilder output = new StringBuilder();
     TTableStats tblStats = desc_.getTable().getTTableStats();
-    String numRows = String.valueOf(tblStats.num_rows);
-    if (tblStats.num_rows == -1) numRows = "unavailable";
     String totalBytes = PrintUtils.printBytes(tblStats.total_file_bytes);
     if (tblStats.total_file_bytes == -1) totalBytes = "unavailable";
     output.append(String.format("%stable: rows=%s size=%s",
-        prefix, numRows, totalBytes));
+        prefix,
+        PrintUtils.printEstCardinality(tblStats.num_rows),
+        totalBytes));
     if (tbl_.getNumClusteringCols() > 0) {
       output.append("\n");
-      String partNumRows = String.valueOf(partitionNumRows_);
-      if (partitionNumRows_ == -1) partNumRows = "unavailable";
       output.append(String.format("%spartitions: %s/%s rows=%s",
-          prefix, numPartitionsWithNumRows_, partitions_.size(), partNumRows));
+          prefix, numPartitionsWithNumRows_, partitions_.size(),
+          PrintUtils.printEstCardinality(partitionNumRows_)));
     }
     return output.toString();
   }
@@ -1376,8 +1506,7 @@ public class HdfsScanNode extends ScanNode {
         // excluding partition columns and columns that are populated from file metadata.
         partitionScanRange = columnReservations.size();
       } else {
-        partitionScanRange = (int) Math.ceil(
-            ((double) scanRangeSize / (double) numNodes_) * SCAN_RANGE_SKEW_FACTOR);
+        partitionScanRange = estimatePerHostScanRanges(scanRangeSize);
       }
       // From the resource management purview, we want to conservatively estimate memory
       // consumption based on the partition with the highest memory requirements.
@@ -1388,20 +1517,11 @@ public class HdfsScanNode extends ScanNode {
 
     // The non-MT scan node requires at least one scanner thread.
     int requiredThreads = useMtScanNode_ ? 0 : 1;
-    int maxScannerThreads;
-    if (queryOptions.getMt_dop() >= 1) {
-      maxScannerThreads = 1;
-    } else {
-      maxScannerThreads = Math.min(perHostScanRanges, RuntimeEnv.INSTANCE.getNumCores());
-      // Account for the max scanner threads query option.
-      if (queryOptions.isSetNum_scanner_threads() &&
-          queryOptions.getNum_scanner_threads() > 0) {
-        maxScannerThreads =
-            Math.min(maxScannerThreads, queryOptions.getNum_scanner_threads());
-      }
-    }
+    int maxScannerThreads = computeMaxNumberOfScannerThreads(queryOptions,
+        perHostScanRanges);
 
-    long avgScanRangeBytes = (long) Math.ceil(totalBytes_ / (double) scanRangeSize);
+    long avgScanRangeBytes =
+        (long) Math.ceil(sumValues(totalBytesPerFs_) / (double) scanRangeSize);
     // The +1 accounts for an extra I/O buffer to read past the scan range due to a
     // trailing record spanning Hdfs blocks.
     long maxIoBufferSize =
@@ -1494,7 +1614,7 @@ public class HdfsScanNode extends ScanNode {
    * if/when that is added.
    */
   private List<Long> computeMinColumnMemReservations() {
-    List<Long> columnByteSizes = Lists.newArrayList();
+    List<Long> columnByteSizes = new ArrayList<>();
     FeFsTable table = (FeFsTable) desc_.getTable();
     boolean havePosSlot = false;
     for (SlotDescriptor slot: desc_.getSlots()) {
@@ -1574,6 +1694,9 @@ public class HdfsScanNode extends ScanNode {
     if (stats.hasAvgSize() && maxScanRangeNumRows_ != -1) {
       // Estimate the column's uncompressed data size based on row count and average
       // size.
+      // TODO: Size of strings seems to be underestimated, as avg size returns the
+      //       average length of the strings and does not include the 4 byte length
+      //       field used in Parquet plain encoding. (IMPALA-8431)
       reservationBytes =
           (long) Math.min(reservationBytes, stats.getAvgSize() * maxScanRangeNumRows_);
       if (stats.hasNumDistinctValues()) {
@@ -1634,4 +1757,11 @@ public class HdfsScanNode extends ScanNode {
   public boolean hasCorruptTableStats() { return hasCorruptTableStats_; }
 
   public boolean hasMissingDiskIds() { return numScanRangesNoDiskIds_ > 0; }
+
+  /**
+   * Returns of all the values in the given {@link Map}.
+   */
+  private static long sumValues(Map<?, Long> input) {
+    return input.values().stream().mapToLong(Long::longValue).sum();
+  }
 }

@@ -18,16 +18,13 @@
 package org.apache.impala.service;
 
 import java.io.IOException;
-import java.io.StringReader;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
-import java.util.Random;
 import java.util.Set;
-import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -39,6 +36,7 @@ import org.apache.impala.analysis.AlterDbStmt;
 import org.apache.impala.analysis.AnalysisContext;
 import org.apache.impala.analysis.AnalysisContext.AnalysisResult;
 import org.apache.impala.analysis.CommentOnStmt;
+import org.apache.impala.analysis.CopyTestCaseStmt;
 import org.apache.impala.analysis.CreateDataSrcStmt;
 import org.apache.impala.analysis.CreateDropRoleStmt;
 import org.apache.impala.analysis.CreateUdaStmt;
@@ -52,13 +50,12 @@ import org.apache.impala.analysis.DropTableOrViewStmt;
 import org.apache.impala.analysis.GrantRevokePrivStmt;
 import org.apache.impala.analysis.GrantRevokeRoleStmt;
 import org.apache.impala.analysis.InsertStmt;
+import org.apache.impala.analysis.Parser;
 import org.apache.impala.analysis.QueryStmt;
 import org.apache.impala.analysis.ResetMetadataStmt;
 import org.apache.impala.analysis.ShowFunctionsStmt;
 import org.apache.impala.analysis.ShowGrantPrincipalStmt;
 import org.apache.impala.analysis.ShowRolesStmt;
-import org.apache.impala.analysis.SqlParser;
-import org.apache.impala.analysis.SqlScanner;
 import org.apache.impala.analysis.StatementBase;
 import org.apache.impala.analysis.StmtMetadataLoader;
 import org.apache.impala.analysis.StmtMetadataLoader.StmtTableCache;
@@ -66,14 +63,14 @@ import org.apache.impala.analysis.TableName;
 import org.apache.impala.analysis.TruncateStmt;
 import org.apache.impala.authorization.AuthorizationChecker;
 import org.apache.impala.authorization.AuthorizationConfig;
-import org.apache.impala.authorization.AuthorizeableTable;
+import org.apache.impala.authorization.AuthorizationManager;
+import org.apache.impala.authorization.AuthorizationFactory;
 import org.apache.impala.authorization.ImpalaInternalAdminUser;
 import org.apache.impala.authorization.Privilege;
 import org.apache.impala.authorization.PrivilegeRequest;
 import org.apache.impala.authorization.PrivilegeRequestBuilder;
 import org.apache.impala.authorization.User;
 import org.apache.impala.catalog.Catalog;
-import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.DatabaseNotFoundException;
 import org.apache.impala.catalog.FeCatalog;
@@ -90,7 +87,6 @@ import org.apache.impala.catalog.ImpaladCatalog;
 import org.apache.impala.catalog.ImpaladTableUsageTracker;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.catalog.local.InconsistentMetadataFetchException;
-import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.InternalException;
@@ -100,7 +96,6 @@ import org.apache.impala.planner.HdfsScanNode;
 import org.apache.impala.planner.PlanFragment;
 import org.apache.impala.planner.Planner;
 import org.apache.impala.planner.ScanNode;
-import org.apache.impala.thrift.TAdminRequest;
 import org.apache.impala.thrift.TAlterDbParams;
 import org.apache.impala.thrift.TCatalogOpRequest;
 import org.apache.impala.thrift.TCatalogOpType;
@@ -123,10 +118,10 @@ import org.apache.impala.thrift.TGrantRevokeRoleParams;
 import org.apache.impala.thrift.TLineageGraph;
 import org.apache.impala.thrift.TLoadDataReq;
 import org.apache.impala.thrift.TLoadDataResp;
+import org.apache.impala.thrift.TCopyTestCaseReq;
 import org.apache.impala.thrift.TMetadataOpRequest;
 import org.apache.impala.thrift.TPlanExecInfo;
 import org.apache.impala.thrift.TPlanFragment;
-import org.apache.impala.thrift.TPrincipalType;
 import org.apache.impala.thrift.TQueryCtx;
 import org.apache.impala.thrift.TQueryExecRequest;
 import org.apache.impala.thrift.TQueryOptions;
@@ -136,7 +131,6 @@ import org.apache.impala.thrift.TResultSet;
 import org.apache.impala.thrift.TResultSetMetadata;
 import org.apache.impala.thrift.TShowFilesParams;
 import org.apache.impala.thrift.TShowStatsOp;
-import org.apache.impala.thrift.TShutdownParams;
 import org.apache.impala.thrift.TStmtType;
 import org.apache.impala.thrift.TTableName;
 import org.apache.impala.thrift.TUpdateCatalogCacheRequest;
@@ -177,8 +171,56 @@ public class Frontend {
   private static final int INCONSISTENT_METADATA_NUM_RETRIES =
       BackendConfig.INSTANCE.getLocalCatalogMaxFetchRetries();
 
+  /**
+   * Plan-time context that allows capturing various artifacts created
+   * during the process.
+   *
+   * The context gathers an optional describe string for display to the
+   * user, and the optional plan fragment nodes for use in unit tests.
+   */
+  public static class PlanCtx {
+    // The query context.
+    protected final TQueryCtx queryCtx_;
+    // The explain string built from the query plan.
+    protected final StringBuilder explainBuf_;
+    // Flag to indicate whether to capture (return) the plan.
+    protected boolean capturePlan_;
+    // The physical plan, divided by fragment, before conversion to
+    // Thrift. For unit testing.
+    protected List<PlanFragment> plan_;
+
+    public PlanCtx(TQueryCtx qCtx) {
+      queryCtx_ = qCtx;
+      explainBuf_ = new StringBuilder();
+    }
+
+    public PlanCtx(TQueryCtx qCtx, StringBuilder describe) {
+      queryCtx_ = qCtx;
+      explainBuf_ = describe;
+    }
+
+    /**
+     * Request to capture the plan tree for unit tests.
+     */
+    public void requestPlanCapture() { capturePlan_ = true; }
+    public boolean planCaptureRequested() { return capturePlan_; }
+    public TQueryCtx getQueryContext() { return queryCtx_; }
+
+    /**
+     * @return the captured plan tree. Used only for unit tests
+     */
+    @VisibleForTesting
+    public List<PlanFragment> getPlan() { return plan_; }
+
+    /**
+     * @return the captured describe string
+     */
+    public String getExplainString() { return explainBuf_.toString(); }
+  }
+
   private final FeCatalogManager catalogManager_;
-  private final AuthorizationConfig authzConfig_;
+  private final AuthorizationFactory authzFactory_;
+  private final AuthorizationManager authzManager_;
   /**
    * Authorization checker. Initialized and periodically loaded by a task
    * running on the {@link #policyReader_} thread.
@@ -190,8 +232,8 @@ public class Frontend {
 
   private final ImpaladTableUsageTracker impaladTableUsageTracker_;
 
-  public Frontend(AuthorizationConfig authorizationConfig) {
-    this(authorizationConfig, FeCatalogManager.createFromBackendConfig());
+  public Frontend(AuthorizationFactory authzFactory) throws ImpalaException {
+    this(authzFactory, FeCatalogManager.createFromBackendConfig());
   }
 
   /**
@@ -199,74 +241,48 @@ public class Frontend {
    * updates and will be used for all requests.
    */
   @VisibleForTesting
-  public Frontend(AuthorizationConfig authorizationConfig,
-      FeCatalog testCatalog) {
-    this(authorizationConfig, FeCatalogManager.createForTests(testCatalog));
+  public Frontend(AuthorizationFactory authzFactory, FeCatalog testCatalog)
+      throws ImpalaException {
+    this(authzFactory, FeCatalogManager.createForTests(testCatalog));
   }
 
-  private Frontend(AuthorizationConfig authorizationConfig,
-      FeCatalogManager catalogManager) {
-    authzConfig_ = authorizationConfig;
+  private Frontend(AuthorizationFactory authzFactory, FeCatalogManager catalogManager)
+      throws ImpalaException {
     catalogManager_ = catalogManager;
+    authzFactory_ = authzFactory;
 
-    // Load the authorization policy once at startup, initializing
-    // authzChecker_. This ensures that, if the policy fails to load,
-    // we will throw an exception and fail to start.
-    AuthorizationPolicyReader policyReaderTask =
-        new AuthorizationPolicyReader(authzConfig_);
-    policyReaderTask.run();
-
-    // If authorization is enabled, reload the policy on a regular basis.
-    if (authzConfig_.isEnabled() && authzConfig_.isFileBasedPolicy()) {
-      // Stagger the reads across nodes
-      Random randomGen = new Random(UUID.randomUUID().hashCode());
-      int delay = AUTHORIZATION_POLICY_RELOAD_INTERVAL_SECS + randomGen.nextInt(60);
-
-      policyReader_.scheduleAtFixedRate(policyReaderTask,
-          delay, AUTHORIZATION_POLICY_RELOAD_INTERVAL_SECS, TimeUnit.SECONDS);
+    AuthorizationConfig authzConfig = authzFactory.getAuthorizationConfig();
+    if (authzConfig.isEnabled()) {
+      authzChecker_.set(authzFactory.newAuthorizationChecker(
+          getCatalog().getAuthPolicy()));
+    } else {
+      authzChecker_.set(authzFactory.newAuthorizationChecker());
     }
+    catalogManager_.setAuthzChecker(authzChecker_);
+    authzManager_ = authzFactory.newAuthorizationManager(catalogManager_,
+        authzChecker_::get);
     impaladTableUsageTracker_ = ImpaladTableUsageTracker.createFromConfig(
         BackendConfig.INSTANCE);
-  }
-
-  /**
-   * Reads (and caches) an authorization policy from HDFS.
-   */
-  private class AuthorizationPolicyReader implements Runnable {
-    private final AuthorizationConfig config_;
-
-    public AuthorizationPolicyReader(AuthorizationConfig config) {
-      config_ = config;
-    }
-
-    @Override
-    public void run() {
-      try {
-        LOG.info("Reloading authorization policy file from: " + config_.getPolicyFile());
-        authzChecker_.set(new AuthorizationChecker(config_,
-            getCatalog().getAuthPolicy()));
-      } catch (Exception e) {
-        LOG.error("Error reloading policy file: ", e);
-      }
-    }
   }
 
   public FeCatalog getCatalog() { return catalogManager_.getOrCreateCatalog(); }
 
   public AuthorizationChecker getAuthzChecker() { return authzChecker_.get(); }
 
+  public AuthorizationManager getAuthzManager() { return authzManager_; }
+
   public ImpaladTableUsageTracker getImpaladTableUsageTracker() {
     return impaladTableUsageTracker_;
   }
 
   public TUpdateCatalogCacheResponse updateCatalogCache(
-      TUpdateCatalogCacheRequest req) throws CatalogException, TException {
+      TUpdateCatalogCacheRequest req) throws ImpalaException, TException {
     TUpdateCatalogCacheResponse resp = catalogManager_.updateCatalogCache(req);
     if (!req.is_delta) {
       // In the case that it was a non-delta update, the catalog might have reloaded
       // itself, and we need to reset the AuthorizationChecker accordingly.
-      authzChecker_.set(new AuthorizationChecker(
-          authzConfig_, getCatalog().getAuthPolicy()));
+      authzChecker_.set(authzFactory_.newAuthorizationChecker(
+          getCatalog().getAuthPolicy()));
     }
     return resp;
   }
@@ -478,21 +494,11 @@ public class Frontend {
       ResetMetadataStmt resetMetadataStmt = (ResetMetadataStmt) analysis.getStmt();
       TResetMetadataRequest req = resetMetadataStmt.toThrift();
       ddl.setReset_metadata_params(req);
-      metadata.setColumns(Collections.<TColumn>emptyList());
+      metadata.setColumns(Collections.emptyList());
     } else if (analysis.isShowRolesStmt()) {
       ddl.op_type = TCatalogOpType.SHOW_ROLES;
       ShowRolesStmt showRolesStmt = (ShowRolesStmt) analysis.getStmt();
       ddl.setShow_roles_params(showRolesStmt.toThrift());
-      Set<String> groupNames =
-          getAuthzChecker().getUserGroups(analysis.getAnalyzer().getUser());
-      // Check if the user is part of the group (case-sensitive) this SHOW ROLE
-      // statement is targeting. If they are already a member of the group,
-      // the admin requirement can be removed.
-      Preconditions.checkState(ddl.getShow_roles_params().isSetIs_admin_op());
-      if (ddl.getShow_roles_params().isSetGrant_group() &&
-          groupNames.contains(ddl.getShow_roles_params().getGrant_group())) {
-        ddl.getShow_roles_params().setIs_admin_op(false);
-      }
       metadata.setColumns(Arrays.asList(
           new TColumn("role_name", Type.STRING.toThrift())));
     } else if (analysis.isShowGrantPrincipalStmt()) {
@@ -500,22 +506,7 @@ public class Frontend {
       ShowGrantPrincipalStmt showGrantPrincipalStmt =
           (ShowGrantPrincipalStmt) analysis.getStmt();
       ddl.setShow_grant_principal_params(showGrantPrincipalStmt.toThrift());
-      Set<String> groupNames =
-          getAuthzChecker().getUserGroups(analysis.getAnalyzer().getUser());
-      // User must be an admin to execute this operation if they have not been granted
-      // this principal, or the same user as the request.
-      boolean requiresAdmin;
-      if (showGrantPrincipalStmt.getPrincipal().getPrincipalType()
-          == TPrincipalType.USER) {
-        requiresAdmin = !showGrantPrincipalStmt.getPrincipal().getName().equals(
-            analysis.getAnalyzer().getUser().getShortName());
-      } else {
-        requiresAdmin = Sets.intersection(groupNames, showGrantPrincipalStmt
-            .getPrincipal().getGrantGroups()).isEmpty();
-      }
-      ddl.getShow_grant_principal_params().setIs_admin_op(requiresAdmin);
-      metadata.setColumns(Arrays.asList(
-          new TColumn("name", Type.STRING.toThrift())));
+      metadata.setColumns(Arrays.asList(new TColumn("name", Type.STRING.toThrift())));
     } else if (analysis.isCreateDropRoleStmt()) {
       CreateDropRoleStmt createDropRoleStmt = (CreateDropRoleStmt) analysis.getStmt();
       TCreateDropRoleParams params = createDropRoleStmt.toThrift();
@@ -557,6 +548,14 @@ public class Frontend {
       req.setAlter_db_params(params);
       ddl.op_type = TCatalogOpType.DDL;
       ddl.setDdl_params(req);
+    } else if (analysis.isTestCaseStmt()){
+      CopyTestCaseStmt stmt = (CopyTestCaseStmt) analysis.getStmt();
+      TCopyTestCaseReq req = new TCopyTestCaseReq(stmt.getHdfsPath());
+      TDdlExecRequest ddlReq = new TDdlExecRequest();
+      ddlReq.setCopy_test_case_params(req);
+      ddlReq.setDdl_type(TDdlType.COPY_TESTCASE);
+      ddl.op_type = TCatalogOpType.DDL;
+      ddl.setDdl_params(ddlReq);
     } else {
       throw new IllegalStateException("Unexpected CatalogOp statement type.");
     }
@@ -585,6 +584,20 @@ public class Frontend {
    * data files.
    */
   public TLoadDataResp loadTableData(TLoadDataReq request) throws ImpalaException,
+      IOException {
+    TTableName tableName = request.getTable_name();
+    RetryTracker retries = new RetryTracker(
+        String.format("load table data %s.%s", tableName.db_name, tableName.table_name));
+    while (true) {
+      try {
+        return doLoadTableData(request);
+      } catch(InconsistentMetadataFetchException e) {
+        retries.handleRetryOrThrow(e);
+      }
+    }
+  }
+
+  private TLoadDataResp doLoadTableData(TLoadDataReq request) throws ImpalaException,
       IOException {
     TableName tableName = TableName.fromThrift(request.getTable_name());
 
@@ -641,9 +654,9 @@ public class Frontend {
    * not increase the query id counter.
    */
   public String getExplainString(TQueryCtx queryCtx) throws ImpalaException {
-    StringBuilder stringBuilder = new StringBuilder();
-    createExecRequest(queryCtx, stringBuilder);
-    return stringBuilder.toString();
+    PlanCtx planCtx = new PlanCtx(queryCtx);
+    createExecRequest(planCtx);
+    return planCtx.getExplainString();
   }
 
   public TGetCatalogMetricsResult getCatalogMetrics() throws ImpalaException {
@@ -657,18 +670,68 @@ public class Frontend {
   }
 
   /**
+   * Keeps track of retries when handling InconsistentMetadataFetchExceptions.
+   * Whenever a Catalog object is acquired (e.g., getCatalog), operations that access
+   * finer-grained objects, such as tables and partitions, can throw such a runtime
+   * exception. Inconsistent metadata comes up due to interleaving catalog object updates
+   * with retrieving those objects. Instead of bubbling up the issue to the user, retrying
+   * can get the user's operation to run on a consistent snapshot and to succeed.
+   * Retries are *not* needed for accessing top-level objects such as databases, since
+   * they do not have a parent, so cannot be inconsistent.
+   * TODO: this class is typically used in a loop at the call-site. replace with lambdas
+   *       in Java 8 to simplify the looping boilerplate.
+   */
+  public static class RetryTracker {
+    // Number of exceptions seen
+    private int attempt_ = 0;
+    // Message to add when logging retries.
+    private final String msg_;
+
+    public RetryTracker(String msg) { msg_ = msg; }
+
+    /**
+     * Record a retry. If the number of retries exceeds to configured maximum, the
+     * exception is thrown. Otherwise, the number of retries is incremented and logged.
+     * TODO: record these retries in the profile as done for query retries.
+     */
+    public void handleRetryOrThrow(InconsistentMetadataFetchException exception) {
+      if (attempt_++ >= INCONSISTENT_METADATA_NUM_RETRIES) throw exception;
+      if (attempt_ > 1) {
+        // Back-off a bit on later retries.
+        Uninterruptibles.sleepUninterruptibly(200 * attempt_, TimeUnit.MILLISECONDS);
+      }
+      LOG.warn(String.format("Retried %s: (retry #%s of %s)", msg_,
+          attempt_, INCONSISTENT_METADATA_NUM_RETRIES), exception);
+    }
+  }
+
+  /**
    * Returns all tables in database 'dbName' that match the pattern of 'matcher' and are
    * accessible to 'user'.
    */
   public List<String> getTableNames(String dbName, PatternMatcher matcher,
       User user) throws ImpalaException {
+    RetryTracker retries = new RetryTracker(
+        String.format("fetching %s table names", dbName));
+    while (true) {
+      try {
+        return doGetTableNames(dbName, matcher, user);
+      } catch(InconsistentMetadataFetchException e) {
+        retries.handleRetryOrThrow(e);
+      }
+    }
+  }
+
+  private List<String> doGetTableNames(String dbName, PatternMatcher matcher,
+      User user) throws ImpalaException {
     List<String> tblNames = getCatalog().getTableNames(dbName, matcher);
-    if (authzConfig_.isEnabled()) {
+    if (authzFactory_.getAuthorizationConfig().isEnabled()) {
       Iterator<String> iter = tblNames.iterator();
       while (iter.hasNext()) {
         String tblName = iter.next();
-        PrivilegeRequest privilegeRequest = new PrivilegeRequestBuilder()
-            .any().onAnyColumn(dbName, tblName).toRequest();
+        PrivilegeRequest privilegeRequest = new PrivilegeRequestBuilder(
+            authzFactory_.getAuthorizableFactory())
+            .any().onAnyColumn(dbName, tblName).build();
         if (!authzChecker_.get().hasAccess(user, privilegeRequest)) {
           iter.remove();
         }
@@ -689,10 +752,11 @@ public class Frontend {
     for (Column column: table.getColumnsInHiveOrder()) {
       String colName = column.getName();
       if (!matcher.matches(colName)) continue;
-      if (authzConfig_.isEnabled()) {
-        PrivilegeRequest privilegeRequest = new PrivilegeRequestBuilder()
+      if (authzFactory_.getAuthorizationConfig().isEnabled()) {
+        PrivilegeRequest privilegeRequest = new PrivilegeRequestBuilder(
+            authzFactory_.getAuthorizableFactory())
             .any().onColumn(table.getTableName().getDb(), table.getTableName().getTbl(),
-            colName).toRequest();
+                colName).build();
         if (!authzChecker_.get().hasAccess(user, privilegeRequest)) continue;
       }
       columns.add(column);
@@ -709,7 +773,7 @@ public class Frontend {
     List<? extends FeDb> dbs = getCatalog().getDbs(matcher);
     // If authorization is enabled, filter out the databases the user does not
     // have permissions on.
-    if (authzConfig_.isEnabled()) {
+    if (authzFactory_.getAuthorizationConfig().isEnabled()) {
       Iterator<? extends FeDb> iter = dbs.iterator();
       while (iter.hasNext()) {
         FeDb db = iter.next();
@@ -728,8 +792,8 @@ public class Frontend {
       // Default DB should always be shown.
       return true;
     }
-    PrivilegeRequest request = new PrivilegeRequestBuilder()
-        .any().onAnyColumn(db.getName(), AuthorizeableTable.ANY_TABLE_NAME).toRequest();
+    PrivilegeRequest request = new PrivilegeRequestBuilder(
+        authzFactory_.getAuthorizableFactory()).any().onAnyColumn(db.getName()).build();
     return authzChecker_.get().hasAccess(user, request);
   }
 
@@ -738,6 +802,7 @@ public class Frontend {
    * matches all data sources.
    */
   public List<? extends FeDataSource> getDataSrcs(String pattern) {
+    // TODO: handle InconsistentMetadataException for data sources.
     return getCatalog().getDataSources(
         PatternMatcher.createHivePatternMatcher(pattern));
   }
@@ -746,6 +811,19 @@ public class Frontend {
    * Generate result set and schema for a SHOW COLUMN STATS command.
    */
   public TResultSet getColumnStats(String dbName, String tableName)
+      throws ImpalaException {
+    RetryTracker retries = new RetryTracker(
+        String.format("fetching column stats from %s.%s", dbName, tableName));
+    while (true) {
+      try {
+        return doGetColumnStats(dbName, tableName);
+      } catch(InconsistentMetadataFetchException e) {
+        retries.handleRetryOrThrow(e);
+      }
+    }
+  }
+
+  private TResultSet doGetColumnStats(String dbName, String tableName)
       throws ImpalaException {
     FeTable table = getCatalog().getTable(dbName, tableName);
     TResultSet result = new TResultSet();
@@ -775,6 +853,19 @@ public class Frontend {
    */
   public TResultSet getTableStats(String dbName, String tableName, TShowStatsOp op)
       throws ImpalaException {
+    RetryTracker retries = new RetryTracker(
+        String.format("fetching table stats from %s.%s", dbName, tableName));
+    while (true) {
+      try {
+        return doGetTableStats(dbName, tableName, op);
+      } catch(InconsistentMetadataFetchException e) {
+        retries.handleRetryOrThrow(e);
+      }
+    }
+  }
+
+  private TResultSet doGetTableStats(String dbName, String tableName, TShowStatsOp op)
+      throws ImpalaException {
     FeTable table = getCatalog().getTable(dbName, tableName);
     if (table instanceof FeFsTable) {
       return ((FeFsTable) table).getTableStats();
@@ -799,6 +890,20 @@ public class Frontend {
    * name instead of pattern and returns exact match only.
    */
   public List<Function> getFunctions(TFunctionCategory category,
+      String dbName, String fnPattern, boolean exactMatch)
+      throws DatabaseNotFoundException {
+    RetryTracker retries = new RetryTracker(
+        String.format("fetching functions from %s", dbName));
+    while (true) {
+      try {
+        return doGetFunctions(category, dbName, fnPattern, exactMatch);
+      } catch(InconsistentMetadataFetchException e) {
+        retries.handleRetryOrThrow(e);
+      }
+    }
+  }
+
+  private List<Function> doGetFunctions(TFunctionCategory category,
       String dbName, String fnPattern, boolean exactMatch)
       throws DatabaseNotFoundException {
     FeDb db = getCatalog().getDb(dbName);
@@ -840,23 +945,39 @@ public class Frontend {
    */
   public TDescribeResult describeTable(TTableName tableName,
       TDescribeOutputStyle outputStyle, User user) throws ImpalaException {
-    FeTable table = getCatalog().getTable(tableName.db_name, tableName.table_name);
+    RetryTracker retries = new RetryTracker(
+        String.format("fetching table %s.%s", tableName.db_name, tableName.table_name));
+    while (true) {
+      try {
+        return doDescribeTable(tableName, outputStyle, user);
+      } catch(InconsistentMetadataFetchException e) {
+        retries.handleRetryOrThrow(e);
+      }
+    }
+  }
+
+  private TDescribeResult doDescribeTable(TTableName tableName,
+      TDescribeOutputStyle outputStyle, User user) throws ImpalaException {
+    FeTable table = getCatalog().getTable(tableName.db_name,
+        tableName.table_name);
     List<Column> filteredColumns;
-    if (authzConfig_.isEnabled()) {
+    if (authzFactory_.getAuthorizationConfig().isEnabled()) {
       // First run a table check
-      PrivilegeRequest privilegeRequest = new PrivilegeRequestBuilder()
+      PrivilegeRequest privilegeRequest = new PrivilegeRequestBuilder(
+          authzFactory_.getAuthorizableFactory())
           .allOf(Privilege.VIEW_METADATA).onTable(table.getDb().getName(),
               table.getName())
-          .toRequest();
+          .build();
       if (!authzChecker_.get().hasAccess(user, privilegeRequest)) {
         // Filter out columns that the user is not authorized to see.
         filteredColumns = new ArrayList<Column>();
         for (Column col: table.getColumnsInHiveOrder()) {
           String colName = col.getName();
-          privilegeRequest = new PrivilegeRequestBuilder()
+          privilegeRequest = new PrivilegeRequestBuilder(
+              authzFactory_.getAuthorizableFactory())
               .allOf(Privilege.VIEW_METADATA)
               .onColumn(table.getDb().getName(), table.getName(), colName)
-              .toRequest();
+              .build();
           if (authzChecker_.get().hasAccess(user, privilegeRequest)) {
             filteredColumns.add(col);
           }
@@ -881,14 +1002,15 @@ public class Frontend {
       TDescribeResult result = DescribeResultFactory.buildDescribeFormattedResult(table,
           filteredColumns);
       // Filter out LOCATION text
-      if (authzConfig_.isEnabled()) {
-        PrivilegeRequest privilegeRequest = new PrivilegeRequestBuilder()
+      if (authzFactory_.getAuthorizationConfig().isEnabled()) {
+        PrivilegeRequest privilegeRequest = new PrivilegeRequestBuilder(
+            authzFactory_.getAuthorizableFactory())
             .allOf(Privilege.VIEW_METADATA)
             .onTable(table.getDb().getName(),table.getName())
-            .toRequest();
+            .build();
         // Only filter if the user doesn't have table access.
         if (!authzChecker_.get().hasAccess(user, privilegeRequest)) {
-          List<TResultRow> results = new ArrayList<TResultRow>();
+          List<TResultRow> results = new ArrayList<>();
           for(TResultRow row: result.getResults()) {
             String stringVal = row.getColVals().get(0).getString_val();
             if (!stringVal.contains("Location")) {
@@ -931,7 +1053,7 @@ public class Frontend {
   private TPlanExecInfo createPlanExecInfo(PlanFragment planRoot, Planner planner,
       TQueryCtx queryCtx, TQueryExecRequest queryExecRequest) {
     TPlanExecInfo result = new TPlanExecInfo();
-    ArrayList<PlanFragment> fragments = planRoot.getNodesPreOrder();
+    List<PlanFragment> fragments = planRoot.getNodesPreOrder();
 
     // collect ScanNodes
     List<ScanNode> scanNodes = Lists.newArrayList();
@@ -984,7 +1106,7 @@ public class Frontend {
    * Create a populated TQueryExecRequest, corresponding to the supplied planner.
    */
   private TQueryExecRequest createExecRequest(
-      Planner planner, StringBuilder explainString) throws ImpalaException {
+      Planner planner, PlanCtx planCtx) throws ImpalaException {
     TQueryCtx queryCtx = planner.getQueryCtx();
     AnalysisResult analysisResult = planner.getAnalysisResult();
     boolean isMtExec = analysisResult.isQueryStmt()
@@ -999,6 +1121,9 @@ public class Frontend {
     } else {
       LOG.trace("create plan");
       planRoots.add(planner.createPlan().get(0));
+    }
+    if (planCtx.planCaptureRequested()) {
+      planCtx.plan_ = planRoots;
     }
 
     // Compute resource requirements of the final plans.
@@ -1029,43 +1154,29 @@ public class Frontend {
 
     // create EXPLAIN output after setting everything else
     result.setQuery_ctx(queryCtx);  // needed by getExplainString()
-    ArrayList<PlanFragment> allFragments = planRoots.get(0).getNodesPreOrder();
-    explainString.append(planner.getExplainString(allFragments, result));
-    result.setQuery_plan(explainString.toString());
+    List<PlanFragment> allFragments = planRoots.get(0).getNodesPreOrder();
+    planCtx.explainBuf_.append(planner.getExplainString(allFragments, result));
+    result.setQuery_plan(planCtx.getExplainString());
 
     return result;
-  }
-
-  @VisibleForTesting
-  public StatementBase parse(String stmt) throws AnalysisException {
-    return parse(stmt, new TQueryOptions());
-  }
-
-  public StatementBase parse(String stmt, TQueryOptions options)
-      throws AnalysisException {
-    SqlScanner input = new SqlScanner(new StringReader(stmt));
-    SqlParser parser = new SqlParser(input);
-    Preconditions.checkArgument(options != null);
-    parser.setQueryOptions(options);
-    try {
-      return (StatementBase) parser.parse().value;
-    } catch (Exception e) {
-      throw new AnalysisException(parser.getErrorMsg(stmt), e);
-    }
   }
 
   /**
-   * Create a populated TExecRequest corresponding to the supplied TQueryCtx.
+   * Create a TExecRequest for the query and query context provided in the plan
+   * context. Fills in the EXPLAIN string and optionally the internal plan tree.
    */
-  public TExecRequest createExecRequest(TQueryCtx queryCtx, StringBuilder explainString)
+  public TExecRequest createExecRequest(PlanCtx planCtx)
       throws ImpalaException {
     // Timeline of important events in the planning process, used for debugging
     // and profiling.
-    EventSequence timeline = new EventSequence("Query Compilation");
-    TExecRequest result = getTExecRequest(queryCtx, timeline, explainString);
-    timeline.markEvent("Planning finished");
-    result.setTimeline(timeline.toThrift());
-    return result;
+    try (FrontendProfile.Scope scope = FrontendProfile.createNewWithScope()) {
+      EventSequence timeline = new EventSequence("Query Compilation");
+      TExecRequest result = getTExecRequest(planCtx, timeline);
+      timeline.markEvent("Planning finished");
+      result.setTimeline(timeline.toThrift());
+      result.setProfile(FrontendProfile.getCurrent().emitAsThrift());
+      return result;
+    }
   }
 
   /**
@@ -1080,15 +1191,17 @@ public class Frontend {
             + "%s of %s times: ",numRetries, INCONSISTENT_METADATA_NUM_RETRIES) + msg);
   }
 
-  private TExecRequest getTExecRequest(TQueryCtx queryCtx, EventSequence timeline,
-      StringBuilder explainString) throws ImpalaException {
-    LOG.info("Analyzing query: " + queryCtx.client_request.stmt);
+  private TExecRequest getTExecRequest(PlanCtx planCtx, EventSequence timeline)
+      throws ImpalaException {
+    TQueryCtx queryCtx = planCtx.getQueryContext();
+    LOG.info("Analyzing query: " + queryCtx.client_request.stmt + " db: "
+        + queryCtx.session.database);
 
     int attempt = 0;
     String retryMsg = "";
     while (true) {
       try {
-        TExecRequest req = doCreateExecRequest(queryCtx, timeline, explainString);
+        TExecRequest req = doCreateExecRequest(planCtx, timeline);
         markTimelineRetries(attempt, retryMsg, timeline);
         return req;
       } catch (InconsistentMetadataFetchException e) {
@@ -1108,17 +1221,18 @@ public class Frontend {
     }
   }
 
-  private TExecRequest doCreateExecRequest(TQueryCtx queryCtx, EventSequence timeline,
-      StringBuilder explainString) throws ImpalaException {
+  private TExecRequest doCreateExecRequest(PlanCtx planCtx,
+      EventSequence timeline) throws ImpalaException {
+    TQueryCtx queryCtx = planCtx.getQueryContext();
     // Parse stmt and collect/load metadata to populate a stmt-local table cache
-    StatementBase stmt =
-        parse(queryCtx.client_request.stmt, queryCtx.client_request.query_options);
+    StatementBase stmt = Parser.parse(
+        queryCtx.client_request.stmt, queryCtx.client_request.query_options);
     StmtMetadataLoader metadataLoader =
         new StmtMetadataLoader(this, queryCtx.session.database, timeline);
     StmtTableCache stmtTableCache = metadataLoader.loadTables(stmt);
 
     // Analyze and authorize stmt
-    AnalysisContext analysisCtx = new AnalysisContext(queryCtx, authzConfig_, timeline);
+    AnalysisContext analysisCtx = new AnalysisContext(queryCtx, authzFactory_, timeline);
     AnalysisResult analysisResult =
         analysisCtx.analyzeAndAuthorize(stmt, stmtTableCache, authzChecker_.get());
     LOG.info("Analysis finished.");
@@ -1160,13 +1274,27 @@ public class Frontend {
           new TColumn("summary", Type.STRING.toThrift()))));
       result.setAdmin_request(analysisResult.getAdminFnStmt().toThrift());
       return result;
+    } else if (analysisResult.isTestCaseStmt()) {
+      CopyTestCaseStmt testCaseStmt = ((CopyTestCaseStmt) stmt);
+      if (testCaseStmt.isTestCaseExport()) {
+        result.setStmt_type(TStmtType.TESTCASE);
+        result.setResult_set_metadata(new TResultSetMetadata(Arrays.asList(
+          new TColumn("Test case data output path", Type.STRING.toThrift()))));
+        result.setTestcase_data_path(testCaseStmt.writeTestCaseData());
+      } else {
+        // Mimic it as a DDL.
+        result.setStmt_type(TStmtType.DDL);
+        createCatalogOpRequest(analysisResult, result);
+      }
+      return result;
     }
+
     // If unset, set MT_DOP to 0 to simplify the rest of the code.
     if (!queryOptions.isSetMt_dop()) queryOptions.setMt_dop(0);
 
     // create TQueryExecRequest
     TQueryExecRequest queryExecRequest =
-        getPlannedExecRequest(queryCtx, analysisResult, timeline, explainString);
+        getPlannedExecRequest(planCtx, analysisResult, timeline);
 
     TLineageGraph thriftLineageGraph = analysisResult.getThriftLineageGraph();
     if (thriftLineageGraph != null && thriftLineageGraph.isSetQuery_text()) {
@@ -1180,7 +1308,7 @@ public class Frontend {
 
     if (analysisResult.isExplainStmt()) {
       // Return the EXPLAIN request
-      createExplainRequest(explainString.toString(), result);
+      createExplainRequest(planCtx.getExplainString(), result);
       return result;
     }
 
@@ -1279,14 +1407,15 @@ public class Frontend {
   /**
    * Get the TQueryExecRequest and use it to populate the query context
    */
-  private TQueryExecRequest getPlannedExecRequest(TQueryCtx queryCtx,
-      AnalysisResult analysisResult, EventSequence timeline, StringBuilder explainString)
+  private TQueryExecRequest getPlannedExecRequest(PlanCtx planCtx,
+      AnalysisResult analysisResult, EventSequence timeline)
       throws ImpalaException {
     Preconditions.checkState(analysisResult.isQueryStmt() || analysisResult.isDmlStmt()
         || analysisResult.isCreateTableAsSelectStmt() || analysisResult.isUpdateStmt()
         || analysisResult.isDeleteStmt());
+    TQueryCtx queryCtx = planCtx.getQueryContext();
     Planner planner = new Planner(analysisResult, queryCtx, timeline);
-    TQueryExecRequest queryExecRequest = createExecRequest(planner, explainString);
+    TQueryExecRequest queryExecRequest = createExecRequest(planner, planCtx);
     queryCtx.setDesc_tbl(
         planner.getAnalysisResult().getAnalyzer().getDescTbl().toThrift());
     queryExecRequest.setQuery_ctx(queryCtx);
@@ -1357,6 +1486,21 @@ public class Frontend {
    * Returns all files info of a table or partition.
    */
   public TResultSet getTableFiles(TShowFilesParams request)
+      throws ImpalaException {
+    TTableName tableName = request.getTable_name();
+    RetryTracker retries = new RetryTracker(
+        String.format("getting table files %s.%s", tableName.db_name,
+            tableName.table_name));
+    while (true) {
+      try {
+        return doGetTableFiles(request);
+      } catch(InconsistentMetadataFetchException e) {
+        retries.handleRetryOrThrow(e);
+      }
+    }
+  }
+
+  private TResultSet doGetTableFiles(TShowFilesParams request)
       throws ImpalaException{
     FeTable table = getCatalog().getTable(request.getTable_name().getDb_name(),
         request.getTable_name().getTable_name());

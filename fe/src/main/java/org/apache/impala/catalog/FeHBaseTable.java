@@ -17,8 +17,12 @@
 
 package org.apache.impala.catalog;
 
-import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.ClusterStatus;
@@ -40,7 +44,6 @@ import org.apache.hadoop.hbase.client.ResultScanner;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.io.compress.Compression;
 import org.apache.hadoop.hbase.util.Bytes;
-import org.apache.hadoop.hive.hbase.HBaseSerDe;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.hadoop.hive.metastore.api.MetaException;
 import org.apache.hadoop.hive.metastore.api.Table;
@@ -54,11 +57,8 @@ import org.apache.impala.util.StatsHelper;
 import org.apache.impala.util.TResultRowBuilder;
 import org.apache.log4j.Logger;
 
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
+import com.google.common.base.Charsets;
+import com.google.common.base.Preconditions;
 
 public interface FeHBaseTable extends FeTable {
   /**
@@ -105,6 +105,16 @@ public interface FeHBaseTable extends FeTable {
     // Minimum number of regions that are checked to estimate the row count
     private static final int MIN_NUM_REGIONS_TO_CHECK = 5;
 
+    // constants from Hive's HBaseSerDe.java copied here to avoid dependending on
+    // hive-hbase-handler (and its transitive dependencies) These are user facing
+    // properties and pretty much guaranteed to not change without breaking backwards
+    // compatibility. Hence it is safe to just copy them here
+    private static final String HBASE_COLUMNS_MAPPING = "hbase.columns.mapping";
+    private static final String HBASE_TABLE_DEFAULT_STORAGE_TYPE =
+        "hbase.table.default.storage.type";
+    private static final String HBASE_KEY_COL = ":key";
+    private static final String HBASE_TABLE_NAME = "hbase.table.name";
+
     /**
      * Table client objects are thread-unsafe and cheap to create. The HBase docs
      * recommend creating a new one for each task and then closing when done.
@@ -126,13 +136,13 @@ public interface FeHBaseTable extends FeTable {
         org.apache.hadoop.hive.metastore.api.Table msTable)
         throws MetaException, SerDeException {
       Map<String, String> serdeParams = msTable.getSd().getSerdeInfo().getParameters();
-      String hbaseColumnsMapping = serdeParams.get(HBaseSerDe.HBASE_COLUMNS_MAPPING);
+      String hbaseColumnsMapping = serdeParams.get(HBASE_COLUMNS_MAPPING);
       if (hbaseColumnsMapping == null) {
         throw new MetaException("No hbase.columns.mapping defined in Serde.");
       }
 
       String hbaseTableDefaultStorageType =
-          msTable.getParameters().get(HBaseSerDe.HBASE_TABLE_DEFAULT_STORAGE_TYPE);
+          msTable.getParameters().get(HBASE_TABLE_DEFAULT_STORAGE_TYPE);
       boolean tableDefaultStorageIsBinary = false;
       if (hbaseTableDefaultStorageType != null &&
           !hbaseTableDefaultStorageType.isEmpty()) {
@@ -140,7 +150,7 @@ public interface FeHBaseTable extends FeTable {
           tableDefaultStorageIsBinary = true;
         } else if (!hbaseTableDefaultStorageType.equalsIgnoreCase("string")) {
           throw new SerDeException(
-              "Error: " + HBaseSerDe.HBASE_TABLE_DEFAULT_STORAGE_TYPE +
+              "Error: " + HBASE_TABLE_DEFAULT_STORAGE_TYPE +
                   " parameter must be specified as" + " 'string' or 'binary'; '" +
                   hbaseTableDefaultStorageType +
                   "' is not a valid specification for this table/serde property.");
@@ -161,7 +171,7 @@ public interface FeHBaseTable extends FeTable {
 
       // Populate tmp cols in the order they appear in the Hive metastore.
       // We will reorder the cols below.
-      List<HBaseColumn> tmpCols = Lists.newArrayList();
+      List<HBaseColumn> tmpCols = new ArrayList<>();
       // Store the key column separately.
       // TODO: Change this to an ArrayList once we support composite row keys.
       HBaseColumn keyCol = null;
@@ -223,7 +233,7 @@ public interface FeHBaseTable extends FeTable {
       }
 
       if (columnsMappingSpec.equals("") ||
-          columnsMappingSpec.equals(HBaseSerDe.HBASE_KEY_COL)) {
+          columnsMappingSpec.equals(HBASE_KEY_COL)) {
         throw new SerDeException("Error: hbase.columns.mapping specifies only " +
             "the HBase table row key. A valid Hive-HBase table must specify at " +
             "least one additional column.");
@@ -257,7 +267,7 @@ public interface FeHBaseTable extends FeTable {
               "badly formed column family, column qualifier specification.");
         }
 
-        if (colInfo.equals(HBaseSerDe.HBASE_KEY_COL)) {
+        if (colInfo.equals(HBASE_KEY_COL)) {
           Preconditions.checkState(fsStartIdxOffset == 0);
           rowKeyIndex = i;
           columnFamilies.add(colInfo);
@@ -310,13 +320,13 @@ public interface FeHBaseTable extends FeTable {
         } else {
           // error in storage specification
           throw new SerDeException(
-              "Error: " + HBaseSerDe.HBASE_COLUMNS_MAPPING + " storage specification " +
+              "Error: " + HBASE_COLUMNS_MAPPING + " storage specification " +
                   mappingSpec + " is not valid for column: " + fieldSchema.getName());
         }
       }
 
       if (rowKeyIndex == -1) {
-        columnFamilies.add(0, HBaseSerDe.HBASE_KEY_COL);
+        columnFamilies.add(0, HBASE_KEY_COL);
         columnQualifiers.add(0, null);
         colIsBinaryEncoded.add(0, supportsBinaryEncoding(fieldSchemas.get(0), tblName) &&
             tableDefaultStorageIsBinary);
@@ -401,6 +411,16 @@ public interface FeHBaseTable extends FeTable {
         }
         if (totalSize == 0) {
           rowCount = totalEstimatedRows;
+        } else if (statsSize.mean() < 1) {
+          // No meaningful row width found. The < 1 handles both the
+          // no row case and the potential case where the average is
+          // too small to be meaningful.
+          LOG.warn(String.format("Table %s: no data available to compute " +
+              "row count estimate for key range ('%s', '%s')",
+              tbl.getFullName(),
+              new String(startRowKey, Charsets.UTF_8),
+              new String(endRowKey, Charsets.UTF_8)));
+          return new Pair<>(-1L, -1L);
         } else {
           rowCount = (long) (totalSize / statsSize.mean());
         }
@@ -477,10 +497,10 @@ public interface FeHBaseTable extends FeTable {
       // Give preference to TBLPROPERTIES over SERDEPROPERTIES
       // (really we should only use TBLPROPERTIES, so this is just
       // for backwards compatibility with the original specs).
-      String tableName = tbl.getParameters().get(HBaseSerDe.HBASE_TABLE_NAME);
+      String tableName = tbl.getParameters().get(HBASE_TABLE_NAME);
       if (tableName == null) {
         tableName =
-            tbl.getSd().getSerdeInfo().getParameters().get(HBaseSerDe.HBASE_TABLE_NAME);
+            tbl.getSd().getSerdeInfo().getParameters().get(HBASE_TABLE_NAME);
       }
       if (tableName == null) {
         tableName = tbl.getDbName() + "." + tbl.getTableName();

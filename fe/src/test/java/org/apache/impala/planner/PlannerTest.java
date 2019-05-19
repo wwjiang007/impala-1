@@ -29,7 +29,9 @@ import org.apache.impala.catalog.HBaseColumn;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.RuntimeEnv;
+import org.apache.impala.service.Frontend.PlanCtx;
 import org.apache.impala.testutil.TestUtils;
+import org.apache.impala.testutil.TestUtils.IgnoreValueFilter;
 import org.apache.impala.thrift.TExecRequest;
 import org.apache.impala.thrift.TExplainLevel;
 import org.apache.impala.thrift.TJoinDistributionMode;
@@ -47,6 +49,38 @@ import com.google.common.collect.Lists;
 // All planner tests, except for S3 specific tests should go here.
 public class PlannerTest extends PlannerTestBase {
 
+  /**
+   * Scan node cardinality test
+   */
+  @Test
+  public void testScanCardinality() {
+    runPlannerTestFile("card-scan");
+  }
+
+  /**
+   * Inner join cardinality test
+   */
+  @Test
+  public void testInnerJoinCardinality() {
+    runPlannerTestFile("card-inner-join");
+  }
+
+  /**
+   * Outer join cardinality test
+   */
+  @Test
+  public void testOuterJoinCardinality() {
+    runPlannerTestFile("card-outer-join");
+  }
+
+  /**
+   * 3+ table join cardinality test
+   */
+  @Test
+  public void testMultiJoinCardinality() {
+    runPlannerTestFile("card-multi-join");
+  }
+
   @Test
   public void testPredicatePropagation() {
     runPlannerTestFile("predicate-propagation");
@@ -63,7 +97,8 @@ public class PlannerTest extends PlannerTestBase {
     // Note that not all Exprs are printed in the explain plan, so validating those
     // via this test is currently not possible.
     runPlannerTestFile("constant-folding",
-        ImmutableSet.of(PlannerTestOption.EXTENDED_EXPLAIN));
+        ImmutableSet.of(PlannerTestOption.EXTENDED_EXPLAIN,
+            PlannerTestOption.INCLUDE_QUERY_WITH_IMPLICIT_CASTS));
   }
 
   @Test
@@ -73,7 +108,8 @@ public class PlannerTest extends PlannerTestBase {
 
   @Test
   public void testEmpty() {
-    runPlannerTestFile("empty");
+    runPlannerTestFile("empty",
+        ImmutableSet.of(PlannerTestOption.VALIDATE_CARDINALITY));
   }
 
   @Test
@@ -126,6 +162,26 @@ public class PlannerTest extends PlannerTestBase {
     runPlannerTestFile("hbase");
   }
 
+  /**
+   * Test of HBase in the case of disabling the key scan.
+   * Normally the HBase scan node goes out to HBase to query the
+   * set of keys within the target key range. There are times when this
+   * can fail. In these times we fall back to using HMS row count and
+   * the estimated key predicate cardinality (which will use key column
+   * NDV.) It is hard to test this case in "real life" with an actual
+   * HBase cluster. Instead, we simply disable the key scan via an
+   * option, then rerun all HBase tests with keys.
+   *
+   * TODO: Once node cardinality is available (IMPALA-8021), compare
+   * estimated cardinality with both methods to ensure we get adequate
+   * estimates.
+   */
+  @Test
+  public void testHbaseNoKeyEstimate() {
+    runPlannerTestFile("hbase-no-key-est",
+        ImmutableSet.of(PlannerTestOption.DISABLE_HBASE_KEY_ESTIMATE));
+  }
+
   @Test
   public void testInsert() {
     runPlannerTestFile("insert");
@@ -161,29 +217,34 @@ public class PlannerTest extends PlannerTestBase {
 
   @Test
   public void testJoins() {
-    runPlannerTestFile("joins");
+    runPlannerTestFile("joins",
+        ImmutableSet.of(PlannerTestOption.VALIDATE_CARDINALITY));
   }
 
   @Test
   public void testJoinOrder() {
-    runPlannerTestFile("join-order");
+    runPlannerTestFile("join-order",
+        ImmutableSet.of(PlannerTestOption.VALIDATE_CARDINALITY));
   }
 
   @Test
   public void testOuterJoins() {
-    runPlannerTestFile("outer-joins");
+    runPlannerTestFile("outer-joins",
+        ImmutableSet.of(PlannerTestOption.VALIDATE_CARDINALITY));
   }
 
   @Test
   public void testImplicitJoins() {
-    runPlannerTestFile("implicit-joins");
+    runPlannerTestFile("implicit-joins",
+        ImmutableSet.of(PlannerTestOption.VALIDATE_CARDINALITY));
   }
 
   @Test
   public void testFkPkJoinDetection() {
     // The FK/PK detection result is included in EXTENDED or higher.
     runPlannerTestFile("fk-pk-join-detection",
-        ImmutableSet.of(PlannerTestOption.EXTENDED_EXPLAIN));
+        ImmutableSet.of(PlannerTestOption.EXTENDED_EXPLAIN,
+            PlannerTestOption.VALIDATE_CARDINALITY));
   }
 
   @Test
@@ -193,7 +254,21 @@ public class PlannerTest extends PlannerTestBase {
 
   @Test
   public void testTopN() {
-    runPlannerTestFile("topn");
+    TQueryOptions options = new TQueryOptions();
+    options.setTopn_bytes_limit(0);
+    runPlannerTestFile("topn", options);
+  }
+
+  @Test
+  public void testTopNBytesLimit() {
+    runPlannerTestFile("topn-bytes-limit");
+  }
+
+  @Test
+  public void testTopNBytesLimitSmall() {
+    TQueryOptions options = new TQueryOptions();
+    options.setTopn_bytes_limit(6);
+    runPlannerTestFile("topn-bytes-limit-small", options);
   }
 
   @Test
@@ -262,7 +337,8 @@ public class PlannerTest extends PlannerTestBase {
   public void testTpch() {
     runPlannerTestFile("tpch-all", "tpch",
         ImmutableSet.of(PlannerTestOption.INCLUDE_RESOURCE_HEADER,
-            PlannerTestOption.VALIDATE_RESOURCES));
+            PlannerTestOption.VALIDATE_RESOURCES,
+            PlannerTestOption.VALIDATE_CARDINALITY));
   }
 
   @Test
@@ -282,7 +358,8 @@ public class PlannerTest extends PlannerTestBase {
   public void testTpchNested() {
     runPlannerTestFile("tpch-nested", "tpch_nested_parquet",
         ImmutableSet.of(PlannerTestOption.INCLUDE_RESOURCE_HEADER,
-            PlannerTestOption.VALIDATE_RESOURCES));
+            PlannerTestOption.VALIDATE_RESOURCES,
+            PlannerTestOption.VALIDATE_CARDINALITY));
   }
 
   @Test
@@ -350,7 +427,9 @@ public class PlannerTest extends PlannerTestBase {
   }
 
   @Test
-  public void testParquetStatsAgg() { runPlannerTestFile("parquet-stats-agg"); }
+  public void testParquetStatsAgg() {
+    runPlannerTestFile("parquet-stats-agg");
+  }
 
   @Test
   public void testParquetFiltering() {
@@ -456,10 +535,10 @@ public class PlannerTest extends PlannerTestBase {
     queryCtx.client_request.setStmt(stmt);
     queryCtx.client_request.query_options = defaultQueryOptions();
     if (userMtDop != -1) queryCtx.client_request.query_options.setMt_dop(userMtDop);
-    StringBuilder explainBuilder = new StringBuilder();
     TExecRequest request = null;
     try {
-      request = frontend_.createExecRequest(queryCtx, explainBuilder);
+      PlanCtx planCtx = new PlanCtx(queryCtx);
+      request = frontend_.createExecRequest(planCtx);
     } catch (ImpalaException e) {
       Assert.fail("Failed to create exec request for '" + stmt + "': " + e.getMessage());
     }
@@ -523,11 +602,16 @@ public class PlannerTest extends PlannerTestBase {
   }
 
   @Test
-  public void testDefaultJoinDistributionMode() {
+  public void testDefaultJoinDistributionBroadcastMode() {
     TQueryOptions options = defaultQueryOptions();
     Preconditions.checkState(
         options.getDefault_join_distribution_mode() == TJoinDistributionMode.BROADCAST);
     runPlannerTestFile("default-join-distr-mode-broadcast", options);
+  }
+
+  @Test
+  public void testDefaultJoinDistributionShuffleMode() {
+    TQueryOptions options = defaultQueryOptions();
     options.setDefault_join_distribution_mode(TJoinDistributionMode.SHUFFLE);
     runPlannerTestFile("default-join-distr-mode-shuffle", options);
   }
@@ -546,14 +630,15 @@ public class PlannerTest extends PlannerTestBase {
     // Setting up a table with computed stats
     queryCtx.client_request.setStmt("compute stats functional.alltypes");
     queryCtx.client_request.query_options = defaultQueryOptions();
-    StringBuilder explainBuilder = new StringBuilder();
-    frontend_.createExecRequest(queryCtx, explainBuilder);
+    PlanCtx planCtx = new PlanCtx(queryCtx);
+    frontend_.createExecRequest(planCtx);
     // Setting up an arbitrary query involving a table with stats.
     queryCtx.client_request.setStmt("select * from functional.alltypes");
     // Setting disable_unsafe_spills = true to verify that it no longer
     // throws a NPE with computed stats (IMPALA-5524)
     queryCtx.client_request.query_options.setDisable_unsafe_spills(true);
-    requestWithDisableSpillOn = frontend_.createExecRequest(queryCtx, explainBuilder);
+    planCtx = new PlanCtx(queryCtx);
+    requestWithDisableSpillOn = frontend_.createExecRequest(planCtx);
     Assert.assertNotNull(requestWithDisableSpillOn);
   }
 
@@ -688,5 +773,37 @@ public class PlannerTest extends PlannerTestBase {
     for (int i = 0; i < 100; i++) largeColumnList.add(stringColWithoutStats);
     assertEquals(HBaseScanNode.memoryEstimateForFetchingColumns(largeColumnList),
         8 * 1024 * 1024);
+  }
+
+  /**
+   * Verify that various expected-result filters work on a
+   * variety of sample input lines.
+   */
+  @Test
+  public void testFilters() {
+    IgnoreValueFilter filter = TestUtils.CARDINALITY_FILTER;
+    assertEquals(" foo=bar cardinality=",
+        filter.transform(" foo=bar cardinality=10"));
+    assertEquals(" foo=bar cardinality=",
+        filter.transform(" foo=bar cardinality=10.3K"));
+    assertEquals(" foo=bar cardinality=",
+        filter.transform(" foo=bar cardinality=unavailable"));
+    filter = TestUtils.ROW_SIZE_FILTER;
+    assertEquals(" row-size= cardinality=10.3K",
+        filter.transform(" row-size=10B cardinality=10.3K"));
+  }
+
+  @Test
+  public void testScanNodeFsScheme() {
+    addTestTable("CREATE TABLE abfs_tbl (col int) LOCATION "
+        + "'abfs://dummy-fs@dummy-account.dfs.core.windows.net/abfs_tbl'");
+    addTestTable("CREATE TABLE abfss_tbl (col int) LOCATION "
+        + "'abfss://dummy-fs@dummy-account.dfs.core.windows.net/abfs_tbl'");
+    addTestTable("CREATE TABLE adl_tbl (col int) LOCATION "
+        + "'adl://dummy-account.azuredatalakestore.net/adl_tbl'");
+    addTestTable("CREATE TABLE s3a_tbl (col int) LOCATION "
+        + "'s3a://dummy-bucket/s3_tbl'");
+    runPlannerTestFile(
+        "scan-node-fs-scheme", ImmutableSet.of(PlannerTestOption.VALIDATE_SCAN_FS));
   }
 }

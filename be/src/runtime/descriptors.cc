@@ -62,6 +62,11 @@ static void DecompressLocation(const impala::THdfsTable& thrift_table,
 
 namespace impala {
 
+const int SchemaPathConstants::ARRAY_ITEM;
+const int SchemaPathConstants::ARRAY_POS;
+const int SchemaPathConstants::MAP_KEY;
+const int SchemaPathConstants::MAP_VALUE;
+
 const int RowDescriptor::INVALID_IDX;
 
 const char* TupleDescriptor::LLVM_CLASS_NAME = "class.impala::TupleDescriptor";
@@ -711,8 +716,6 @@ llvm::StructType* TupleDescriptor::GetLlvmStruct(LlvmCodeGen* codegen) const {
   vector<llvm::Type*> struct_fields;
   int curr_struct_offset = 0;
   for (SlotDescriptor* slot: sorted_slots) {
-    // IMPALA-3207: Codegen for CHAR is not yet implemented: bail out of codegen here.
-    if (slot->type().type == TYPE_CHAR) return nullptr;
     DCHECK_EQ(curr_struct_offset, slot->tuple_offset());
     slot->llvm_field_idx_ = struct_fields.size();
     struct_fields.push_back(codegen->GetSlotType(slot->type()));
@@ -742,7 +745,8 @@ llvm::StructType* TupleDescriptor::GetLlvmStruct(LlvmCodeGen* codegen) const {
   for (SlotDescriptor* slot: slots()) {
     // Verify that the byte offset in the llvm struct matches the tuple offset
     // computed in the FE.
-    DCHECK_EQ(layout->getElementOffset(slot->llvm_field_idx()), slot->tuple_offset());
+    DCHECK_EQ(layout->getElementOffset(slot->llvm_field_idx()), slot->tuple_offset())
+        << id_;
   }
   return tuple_struct;
 }

@@ -27,18 +27,18 @@
 
 #include "common/logging.h"
 #include "rpc/jni-thrift-util.h"
-#include "runtime/mem-tracker.h"
 #include "runtime/exec-env.h"
+#include "runtime/mem-tracker.h"
 #include "service/impala-server.h"
+#include "util/cgroup-util.h"
 #include "util/common-metrics.h"
+#include "util/cpu-info.h"
 #include "util/debug-util.h"
+#include "util/disk-info.h"
+#include "util/jni-util.h"
 #include "util/mem-info.h"
 #include "util/pprof-path-handlers.h"
-#include "util/mem-info.h"
-#include "util/cpu-info.h"
-#include "util/disk-info.h"
 #include "util/process-state-info.h"
-#include "util/jni-util.h"
 
 #include "common/names.h"
 
@@ -48,12 +48,13 @@ using namespace rapidjson;
 using namespace strings;
 
 DECLARE_bool(enable_process_lifetime_heap_profiling);
+DECLARE_bool(use_local_catalog);
 DEFINE_int64(web_log_bytes, 1024 * 1024,
     "The maximum number of bytes to display on the debug webserver's log page");
 
 // Writes the last FLAGS_web_log_bytes of the INFO logfile to a webpage
 // Note to get best performance, set GLOG_logbuflevel=-1 to prevent log buffering
-void LogsHandler(const Webserver::ArgumentMap& args, Document* document) {
+void LogsHandler(const Webserver::WebRequest& req, Document* document) {
   string logfile;
   impala::GetFullLogFilename(google::INFO, &logfile);
   Value log_path(logfile.c_str(), document->GetAllocator());
@@ -80,7 +81,7 @@ void LogsHandler(const Webserver::ArgumentMap& args, Document* document) {
   }
 }
 
-// Registered to handle "/flags", and produces json containing an array of flag metadata
+// Registered to handle "/varz", and produces json containing an array of flag metadata
 // objects:
 //
 // "title": "Command-line Flags",
@@ -93,9 +94,9 @@ void LogsHandler(const Webserver::ArgumentMap& args, Document* document) {
 //       "current": "26000"
 //     },
 // .. etc
-void FlagsHandler(const Webserver::ArgumentMap& args, Document* document) {
+void FlagsHandler(const Webserver::WebRequest& req, Document* document) {
   vector<CommandLineFlagInfo> flag_info;
-  GetAllFlags(&flag_info);
+  GetAllFlags(&flag_info, true);
   Value flag_arr(kArrayType);
   for (const CommandLineFlagInfo& flag: flag_info) {
     Value flag_val(kObjectType);
@@ -114,6 +115,8 @@ void FlagsHandler(const Webserver::ArgumentMap& args, Document* document) {
     Value current_value(flag.current_value.c_str(), document->GetAllocator());
     flag_val.AddMember("current", current_value, document->GetAllocator());
 
+    flag_val.AddMember("experimental", flag.hidden, document->GetAllocator());
+
     if (!flag.is_default) {
       flag_val.AddMember("value_changed", 1, document->GetAllocator());
     }
@@ -126,7 +129,7 @@ void FlagsHandler(const Webserver::ArgumentMap& args, Document* document) {
 
 // Registered to handle "/memz"
 void MemUsageHandler(MemTracker* mem_tracker, MetricGroup* metric_group,
-    const Webserver::ArgumentMap& args, Document* document) {
+    const Webserver::WebRequest& req, Document* document) {
   DCHECK(mem_tracker != NULL);
   Value mem_limit(PrettyPrinter::Print(mem_tracker->limit(), TUnit::BYTES).c_str(),
       document->GetAllocator());
@@ -194,7 +197,7 @@ void MemUsageHandler(MemTracker* mem_tracker, MetricGroup* metric_group,
   }
 }
 
-void JmxHandler(const Webserver::ArgumentMap& args, Document* document) {
+void JmxHandler(const Webserver::WebRequest& req, Document* document) {
   document->AddMember(rapidjson::StringRef(Webserver::ENABLE_PLAIN_JSON_KEY), true,
       document->GetAllocator());
   TGetJMXJsonResponse result;
@@ -224,11 +227,38 @@ void JmxHandler(const Webserver::ArgumentMap& args, Document* document) {
   }
 }
 
+// Helper function that creates a Value for a given build flag name, value and adds it to
+// an array of build_flags
+void AddBuildFlag(const std::string& flag_name, const std::string& flag_value,
+    Document* document, Value* build_flags) {
+  Value build_type(kObjectType);
+  Value build_type_name(flag_name.c_str(), document->GetAllocator());
+  build_type.AddMember("flag_name", build_type_name, document->GetAllocator());
+  Value build_type_value(flag_value.c_str(), document->GetAllocator());
+  build_type.AddMember("flag_value", build_type_value, document->GetAllocator());
+  build_flags->PushBack(build_type, document->GetAllocator());
+}
+
 namespace impala {
 
-void RootHandler(const Webserver::ArgumentMap& args, Document* document) {
+void RootHandler(const Webserver::WebRequest& req, Document* document) {
   Value version(GetVersionString().c_str(), document->GetAllocator());
   document->AddMember("version", version, document->GetAllocator());
+
+#ifdef NDEBUG
+  const char* is_ndebug = "true";
+#else
+  const char* is_ndebug = "false";
+#endif
+
+  Value build_flags(kArrayType);
+  AddBuildFlag("is_ndebug", is_ndebug, document, &build_flags);
+  string cmake_build_type(GetCMakeBuildType());
+  replace(cmake_build_type.begin(), cmake_build_type.end(), '-', '_');
+  AddBuildFlag("cmake_build_type", cmake_build_type, document, &build_flags);
+  AddBuildFlag("library_link_type", GetLibraryLinkType(), document, &build_flags);
+  document->AddMember("build_flags", build_flags, document->GetAllocator());
+
   Value cpu_info(CpuInfo::DebugString().c_str(), document->GetAllocator());
   document->AddMember("cpu_info", cpu_info, document->GetAllocator());
   Value mem_info(MemInfo::DebugString().c_str(), document->GetAllocator());
@@ -237,16 +267,17 @@ void RootHandler(const Webserver::ArgumentMap& args, Document* document) {
   document->AddMember("disk_info", disk_info, document->GetAllocator());
   Value os_info(OsInfo::DebugString().c_str(), document->GetAllocator());
   document->AddMember("os_info", os_info, document->GetAllocator());
-  Value process_state_info(ProcessStateInfo().DebugString().c_str(),
-    document->GetAllocator());
-  document->AddMember("process_state_info", process_state_info,
-    document->GetAllocator());
+  Value process_state_info(
+      ProcessStateInfo().DebugString().c_str(), document->GetAllocator());
+  document->AddMember("process_state_info", process_state_info, document->GetAllocator());
+  Value cgroup_info(CGroupUtil::DebugString().c_str(), document->GetAllocator());
+  document->AddMember("cgroup_info", cgroup_info, document->GetAllocator());
 
   if (CommonMetrics::PROCESS_START_TIME != nullptr) {
-    Value process_start_time(CommonMetrics::PROCESS_START_TIME->GetValue().c_str(),
-      document->GetAllocator());
-    document->AddMember("process_start_time", process_start_time,
-      document->GetAllocator());
+    Value process_start_time(
+        CommonMetrics::PROCESS_START_TIME->GetValue().c_str(), document->GetAllocator());
+    document->AddMember(
+        "process_start_time", process_start_time, document->GetAllocator());
   }
 
   ExecEnv* env = ExecEnv::GetInstance();
@@ -254,6 +285,8 @@ void RootHandler(const Webserver::ArgumentMap& args, Document* document) {
   ImpalaServer* impala_server = env->impala_server();
   document->AddMember("impala_server_mode", true, document->GetAllocator());
   document->AddMember("is_coordinator", impala_server->IsCoordinator(),
+      document->GetAllocator());
+  document->AddMember("use_local_catalog", FLAGS_use_local_catalog,
       document->GetAllocator());
   document->AddMember("is_executor", impala_server->IsExecutor(),
       document->GetAllocator());
@@ -269,20 +302,20 @@ void RootHandler(const Webserver::ArgumentMap& args, Document* document) {
 
 void AddDefaultUrlCallbacks(Webserver* webserver, MemTracker* process_mem_tracker,
     MetricGroup* metric_group) {
-  webserver->RegisterUrlCallback("/logs", "logs.tmpl", LogsHandler);
-  webserver->RegisterUrlCallback("/varz", "flags.tmpl", FlagsHandler);
+  webserver->RegisterUrlCallback("/logs", "logs.tmpl", LogsHandler, true);
+  webserver->RegisterUrlCallback("/varz", "flags.tmpl", FlagsHandler, true);
   if (JniUtil::is_jvm_inited()) {
     // JmxHandler outputs a plain JSON string and does not require a template to
     // render. However RawUrlCallback only supports PLAIN content type.
     // (TODO): Switch to RawUrlCallback when it supports JSON content-type.
-    webserver->RegisterUrlCallback("/jmx", "raw_text.tmpl", JmxHandler);
+    webserver->RegisterUrlCallback("/jmx", "raw_text.tmpl", JmxHandler, true);
   }
   if (process_mem_tracker != NULL) {
     auto callback = [process_mem_tracker, metric_group]
-        (const Webserver::ArgumentMap& args, Document* doc) {
-      MemUsageHandler(process_mem_tracker, metric_group, args, doc);
+        (const Webserver::WebRequest& req, Document* doc) {
+      MemUsageHandler(process_mem_tracker, metric_group, req, doc);
     };
-    webserver->RegisterUrlCallback("/memz", "memz.tmpl", callback);
+    webserver->RegisterUrlCallback("/memz", "memz.tmpl", callback, true);
   }
 
 #if !defined(ADDRESS_SANITIZER) && !defined(THREAD_SANITIZER)
@@ -293,10 +326,10 @@ void AddDefaultUrlCallbacks(Webserver* webserver, MemTracker* process_mem_tracke
 #endif
 
   auto root_handler =
-    [](const Webserver::ArgumentMap& args, Document* doc) {
-      RootHandler(args, doc);
+    [](const Webserver::WebRequest& req, Document* doc) {
+      RootHandler(req, doc);
     };
-  webserver->RegisterUrlCallback("/", "root.tmpl", root_handler);
+  webserver->RegisterUrlCallback("/", "root.tmpl", root_handler, true);
 }
 
 }

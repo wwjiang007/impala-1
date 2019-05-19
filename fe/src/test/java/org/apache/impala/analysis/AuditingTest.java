@@ -19,8 +19,8 @@ package org.apache.impala.analysis;
 
 import java.util.Set;
 
-import org.apache.impala.authorization.AuthorizationConfig;
-import org.apache.impala.catalog.AuthorizationException;
+import org.apache.impala.authorization.AuthorizationFactory;
+import org.apache.impala.authorization.AuthorizationException;
 import org.apache.impala.catalog.Catalog;
 import org.apache.impala.catalog.ImpaladCatalog;
 import org.apache.impala.common.AnalysisException;
@@ -364,21 +364,20 @@ public class AuditingTest extends FrontendTestBase {
   }
 
   @Test
-  public void TestAccessEventsOnAuthFailure() throws AuthorizationException,
-      ImpalaException {
+  public void TestAccessEventsOnAuthFailure() throws ImpalaException {
     // The policy file doesn't exist so all operations will result in
     // an AuthorizationError
-    AuthorizationConfig config = AuthorizationConfig.createHadoopGroupAuthConfig(
-        "server1", "/does/not/exist", "");
-    ImpaladCatalog catalog = new ImpaladTestCatalog(config);
-    Frontend fe = new Frontend(config, catalog);
-    AnalysisContext analysisCtx = createAnalysisCtx(config);
-    // We should get an audit event even when an authorization failure occurs.
-    try {
-      parseAndAnalyze("create table foo_does_not_exist(i int)", analysisCtx, fe);
-      Assert.fail("Expected AuthorizationException");
-    } catch (AuthorizationException e) {
-      Assert.assertEquals(1, analysisCtx.getAnalyzer().getAccessEvents().size());
+    AuthorizationFactory authzFactory = createAuthorizationFactory(false);
+    try (ImpaladCatalog catalog = new ImpaladTestCatalog(authzFactory)) {
+      Frontend fe = new Frontend(authzFactory, catalog);
+      AnalysisContext analysisCtx = createAnalysisCtx(authzFactory);
+      // We should get an audit event even when an authorization failure occurs.
+      try {
+        parseAndAnalyze("create table foo_does_not_exist(i int)", analysisCtx, fe);
+        Assert.fail("Expected AuthorizationException");
+      } catch (AuthorizationException e) {
+        Assert.assertEquals(1, analysisCtx.getAnalyzer().getAccessEvents().size());
+      }
     }
   }
 

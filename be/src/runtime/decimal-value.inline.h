@@ -21,12 +21,14 @@
 #include "runtime/decimal-value.h"
 
 #include <cmath>
+#include <functional>
 #include <iomanip>
 #include <limits>
 #include <ostream>
 #include <sstream>
 
 #include "common/logging.h"
+#include "util/arithmetic-util.h"
 #include "util/bit-util.h"
 #include "util/decimal-util.h"
 #include "util/hash-util.h"
@@ -56,6 +58,13 @@ inline DecimalValue<T> DecimalValue<T>::FromDouble(int precision, int scale, dou
 
   // Return the rounded or truncated integer part.
   return DecimalValue(static_cast<T>(d));
+}
+
+template <typename T>
+inline DecimalValue<T> DecimalValue<T>::FromTColumnValue(const TColumnValue& tvalue) {
+  T value = 0;
+  memcpy(&value, tvalue.decimal_val.c_str(), tvalue.decimal_val.length());
+  return DecimalValue<T>(value);
 }
 
 template<typename T>
@@ -250,14 +259,17 @@ inline int128_t AddLarge(int128_t x, int x_scale, int128_t y, int y_scale,
   DCHECK(right <= DecimalUtil::GetScaleMultiplier<int128_t>(result_scale));
 
   *overflow |= x_left > DecimalUtil::MAX_UNSCALED_DECIMAL16 - y_left - carry_to_left;
-  left = x_left + y_left + carry_to_left;
+  left = ArithmeticUtil::AsUnsigned<std::plus>(
+      ArithmeticUtil::AsUnsigned<std::plus>(x_left, y_left),
+      static_cast<int128_t>(carry_to_left));
 
   int128_t mult = DecimalUtil::GetScaleMultiplier<int128_t>(result_scale);
   if (UNLIKELY(!*overflow &&
       left > (DecimalUtil::MAX_UNSCALED_DECIMAL16 - right) / mult)) {
     *overflow = true;
   }
-  return DecimalUtil::SafeMultiply(left, mult, *overflow) + right;
+  return ArithmeticUtil::AsUnsigned<std::plus>(
+      DecimalUtil::SafeMultiply(left, mult, *overflow), right);
 }
 
 // Subtracts numbers that are large enough so that we can't subtract directly. Neither
@@ -669,21 +681,25 @@ inline std::string DecimalValue<T>::ToString(const ColumnType& type) const {
 
 template<typename T>
 inline std::string DecimalValue<T>::ToString(int precision, int scale) const {
+  T value;
+  // 'value_' may be unaligned. Use memcpy to avoid emitting instructions that assume
+  // alignment - see IMPALA-7473.
+  memcpy(&value, &value_, sizeof(T));
   // Decimal values are sent to clients as strings so in the interest of
   // speed the string will be created without the using stringstream with the
   // whole/fractional_part().
   int last_char_idx = precision
       + (scale > 0)   // Add a space for decimal place
       + (scale == precision)   // Add a space for leading 0
-      + (value_ < 0);   // Add a space for negative sign
+      + (value < 0);   // Add a space for negative sign
   std::string str = std::string(last_char_idx, '0');
   // Start filling in the values in reverse order by taking the last digit
   // of the value. Use a positive value and worry about the sign later. At this
   // point the last_char_idx points to the string terminator.
-  T remaining_value = value_;
+  T remaining_value = value;
   int first_digit_idx = 0;
-  if (value_ < 0) {
-    remaining_value = -value_;
+  if (value < 0) {
+    remaining_value = -value;
     first_digit_idx = 1;
   }
   if (scale > 0) {
@@ -705,7 +721,7 @@ inline std::string DecimalValue<T>::ToString(int precision, int scale) const {
     }
     // For safety, enforce string length independent of remaining_value.
   } while (last_char_idx > first_digit_idx);
-  if (value_ < 0) str[0] = '-';
+  if (value < 0) str[0] = '-';
   return str;
 }
 

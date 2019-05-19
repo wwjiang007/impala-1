@@ -19,6 +19,7 @@
 
 #include <sstream>
 
+#include "exec/exec-node-util.h"
 #include "gutil/strings/substitute.h"
 #include "runtime/row-batch.h"
 #include "runtime/runtime-state.h"
@@ -42,6 +43,7 @@ AggregationNode::AggregationNode(
 
 Status AggregationNode::Open(RuntimeState* state) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedOpenEventAdder ea(this);
   // Open the child before consuming resources in this node.
   RETURN_IF_ERROR(child(0)->Open(state));
   RETURN_IF_ERROR(ExecNode::Open(state));
@@ -106,6 +108,7 @@ Status AggregationNode::Open(RuntimeState* state) {
 
 Status AggregationNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedGetNextEventAdder ea(this, eos);
   RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::GETNEXT, state));
   RETURN_IF_CANCELLED(state);
 
@@ -123,8 +126,8 @@ Status AggregationNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* 
   if (pagg_eos) ++curr_output_agg_idx_;
 
   *eos = ReachedLimit() || (pagg_eos && curr_output_agg_idx_ >= aggs_.size());
-  num_rows_returned_ += row_batch->num_rows();
-  COUNTER_SET(rows_returned_counter_, num_rows_returned_);
+  IncrementNumRowsReturned(row_batch->num_rows());
+  COUNTER_SET(rows_returned_counter_, rows_returned());
   return Status::OK();
 }
 

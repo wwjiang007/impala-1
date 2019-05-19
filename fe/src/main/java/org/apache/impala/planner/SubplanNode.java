@@ -17,6 +17,8 @@
 
 package org.apache.impala.planner;
 
+import java.util.ArrayList;
+
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.thrift.TExecNodePhase;
@@ -26,7 +28,6 @@ import org.apache.impala.thrift.TPlanNodeType;
 import org.apache.impala.thrift.TQueryOptions;
 
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
 
 /**
  * A SubplanNode evaluates its right child plan tree for every row from its left child,
@@ -91,7 +92,7 @@ public class SubplanNode extends PlanNode {
     } else {
       cardinality_ = -1;
     }
-    cardinality_ = capAtLimit(cardinality_);
+    cardinality_ = capCardinalityAtLimit(cardinality_);
   }
 
   @Override
@@ -120,7 +121,7 @@ public class SubplanNode extends PlanNode {
   @Override
   public void computePipelineMembership() {
     children_.get(0).computePipelineMembership();
-    pipelines_ = Lists.newArrayList();
+    pipelines_ = new ArrayList<>();
     for (PipelineMembership leftPipeline : children_.get(0).getPipelines()) {
       if (leftPipeline.getPhase() == TExecNodePhase.GETNEXT) {
           pipelines_.add(new PipelineMembership(
@@ -137,8 +138,8 @@ public class SubplanNode extends PlanNode {
     output.append(String.format("%s%s\n", prefix, getDisplayLabel()));
     if (detailLevel.ordinal() >= TExplainLevel.STANDARD.ordinal()) {
       if (!conjuncts_.isEmpty()) {
-        output.append(detailPrefix + "predicates: " +
-            getExplainString(conjuncts_) + "\n");
+        output.append(detailPrefix
+            + "predicates: " + getExplainString(conjuncts_, detailLevel) + "\n");
       }
     }
     return output.toString();
